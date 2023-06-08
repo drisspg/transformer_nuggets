@@ -18,7 +18,9 @@ classifiers = [
 ]
 
 dependencies = [
-    "torch >= 2.0.1"
+    "torch >= 2.0.1",
+    "scipy >= 1.9.1",
+    "tqdm"
 ]
 
 [project.optional-dependencies]
