@@ -17,6 +17,10 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 
+dependencies = [
+    "torch >= 2.0.1"
+]
+
 [project.optional-dependencies]
 dev = ["black", "bumpver", "isort", "pip-tools", "pytest"]
 
