@@ -1,9 +1,7 @@
 import torch
 from scipy.stats import norm
 import torch
-import torch.nn.functional as F
 from tqdm import tqdm
-import torch.utils.benchmark as benchmark
 
 class QLoRAWeight:
     def __init__(self, inpt_tensor: torch.Tensor, block_size: int = 64):
