@@ -1,0 +1,22 @@
+# pyproject.toml
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "transformer_nuggets"
+version = "0.0.1"
+authors = [{ name = "Driss Guessous", email = "drisspguessous@gmail.com" }]
+description = "A place to store reusable transformer components found around the interwebs"
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[project.optional-dependencies]
+dev = ["black", "bumpver", "isort", "pip-tools", "pytest"]
+
