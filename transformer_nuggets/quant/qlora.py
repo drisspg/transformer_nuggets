@@ -4,7 +4,14 @@ import torch
 from tqdm import tqdm
 
 class QLoRAWeight:
+    """QLoRAWeight class for converting a weight to the QLoRA format"""
     def __init__(self, inpt_tensor: torch.Tensor, block_size: int = 64):
+        """Initialize the QLoRAWeight class
+        
+        Args:
+            inpt_tensor (torch.Tensor): Input tensor to convert to QLoRA format
+            block_size (int, optional): Block size to use for QLoRA. Defaults to 64.
+        """
         assert inpt_tensor.dtype == torch.bfloat16
         assert (
             inpt_tensor.numel() % block_size == 0
