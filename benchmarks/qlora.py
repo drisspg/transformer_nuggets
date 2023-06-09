@@ -67,7 +67,7 @@ def main():
     # Compare against bits and bytes:
     if device == "cuda" and bnb_available:
         param = bnb.nn.Params4bit(input_weight, requires_grad=False, quant_type="nf4").cuda(0)
-        bnb_linear = bnb.nn.LinearNF4(input_weight.size(0), input_weight.size(1))
+        bnb_linear = bnb.nn.LinearNF4(input_weight.size(0), input_weight.size(1), bias=False)
         bnb_linear.weight = param
         bnb_linear.to(device)
         # warmup
@@ -80,11 +80,8 @@ def main():
     eager_result = dequant_matmul(qlora_weight, sample_input)
     compiled_result = compile_dequant_matmul(qlora_weight, sample_input)
     bnb_result = bnb_linear(sample_input)
-    print(
-        f"Max abs diff between eager and compiled: {(eager_result - compiled_result).abs().max()}"
-    )
-    print(f"Max abs diff between eager and bnb: {(eager_result - bnb_result).abs().max()}")
-
+    torch.testing.assert_close(eager_result, compiled_result)
+    torch.testing.assert_close(compiled_result, bnb_result)
 
 if __name__ == "__main__":
     main()
