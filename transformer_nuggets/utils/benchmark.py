@@ -1,6 +1,6 @@
 import random
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -16,6 +16,7 @@ class ProfileConfig:
     cuda: bool = True
     iters: int = 0
     warmup_iters: int = 0
+    extra_kwargs: dict = field(default_factory=dict)
 
 
 def benchmark_torch_function_in_microseconds(func: Callable, *args, **kwargs) -> float:
@@ -40,7 +41,7 @@ def profile_function(config: ProfileConfig, func: Callable, *args, **kwargs) -> 
             func(*args, **kwargs)
 
     name_context = nullcontext() if config.name is None else record_function(config.name)
-    with profile(activities=activities, record_shapes=False) as prof:
+    with profile(activities=activities, record_shapes=False, **config.extra_kwargs) as prof:
         for _ in range(config.iters):
             with name_context:
                 func(*args, **kwargs)
