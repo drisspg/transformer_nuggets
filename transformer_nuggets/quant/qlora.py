@@ -122,7 +122,7 @@ class QLoRAWeight:
         scaler_absmax = get_block_absmax(scalers_1, self.scaler_block_size)
         scaler_absmax = scaler_absmax.unsqueeze(-1).expand(n_scaler_blocks, self.scaler_block_size)
 
-        quantization_factor = 256 / (2*scaler_absmax)
+        quantization_factor = 256 / (2 * scaler_absmax)
         quantized_scaler_blocks = scaler_blocks * quantization_factor
         quantized_scaler_blocks = quantized_scaler_blocks.round()
         quantized_scaler_blocks = quantized_scaler_blocks.clamp(-128, 127)
@@ -130,7 +130,7 @@ class QLoRAWeight:
         # This is needed to make sure that quantization_factor remains a repeated view of n_scaler_blocks
         # For some reason the 127/scaler_absmax realizes n_scaler entries when only n_scaler_blocks are needed
         # The following will graph the first entry for the n_scaler_blocks which is the same accrose the scaler_block_size
-        quantization_factor = quantization_factor[:,0]
+        quantization_factor = quantization_factor[:, 0]
 
         return (
             quantized_scaler_blocks.flatten().to(torch.int8),
@@ -156,7 +156,9 @@ class QLoRAWeight:
         ) == 0, f"Input tensor must be divisible by block size, got {inpt_tensor.numel()} and {scaler_block_size}"
         n_scaler_blocks = inpt_tensor.numel() // scaler_block_size
         inpt_tensor = inpt_tensor.view(n_scaler_blocks, scaler_block_size)
-        dequantized = (inpt_tensor / quantization_factor.unsqueeze(-1)).flatten().to(torch.bfloat16) + self.scaler_mean
+        dequantized = (inpt_tensor / quantization_factor.unsqueeze(-1)).flatten().to(
+            torch.bfloat16
+        ) + self.scaler_mean
         return dequantized
 
     def convert_to_norm_float_weight(self, inpt_tensor: torch.Tensor) -> torch.Tensor:
@@ -171,14 +173,15 @@ class QLoRAWeight:
         blocks = flattened_tensor.view(self.n_blocks, self.block_size)
 
         # Scale the blocks
-        # !!!THIS IS HUGE!!!! BIT shifting or quantization is really dependent on having good scales. 
+        # !!!THIS IS HUGE!!!! BIT shifting or quantization is really dependent on having good scales.
         # So we dont use the double quantized scales during construction of the nf4 weights but only
         # during the actual running of the model
+        # ACTUALLY I think the rounding around 0 is still behaving weirdly idk
         scales = self.scalers.unsqueeze(-1).expand(self.n_blocks, self.block_size)
         scaled_blocks = blocks / scales
 
         # Returns a flattened tensor with each element quantized to nf4 index
-        quantized_blocks = self.quantize_tensor(scaled_blocks.flatten(), self.nf4)
+        quantized_blocks = self.quantize_tensor_nearest(scaled_blocks.flatten(), self.nf4)
 
         # Combine the quantized elements into uint8 values
         combined_blocks = quantized_blocks[::2] << 4 | quantized_blocks[1::2]
@@ -199,7 +202,9 @@ class QLoRAWeight:
         # Build up matrix of scalers repeated for each element in the block
         # Since first and second elements make up a full block, so
         # we expand out to half the size of the full block
-        scalers = self.dequantize_scalers(self.quantized_scalers, self.quantization_factor, self.scaler_block_size)
+        scalers = self.dequantize_scalers(
+            self.quantized_scalers, self.quantization_factor, self.scaler_block_size
+        )
         repeated = scalers.unsqueeze(-1).expand(scalers.size(0), self.block_size // 2)
 
         scaled_first = dequantized_first * repeated.flatten()
@@ -224,6 +229,15 @@ class QLoRAWeight:
         # Set the appropriate 4 bits to 1
         # TODO Dont know if i need to the or 0 here
         return 0 | indexes
+
+    @staticmethod
+    def quantize_tensor_nearest(value: torch.float16, nf4: torch.Tensor) -> torch.Tensor:
+        """Quantize a float16 tensor to nf4 format to nearest and not rounded up"""
+        value = value.unsqueeze(-1)  # (numel, 1)
+        # Compare the value tensor with the nf4 tensor element-wise
+        diff = (value - nf4).abs()
+        closest_nf4 = diff.min(dim=-1).indices
+        return closest_nf4
 
     @staticmethod
     def dequantize(value: torch.Tensor, nf4: torch.Tensor) -> torch.Tensor:
@@ -279,6 +293,17 @@ class QLoRAWeightDebug:
         return 0 | (len(nkf) - 1)
 
     @staticmethod
+    def quantize_nearest(value: torch.float16, nkf: torch.Tensor) -> torch.Tensor:
+        closest_index = 0
+        closest_diff = abs(nkf[0] - value)
+        for i in range(1, len(nkf)):
+            diff = abs(nkf[i] - value)
+            if diff < closest_diff:
+                closest_diff = diff
+                closest_index = i
+        return 0 | closest_index
+
+    @staticmethod
     def dequantize(value: torch.Tensor, nkf: torch.Tensor) -> torch.Tensor:
         """Dequantize a nkf value to float16 format"""
         # return nkf.index_select(0, value)
@@ -326,8 +351,8 @@ class QLoRAWeightDebug:
             # In groups of 2
             for j in range(0, self.block_size, 2):
                 # Combine two bfloat16s via quantization to 4 bit types into a single uint8
-                element_1 = self.quantize(block[j], nkf)
-                element_2 = self.quantize(block[j + 1], nkf)
+                element_1 = self.quantize_nearest(block[j], nkf)
+                element_2 = self.quantize_nearest(block[j + 1], nkf)
                 combined = element_1 << 4 | element_2
                 quantized_tensor[(i * self.block_size // 2) + j // 2] = combined
         return quantized_tensor
