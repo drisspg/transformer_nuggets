@@ -122,10 +122,10 @@ class QLoRAWeight:
         scaler_absmax = get_block_absmax(scalers_1, self.scaler_block_size)
         scaler_absmax = scaler_absmax.unsqueeze(-1).expand(n_scaler_blocks, self.scaler_block_size)
 
-        quantization_factor = 127 / scaler_absmax
+        quantization_factor = 256 / (2*scaler_absmax)
         quantized_scaler_blocks = scaler_blocks * quantization_factor
         quantized_scaler_blocks = quantized_scaler_blocks.round()
-        quantized_scaler_blocks = quantized_scaler_blocks.clamp(-127, 127)
+        quantized_scaler_blocks = quantized_scaler_blocks.clamp(-128, 127)
 
         # This is needed to make sure that quantization_factor remains a repeated view of n_scaler_blocks
         # For some reason the 127/scaler_absmax realizes n_scaler entries when only n_scaler_blocks are needed

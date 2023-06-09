@@ -17,14 +17,14 @@ def debug_sanity_check(device):
     torch.manual_seed(0)
     input_weight = torch.empty(1, 16384, device=device, dtype=torch.bfloat16)
     input_weight = input_weight.normal_(0, 1)
-
+    
     qlora_debug = QLoRAWeightDebug(input_weight, 64)
-    qlora = QLoRAWeight(input_weight, 64, 64)
-    max_abs_debug = (qlora_debug.get_original_weight().to(device) - input_weight).abs().max()
-    max_abs = (qlora.get_original_weight() - input_weight).abs().max()
+    qlora = QLoRAWeight(input_weight, 64, 32)
+    debug_diff = (qlora_debug.get_original_weight().to(device) - input_weight).abs()
+    diff = (qlora.get_original_weight() - input_weight).abs()
 
-    print(f"Max abs diff for QLoRADebug: {max_abs_debug}")
-    print(f"Max abs diff for QLoRA: {max_abs}")
+    print(f"Max abs diff for QLoRADebug: {debug_diff.max()}")
+    print(f"Max abs diff for QLoRA: {diff.max()}")
 
     
 def build_llama_7b(device):
