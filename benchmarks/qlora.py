@@ -15,7 +15,7 @@ except ImportError:
 
 def debug_sanity_check(device):
     torch.manual_seed(0)
-    input_weight = torch.empty(1, 128, device=device, dtype=torch.bfloat16)
+    input_weight = torch.empty(1, 16384, device=device, dtype=torch.bfloat16)
     input_weight = input_weight.normal_(0, 1)
 
     qlora_debug = QLoRAWeightDebug(input_weight, 64)
