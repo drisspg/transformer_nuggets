@@ -19,7 +19,7 @@ def debug_sanity_check(device):
     input_weight = input_weight.normal_(0, 1)
 
     qlora_debug = QLoRAWeightDebug(input_weight, 64)
-    qlora = QLoRAWeight(input_weight, 64)
+    qlora = QLoRAWeight(input_weight, 64, 64)
     max_abs_debug = (qlora_debug.get_original_weight().to(device) - input_weight).abs().max()
     max_abs = (qlora.get_original_weight() - input_weight).abs().max()
 

@@ -20,7 +20,7 @@ classifiers = [
 dependencies = [
     "torch >= 2.0.1",
     "scipy >= 1.9.1",
-    "tqdm"
+    "tqdm",
 ]
 
 [project.optional-dependencies]

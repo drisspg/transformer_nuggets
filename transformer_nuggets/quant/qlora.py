@@ -5,15 +5,40 @@ from tqdm import tqdm
 from typing import Tuple
 
 
+def get_block_absmax(inpt_tensor: torch.Tensor, block_size: int) -> torch.Tensor:
+    """Iterate through a flattened tensor getting the absmax scalers for each block
+
+    Args:
+        inpt_tensor: Input tensor to get scalers for
+        block_size: Block size for the scanning window
+    Returns:
+        torch.Tensor: Tensor of scalers for each block
+    """
+    assert inpt_tensor.dim() == 1, "Input tensor must be flattened"
+    assert (
+        inpt_tensor.numel() % block_size
+    ) == 0, (
+        f"Input tensor must be divisible by block size, got {inpt_tensor.numel()} and {block_size}"
+    )
+
+    n_blocks = inpt_tensor.numel() // block_size
+    blocks = inpt_tensor.view(n_blocks, block_size)
+    block_scalers = blocks.abs().max(dim=1).values
+    return block_scalers
+
+
 class QLoRAWeight:
     """QLoRAWeight class for converting a weight to the QLoRA format"""
 
-    def __init__(self, inpt_tensor: torch.Tensor, block_size: int = 64, scaler_block_size: int = 256):
+    def __init__(
+        self, inpt_tensor: torch.Tensor, block_size: int = 64, scaler_block_size: int = 256
+    ):
         """Initialize the QLoRAWeight class
 
         Args:
-            inpt_tensor (torch.Tensor): Input tensor to convert to QLoRA format
-            block_size (int, optional): Block size to use for QLoRA. Defaults to 64.
+            inpt_tensor: Input tensor to convert to QLoRA format
+            block_size: Block size to use for QLoRA.
+            scaler_block_size: Scaler block size to use for QLoRA.
         """
         assert inpt_tensor.dtype == torch.bfloat16
         assert (
@@ -49,22 +74,28 @@ class QLoRAWeight:
         self.scaler_block_size = scaler_block_size
         # First round of quantization
         # TODO REMOVE ONCE WE HAVE verified the double quantization
-        self.scalers = self.get_scalers(inpt_tensor.flatten(), self.block_size)
+        self.scalers = get_block_absmax(inpt_tensor.flatten(), self.block_size)
 
         # Second of quantization
-        self.quantized_scalers, self.quantization_factor, self.scaler_mean = self.double_quantize_scalers(inpt_tensor.flatten())
+        (
+            self.quantized_scalers,
+            self.quantization_factor,
+            self.scaler_mean,
+        ) = self.double_quantize_scalers(inpt_tensor.flatten())
         self.norm_float_weight = self.convert_to_norm_float_weight(inpt_tensor.clone())
         self.original_shape = inpt_tensor.shape
 
-    def double_quantize_scalers(self, inpt_tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """ Used to achieve the double quantization of the scalers
+    def double_quantize_scalers(
+        self, inpt_tensor: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Used to achieve the double quantization of the scalers
         We take the input tensor first calculate the absmax quantization factors for each block.
         We then find the mean of our positive absmax scalers. We subtract this mean from the scalers
         And then we calculate the absmax quantization factors for each block again. We then quantize the scalers to int8.
-        
+
         Args:
-            inpt_tensor (torch.Tensor): Input tensor to convert to QLoRA format
-        
+            inpt_tensor: Input tensor to convert to QLoRA format, typically a weight tensor
+
         Returns:
             torch.Tensor: Tensor of per_block quantization factors stored in int8 format
                 size: (n_blocks)
@@ -73,49 +104,60 @@ class QLoRAWeight:
         """
         assert inpt_tensor.dim() == 1, "Input tensor must be flattened"
         assert (
-            (inpt_tensor.numel() % self.scaler_block_size) == 0
-        ), f"Input tensor must be divisible by block size, got {inpt_tensor.numel()} and {self.scaler_block_size}"
-        
+            inpt_tensor.numel() % self.scaler_block_size
+        ) == 0, f"Input tensor must be divisible by block size, got {inpt_tensor.numel()} and {self.scaler_block_size}"
+
         # First round of quantization
         # Produces: A tensor of size (n_blocks) of inpt_tensor.dtype
-        scalers_1 = self.get_scalers(inpt_tensor, self.block_size)
+        scalers_1 = get_block_absmax(inpt_tensor, self.block_size)
         scalers_1_mean = scalers_1.mean()
         scalers_1 = scalers_1 - scalers_1_mean
         # Second round of quantization
-        assert scalers_1.numel() % self.scaler_block_size == 0, "Number of scalers must be divisible by scaler block size"
+        assert (
+            scalers_1.numel() % self.scaler_block_size == 0
+        ), "Number of scalers must be divisible by scaler block size"
         n_scaler_blocks = scalers_1.numel() // self.scaler_block_size
         scaler_blocks = scalers_1.view(n_scaler_blocks, self.scaler_block_size)
 
-        scaler_absmax = self.get_scalers(scalers_1, self.scaler_block_size)
+        scaler_absmax = get_block_absmax(scalers_1, self.scaler_block_size)
         scaler_absmax = scaler_absmax.unsqueeze(-1).expand(n_scaler_blocks, self.scaler_block_size)
 
         quantization_factor = 127 / scaler_absmax
         quantized_scaler_blocks = scaler_blocks * quantization_factor
         quantized_scaler_blocks = quantized_scaler_blocks.round()
         quantized_scaler_blocks = quantized_scaler_blocks.clamp(-127, 127)
-        return quantized_scaler_blocks.flatten().to(torch.int8), quantization_factor.flatten(), scalers_1_mean
-    
-    def dequantize_scalers(self, inpt_tensor: torch.Tensor, quantization_factor: torch.Tensor) -> torch.Tensor:
-        """ Used to unpack the double quantization of the scalers"""
+
+        # This is needed to make sure that quantization_factor remains a repeated view of n_scaler_blocks
+        # For some reason the 127/scaler_absmax realizes n_scaler entries when only n_scaler_blocks are needed
+        # The following will graph the first entry for the n_scaler_blocks which is the same accrose the scaler_block_size
+        quantization_factor = quantization_factor[:,0]
+
+        return (
+            quantized_scaler_blocks.flatten().to(torch.int8),
+            quantization_factor.view(n_scaler_blocks),
+            scalers_1_mean,
+        )
+
+    def dequantize_scalers(
+        self, inpt_tensor: torch.Tensor, quantization_factor: torch.Tensor, scaler_block_size: int
+    ) -> torch.Tensor:
+        """Used to unpack the double quantized scalers
+
+        Args;
+            inpt_tensor: Input tensor to convert to QLoRA format this is the quantized scalers in int8 format
+            quantization_factor: Tensor of per_scaler_block quantization factors stored in inpt_weight.dtype
+                size: (n_scaler_blocks)
+            scaler_block_size: Scaler block size to use for double quantization.
+
+        """
         assert inpt_tensor.dim() == 1, "Input tensor must be flattened"
         assert (
-            (inpt_tensor.numel() % self.scaler_block_size) == 0
-        ), f"Input tensor must be divisible by block size, got {inpt_tensor.numel()} and {self.scaler_block_size}"
-        dequantized = (inpt_tensor / quantization_factor).to(torch.bfloat16) + self.scaler_mean
+            inpt_tensor.numel() % scaler_block_size
+        ) == 0, f"Input tensor must be divisible by block size, got {inpt_tensor.numel()} and {scaler_block_size}"
+        n_scaler_blocks = inpt_tensor.numel() // scaler_block_size
+        inpt_tensor = inpt_tensor.view(n_scaler_blocks, scaler_block_size)
+        dequantized = (inpt_tensor / quantization_factor.unsqueeze(-1)).flatten().to(torch.bfloat16) + self.scaler_mean
         return dequantized
-
-    @staticmethod
-    def get_scalers(inpt_tensor: torch.Tensor, block_size) -> torch.Tensor:
-        """Iterate through a flattened tensor getting the scalers for each block"""
-        assert inpt_tensor.dim() == 1, "Input tensor must be flattened"
-        assert (
-            (inpt_tensor.numel() % block_size )== 0
-        ), f"Input tensor must be divisible by block size, got {inpt_tensor.numel()} and {block_size}"
-
-        n_blocks = inpt_tensor.numel() // block_size
-        blocks = inpt_tensor.view(n_blocks, block_size)
-        block_scalers = blocks.abs().max(dim=1).values
-        return block_scalers
 
     def convert_to_norm_float_weight(self, inpt_tensor: torch.Tensor) -> torch.Tensor:
         """Convert a tensor to the normalized float weight format"""
@@ -129,7 +171,9 @@ class QLoRAWeight:
         blocks = flattened_tensor.view(self.n_blocks, self.block_size)
         # blocks = flattened_tensor.unfold(0, self.block_size, self.block_size)
         # Scale the blocks
-        scales = self.scalers.unsqueeze(-1).expand(self.n_blocks, self.block_size)
+        scalers = self.dequantize_scalers(self.quantized_scalers, self.quantization_factor, self.scaler_block_size)
+        scales = scalers.unsqueeze(-1).expand(self.n_blocks, self.block_size)
+        # scales = self.scalers.unsqueeze(-1).expand(self.n_blocks, self.block_size)
         scaled_blocks = blocks / scales
 
         # Returns a flattened tensor with each element quantized to nf4 index
@@ -154,7 +198,9 @@ class QLoRAWeight:
         # Build up matrix of scalers repeated for each element in the block
         # Since first and second elements make up a full block, so
         # we expand out to half the size of the full block
-        repeated = self.scalers.unsqueeze(-1).expand(self.scalers.size(0), self.block_size // 2)
+        scalers = self.dequantize_scalers(self.quantized_scalers, self.quantization_factor, self.scaler_block_size)
+        repeated = scalers.unsqueeze(-1).expand(scalers.size(0), self.block_size // 2)
+        # repeated = self.scalers.unsqueeze(-1).expand(self.scalers.size(0), self.block_size // 2)
 
         scaled_first = dequantized_first * repeated.flatten()
         scaled_second = dequantized_second * repeated.flatten()
@@ -184,11 +230,6 @@ class QLoRAWeight:
         """Dequantize a nf4 value to float16 format"""
         # return nf4.index_select(0, value)
         return nf4[value]
-
-    # def test_dequantize(self):
-    #     print(self.scalers)
-    #     print(self.dequantize_scalers(self.scalers_2, self.quan\
-    #         ))
 
 
 class QLoRAWeightDebug:
