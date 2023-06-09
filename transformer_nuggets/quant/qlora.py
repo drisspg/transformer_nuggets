@@ -1,8 +1,8 @@
+from typing import Tuple
+
 import torch
 from scipy.stats import norm
-import torch
 from tqdm import tqdm
-from typing import Tuple
 
 
 def get_block_absmax(inpt_tensor: torch.Tensor, block_size: int) -> torch.Tensor:

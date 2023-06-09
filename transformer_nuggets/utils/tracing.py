@@ -1,13 +1,12 @@
+import itertools
+import weakref
+from functools import partial
+
 import torch
+import torch.overrides
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_map
 from torch.utils.weak import WeakIdRef
-import torch.overrides
-
-import weakref
-from functools import partial
-import itertools
-
 
 dtype_abbrs = {
     torch.bfloat16: "bf16",

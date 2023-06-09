@@ -1,11 +1,12 @@
+import random
+from contextlib import nullcontext
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Optional
+
 import torch
 import torch.utils.benchmark as benchmark
-from pathlib import Path
-import random
-from torch.profiler import profile, record_function, ProfilerActivity
-from dataclasses import dataclass
-from typing import Optional, Callable
-from contextlib import nullcontext
+from torch.profiler import ProfilerActivity, profile, record_function
 
 
 @dataclass

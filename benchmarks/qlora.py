@@ -1,8 +1,8 @@
 import torch
 import torch.nn.functional as F
+
 import transformer_nuggets as nugs
 from transformer_nuggets.quant import QLoRAWeight, QLoRAWeightDebug
-
 
 bnb_available = False
 try:
@@ -82,6 +82,7 @@ def main():
     bnb_result = bnb_linear(sample_input)
     torch.testing.assert_close(eager_result, compiled_result)
     torch.testing.assert_close(compiled_result, bnb_result)
+
 
 if __name__ == "__main__":
     main()
