@@ -13,20 +13,6 @@ except ImportError:
     print("Could not import bitsandbytes")
 
 
-def debug_sanity_check(device):
-    torch.manual_seed(0)
-    input_weight = torch.empty(1, 16384, device=device, dtype=torch.bfloat16)
-    input_weight = input_weight.normal_(0, 1)
-    
-    qlora_debug = QLoRAWeightDebug(input_weight, 64)
-    qlora = QLoRAWeight(input_weight, 64, 32)
-    debug_diff = (qlora_debug.get_original_weight().to(device) - input_weight).abs()
-    diff = (qlora.get_original_weight() - input_weight).abs()
-
-    print(f"Max abs diff for QLoRADebug: {debug_diff.max()}")
-    print(f"Max abs diff for QLoRA: {diff.max()}")
-
-    
 def build_llama_7b(device):
     # Lets do an actual llama size 7b
     # Number of parameters	dimension	n heads	n layers	Learn rate	Batch size	n tokens
@@ -51,10 +37,8 @@ def build_llama_7b(device):
     return qlora_weght, input_weight, sample_input
 
 
-def main(debug=True):
+def main():
     device = "cuda"
-    if debug:
-        debug_sanity_check(device)
 
     qlora_weight, input_weight, sample_input = build_llama_7b(device)
 
@@ -92,7 +76,6 @@ def main(debug=True):
         bnb_time = nugs.utils.benchmark_torch_function_in_microseconds(bnb_linear, sample_input)
         print(f"Time for bnb linear: {bnb_time} us")
 
-  
     # correctness
     eager_result = dequant_matmul(qlora_weight, sample_input)
     compiled_result = compile_dequant_matmul(qlora_weight, sample_input)

@@ -24,16 +24,18 @@ def test_single_to_double_quantization(block_size: int, scaler_block_size: int):
     assert_close(single_quantization, double_quantization, atol=2e-2, rtol=2e-2)
 
 
-@pytest.mark.parametrize("block_size, scaler_block_size", [(64, 256)])
-def test_reconstruction(block_size: int, scaler_block_size: int):
+@pytest.mark.parametrize(
+    "inpt_size, block_size, scaler_block_size", [(16384, 64, 256), (256, 16, 16), (1024, 32, 32)]
+)
+def test_reconstruction(inpt_size: int, block_size: int, scaler_block_size: int):
     torch.manual_seed(0)
     device = "cuda"
-    input_weight = torch.empty(1, 16384, device=device, dtype=torch.bfloat16)
+    input_weight = torch.empty(1, inpt_size, device=device, dtype=torch.bfloat16)
     input_weight = input_weight.normal_(0, 1)
 
     qlora_debug = QLoRAWeightDebug(input_weight, block_size)
     qlora = QLoRAWeight(input_weight, block_size, scaler_block_size)
-    max_abs_debug = (qlora_debug.get_original_weight().to(device) - input_weight).abs().max()
-    max_abs = (qlora.get_original_weight() - input_weight).abs().max()
+    debug_diff = (qlora_debug.get_original_weight().to(device) - input_weight).abs()
+    diff = (qlora.get_original_weight() - input_weight).abs()
 
-    assert abs(max_abs_debug - max_abs) < 1e-2
+    assert abs(debug_diff.max() - diff.max()) < 1e-2

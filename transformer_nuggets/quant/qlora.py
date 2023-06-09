@@ -169,11 +169,12 @@ class QLoRAWeight:
         ), "Number of elements must be even just to not have to think about the end"
         # Reshape the flattened tensor into blocks of size self.block_size
         blocks = flattened_tensor.view(self.n_blocks, self.block_size)
-        # blocks = flattened_tensor.unfold(0, self.block_size, self.block_size)
+
         # Scale the blocks
-        scalers = self.dequantize_scalers(self.quantized_scalers, self.quantization_factor, self.scaler_block_size)
-        scales = scalers.unsqueeze(-1).expand(self.n_blocks, self.block_size)
-        # scales = self.scalers.unsqueeze(-1).expand(self.n_blocks, self.block_size)
+        # !!!THIS IS HUGE!!!! BIT shifting or quantization is really dependent on having good scales. 
+        # So we dont use the double quantized scales during construction of the nf4 weights but only
+        # during the actual running of the model
+        scales = self.scalers.unsqueeze(-1).expand(self.n_blocks, self.block_size)
         scaled_blocks = blocks / scales
 
         # Returns a flattened tensor with each element quantized to nf4 index
@@ -200,7 +201,6 @@ class QLoRAWeight:
         # we expand out to half the size of the full block
         scalers = self.dequantize_scalers(self.quantized_scalers, self.quantization_factor, self.scaler_block_size)
         repeated = scalers.unsqueeze(-1).expand(scalers.size(0), self.block_size // 2)
-        # repeated = self.scalers.unsqueeze(-1).expand(self.scalers.size(0), self.block_size // 2)
 
         scaled_first = dequantized_first * repeated.flatten()
         scaled_second = dequantized_second * repeated.flatten()
