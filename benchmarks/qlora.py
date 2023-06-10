@@ -252,8 +252,8 @@ def main(output_path: Optional[Path], profile_path: Optional[Path]):
 if __name__ == "__main__":
     """Sample usage:
     # Running sweep
-    python benchmarks/qlora.py -o qlora_sweep.csv
-    python benchmarks/qlora.py -p 4096_8_128_qlora.json
+    python benchmarks/qlora.py -o benchmarks/data/qlora_sweep.csv
+    python benchmarks/qlora.py -p benchmarks/data/4096_8_128_qlora.json
     """
     parser = argparse.ArgumentParser(description="Run experiments and output results to file")
     parser.add_argument(
