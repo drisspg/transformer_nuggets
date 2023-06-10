@@ -2,8 +2,9 @@ import argparse
 import csv
 import gc
 from dataclasses import asdict, dataclass
+import itertools
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import torch
 import torch.nn as nn
@@ -158,11 +159,6 @@ def linear_experiment(config: ExperimentConfig) -> ExperimentResult:
     )
     bnb_linear_time = nugs.utils.benchmark_torch_function_in_microseconds(bnb_linear, sample_input)
 
-    # QLoRA and BnB parity
-    # compiled_qlora_linear_result = compiled_qlora_linear(sample_input)
-    # bnb_linear_result = bnb_linear(sample_input)
-    # torch.testing.assert_close(compiled_qlora_linear_result, bnb_linear_result)
-
     return ExperimentResult(
         linear_time, qlora_linear_time, compiled_qlora_linear_time, bnb_linear_time
     )
@@ -195,11 +191,6 @@ def mlp_experiment(config: ExperimentConfig) -> ExperimentResult:
     )
     bnb_mlp_time = nugs.utils.benchmark_torch_function_in_microseconds(bnb_mlp, sample_input)
 
-    # QLoRA and BnB parity
-    # compiled_qlora_mlp_result = compiled_qlora_mlp(sample_input)
-    # bnb_mlp_result = bnb_mlp(sample_input)
-    # torch.testing.assert_close(compiled_qlora_mlp_result, bnb_mlp_result)
-
     return ExperimentResult(mlp_time, qlora_mlp_time, compiled_qlora_mlp_time, bnb_mlp_time)
 
 
@@ -209,50 +200,62 @@ experiment_types = {
 }
 
 
-def main(
-    path: Optional[Path],
-    print_times: int,
-):
+def gen_configs() -> List[ExperimentConfig]:
     # https://github.com/facebookresearch/llama/blob/main/MODEL_CARD.md
-    configs = [
-        # Llama 7b
-        ExperimentConfig(4096, 8, 128, torch.device("cuda:0")),
-        # Llama 13b
-        ExperimentConfig(5120, 8, 128, torch.device("cuda:0")),
-        # Llama 33b
-        ExperimentConfig(6656, 8, 128, torch.device("cuda:0")),
-        # LLama 65b
-        ExperimentConfig(8192, 8, 128, torch.device("cuda:0")),
-    ]
-    results = []
-    for experiment_config in tqdm(configs):
-        # experiment_result = run_experiment(experiment_config)
-        experiment = experiment_types[experiment_config.op]
-        experiment_result = experiment(experiment_config)
-        if print_times:
-            print(f"Experiment config: {experiment_config}")
-            print(f"Time in eager for full matmul: {experiment_result.matmul_time} us")
-            print(f"Time in eager for dequant_matmul: {experiment_result.eager_dequant_time} us")
-            print(
-                f"Time for compiled dequant_matmul : {experiment_result.compiled_dequant_time} us"
-            )
-            print(f"Time for bnb linear: {experiment_result.bnb_time} us")
-        merged = asdict(experiment_config) | asdict(experiment_result)
-        results.append(merged)
-        # force a garbage collection to avoid OOM
-        gc.collect()
-        torch.cuda.empty_cache()
+    # LLama 7b, 13b, 33b, 65b
+    embed_dims = [4096, 5120, 6656, 8192]
+    bszs = [8, 16, 32]
+    seqlens = [128, 256, 512]
+    devices = [torch.device("cuda:0")]
+    types = ["linear", "mlp"]
+    configs = []
+    for item in itertools.product(embed_dims, bszs, seqlens, devices, types):
+        configs.append(ExperimentConfig(*item))
+    return configs
 
-    if path is not None:
-        with open(path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=results[0].keys())
-            writer.writeheader()
-            writer.writerows(results)
+
+def main(output_path: Optional[Path], profile_path: Optional[Path]):
+    if output_path is not None:
+        results = []
+        for experiment_config in tqdm(gen_configs()):
+            experiment = experiment_types[experiment_config.op]
+            experiment_result = experiment(experiment_config)
+            merged = asdict(experiment_config) | asdict(experiment_result)
+            results.append(merged)
+
+            with open(output_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=results[0].keys())
+                writer.writeheader()
+                writer.writerows(results)
+
+    if profile_path is not None:
+        profile_experiment = ExperimentConfig(4096, 8, 128, torch.device("cuda:0"), "mlp")
+        weights = get_mlp_weights(profile_experiment.embed_dim, profile_experiment.device)
+        sample_input = get_sample_inputs(
+            profile_experiment.bsz,
+            profile_experiment.seqlen,
+            profile_experiment.embed_dim,
+            profile_experiment.device,
+        )
+        qlora_mlp = QloraMLP(*weights)
+        compiled_qlora_mlp = torch.compile(qlora_mlp, fullgraph=True)
+        profile_config = nugs.utils.ProfileConfig(
+            str(profile_path), "qlora_mlp", iters=5, warmup_iters=3
+        )
+        nugs.utils.profile_function(
+            profile_config,
+            compiled_qlora_mlp,
+            sample_input,
+        )
 
 
 if __name__ == "__main__":
+    """Sample usage:
+    # Running sweep
+    python benchmarks/qlora.py -o qlora_sweep.csv
+    python benchmarks/qlora.py -p 4096_8_128_qlora.json
+    """
     parser = argparse.ArgumentParser(description="Run experiments and output results to file")
-    parser.add_argument("--print-times", action="store_true", help="print execution times")
     parser.add_argument(
         "-o",
         "--output_file",
@@ -260,10 +263,20 @@ if __name__ == "__main__":
         help="Path to write out CSV file for experiment results.",
         default=None,
     )
+    parser.add_argument(
+        "-p",
+        "--profile_path",
+        type=str,
+        help="Path to write out json chrome trace file for an experiment.",
+        default=None,
+    )
 
     args = parser.parse_args()
-    path = None
+    output_path = None
+    profile_path = None
     if args.output_file is not None:
-        path = Path(args.output_file)
+        output_path = Path(args.output_file)
+    if args.profile_path is not None:
+        profile_path = Path(args.profile_path)
 
-    main(path, args.print_times)
+    main(output_path, profile_path)

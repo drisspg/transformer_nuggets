@@ -30,28 +30,6 @@ def get_block_absmax(inpt_tensor: torch.Tensor, block_size: int) -> torch.Tensor
 class QLoRAWeight:
     """QLoRAWeight class for converting a weight to the QLoRA format"""
 
-    nf4 = torch.tensor(
-        [
-            -1.0000,
-            -0.6962,
-            -0.5251,
-            -0.3949,
-            -0.2844,
-            -0.1848,
-            -0.0911,
-            0.0000,
-            0.0796,
-            0.1609,
-            0.2461,
-            0.3379,
-            0.4407,
-            0.5626,
-            0.7230,
-            1.0000,
-        ],
-        dtype=torch.bfloat16,
-    )
-
     def __init__(
         self, inpt_tensor: torch.Tensor, block_size: int = 64, scaler_block_size: int = 256
     ):
@@ -69,7 +47,28 @@ class QLoRAWeight:
         assert inpt_tensor.dtype == torch.bfloat16, "Input tensor must be bfloat16"
         self.device = inpt_tensor.device
         # Cache the tensor on the class def
-        self.nf4 = self.nf4.to(self.device)
+        self.nf4 = torch.tensor(
+            [
+                -1.0000,
+                -0.6962,
+                -0.5251,
+                -0.3949,
+                -0.2844,
+                -0.1848,
+                -0.0911,
+                0.0000,
+                0.0796,
+                0.1609,
+                0.2461,
+                0.3379,
+                0.4407,
+                0.5626,
+                0.7230,
+                1.0000,
+            ],
+            device=self.device,
+            dtype=torch.bfloat16,
+        )
         self.block_size = block_size
         self.n_blocks = inpt_tensor.numel() // block_size
         self.scaler_block_size = scaler_block_size

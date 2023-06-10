@@ -11,7 +11,7 @@ from torch.profiler import ProfilerActivity, profile, record_function
 
 @dataclass
 class ProfileConfig:
-    file_path: Optional[Path] = None
+    file_path: Optional[str] = None
     name: Optional[str] = None
     cuda: bool = True
     iters: int = 0
