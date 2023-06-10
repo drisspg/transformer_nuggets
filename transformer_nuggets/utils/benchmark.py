@@ -17,6 +17,7 @@ class ProfileConfig:
     iters: int = 0
     warmup_iters: int = 0
     extra_kwargs: dict = field(default_factory=dict)
+    sync: bool = False
 
 
 def benchmark_torch_function_in_microseconds(func: Callable, *args, **kwargs) -> float:
@@ -45,6 +46,8 @@ def profile_function(config: ProfileConfig, func: Callable, *args, **kwargs) -> 
         for _ in range(config.iters):
             with name_context:
                 func(*args, **kwargs)
+                if config.sync:
+                    torch.cuda.synchronize()
 
     if config.file_path is not None:
         prof.export_chrome_trace(config.file_path)
