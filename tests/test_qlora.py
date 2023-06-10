@@ -7,7 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.testing import assert_close
 
-import transformer_nuggets as nugs
 import transformer_nuggets.quant as quant
 from transformer_nuggets.quant import QLoRAWeight, QLoRAWeightDebug
 
@@ -138,23 +137,25 @@ def test_reconstruction(inpt_size: int, block_size: int, scaler_block_size: int)
 
 
 @unittest.skipIf(not bnb_available, "Bitsandbytes not available")
-# @pytest.mark.parametrize("embed_dim", [4096, 5120, 6656, 8192])
-@pytest.mark.parametrize("embed_dim", [256])
+@pytest.mark.parametrize("embed_dim", [256, 4096, 5120, 6656, 8192])
 @pytest.mark.parametrize("compile", [True, False])
-def test_bitsandbytes_parity(embed_dim, compile):
+def test_bitsandbytes_linear_parity(embed_dim, compile):
     device = torch.device("cuda:0")
     input_weight = build_input_weight(embed_dim, device)
     sample_input = get_sample_inputs(8, 128, embed_dim, device)
     bnb_linear = build_bitsandbytes_linear(input_weight, device)
     qlora_weight = QLoRAWeight(input_weight)
 
-    def dequant_matmul(lora_weight: QLoRAWeight, input_tensor: torch.Tensor):
+    def qlora_linear(
+        input_tensor: torch.Tensor,
+        lora_weight: QLoRAWeight,
+    ):
         return F.linear(input_tensor, lora_weight.get_original_weight())
 
     if compile:
-        dequant_matmul = torch.compile(dequant_matmul, fullgraph=True)
+        qlora_linear = torch.compile(qlora_linear, fullgraph=True)
 
-    nugs_result = dequant_matmul(qlora_weight, sample_input)
+    nugs_result = qlora_linear(sample_input, qlora_weight)
     bnb_result = bnb_linear(sample_input)
     torch.testing.assert_close(nugs_result, bnb_result)
 
@@ -165,7 +166,7 @@ def test_bitsandbytes_mlp_parity(embed_dim):
     device = torch.device("cuda:0")
     weights = get_mlp_weights(embed_dim, device)
     sample_input = get_sample_inputs(8, 128, embed_dim, device)
-    mlp = MLP(*weights)
+
     qlora_mlp = QloraMLP(*weights)
     compiled_qlora_mlp = torch.compile(qlora_mlp, fullgraph=True)
     bnb_mlp = BnbQloraMLP(*weights, device)
