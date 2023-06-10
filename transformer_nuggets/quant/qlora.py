@@ -170,15 +170,18 @@ class QLoRAWeight:
         blocks = flattened_tensor.view(self.n_blocks, self.block_size)
 
         # Scale the blocks
-        # !!!THIS IS HUGE!!!! BIT shifting or quantization is really dependent on having good scales.
-        # So we dont use the double quantized scales during construction of the nf4 weights but only
-        # during the actual running of the model
-        # ACTUALLY I think the rounding around 0 is still behaving weirdly idk
         scalers = get_block_absmax(inpt_tensor.flatten(), self.block_size)
         scales = scalers.unsqueeze(-1).expand(self.n_blocks, self.block_size)
         scaled_blocks = blocks / scales
 
         # Returns a flattened tensor with each element quantized to nf4 index
+        # The weird behavior comes here with how qlora vs bnb break nf4 ties.
+        # Since we ust torch.min(nf4 - inpt/scale) we will always pick the smallest index
+        # While bnb appears to be pick the larger index when breaking ties
+        # ACTUALLYYY I think that what ever op bnb is using to get the nearest NF4 value
+        # Is not consistent with torch.round. Example: input 1.1016 with abs max
+        # scale of 2.2821 will get mapped to 1.25 while mine will get mapped to 0.9570
+        # The difference for mine is 0.1445 and for bnb 0.1484
         quantized_blocks = self.quantize_tensor_nearest(scaled_blocks.flatten(), self.nf4)
 
         # Combine the quantized elements into uint8 values
@@ -234,6 +237,7 @@ class QLoRAWeight:
         value = value.unsqueeze(-1)  # (numel, 1)
         # Compare the value tensor with the nf4 tensor element-wise
         diff = (value - nf4).abs()
+        # BnB appears to break ties by choosing the larger nf4 value
         closest_nf4 = diff.min(dim=-1).indices
         return closest_nf4
 

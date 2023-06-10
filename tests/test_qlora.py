@@ -138,6 +138,25 @@ def test_reconstruction(inpt_size: int, block_size: int, scaler_block_size: int)
 
 @unittest.skipIf(not bnb_available, "Bitsandbytes not available")
 @pytest.mark.parametrize("embed_dim", [256, 4096, 5120, 6656, 8192])
+def test_reconstruction_qlora_vs_bnb(embed_dim: int):
+    torch.manual_seed(0)
+    device = "cuda:0"
+    input_weight = build_input_weight(embed_dim, device)
+    qlora = QLoRAWeight(input_weight)
+    bnb_linear = build_bitsandbytes_linear(input_weight, device)
+    # This is sneaky but don't know if there is a better way to get the reconstruction
+    bnb_reconstruction = bnb_linear(
+        torch.eye(embed_dim, embed_dim, dtype=torch.bfloat16, device=device)
+    )
+    bnb_diff = (bnb_reconstruction.T - input_weight).abs().max()
+    nugs_diff = (qlora.get_original_weight() - input_weight).abs().max()
+    # Since we are subtle different we assume that we both reconstruct with
+    # a similar precision
+    assert (nugs_diff - bnb_diff).abs() < 2e-1
+
+
+@unittest.skipIf(not bnb_available, "Bitsandbytes not available")
+@pytest.mark.parametrize("embed_dim", [256, 4096, 5120, 6656, 8192])
 @pytest.mark.parametrize("compile", [True, False])
 def test_bitsandbytes_linear_parity(embed_dim, compile):
     device = torch.device("cuda:0")
