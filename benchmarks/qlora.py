@@ -144,14 +144,27 @@ def main(output_path: Optional[Path], profile_path: Optional[Path]):
 
     if profile_path is not None:
         profile_experiment = ExperimentConfig(4096, 8, 128, torch.device("cuda:0"), "mlp")
-        weights = qlora.get_mlp_weights(profile_experiment.embed_dim, profile_experiment.device)
+        with nugs.utils.print_cuda_memory_usage():
+            weights = qlora.get_mlp_weights(
+                profile_experiment.embed_dim, profile_experiment.device
+            )
         sample_input = qlora.get_sample_inputs(
             profile_experiment.bsz,
             profile_experiment.seqlen,
             profile_experiment.embed_dim,
             profile_experiment.device,
         )
-        qlora_mlp = qlora.QloraMLP(*weights)
+        with nugs.utils.print_cuda_memory_usage():
+            qlora_mlp = qlora.QloraMLP(*weights)
+            weight1, weight2, weight3 = weights
+
+            del weight1
+            del weight2
+            del weight3
+            import gc
+
+            gc.collect()
+
         compiled_qlora_mlp = torch.compile(qlora_mlp, fullgraph=True)
         profile_config = nugs.utils.ProfileConfig(
             str(profile_path), "qlora_mlp", iters=5, warmup_iters=3, sync=True

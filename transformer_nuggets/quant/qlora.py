@@ -412,8 +412,13 @@ def get_sample_inputs(bsz: int, seqlen: int, embed_dim: int, device: torch.devic
 
 
 def get_mlp_weights(
-    embed_dim: int, device: torch.dtype
+    embed_dim: int, device: torch.dtype = torch.device("cuda:0")
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """These three weights take up
+    3 * (embed_dim * n_hidden) * 2 bytes of memory
+    i.g. for embed_dim = 4096 and hidden_dim = 11008
+    Total memory usage is 270532608 bytes or 0.27 gb
+    """
     torch.manual_seed(0)
 
     def find_multiple(n: int, k: int) -> int:
@@ -468,6 +473,15 @@ class BnbQloraMLP(nn.Module):
         x = F.silu(self.w1(x)) * self.w2(x)
         x = self.w3(x)
         return x
+
+
+class QloraLinear(nn.Module):
+    def __init__(self, weight) -> None:
+        super().__init__()
+        self.weight = QLoRAWeight(weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(x, self.weight.get_original_weight())
 
 
 def qlora_linear(

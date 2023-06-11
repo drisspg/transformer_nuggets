@@ -1,8 +1,8 @@
 import random
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Callable, Optional
+from contextlib import contextmanager
 
 import torch
 import torch.utils.benchmark as benchmark
@@ -51,3 +51,14 @@ def profile_function(config: ProfileConfig, func: Callable, *args, **kwargs) -> 
 
     if config.file_path is not None:
         prof.export_chrome_trace(config.file_path)
+
+
+@contextmanager
+def print_cuda_memory_usage():
+    initial_memory = torch.cuda.memory_allocated()
+    try:
+        yield
+    finally:
+        memory_usage = torch.cuda.memory_allocated() - initial_memory
+        memory_usage_gb = memory_usage / (1024**3)
+        print(f"CUDA memory usage: {memory_usage_gb:.2f} GB")
