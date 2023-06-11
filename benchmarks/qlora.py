@@ -167,11 +167,11 @@ def main(output_path: Optional[Path], profile_path: Optional[Path]):
 
         compiled_qlora_mlp = torch.compile(qlora_mlp, fullgraph=True)
         profile_config = nugs.utils.ProfileConfig(
-            str(profile_path), "qlora_mlp", iters=5, warmup_iters=3, sync=True
+            str(profile_path), "qlora_mlp", iters=5, warmup_iters=3, sync=True, profile_memory=True
         )
         nugs.utils.profile_function(
             profile_config,
-            compiled_qlora_mlp,
+            qlora_mlp,
             sample_input,
         )
 

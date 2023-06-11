@@ -6,6 +6,7 @@ Based on the nanoGPT implementation: https://github.com/karpathy/nanoGPT.
 import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
+from enum import Enum
 
 import torch
 import torch.nn as nn
@@ -26,6 +27,12 @@ def find_multiple(n: int, k: int) -> int:
     return n + k - (n % k)
 
 
+class MLPType(Enum):
+    BnB = "bnb"
+    NF4 = "nf4"
+    Original = "original"
+
+
 @dataclass
 class LLaMAConfig:
     block_size: int = 2048
@@ -34,6 +41,7 @@ class LLaMAConfig:
     n_layer: int = 32
     n_head: int = 32
     n_embd: int = 4096
+    mlp_type: MLPType = MLPType.Original
 
     def __post_init__(self):
         if self.padded_vocab_size is None:
@@ -175,9 +183,12 @@ class Block(nn.Module):
         self.rms_1 = RMSNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
         self.rms_2 = RMSNorm(config.n_embd)
-        # self.mlp = MLP(config)
-        # self.mlp = NF4MLP(config)
-        self.mlp = BnbNF4MLP(config)
+        if config.mlp_type == MLPType.Original:
+            self.mlp = MLP(config)
+        elif config.mlp_type == MLPType.Bnb:
+            self.mlp = BnbNF4MLP(config)
+        elif config.mlp_type == MLPType.NF4:
+            self.mlp = NF4MLP(config)
 
     def forward(
         self,
@@ -382,18 +393,23 @@ def apply_rope(x: torch.Tensor, rope_cache: RoPECache) -> torch.Tensor:
     return x_out2.type_as(x)
 
 
-def get_rand_batch(device: torch.device):
+def main():
+    compile = False
+    device = torch.device("cuda:0")
+    # 7B
+    config = LLaMAConfig(n_layer=32, n_head=32, n_embd=4096, mlp_type=MLPType.Original)
+    model = LLaMA(config).to(device).to(torch.bfloat16)
     bsz = 4
     max_seq_len = 256
-    return torch.randint(32000, (bsz, max_seq_len), device=device)
+    input_batch = torch.randint(32000, (bsz, max_seq_len), device=device)
 
+    if compile:
+        model = torch.compile(model)
 
-def main():
-    device = torch.device("cuda:0")
-    config = LLaMAConfig.from_name("7B")
-    model = LLaMA(config).to(device).to(torch.bfloat16)
-    # model = torch.compile(model)
-    model(get_rand_batch(device))
+    # Warmup
+    for _ in range(3):
+        model(input_batch)
+
     torch.cuda.memory._record_memory_history(
         True,
         # keep 100,000 alloc/free events from before the snapshot
@@ -402,13 +418,14 @@ def main():
         trace_alloc_record_context=True,
     )
     for _ in range(3):
-        out = model(get_rand_batch(device))
+        out = model(input_batch)
     peak_cuda_mem = torch.cuda.max_memory_allocated(device)
     print(f"Peak CUDA memory: {peak_cuda_mem / 1024 ** 3:.2f} GB")
+
     from pickle import dump
 
     snapshot = torch.cuda.memory._snapshot()
-    with open("snapshot_bnb.pickle", "wb") as f:
+    with open("snapshot_nf4.pickle", "wb") as f:
         dump(snapshot, f)
 
 

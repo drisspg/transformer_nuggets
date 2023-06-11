@@ -7,6 +7,7 @@ from contextlib import contextmanager
 import torch
 import torch.utils.benchmark as benchmark
 from torch.profiler import ProfilerActivity, profile, record_function
+from torch.cuda._memory_viz import profile_plot
 
 
 @dataclass
@@ -18,6 +19,7 @@ class ProfileConfig:
     warmup_iters: int = 0
     extra_kwargs: dict = field(default_factory=dict)
     sync: bool = False
+    profile_memory: bool = False
 
 
 def benchmark_torch_function_in_microseconds(func: Callable, *args, **kwargs) -> float:
@@ -27,7 +29,9 @@ def benchmark_torch_function_in_microseconds(func: Callable, *args, **kwargs) ->
     return t0.blocked_autorange().mean * 1e6
 
 
-def profile_function(config: ProfileConfig, func: Callable, *args, **kwargs) -> None:
+def profile_function(
+    config: ProfileConfig, func: Callable, *args, **kwargs
+) -> torch.profiler.profile:
     """Profile a torch function and save the result to a file"""
     seed = 123
     random.seed(seed)
@@ -42,7 +46,13 @@ def profile_function(config: ProfileConfig, func: Callable, *args, **kwargs) -> 
             func(*args, **kwargs)
 
     name_context = nullcontext() if config.name is None else record_function(config.name)
-    with profile(activities=activities, record_shapes=False, **config.extra_kwargs) as prof:
+    with profile(
+        activities=activities,
+        profile_memory=config.profile_memory,
+        record_shapes=config.profile_memory,
+        with_stack=config.profile_memory,
+        **config.extra_kwargs,
+    ) as prof:
         for _ in range(config.iters):
             with name_context:
                 func(*args, **kwargs)
@@ -51,6 +61,12 @@ def profile_function(config: ProfileConfig, func: Callable, *args, **kwargs) -> 
 
     if config.file_path is not None:
         prof.export_chrome_trace(config.file_path)
+
+    if config.profile_memory:
+        with open("memory_output.html", "w") as f:
+            f.write(profile_plot(prof))
+
+    return prof
 
 
 @contextmanager
