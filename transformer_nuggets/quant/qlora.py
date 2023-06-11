@@ -90,7 +90,7 @@ class QLoRAWeight:
             self.quantization_factor,
             self.scaler_mean,
         ) = self.double_quantize_scalers(inpt_tensor.flatten())
-        self.norm_float_weight = self.convert_to_norm_float_weight(inpt_tensor.clone())
+        self.norm_float_weight = self.convert_to_norm_float_weight(inpt_tensor)
         self.original_shape = inpt_tensor.shape
 
     def double_quantize_scalers(

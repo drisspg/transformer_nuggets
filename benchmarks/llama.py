@@ -176,7 +176,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.rms_2 = RMSNorm(config.n_embd)
         # self.mlp = MLP(config)
-        self.mlp = NF4MLP(config)
+        # self.mlp = NF4MLP(config)
+        self.mlp = BnbNF4MLP(config)
 
     def forward(
         self,
@@ -262,6 +263,21 @@ class CausalSelfAttention(nn.Module):
         y = self.c_proj(y)
 
         return y, kv_cache
+
+
+class BnbNF4MLP(nn.Module):
+    def __init__(self, config: LLaMAConfig) -> None:
+        super().__init__()
+        weight1, weight2, weight3 = qlora.get_mlp_weights(config.n_embd)
+        device = torch.device("cuda:0")
+        self.w1 = qlora.build_bitsandbytes_linear(weight1, device)
+        self.w2 = qlora.build_bitsandbytes_linear(weight2, device)
+        self.w3 = qlora.build_bitsandbytes_linear(weight3, device)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.silu(self.w1(x)) * self.w2(x)
+        x = self.w3(x)
+        return x
 
 
 class NF4MLP(nn.Module):
@@ -376,12 +392,24 @@ def main():
     device = torch.device("cuda:0")
     config = LLaMAConfig.from_name("7B")
     model = LLaMA(config).to(device).to(torch.bfloat16)
-    get_rand_batch(device)
-
-    out = model(get_rand_batch(device))
-
+    # model = torch.compile(model)
+    model(get_rand_batch(device))
+    torch.cuda.memory._record_memory_history(
+        True,
+        # keep 100,000 alloc/free events from before the snapshot
+        trace_alloc_max_entries=100000,
+        # record stack information for the trace events
+        trace_alloc_record_context=True,
+    )
+    for _ in range(3):
+        out = model(get_rand_batch(device))
     peak_cuda_mem = torch.cuda.max_memory_allocated(device)
     print(f"Peak CUDA memory: {peak_cuda_mem / 1024 ** 3:.2f} GB")
+    from pickle import dump
+
+    snapshot = torch.cuda.memory._snapshot()
+    with open("snapshot_bnb.pickle", "wb") as f:
+        dump(snapshot, f)
 
 
 if __name__ == "__main__":

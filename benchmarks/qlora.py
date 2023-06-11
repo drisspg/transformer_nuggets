@@ -51,7 +51,7 @@ def linear_experiment(config: ExperimentConfig) -> ExperimentResult:
         config.embed_dim,
         config.device,
     )
-    qlora_weight = QLoRAWeight(input_weight)
+    qlora_weight = QLoRAWeight(input_weight.clone())
     bnb_linear = qlora.build_bitsandbytes_linear(input_weight, config.device)
     compiled_qlora_linear = torch.compile(qlora.qlora_linear, fullgraph=True)
 
