@@ -23,6 +23,7 @@ class ProfileConfig:
     sync: bool = False
     profile_memory: bool = False
     extra_kwargs: dict = field(default_factory=dict)
+    memory_profile_path: Optional[str] = None
 
 
 def benchmark_torch_function_in_microseconds(func: Callable, *args, **kwargs) -> float:
@@ -65,8 +66,11 @@ def profile_function(
     if config.file_path is not None:
         prof.export_chrome_trace(config.file_path)
 
+    memory_profile_path = (
+        config.memory_profile_path if config.profile_memory else "memory_output.html"
+    )
     if config.profile_memory:
-        with open("memory_output.html", "w") as f:
+        with open(memory_profile_path, "w") as f:
             f.write(profile_plot(prof))
 
     return prof

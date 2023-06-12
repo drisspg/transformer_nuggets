@@ -39,7 +39,7 @@ def get_block_absmax(inpt_tensor: torch.Tensor, block_size: int) -> torch.Tensor
     return block_scalers
 
 
-class QLoRAWeight:
+class NF4Tensor:
     """QLoRAWeight class for converting a weight to the QLoRA format"""
 
     def __init__(
@@ -259,7 +259,7 @@ class QLoRAWeight:
         return nf4[value]
 
 
-class QLoRAWeightDebug:
+class NF4TensorDebug:
     """QLoRA Weight written in a more Debug friendly manner"""
 
     @staticmethod
@@ -450,9 +450,9 @@ class MLP(nn.Module):
 class QloraMLP(nn.Module):
     def __init__(self, weight1, weight2, weight3) -> None:
         super().__init__()
-        self.w1 = QLoRAWeight(weight1)
-        self.w2 = QLoRAWeight(weight2)
-        self.w3 = QLoRAWeight(weight3)
+        self.w1 = NF4Tensor(weight1)
+        self.w2 = NF4Tensor(weight2)
+        self.w3 = NF4Tensor(weight3)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.silu(F.linear(x, self.w1.get_original_weight())) * F.linear(
@@ -460,6 +460,30 @@ class QloraMLP(nn.Module):
         )
         x = F.linear(x, self.w3.get_original_weight())
         return x
+
+
+class QloraMLP(nn.Module):
+    def __init__(self, weight1, weight2, weight3) -> None:
+        super().__init__()
+        self.w1 = NF4Tensor(weight1)
+        self.w2 = NF4Tensor(weight2)
+        self.w3 = NF4Tensor(weight3)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Lets try and reduce memory pressure:
+        w1 = self.w1.get_original_weight()
+        y = F.silu(F.linear(x, w1))
+        del w1
+        torch.cuda.empty_cache()
+        w2 = self.w2.get_original_weight()
+        y = y * F.linear(x, w2)
+        del w2
+        torch.cuda.empty_cache()
+        w3 = self.w3.get_original_weight()
+        y = F.linear(y, w3)
+        del w3
+        torch.cuda.empty_cache()
+        return y
 
 
 class BnbQloraMLP(nn.Module):
@@ -478,7 +502,7 @@ class BnbQloraMLP(nn.Module):
 class QloraLinear(nn.Module):
     def __init__(self, weight) -> None:
         super().__init__()
-        self.weight = QLoRAWeight(weight)
+        self.weight = NF4Tensor(weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self.weight.get_original_weight())
@@ -486,6 +510,29 @@ class QloraLinear(nn.Module):
 
 def qlora_linear(
     input_tensor: torch.Tensor,
-    lora_weight: QLoRAWeight,
+    lora_weight: NF4Tensor,
 ):
     return F.linear(input_tensor, lora_weight.get_original_weight())
+
+
+class LinearNF4(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input: torch.Tensor, weight: NF4Tensor):
+        """
+        In the forward pass we receive a Tensor containing the input and return
+        a Tensor containing the output. ctx is a context object that can be used
+        to stash information for backward computation. You can cache arbitrary
+        objects for use in the backward pass using the ctx.save_for_backward method.
+        """
+        ctx.save_for_backward(weight)
+        return F.linear(input, weight.get_original_weight())
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """
+        In the backward pass we receive a Tensor containing the gradient of the loss
+        with respect to the output, and we need to compute the gradient of the loss
+        with respect to the input.
+        """
+        (input,) = ctx.saved_tensors
+        return grad_output * 1.5 * (5 * input**2 - 1)

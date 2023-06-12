@@ -1,1 +1,1 @@
-from transformer_nuggets.quant.qlora import QLoRAWeight, QLoRAWeightDebug, get_block_absmax
+from transformer_nuggets.quant.qlora import NF4Tensor, NF4TensorDebug, get_block_absmax

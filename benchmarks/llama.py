@@ -295,9 +295,9 @@ class NF4MLP(nn.Module):
     def __init__(self, config: LLaMAConfig) -> None:
         super().__init__()
         weight1, weight2, weight3 = qlora.get_mlp_weights(config.n_embd)
-        self.w1 = qlora.QLoRAWeight(weight1)
-        self.w2 = qlora.QLoRAWeight(weight2)
-        self.w3 = qlora.QLoRAWeight(weight3)
+        self.w1 = qlora.NF4Tensor(weight1)
+        self.w2 = qlora.NF4Tensor(weight2)
+        self.w3 = qlora.NF4Tensor(weight3)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.silu(F.linear(x, self.w1.get_original_weight())) * F.linear(
@@ -394,10 +394,10 @@ def apply_rope(x: torch.Tensor, rope_cache: RoPECache) -> torch.Tensor:
 
 
 def main():
-    compile = True
+    compile = False
     device = torch.device("cuda:0")
     # 7B
-    config = LLaMAConfig(n_layer=32, n_head=32, n_embd=4096, mlp_type=MLPType.NF4)
+    config = LLaMAConfig(n_layer=32, n_head=32, n_embd=4096, mlp_type=MLPType.Original)
     model = LLaMA(config).to(device).to(torch.bfloat16)
     bsz = 4
     max_seq_len = 256
@@ -407,18 +407,20 @@ def main():
         model = torch.compile(model)
 
     profile_config = benchmark_utils.ProfileConfig(
-        "llama_original.json",
-        "llama_forward_original",
+        "llama_NF4.json",
+        "llama_forward_NF4",
         iters=3,
         warmup_iters=3,
         profile_memory=True,
         sync=True,
+        memory_profile_path="llama_NF4_memory_del_temps.html",
     )
-    benchmark_utils.profile_function(profile_config, model, input_batch)
+    # benchmark_utils.profile_function(profile_config, model, input_batch)
+
     # Get the fullmodel snapshot
-    # model(input_batch)
-    # with benchmark_utils.save_memory_snapshot("full_llama_nf4_snapshot.pickle"):
-    #     model(input_batch)
+    model(input_batch)
+    with benchmark_utils.save_memory_snapshot("llama_original.pickle"):
+        model(input_batch)
 
 
 if __name__ == "__main__":
