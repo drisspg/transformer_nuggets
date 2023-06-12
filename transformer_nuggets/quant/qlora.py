@@ -56,7 +56,7 @@ class NF4Tensor:
         assert inpt_tensor.dtype == torch.bfloat16, "Input tensor must be bfloat16"
         device = inpt_tensor.device
         # Cache the tensor on the class def
-        cls.nf4 = torch.tensor(
+        nf4 = torch.tensor(
             [
                 -1.0000,
                 -0.6962,
@@ -85,9 +85,7 @@ class NF4Tensor:
             quantization_factor,
             scaler_mean,
         ) = cls.double_quantize_scalers(inpt_tensor.flatten(), block_size, scaler_block_size)
-        quantized_data = cls.convert_to_norm_float_weight(
-            inpt_tensor, n_blocks, block_size, cls.nf4
-        )
+        quantized_data = cls.convert_to_norm_float_weight(inpt_tensor, n_blocks, block_size, nf4)
         original_shape = inpt_tensor.shape
         return cls(
             block_size,
@@ -98,6 +96,7 @@ class NF4Tensor:
             scaler_mean,
             quantized_data,
             original_shape,
+            nf4=nf4,
         )
 
     def __init__(
@@ -110,6 +109,7 @@ class NF4Tensor:
         scaler_mean: torch.Tensor,
         quantized_data: torch.Tensor,
         original_shape: torch.Size,
+        nf4: torch.Tensor,
     ):
         """Initialize the NF4Tensor class"""
         self.device = quantized_data.device
@@ -121,6 +121,7 @@ class NF4Tensor:
         self.scaler_mean = scaler_mean
         self.quantized_data = quantized_data
         self.original_shape = original_shape
+        self.nf4 = nf4
 
     @staticmethod
     def double_quantize_scalers(
@@ -562,11 +563,6 @@ class LinearNF4(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        """
-        In the backward pass we receive a Tensor containing the gradient of the loss
-        with respect to the output, and we need to compute the gradient of the loss
-        with respect to the input.
-        """
         weight: NF4Tensor = ctx.nf4_weight
         return grad_output @ weight.get_original_weight(), None
 
