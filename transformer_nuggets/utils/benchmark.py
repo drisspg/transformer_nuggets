@@ -3,6 +3,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 from contextlib import contextmanager
+from pickle import dump
 
 import torch
 import torch.utils.benchmark as benchmark
@@ -19,9 +20,9 @@ class ProfileConfig:
     cuda: bool = True
     iters: int = 0
     warmup_iters: int = 0
-    extra_kwargs: dict = field(default_factory=dict)
     sync: bool = False
     profile_memory: bool = False
+    extra_kwargs: dict = field(default_factory=dict)
 
 
 def benchmark_torch_function_in_microseconds(func: Callable, *args, **kwargs) -> float:
@@ -80,3 +81,14 @@ def print_cuda_memory_usage():
         memory_usage = torch.cuda.memory_allocated() - initial_memory
         memory_usage_gb = memory_usage / (1024**3)
         print(f"CUDA memory usage: {memory_usage_gb:.2f} GB")
+
+
+@contextmanager
+def save_memory_snapshot(file_path):
+    torch.cuda.memory._record_memory_history()
+    try:
+        yield
+    finally:
+        snapshot = torch.cuda.memory._snapshot()
+        with open(file_path, "wb") as f:
+            dump(snapshot, f)

@@ -14,7 +14,7 @@ from torch.nn import functional as F
 from typing_extensions import Self
 
 import transformer_nuggets.quant.qlora as qlora
-
+import transformer_nuggets.utils.benchmark as benchmark_utils
 
 MaskCache = torch.Tensor
 RoPECache = torch.Tensor
@@ -185,7 +185,7 @@ class Block(nn.Module):
         self.rms_2 = RMSNorm(config.n_embd)
         if config.mlp_type == MLPType.Original:
             self.mlp = MLP(config)
-        elif config.mlp_type == MLPType.Bnb:
+        elif config.mlp_type == MLPType.BnB:
             self.mlp = BnbNF4MLP(config)
         elif config.mlp_type == MLPType.NF4:
             self.mlp = NF4MLP(config)
@@ -394,39 +394,31 @@ def apply_rope(x: torch.Tensor, rope_cache: RoPECache) -> torch.Tensor:
 
 
 def main():
-    compile = False
+    compile = True
     device = torch.device("cuda:0")
     # 7B
-    config = LLaMAConfig(n_layer=32, n_head=32, n_embd=4096, mlp_type=MLPType.Original)
+    config = LLaMAConfig(n_layer=32, n_head=32, n_embd=4096, mlp_type=MLPType.NF4)
     model = LLaMA(config).to(device).to(torch.bfloat16)
     bsz = 4
     max_seq_len = 256
-    input_batch = torch.randint(32000, (bsz, max_seq_len), device=device)
+    input_batch = torch.randint(config.vocab_size, (bsz, max_seq_len), device=device)
 
     if compile:
         model = torch.compile(model)
 
-    # Warmup
-    for _ in range(3):
-        model(input_batch)
-
-    torch.cuda.memory._record_memory_history(
-        True,
-        # keep 100,000 alloc/free events from before the snapshot
-        trace_alloc_max_entries=100000,
-        # record stack information for the trace events
-        trace_alloc_record_context=True,
+    profile_config = benchmark_utils.ProfileConfig(
+        "llama_original.json",
+        "llama_forward_original",
+        iters=3,
+        warmup_iters=3,
+        profile_memory=True,
+        sync=True,
     )
-    for _ in range(3):
-        out = model(input_batch)
-    peak_cuda_mem = torch.cuda.max_memory_allocated(device)
-    print(f"Peak CUDA memory: {peak_cuda_mem / 1024 ** 3:.2f} GB")
-
-    from pickle import dump
-
-    snapshot = torch.cuda.memory._snapshot()
-    with open("snapshot_nf4.pickle", "wb") as f:
-        dump(snapshot, f)
+    benchmark_utils.profile_function(profile_config, model, input_batch)
+    # Get the fullmodel snapshot
+    # model(input_batch)
+    # with benchmark_utils.save_memory_snapshot("full_llama_nf4_snapshot.pickle"):
+    #     model(input_batch)
 
 
 if __name__ == "__main__":
