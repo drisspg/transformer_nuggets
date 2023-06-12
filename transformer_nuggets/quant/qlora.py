@@ -40,45 +40,23 @@ def get_block_absmax(inpt_tensor: torch.Tensor, block_size: int) -> torch.Tensor
 
 
 class NF4Tensor:
-    """QLoRAWeight class for converting a weight to the QLoRA format"""
+    """NF4Tensor class for converting a weight to the QLoRA NF4 format"""
 
     @classmethod
-    def from_quantized(
-        cls,
-        block_size: int,
-        n_blocks: int,
-        scaler_block_size: int,
-        quantized_scalers: torch.Tensor,
-        quantization_factor: torch.Tensor,
-        scaler_mean: torch.Tensor,
-        quantized_data: torch.Tensor,
-        shape: torch.Size,
-    ):
-        pass
-
     def from_tensor(
         cls,
+        inpt_tensor: torch.Tensor,
+        block_size: int = 64,
+        scaler_block_size: int = 256,
     ):
-        pass
-
-    def __init__(
-        self, inpt_tensor: torch.Tensor, block_size: int = 64, scaler_block_size: int = 256
-    ):
-        """Initialize the QLoRAWeight class
-
-        Args:
-            inpt_tensor: Input tensor to convert to QLoRA format
-            block_size: Block size to use for QLoRA.
-            scaler_block_size: Scaler block size to use for QLoRA.
-        """
         assert inpt_tensor.dtype == torch.bfloat16
         assert (
             inpt_tensor.numel() % block_size == 0
         ), "Input tensor must be divisible by block size"
         assert inpt_tensor.dtype == torch.bfloat16, "Input tensor must be bfloat16"
-        self.device = inpt_tensor.device
+        device = inpt_tensor.device
         # Cache the tensor on the class def
-        self.nf4 = torch.tensor(
+        cls.nf4 = torch.tensor(
             [
                 -1.0000,
                 -0.6962,
@@ -97,23 +75,58 @@ class NF4Tensor:
                 0.7230,
                 1.0000,
             ],
-            device=self.device,
+            device=device,
             dtype=torch.bfloat16,
         )
-        self.block_size = block_size
-        self.n_blocks = inpt_tensor.numel() // block_size
-        self.scaler_block_size = scaler_block_size
+        n_blocks = inpt_tensor.numel() // block_size
         # Double quantization
         (
-            self.quantized_scalers,
-            self.quantization_factor,
-            self.scaler_mean,
-        ) = self.double_quantize_scalers(inpt_tensor.flatten())
-        self.quantized_data = self.convert_to_norm_float_weight(inpt_tensor)
-        self.original_shape = inpt_tensor.shape
+            quantized_scalers,
+            quantization_factor,
+            scaler_mean,
+        ) = cls.double_quantize_scalers(inpt_tensor.flatten(), block_size, scaler_block_size)
+        quantized_data = cls.convert_to_norm_float_weight(
+            inpt_tensor, n_blocks, block_size, cls.nf4
+        )
+        original_shape = inpt_tensor.shape
+        return cls(
+            block_size,
+            n_blocks,
+            scaler_block_size,
+            quantized_scalers,
+            quantization_factor,
+            scaler_mean,
+            quantized_data,
+            original_shape,
+        )
 
+    def __init__(
+        self,
+        block_size: int,
+        n_blocks: int,
+        scaler_block_size: int,
+        quantized_scalers: torch.Tensor,
+        quantization_factor: torch.Tensor,
+        scaler_mean: torch.Tensor,
+        quantized_data: torch.Tensor,
+        original_shape: torch.Size,
+    ):
+        """Initialize the NF4Tensor class"""
+        self.device = quantized_data.device
+        self.block_size = block_size
+        self.n_blocks = n_blocks
+        self.scaler_block_size = scaler_block_size
+        self.quantized_scalers = quantized_scalers
+        self.quantization_factor = quantization_factor
+        self.scaler_mean = scaler_mean
+        self.quantized_data = quantized_data
+        self.original_shape = original_shape
+
+    @staticmethod
     def double_quantize_scalers(
-        self, inpt_tensor: torch.Tensor
+        inpt_tensor: torch.Tensor,
+        block_size: int,
+        scaler_block_size: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Used to achieve the double quantization of the scalers
         We take the input tensor first calculate the absmax quantization factors for each block.
@@ -131,23 +144,23 @@ class NF4Tensor:
         """
         assert inpt_tensor.dim() == 1, "Input tensor must be flattened"
         assert (
-            inpt_tensor.numel() % self.scaler_block_size
-        ) == 0, f"Input tensor must be divisible by block size, got {inpt_tensor.numel()} and {self.scaler_block_size}"
+            inpt_tensor.numel() % scaler_block_size
+        ) == 0, f"Input tensor must be divisible by block size, got {inpt_tensor.numel()} and {scaler_block_size}"
 
         # First round of quantization
         # Produces: A tensor of size (n_blocks) of inpt_tensor.dtype
-        scalers_1 = get_block_absmax(inpt_tensor, self.block_size)
+        scalers_1 = get_block_absmax(inpt_tensor, block_size)
         scalers_1_mean = scalers_1.mean()
         scalers_1 = scalers_1 - scalers_1_mean
         # Second round of quantization
         assert (
-            scalers_1.numel() % self.scaler_block_size == 0
+            scalers_1.numel() % scaler_block_size == 0
         ), "Number of scalers must be divisible by scaler block size"
-        n_scaler_blocks = scalers_1.numel() // self.scaler_block_size
-        scaler_blocks = scalers_1.view(n_scaler_blocks, self.scaler_block_size)
+        n_scaler_blocks = scalers_1.numel() // scaler_block_size
+        scaler_blocks = scalers_1.view(n_scaler_blocks, scaler_block_size)
 
-        scaler_absmax = get_block_absmax(scalers_1, self.scaler_block_size)
-        scaler_absmax = scaler_absmax.unsqueeze(-1).expand(n_scaler_blocks, self.scaler_block_size)
+        scaler_absmax = get_block_absmax(scalers_1, scaler_block_size)
+        scaler_absmax = scaler_absmax.unsqueeze(-1).expand(n_scaler_blocks, scaler_block_size)
 
         quantization_factor = 256 / (2 * scaler_absmax)
         quantized_scaler_blocks = scaler_blocks * quantization_factor
@@ -188,7 +201,10 @@ class NF4Tensor:
         ) + self.scaler_mean
         return dequantized
 
-    def convert_to_norm_float_weight(self, inpt_tensor: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def convert_to_norm_float_weight(
+        inpt_tensor: torch.Tensor, n_blocks: int, block_size: int, nf4: torch.tensor
+    ) -> torch.Tensor:
         """Convert a tensor to the normalized float weight format"""
         flattened_tensor = inpt_tensor.flatten()
         #  Since we are using uint8 we will encode 2 entries per byte
@@ -197,11 +213,11 @@ class NF4Tensor:
             numel % 2 == 0
         ), "Number of elements must be even just to not have to think about the end"
         # Reshape the flattened tensor into blocks of size self.block_size
-        blocks = flattened_tensor.view(self.n_blocks, self.block_size)
+        blocks = flattened_tensor.view(n_blocks, block_size)
 
         # Scale the blocks
-        scalers = get_block_absmax(inpt_tensor.flatten(), self.block_size)
-        scales = scalers.unsqueeze(-1).expand(self.n_blocks, self.block_size)
+        scalers = get_block_absmax(inpt_tensor.flatten(), block_size)
+        scales = scalers.unsqueeze(-1).expand(n_blocks, block_size)
         scaled_blocks = blocks / scales
 
         # Returns a flattened tensor with each element quantized to nf4 index
@@ -212,7 +228,7 @@ class NF4Tensor:
         # Is not consistent with torch.round. Example: input 1.1016 with abs max
         # scale of 2.2821 will get mapped to 1.25 while mine will get mapped to 0.9570
         # The difference for mine is 0.1445 and for bnb 0.1484
-        quantized_blocks = self.quantize_tensor_nearest(scaled_blocks.flatten(), self.nf4)
+        quantized_blocks = NF4Tensor.quantize_tensor_nearest(scaled_blocks.flatten(), nf4)
 
         # Combine the quantized elements into uint8 values
         combined_blocks = quantized_blocks[::2] << 4 | quantized_blocks[1::2]
@@ -488,9 +504,9 @@ class QloraMLP(nn.Module):
 class QloraMLP(nn.Module):
     def __init__(self, weight1, weight2, weight3) -> None:
         super().__init__()
-        self.w1 = NF4Tensor(weight1)
-        self.w2 = NF4Tensor(weight2)
-        self.w3 = NF4Tensor(weight3)
+        self.w1 = NF4Tensor.from_tensor(weight1)
+        self.w2 = NF4Tensor.from_tensor(weight2)
+        self.w3 = NF4Tensor.from_tensor(weight3)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Lets try and reduce memory pressure:
@@ -525,7 +541,7 @@ class BnbQloraMLP(nn.Module):
 class QloraLinear(nn.Module):
     def __init__(self, weight) -> None:
         super().__init__()
-        self.weight = NF4Tensor(weight)
+        self.weight = NF4Tensor.from_tensor(weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self.weight.get_original_weight())

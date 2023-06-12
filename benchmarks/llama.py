@@ -295,9 +295,9 @@ class NF4MLP(nn.Module):
     def __init__(self, config: LLaMAConfig) -> None:
         super().__init__()
         weight1, weight2, weight3 = qlora.get_mlp_weights(config.n_embd)
-        self.w1 = qlora.NF4Tensor(weight1)
-        self.w2 = qlora.NF4Tensor(weight2)
-        self.w3 = qlora.NF4Tensor(weight3)
+        self.w1 = qlora.NF4Tensor.from_tensor(weight1)
+        self.w2 = qlora.NF4Tensor.from_tensor(weight2)
+        self.w3 = qlora.NF4Tensor.from_tensor(weight3)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.silu(F.linear(x, self.w1.get_original_weight())) * F.linear(

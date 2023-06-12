@@ -28,7 +28,7 @@ def test_reconstruction(inpt_size: int, block_size: int, scaler_block_size: int)
     input_weight = input_weight.normal_(0, 1)
 
     qlora_debug = NF4TensorDebug(input_weight, block_size)
-    nugs_qlora = NF4Tensor(input_weight, block_size, scaler_block_size)
+    nugs_qlora = NF4Tensor.from_tensor(input_weight, block_size, scaler_block_size)
     debug_diff = (qlora_debug.get_original_weight().to(device) - input_weight).abs()
     diff = (nugs_qlora.get_original_weight() - input_weight).abs()
 
@@ -41,7 +41,7 @@ def test_reconstruction_qlora_vs_bnb(embed_dim: int):
     torch.manual_seed(0)
     device = "cuda:0"
     input_weight = qlora.build_input_weight(embed_dim, device)
-    nugs_qlora = NF4Tensor(input_weight)
+    nugs_qlora = NF4Tensor.from_tensor(input_weight)
     bnb_linear = qlora.build_bitsandbytes_linear(input_weight, device)
     # This is sneaky but don't know if there is a better way to get the reconstruction
     bnb_reconstruction = bnb_linear(
@@ -62,7 +62,7 @@ def test_autograd_func_to_eager(embed_dim: int, compile: bool, requires_grad: bo
     device = "cuda:0"
     input_weight = qlora.build_input_weight(embed_dim, device)
     sample_input = qlora.get_sample_inputs(8, 128, embed_dim, device, requires_grad=requires_grad)
-    nugs_qlora = NF4Tensor(input_weight)
+    nugs_qlora = NF4Tensor.from_tensor(input_weight)
     if compile:
         func = torch.compile(linear_nf4, fullgraph=True)
     else:
@@ -80,7 +80,7 @@ def test_bitsandbytes_linear_parity(embed_dim, compile):
     input_weight = qlora.build_input_weight(embed_dim, device)
     sample_input = qlora.get_sample_inputs(8, 128, embed_dim, device)
     bnb_linear = qlora.build_bitsandbytes_linear(input_weight, device)
-    qlora_weight = NF4Tensor(input_weight)
+    qlora_weight = NF4Tensor.from_tensor(input_weight)
 
     def qlora_linear(
         input_tensor: torch.Tensor,
