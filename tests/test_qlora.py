@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 
 import transformer_nuggets.quant.qlora as qlora
-from transformer_nuggets.quant import NF4Tensor, NF4TensorDebug
+from transformer_nuggets.quant import NF4Tensor, NF4TensorDebug, linear_nf4
 
 bnb_available = False
 try:
@@ -52,6 +52,24 @@ def test_reconstruction_qlora_vs_bnb(embed_dim: int):
     # Since we are subtle different we assume that we both reconstruct with
     # a similar precision
     assert (nugs_diff - bnb_diff).abs() < 2e-1
+
+
+@pytest.mark.parametrize("embed_dim", [256, 4096, 5120, 6656, 8192])
+@pytest.mark.parametrize("compile", [True, False])
+@pytest.mark.parametrize("requires_grad", [True, False])
+def test_autograd_func_to_eager(embed_dim: int, compile: bool, requires_grad: bool):
+    torch.manual_seed(0)
+    device = "cuda:0"
+    input_weight = qlora.build_input_weight(embed_dim, device)
+    sample_input = qlora.get_sample_inputs(8, 128, embed_dim, device, requires_grad=requires_grad)
+    nugs_qlora = NF4Tensor(input_weight)
+    if compile:
+        func = torch.compile(linear_nf4, fullgraph=True)
+    else:
+        func = linear_nf4
+    out = func(sample_input, nugs_qlora)
+    if requires_grad:
+        out.sum().backward()
 
 
 @unittest.skip("BnB and nugs reconstruction are slightly different")

@@ -42,6 +42,25 @@ def get_block_absmax(inpt_tensor: torch.Tensor, block_size: int) -> torch.Tensor
 class NF4Tensor:
     """QLoRAWeight class for converting a weight to the QLoRA format"""
 
+    @classmethod
+    def from_quantized(
+        cls,
+        block_size: int,
+        n_blocks: int,
+        scaler_block_size: int,
+        quantized_scalers: torch.Tensor,
+        quantization_factor: torch.Tensor,
+        scaler_mean: torch.Tensor,
+        quantized_data: torch.Tensor,
+        shape: torch.Size,
+    ):
+        pass
+
+    def from_tensor(
+        cls,
+    ):
+        pass
+
     def __init__(
         self, inpt_tensor: torch.Tensor, block_size: int = 64, scaler_block_size: int = 256
     ):
@@ -90,12 +109,12 @@ class NF4Tensor:
             self.quantization_factor,
             self.scaler_mean,
         ) = self.double_quantize_scalers(inpt_tensor.flatten())
-        self.norm_float_weight = self.convert_to_norm_float_weight(inpt_tensor)
+        self.quantized_data = self.convert_to_norm_float_weight(inpt_tensor)
         self.original_shape = inpt_tensor.shape
 
     def double_quantize_scalers(
         self, inpt_tensor: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Used to achieve the double quantization of the scalers
         We take the input tensor first calculate the absmax quantization factors for each block.
         We then find the mean of our positive absmax scalers. We subtract this mean from the scalers
@@ -204,8 +223,8 @@ class NF4Tensor:
         """Get the original weight from the normalized float weight format"""
         # since we are using uint8 we will decode 2 entries per byte
         # Shift elements down 4 and select out the bottom 4 bits
-        first_elements = (self.norm_float_weight >> 4).to(torch.long)
-        second_elements = (self.norm_float_weight & 0b1111).to(torch.long)
+        first_elements = (self.quantized_data >> 4).to(torch.long)
+        second_elements = (self.quantized_data & 0b1111).to(torch.long)
 
         # Dequantize every element
         dequantized_first = self.dequantize(first_elements, self.nf4)
@@ -405,8 +424,12 @@ def build_bitsandbytes_linear(input_weight: torch.Tensor, device: torch.device):
     return bnb_linear
 
 
-def get_sample_inputs(bsz: int, seqlen: int, embed_dim: int, device: torch.device):
-    sample_input = torch.rand(bsz, seqlen, embed_dim, device=device, dtype=torch.bfloat16)
+def get_sample_inputs(
+    bsz: int, seqlen: int, embed_dim: int, device: torch.device, requires_grad: bool = False
+) -> torch.Tensor:
+    sample_input = torch.rand(
+        bsz, seqlen, embed_dim, device=device, dtype=torch.bfloat16, requires_grad=requires_grad
+    )
     sample_input = sample_input.view(bsz * seqlen, embed_dim)
     return sample_input
 
@@ -518,13 +541,7 @@ def qlora_linear(
 class LinearNF4(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input: torch.Tensor, weight: NF4Tensor):
-        """
-        In the forward pass we receive a Tensor containing the input and return
-        a Tensor containing the output. ctx is a context object that can be used
-        to stash information for backward computation. You can cache arbitrary
-        objects for use in the backward pass using the ctx.save_for_backward method.
-        """
-        ctx.save_for_backward(weight)
+        ctx.nf4_weight = weight
         return F.linear(input, weight.get_original_weight())
 
     @staticmethod
@@ -534,5 +551,9 @@ class LinearNF4(torch.autograd.Function):
         with respect to the output, and we need to compute the gradient of the loss
         with respect to the input.
         """
-        (input,) = ctx.saved_tensors
-        return grad_output * 1.5 * (5 * input**2 - 1)
+        weight: NF4Tensor = ctx.nf4_weight
+        return grad_output @ weight.get_original_weight(), None
+
+
+def linear_nf4(input: torch.Tensor, weight: NF4Tensor) -> torch.Tensor:
+    return LinearNF4.apply(input, weight)
