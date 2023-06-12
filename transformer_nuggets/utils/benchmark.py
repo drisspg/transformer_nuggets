@@ -7,7 +7,9 @@ from contextlib import contextmanager
 import torch
 import torch.utils.benchmark as benchmark
 from torch.profiler import ProfilerActivity, profile, record_function
-from torch.cuda._memory_viz import profile_plot
+
+# Patched version until https://github.com/pytorch/pytorch/pull/103384 lands.
+from transformer_nuggets.utils.memory_viz import profile_plot
 
 
 @dataclass
