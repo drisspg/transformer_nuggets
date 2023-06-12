@@ -264,20 +264,6 @@ class NF4Tensor:
         return torch.stack([scaled_first, scaled_second], dim=-1).reshape(self.original_shape)
 
     @staticmethod
-    def quantize_tensor(value: torch.float16, nf4: torch.Tensor) -> torch.Tensor:
-        """Quantize a float16 tensor to nf4 format"""
-        # Add a new dimension to the value tensor to enable broadcasting
-        value = value.unsqueeze(-1)  # (numel, 1)
-        # Compare the value tensor with the nf4 tensor element-wise
-        mask = value <= nf4
-        # Find the index of the first True value along the last dimension
-        # Argmax isn't defined on bool tensors, so do the lil trick below
-        indexes = 16 - mask.sum(dim=-1)
-        # Set the appropriate 4 bits to 1
-        # TODO Dont know if i need to the or 0 here
-        return 0 | indexes
-
-    @staticmethod
     def quantize_tensor_nearest(value: torch.float16, nf4: torch.Tensor) -> torch.Tensor:
         """Quantize a float16 tensor to nf4 format to nearest and not rounded up"""
         value = value.unsqueeze(-1)  # (numel, 1)
@@ -292,6 +278,20 @@ class NF4Tensor:
         """Dequantize a nf4 value to float16 format"""
         # return nf4.index_select(0, value)
         return nf4[value]
+
+    def unpack(
+        self,
+    ) -> Tuple[int, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Size]:
+        return (
+            self.block_size,
+            self.n_blocks,
+            self.scaler_block_size,
+            self.quantized_scalers,
+            self.quantization_factor,
+            self.scaler_mean,
+            self.quantized_data,
+            self.original_shape,
+        )
 
 
 class NF4TensorDebug:
