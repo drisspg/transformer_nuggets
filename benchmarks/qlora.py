@@ -53,12 +53,12 @@ def linear_experiment(config: ExperimentConfig) -> ExperimentResult:
     )
     qlora_weight = NF4Tensor.from_tensor(input_weight.clone())
     bnb_linear = qlora.build_bitsandbytes_linear(input_weight, config.device)
-    compiled_qlora_linear = torch.compile(qlora.qlora_linear, fullgraph=True)
+    compiled_qlora_linear = torch.compile(qlora.linear_nf4, fullgraph=True)
 
     # warmup
     for _ in range(3):
         F.linear(sample_input, input_weight)
-        qlora.qlora_linear(sample_input, qlora_weight)
+        qlora.linear_nf4(sample_input, qlora_weight)
         compiled_qlora_linear(sample_input, qlora_weight)
         bnb_linear(sample_input)
 
@@ -66,7 +66,7 @@ def linear_experiment(config: ExperimentConfig) -> ExperimentResult:
         F.linear, sample_input, input_weight
     )
     qlora_linear_time = nugs.utils.benchmark_torch_function_in_microseconds(
-        qlora.qlora_linear, sample_input, qlora_weight
+        qlora.linear_nf4, sample_input, qlora_weight
     )
     compiled_qlora_linear_time = nugs.utils.benchmark_torch_function_in_microseconds(
         compiled_qlora_linear, sample_input, qlora_weight
@@ -87,19 +87,19 @@ def mlp_experiment(config: ExperimentConfig) -> ExperimentResult:
         config.device,
     )
     mlp = qlora.MLP(*weights)
-    qlora_mlp = qlora.NF4MLP(*weights)
-    compiled_qlora_mlp = torch.compile(qlora_mlp, fullgraph=True)
+    nf4_mlp = qlora.NF4MLP(*weights)
+    compiled_qlora_mlp = torch.compile(nf4_mlp, fullgraph=True)
     bnb_mlp = qlora.BnbQloraMLP(*weights, config.device)
 
     # warmup
     for _ in range(3):
         mlp(sample_input)
-        qlora_mlp(sample_input)
+        nf4_mlp(sample_input)
         compiled_qlora_mlp(sample_input)
         bnb_mlp(sample_input)
 
     mlp_time = nugs.utils.benchmark_torch_function_in_microseconds(mlp, sample_input)
-    qlora_mlp_time = nugs.utils.benchmark_torch_function_in_microseconds(qlora_mlp, sample_input)
+    qlora_mlp_time = nugs.utils.benchmark_torch_function_in_microseconds(nf4_mlp, sample_input)
     compiled_qlora_mlp_time = nugs.utils.benchmark_torch_function_in_microseconds(
         compiled_qlora_mlp, sample_input
     )

@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.stats import norm
 from tqdm import tqdm
+import math
 
 bnb_available = False
 try:
@@ -515,22 +516,6 @@ class BnbQloraMLP(nn.Module):
         return x
 
 
-class QloraLinear(nn.Module):
-    def __init__(self, weight) -> None:
-        super().__init__()
-        self.weight = NF4Tensor.from_tensor(weight)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight.get_original_weight())
-
-
-def qlora_linear(
-    input_tensor: torch.Tensor,
-    lora_weight: NF4Tensor,
-):
-    return F.linear(input_tensor, lora_weight.get_original_weight())
-
-
 class LinearNF4(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input: torch.Tensor, weight: NF4Tensor):
@@ -544,4 +529,18 @@ class LinearNF4(torch.autograd.Function):
 
 
 def linear_nf4(input: torch.Tensor, weight: NF4Tensor) -> torch.Tensor:
-    return LinearNF4.apply(input, weight)
+    return F.linear(input, weight.get_original_weight())
+
+
+# I GIVE Up this should work but doesn't
+
+# # When I can pass the NFTensor from forward to backward, I can should
+# # be able to remove this code
+# import torch._dynamo
+
+# torch._dynamo.config.capture_autograd_function = False
+
+
+# @torch._dynamo.allow_in_graph
+# def linear_nf4(input: torch.Tensor, weight: NF4Tensor) -> torch.Tensor:
+#     return LinearNF4.apply(input, weight)

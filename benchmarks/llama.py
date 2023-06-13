@@ -397,7 +397,7 @@ def main():
     compile = True
     device = torch.device("cuda:0")
     # 7B
-    config = LLaMAConfig(n_layer=32, n_head=32, n_embd=4096, mlp_type=MLPType.BnB)
+    config = LLaMAConfig(n_layer=32, n_head=32, n_embd=4096, mlp_type=MLPType.NF4)
     model = LLaMA(config).to(device).to(torch.bfloat16)
     bsz = 4
     max_seq_len = 256
@@ -405,6 +405,9 @@ def main():
 
     if compile:
         model = torch.compile(model)
+
+    # Warmup
+    model(input_batch)
 
     profile_config = benchmark_utils.ProfileConfig(
         f"llama_{config.mlp_type.value}_compile_{compile}.json",
@@ -415,12 +418,16 @@ def main():
     )
     benchmark_utils.profile_function(profile_config, model, input_batch)
 
-    # # Get the full model snapshot
-    # model(input_batch)
-    # with benchmark_utils.save_memory_snapshot(
-    #     f"llama_{config.mlp_type.value}_compile_{compile}.pickle"
-    # ):
-    #     model(input_batch)
+    benchmark_time = benchmark_utils.benchmark_torch_function_in_microseconds(model, input_batch)
+    print(
+        f"Benchmark time for llama_forward_{config.mlp_type.value}_compile_{compile}: {benchmark_time} us"
+    )
+    # Get the full model snapshot
+    model(input_batch)
+    with benchmark_utils.save_memory_snapshot(
+        f"llama_{config.mlp_type.value}_compile_{compile}.pickle"
+    ):
+        model(input_batch)
 
 
 if __name__ == "__main__":
