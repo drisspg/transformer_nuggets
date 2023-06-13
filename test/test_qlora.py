@@ -57,6 +57,29 @@ def test_reconstruction_qlora_vs_bnb(embed_dim: int):
 
 
 @pytest.mark.parametrize("embed_dim", [256, 4096, 5120, 6656, 8192])
+def test_binning_distribution(embed_dim: int):
+    device = "cuda:0"
+    input_weight = qlora.build_input_weight(embed_dim, device)
+    nugs_qlora = NF4Tensor.from_tensor(input_weight)
+    first_elements = (nugs_qlora.quantized_data >> 4).to(torch.long)
+    second_elements = (nugs_qlora.quantized_data & 0b1111).to(torch.long)
+
+    bnb_param = bnb.nn.Params4bit(input_weight, requires_grad=False, quant_type="nf4").cuda(device)
+    bnb_data = bnb_param.data
+
+    bnb_first_elements = (bnb_data >> 4).to(torch.long)
+    bnb_second_elements = (bnb_data & 0b1111).to(torch.long)
+
+    bnb_first_counts = torch.unique(bnb_first_elements, return_counts=True)[1]
+    bnb_second_counts = torch.unique(bnb_second_elements, return_counts=True)[1]
+
+    first_counts = torch.unique(first_elements, return_counts=True)[1]
+    second_counts = torch.unique(second_elements, return_counts=True)[1]
+
+    # Why are these normally distributed and not uniform?
+
+
+@pytest.mark.parametrize("embed_dim", [256, 4096, 5120, 6656, 8192])
 @pytest.mark.parametrize("compile", [True, False])
 @pytest.mark.parametrize("requires_grad", [True, False])
 def test_autograd_func_to_eager(embed_dim: int, compile: bool, requires_grad: bool):
