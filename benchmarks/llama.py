@@ -394,10 +394,10 @@ def apply_rope(x: torch.Tensor, rope_cache: RoPECache) -> torch.Tensor:
 
 
 def main():
-    compile = False
+    compile = True
     device = torch.device("cuda:0")
     # 7B
-    config = LLaMAConfig(n_layer=32, n_head=32, n_embd=4096, mlp_type=MLPType.Original)
+    config = LLaMAConfig(n_layer=32, n_head=32, n_embd=4096, mlp_type=MLPType.BnB)
     model = LLaMA(config).to(device).to(torch.bfloat16)
     bsz = 4
     max_seq_len = 256
@@ -407,20 +407,20 @@ def main():
         model = torch.compile(model)
 
     profile_config = benchmark_utils.ProfileConfig(
-        "llama_NF4.json",
-        "llama_forward_NF4",
+        f"llama_{config.mlp_type.value}_compile_{compile}.json",
+        f"llama_forward_{config.mlp_type.value}",
         iters=3,
         warmup_iters=3,
-        profile_memory=True,
         sync=True,
-        memory_profile_path="llama_NF4_memory_del_temps.html",
     )
-    # benchmark_utils.profile_function(profile_config, model, input_batch)
+    benchmark_utils.profile_function(profile_config, model, input_batch)
 
-    # Get the fullmodel snapshot
-    model(input_batch)
-    with benchmark_utils.save_memory_snapshot("llama_original.pickle"):
-        model(input_batch)
+    # # Get the full model snapshot
+    # model(input_batch)
+    # with benchmark_utils.save_memory_snapshot(
+    #     f"llama_{config.mlp_type.value}_compile_{compile}.pickle"
+    # ):
+    #     model(input_batch)
 
 
 if __name__ == "__main__":
