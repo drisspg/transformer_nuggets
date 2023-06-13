@@ -87,7 +87,7 @@ def mlp_experiment(config: ExperimentConfig) -> ExperimentResult:
         config.device,
     )
     mlp = qlora.MLP(*weights)
-    qlora_mlp = qlora.QloraMLP(*weights)
+    qlora_mlp = qlora.NF4MLP(*weights)
     compiled_qlora_mlp = torch.compile(qlora_mlp, fullgraph=True)
     bnb_mlp = qlora.BnbQloraMLP(*weights, config.device)
 
@@ -154,24 +154,15 @@ def main(output_path: Optional[Path], profile_path: Optional[Path]):
             profile_experiment.embed_dim,
             profile_experiment.device,
         )
-        with nugs.utils.print_cuda_memory_usage():
-            qlora_mlp = qlora.QloraMLP(*weights)
-            weight1, weight2, weight3 = weights
 
-            del weight1
-            del weight2
-            del weight3
-            import gc
-
-            gc.collect()
-
+        qlora_mlp = qlora.NF4MLP(*weights)
         compiled_qlora_mlp = torch.compile(qlora_mlp, fullgraph=True)
         profile_config = nugs.utils.ProfileConfig(
             str(profile_path), "qlora_mlp", iters=5, warmup_iters=3, sync=True, profile_memory=True
         )
         nugs.utils.profile_function(
             profile_config,
-            qlora_mlp,
+            compiled_qlora_mlp,
             sample_input,
         )
 

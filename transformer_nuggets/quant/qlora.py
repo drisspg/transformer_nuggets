@@ -487,22 +487,7 @@ class MLP(nn.Module):
         return x
 
 
-class QloraMLP(nn.Module):
-    def __init__(self, weight1, weight2, weight3) -> None:
-        super().__init__()
-        self.w1 = NF4Tensor(weight1)
-        self.w2 = NF4Tensor(weight2)
-        self.w3 = NF4Tensor(weight3)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.silu(F.linear(x, self.w1.get_original_weight())) * F.linear(
-            x, self.w2.get_original_weight()
-        )
-        x = F.linear(x, self.w3.get_original_weight())
-        return x
-
-
-class QloraMLP(nn.Module):
+class NF4MLP(nn.Module):
     def __init__(self, weight1, weight2, weight3) -> None:
         super().__init__()
         self.w1 = NF4Tensor.from_tensor(weight1)
@@ -510,20 +495,11 @@ class QloraMLP(nn.Module):
         self.w3 = NF4Tensor.from_tensor(weight3)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Lets try and reduce memory pressure:
-        w1 = self.w1.get_original_weight()
-        y = F.silu(F.linear(x, w1))
-        del w1
-        torch.cuda.empty_cache()
-        w2 = self.w2.get_original_weight()
-        y = y * F.linear(x, w2)
-        del w2
-        torch.cuda.empty_cache()
-        w3 = self.w3.get_original_weight()
-        y = F.linear(y, w3)
-        del w3
-        torch.cuda.empty_cache()
-        return y
+        x = F.silu(F.linear(x, self.w1.get_original_weight())) * F.linear(
+            x, self.w2.get_original_weight()
+        )
+        x = F.linear(x, self.w3.get_original_weight())
+        return x
 
 
 class BnbQloraMLP(nn.Module):

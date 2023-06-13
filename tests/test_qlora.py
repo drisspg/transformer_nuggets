@@ -108,7 +108,7 @@ def test_bitsandbytes_mlp_parity(embed_dim, compile):
     weights = qlora.get_mlp_weights(embed_dim, device)
     sample_input = qlora.get_sample_inputs(8, 128, embed_dim, device)
 
-    qlora_mlp = qlora.QloraMLP(*weights)
+    qlora_mlp = qlora.NF4MLP(*weights)
     bnb_mlp = qlora.BnbQloraMLP(*weights, device)
     mlp = qlora.MLP(*weights)
 
