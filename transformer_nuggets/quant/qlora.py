@@ -532,6 +532,45 @@ def linear_nf4(input: torch.Tensor, weight: NF4Tensor) -> torch.Tensor:
     return F.linear(input, weight.get_original_weight())
 
 
+class QloraLinear(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        weight: torch.Tensor,
+        r: int,
+        lora_alpha: int = 1,
+        lora_dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.weight = NF4Tensor.from_tensor(weight)
+        self.r = r
+        self.lora_alpha = lora_alpha
+        self.in_features = in_features
+        self.out_features = out_features
+        self.lora_A = nn.Parameter(weight.new_zeros((r, in_features)))
+        self.lora_B = nn.Parameter(weight.new_zeros((out_features, r)))
+        self.scaling = self.lora_alpha / self.r
+
+        # Optional dropout
+        if lora_dropout > 0.0:
+            self.lora_dropout = nn.Dropout(p=lora_dropout)
+        else:
+            self.lora_dropout = lambda x: x
+
+    def reset_parameters(self):
+        nn.Linear.reset_parameters(self)
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        result = F.linear(x, self.weight.get_original_weight())
+        result += (
+            self.lora_dropout(x) @ self.lora_A.transpose(0, 1) @ self.lora_B.transpose(0, 1)
+        ) * self.scaling
+        return result
+
+
 # I GIVE Up this should work but doesn't
 
 # # When I can pass the NFTensor from forward to backward, I can should

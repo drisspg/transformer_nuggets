@@ -149,3 +149,26 @@ def test_bitsandbytes_mlp_parity(embed_dim, compile):
 
     assert nugs_difference.max() < (0.5 * embed_dim) ** 2
     assert bnb_difference.max() < (0.5 * embed_dim) ** 2
+
+
+@pytest.mark.parametrize("embed_dim", [256, 4096])
+@pytest.mark.parametrize("compile", [True, False])
+@pytest.mark.parametrize("r", [1, 2])
+@pytest.mark.parametrize("dropout", [0.0, 0.2])
+@pytest.mark.parametrize("run_backward", [True, False])
+def test_qlora_linear(embed_dim: int, compile: bool, r: int, dropout: float, run_backward: bool):
+    torch.manual_seed(0)
+    device = "cuda:0"
+    # Analog for replacing first linear in MLP
+    weight = qlora.get_mlp_weights(embed_dim, device)[0]
+    n_hidden = weight.size(0)  # hardcode llama 7b
+    nugs_qlora_linear = qlora.QloraLinear(embed_dim, n_hidden, weight, r, lora_dropout=dropout)
+    func = nugs_qlora_linear
+    if compile:
+        func = torch.compile(nugs_qlora_linear, fullgraph=True)
+    sample_input = qlora.get_sample_inputs(8, 128, embed_dim, device)
+    out = func(sample_input)
+    if run_backward:
+        out.sum().backward()
+        assert nugs_qlora_linear.lora_A.grad is not None
+        assert nugs_qlora_linear.lora_B.grad is not None
