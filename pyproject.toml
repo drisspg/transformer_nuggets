@@ -24,7 +24,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["black", "bumpver", "isort", "pip-tools", "pytest", "pre-commit"]
+dev = ["black", "bumpver", "isort", "pip-tools", "pytest"]
 
 
 [tool.black]

@@ -66,9 +66,9 @@ def test_autograd_func_to_eager(embed_dim: int, compile: bool, requires_grad: bo
     sample_input = qlora.get_sample_inputs(8, 128, embed_dim, device, requires_grad=requires_grad)
     nugs_qlora = NF4Tensor.from_tensor(input_weight)
     if compile:
-        func = torch.compile(linear_nf4, fullgraph=True)
+        func = torch.compile(qlora.wrapped_linear, fullgraph=True)
     else:
-        func = linear_nf4
+        func = qlora.wrapped_linear
     out = func(sample_input, nugs_qlora)
     if requires_grad:
         out.sum().backward()
