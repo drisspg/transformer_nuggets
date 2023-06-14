@@ -21,7 +21,6 @@ class ProfileConfig:
     iters: int = 0
     warmup_iters: int = 0
     sync: bool = False
-    profile_memory: bool = False
     extra_kwargs: dict = field(default_factory=dict)
     memory_profile_path: Optional[str] = None
 
@@ -50,11 +49,12 @@ def profile_function(
             func(*args, **kwargs)
 
     name_context = nullcontext() if config.name is None else record_function(config.name)
+    profile_memory = config.memory_profile_path is not None
     with profile(
         activities=activities,
-        profile_memory=config.profile_memory,
-        record_shapes=config.profile_memory,
-        with_stack=config.profile_memory,
+        profile_memory=profile_memory,
+        record_shapes=profile_memory,
+        with_stack=profile_memory,
         **config.extra_kwargs,
     ) as prof:
         for _ in range(config.iters):
@@ -66,11 +66,8 @@ def profile_function(
     if config.file_path is not None:
         prof.export_chrome_trace(config.file_path)
 
-    memory_profile_path = (
-        config.memory_profile_path if config.profile_memory else "memory_output.html"
-    )
-    if config.profile_memory:
-        with open(memory_profile_path, "w") as f:
+    if profile_memory:
+        with open(config.memory_profile_path, "w") as f:
             f.write(profile_plot(prof))
 
     return prof

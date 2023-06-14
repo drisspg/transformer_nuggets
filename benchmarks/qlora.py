@@ -32,7 +32,8 @@ class ExperimentConfig:
     bsz: int
     seqlen: int
     device: torch.device
-    op: str = "linear"
+    op: str
+    dynamic: bool
 
 
 @dataclass
@@ -53,7 +54,7 @@ def linear_experiment(config: ExperimentConfig) -> ExperimentResult:
     )
     qlora_weight = NF4Tensor.from_tensor(input_weight.clone())
     bnb_linear = qlora.build_bitsandbytes_linear(input_weight, config.device)
-    compiled_qlora_linear = torch.compile(qlora.linear_nf4, fullgraph=True)
+    compiled_qlora_linear = torch.compile(qlora.linear_nf4, fullgraph=True, dynamic=config.dynamic)
 
     # warmup
     for _ in range(3):
@@ -88,7 +89,7 @@ def mlp_experiment(config: ExperimentConfig) -> ExperimentResult:
     )
     mlp = qlora.MLP(*weights)
     nf4_mlp = qlora.NF4MLP(*weights)
-    compiled_qlora_mlp = torch.compile(nf4_mlp, fullgraph=True)
+    compiled_qlora_mlp = torch.compile(nf4_mlp, fullgraph=True, dynamic=config.dynamic)
     bnb_mlp = qlora.BnbQloraMLP(*weights, config.device)
 
     # warmup
@@ -122,16 +123,23 @@ def gen_configs() -> List[ExperimentConfig]:
     seqlens = [128, 256, 512]
     devices = [torch.device("cuda:0")]
     types = ["linear", "mlp"]
+    # NotImplementedError: could not find kernel for aten.__rshift__.Scalar at dispatch key DispatchKey.Meta with dynamic shapes
+    # dynamic = [False, True]
+    dynamic = [False]
     configs = []
-    for item in itertools.product(embed_dims, bszs, seqlens, devices, types):
+    for item in itertools.product(embed_dims, bszs, seqlens, devices, types, dynamic):
         configs.append(ExperimentConfig(*item))
     return configs
 
 
-def main(output_path: Optional[Path], profile_path: Optional[Path]):
+def main(output_path: Optional[Path], profile_path: Optional[Path], dynamic: bool):
     if output_path is not None:
         results = []
         for experiment_config in tqdm(gen_configs()):
+            # Since we are changing between dynamic and not
+            import torch._dynamo
+
+            torch._dynamo.reset()
             experiment = experiment_types[experiment_config.op]
             experiment_result = experiment(experiment_config)
             merged = asdict(experiment_config) | asdict(experiment_result)
@@ -143,7 +151,7 @@ def main(output_path: Optional[Path], profile_path: Optional[Path]):
                 writer.writerows(results)
 
     if profile_path is not None:
-        profile_experiment = ExperimentConfig(4096, 8, 128, torch.device("cuda:0"), "mlp")
+        profile_experiment = ExperimentConfig(4096, 8, 128, torch.device("cuda:0"), "mlp", dynamic)
         with nugs.utils.print_cuda_memory_usage():
             weights = qlora.get_mlp_weights(
                 profile_experiment.embed_dim, profile_experiment.device
@@ -156,9 +164,10 @@ def main(output_path: Optional[Path], profile_path: Optional[Path]):
         )
 
         qlora_mlp = qlora.NF4MLP(*weights)
-        compiled_qlora_mlp = torch.compile(qlora_mlp, fullgraph=True)
+        compiled_qlora_mlp = torch.compile(qlora_mlp, fullgraph=True, dynamic=dynamic)
+        print("dynamic = ", dynamic)
         profile_config = nugs.utils.ProfileConfig(
-            str(profile_path), "qlora_mlp", iters=5, warmup_iters=3, sync=True, profile_memory=True
+            str(profile_path), "qlora_mlp", iters=5, warmup_iters=3, sync=True
         )
         nugs.utils.profile_function(
             profile_config,
@@ -188,6 +197,9 @@ if __name__ == "__main__":
         help="Path to write out json chrome trace file for an experiment.",
         default=None,
     )
+    parser.add_argument(
+        "--dynamic_shapes", action="store_true", help="Compile with Dynamic shapes"
+    )
 
     args = parser.parse_args()
     output_path = None
@@ -197,4 +209,4 @@ if __name__ == "__main__":
     if args.profile_path is not None:
         profile_path = Path(args.profile_path)
 
-    main(output_path, profile_path)
+    main(output_path, profile_path, args.dynamic_shapes)
