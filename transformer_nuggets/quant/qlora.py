@@ -427,6 +427,25 @@ class NF4TensorDebug:
         return original_weight.reshape(self.original_shape)
 
 
+class LinearNF4(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input: torch.Tensor, weight: NF4Tensor):
+        ctx.nf4_weight = weight
+        return F.linear(input, weight.get_original_weight())
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        weight: NF4Tensor = ctx.nf4_weight
+        return grad_output @ weight.get_original_weight(), None
+
+
+# TODO: Change to Below when works with torch ocmpile
+# def linear_nf4(input: torch.Tensor, weight: NF4Tensor) -> torch.Tensor:
+#     return LinearNF4.apply(input, weight
+def linear_nf4(input: torch.Tensor, weight: NF4Tensor) -> torch.Tensor:
+    return F.linear(input, weight.get_original_weight())
+
+
 def build_input_weight(embed_dim: int, device: torch.device):
     torch.manual_seed(0)
     input_weight = torch.empty(embed_dim, embed_dim, device=device, dtype=torch.bfloat16)
@@ -496,10 +515,8 @@ class NF4MLP(nn.Module):
         self.w3 = NF4Tensor.from_tensor(weight3)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.silu(F.linear(x, self.w1.get_original_weight())) * F.linear(
-            x, self.w2.get_original_weight()
-        )
-        x = F.linear(x, self.w3.get_original_weight())
+        x = F.silu(linear_nf4(x, self.w1)) * linear_nf4(x, self.w2)
+        x = linear_nf4(x, self.w3)
         return x
 
 
@@ -514,22 +531,6 @@ class BnbQloraMLP(nn.Module):
         x = F.silu(self.w1(x)) * self.w2(x)
         x = self.w3(x)
         return x
-
-
-class LinearNF4(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, input: torch.Tensor, weight: NF4Tensor):
-        ctx.nf4_weight = weight
-        return F.linear(input, weight.get_original_weight())
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        weight: NF4Tensor = ctx.nf4_weight
-        return grad_output @ weight.get_original_weight(), None
-
-
-def linear_nf4(input: torch.Tensor, weight: NF4Tensor) -> torch.Tensor:
-    return F.linear(input, weight.get_original_weight())
 
 
 class QloraLinear(nn.Module):
@@ -564,7 +565,7 @@ class QloraLinear(nn.Module):
         nn.init.zeros_(self.lora_B)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        result = F.linear(x, self.weight.get_original_weight())
+        result = linear_nf4(x, self.weight)
         result += (
             self.lora_dropout(x) @ self.lora_A.transpose(0, 1) @ self.lora_B.transpose(0, 1)
         ) * self.scaling

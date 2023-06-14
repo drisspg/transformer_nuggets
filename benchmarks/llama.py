@@ -14,6 +14,7 @@ from torch.nn import functional as F
 from typing_extensions import Self
 
 import transformer_nuggets.quant.qlora as qlora
+from transformer_nuggets.quant import linear_nf4
 import transformer_nuggets.utils.benchmark as benchmark_utils
 
 MaskCache = torch.Tensor
@@ -303,10 +304,8 @@ class NF4MLP(nn.Module):
         self.w3 = qlora.NF4Tensor.from_tensor(weight3)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.silu(F.linear(x, self.w1.get_original_weight())) * F.linear(
-            x, self.w2.get_original_weight()
-        )
-        x = F.linear(x, self.w3.get_original_weight())
+        x = F.silu(linear_nf4(x, self.w1)) * linear_nf4(x, self.w2)
+        x = linear_nf4(x, self.w3)
         return x
 
 

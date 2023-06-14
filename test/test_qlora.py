@@ -111,7 +111,7 @@ def test_bitsandbytes_linear_parity(embed_dim, compile):
         input_tensor: torch.Tensor,
         lora_weight: NF4Tensor,
     ):
-        return F.linear(input_tensor, lora_weight.get_original_weight())
+        return linear_nf4(input_tensor, lora_weight)
 
     if compile:
         qlora_linear = torch.compile(qlora_linear, fullgraph=True)
