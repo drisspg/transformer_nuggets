@@ -31,6 +31,7 @@ class MLPType(Enum):
     BnB = "bnb"
     NF4 = "nf4"
     Original = "original"
+    QloraNugs = "qlora_nugs"
 
 
 @dataclass
@@ -189,6 +190,8 @@ class Block(nn.Module):
             self.mlp = BnbNF4MLP(config)
         elif config.mlp_type == MLPType.NF4:
             self.mlp = NF4MLP(config)
+        elif config.mlp_type == MLPType.QloraNugs:
+            self.mlp = QloraMLP(config)
 
     def forward(
         self,
@@ -304,6 +307,21 @@ class NF4MLP(nn.Module):
             x, self.w2.get_original_weight()
         )
         x = F.linear(x, self.w3.get_original_weight())
+        return x
+
+
+class QloraMLP(nn.Module):
+    # This very notably doesn't save on backward compute
+    def __init__(self, config: LLaMAConfig) -> None:
+        super().__init__()
+        weight1, weight2, weight3 = qlora.get_mlp_weights(config.n_embd)
+        self.qlora_w1 = qlora.QloraLinear(weight1.shape[1], weight1.shape[0], weight1, r=2)
+        self.qlora_w2 = qlora.QloraLinear(weight2.shape[1], weight2.shape[0], weight2, r=2)
+        self.qlora_w3 = qlora.QloraLinear(weight3.shape[1], weight3.shape[0], weight3, r=2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.silu(self.qlora_w1(x)) * self.qlora_w2(x)
+        x = self.qlora_w3(x)
         return x
 
 
