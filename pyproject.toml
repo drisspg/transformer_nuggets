@@ -25,7 +25,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["black", "bumpver", "isort", "pip-tools", "pytest"]
-
+qlora = ['bitsandbytes']
 
 [tool.black]
 line-length = 99
