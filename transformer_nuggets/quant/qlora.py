@@ -8,15 +8,6 @@ from tqdm import tqdm
 import math
 
 bnb_available = False
-try:
-    import bitsandbytes as bnb
-
-    bnb_available = True
-except ImportError:
-    print(
-        "Could not import bitsandbytes, make sure you have installed it `pip install bitsandbytes` "
-    )
-
 
 def get_block_absmax(inpt_tensor: torch.Tensor, block_size: int) -> torch.Tensor:
     """Iterate through a flattened tensor getting the absmax scalers for each block
@@ -454,6 +445,9 @@ def build_input_weight(embed_dim: int, device: torch.device):
 
 
 def build_bitsandbytes_linear(input_weight: torch.Tensor, device: torch.device):
+    global bnb
+    if 'bnb' not in globals():
+        import bitsandbytes as bnb
     param = bnb.nn.Params4bit(input_weight, requires_grad=False, quant_type="nf4").cuda(device)
     bnb_linear = bnb.nn.LinearNF4(input_weight.size(0), input_weight.size(1), bias=False)
     bnb_linear.weight = param
