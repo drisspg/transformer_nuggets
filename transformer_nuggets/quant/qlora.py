@@ -430,11 +430,8 @@ class LinearNF4(torch.autograd.Function):
         return grad_output @ weight.get_original_weight(), None
 
 
-# TODO: Change to Below when works with torch ocmpile
-# def linear_nf4(input: torch.Tensor, weight: NF4Tensor) -> torch.Tensor:
-#     return LinearNF4.apply(input, weight
 def linear_nf4(input: torch.Tensor, weight: NF4Tensor) -> torch.Tensor:
-    return F.linear(input, weight.get_original_weight())
+    return LinearNF4.apply(input, weight)
 
 
 def build_input_weight(embed_dim: int, device: torch.device):
@@ -565,16 +562,3 @@ class QloraLinear(nn.Module):
         ) * self.scaling
         return result
 
-
-# I GIVE Up this should work but doesn't
-
-# # When I can pass the NFTensor from forward to backward, I can should
-# # be able to remove this code
-# import torch._dynamo
-
-# torch._dynamo.config.capture_autograd_function = False
-
-
-# @torch._dynamo.allow_in_graph
-# def linear_nf4(input: torch.Tensor, weight: NF4Tensor) -> torch.Tensor:
-#     return LinearNF4.apply(input, weight)
