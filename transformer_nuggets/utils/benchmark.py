@@ -9,8 +9,7 @@ import torch
 import torch.utils.benchmark as benchmark
 from torch.profiler import ProfilerActivity, profile, record_function
 
-# Patched version until https://github.com/pytorch/pytorch/pull/103384 lands.
-from transformer_nuggets.utils.memory_viz import profile_plot
+from torch.cuda._memory_viz import profile_plot
 
 
 @dataclass
@@ -69,6 +68,9 @@ def profile_function(
     if profile_memory:
         with open(config.memory_profile_path, "w") as f:
             f.write(profile_plot(prof))
+
+    if config.file_path is None:
+        print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
 
     return prof
 
