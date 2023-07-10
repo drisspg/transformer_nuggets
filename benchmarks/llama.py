@@ -308,7 +308,6 @@ class NF4MLP(nn.Module):
         x = linear_nf4(x, self.w3)
         return x
 
-
 class QloraMLP(nn.Module):
     # This very notably doesn't save on backward compute
     def __init__(self, config: LLaMAConfig) -> None:
@@ -444,7 +443,7 @@ def main():
     with benchmark_utils.save_memory_snapshot(
         f"llama_{config.mlp_type.value}_compile_{compile}.pickle"
     ):
-        model(input_batch)
+        model(input_batch).sum().backward()
 
 
 if __name__ == "__main__":
