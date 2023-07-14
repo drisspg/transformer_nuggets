@@ -286,6 +286,12 @@ class NF4Tensor:
             self.original_shape,
         )
 
+    def __repr__(self):
+        return f"Quantized Data: {self.quantized_data}\nScalers: {self.quantized_scalers}\n"
+
+    def __str__(self):
+        return f"NF4Tensor({self.original_shape}, {self.block_size})"
+
 
 class NF4TensorDebug:
     """QLoRA Weight written in a more Debug friendly manner"""
@@ -551,7 +557,6 @@ class QloraLinear(nn.Module):
             self.lora_dropout = lambda x: x
 
     def reset_parameters(self):
-        nn.Linear.reset_parameters(self)
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B)
 
