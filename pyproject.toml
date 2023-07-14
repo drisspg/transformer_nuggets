@@ -26,6 +26,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["black", "bumpver", "isort", "pip-tools", "pytest"]
 qlora = ['bitsandbytes']
+flash = ['triton']
 
 [tool.black]
 line-length = 99
