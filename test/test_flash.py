@@ -45,9 +45,16 @@ def test_op(Z, H, N_CTX, D_HEAD, causal, bias_choice, dtype=torch.float16):
     
     # compare
     torch.testing.assert_close(ref_out, tri_out, atol=4e-2, rtol=0)
-    # torch.testing.assert_close(ref_dv, tri_dv, atol=1e-2, rtol=0)
-    # torch.testing.assert_close(ref_dk, tri_dk, atol=1e-2, rtol=0)
-    # torch.testing.assert_close(ref_dq, tri_dq, atol=1e-2, rtol=0)
+    if bias_choice != BiasMode.none:
+        fudge_factor = 5
+    else:
+        fudge_factor = 1
+    atol = 1e-2 * fudge_factor
+    if bias_choice == BiasMode.rel_pos and not causal:
+        atol *= 3
+    torch.testing.assert_close(ref_dv, tri_dv, atol=atol, rtol=0)
+    torch.testing.assert_close(ref_dk, tri_dk, atol=atol, rtol=0)
+    torch.testing.assert_close(ref_dq, tri_dq, atol=atol, rtol=0)
 
 
 if __name__ == '__main__':

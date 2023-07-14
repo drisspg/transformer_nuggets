@@ -218,11 +218,13 @@ def _bwd_preprocess(
     NewDO, Delta,
     BLOCK_M: tl.constexpr, D_HEAD: tl.constexpr,
 ):
+    # This jumps to a block of attention 
     off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     off_n = tl.arange(0, D_HEAD)
-    # load
+    # O and DO is a block of output embeddings 
     o = tl.load(Out + off_m[:, None] * D_HEAD + off_n[None, :]).to(tl.float32)
     do = tl.load(DO + off_m[:, None] * D_HEAD + off_n[None, :]).to(tl.float32)
+    # get the seqlen_q block from L
     denom = tl.load(L + off_m).to(tl.float32)
     # compute
     do = do / denom[:, None]
@@ -237,7 +239,7 @@ def _bwd_kernel(
     Q, K, V, sm_scale, Out, DO,
     DQ, DK, DV,
     L, M,
-    D,
+    D, mask_scratch_space,
     stride_qz, stride_qh, stride_qm, stride_qk,
     stride_kz, stride_kh, stride_kn, stride_kk,
     stride_vz, stride_vh, stride_vk, stride_vn,
@@ -246,11 +248,15 @@ def _bwd_kernel(
     BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
     MODE: tl.constexpr,
+    BIAS_CHOICE: tl.constexpr,
+    DEBUG_MASK: tl.constexpr
 ):
     off_hz = tl.program_id(0)
     off_z = off_hz // H
     off_h = off_hz % H
-    qk_scale = sm_scale * 1.44269504
+    #  Removed and switch to exp. Could probably
+    # use the same trick with the lambda funcs to change base
+    # qk_scale = sm_scale * 1.44269504
     # offset pointers for batch/head
     Q += off_z * stride_qz + off_h * stride_qh
     K += off_z * stride_qz + off_h * stride_qh
@@ -259,10 +265,14 @@ def _bwd_kernel(
     DQ += off_z * stride_qz + off_h * stride_qh
     DK += off_z * stride_qz + off_h * stride_qh
     DV += off_z * stride_qz + off_h * stride_qh
+    if DEBUG_MASK:
+        mask_scratch_space += off_hz * N_CTX * N_CTX
     for start_n in range(0, num_block):
         if MODE == 0:
+            # if non_causal
             lo = 0
         else:
+            # Causal
             lo = start_n * BLOCK_M
         # initialize row/col offsets
         offs_qm = lo + tl.arange(0, BLOCK_M)
@@ -275,6 +285,8 @@ def _bwd_kernel(
         v_ptrs = V + (offs_n[:, None] * stride_qm + offs_k[None, :] * stride_qk)
         do_ptrs = DO + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
         dq_ptrs = DQ + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
+        if DEBUG_MASK:
+            mask_ptrs = mask_scratch_space + (offs_qm[:, None] * N_CTX + offs_n[None, :])
         # pointer to row-wise quantities in value-like data
         D_ptrs = D + off_hz * N_CTX
         m_ptrs = M + off_hz * N_CTX
@@ -292,14 +304,22 @@ def _bwd_kernel(
             # recompute p = softmax(qk, dim=-1).T
             # NOTE: `do` is pre-divided by `l`; no normalization here
             # if MODE == 1:
+
             if MODE == 1:
                 qk = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), float(0.), float("-inf"))
             else:
                 qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+                
+            # do the bias shenangians
+            if BIAS_CHOICE == BiasMode.rel_pos:
+                qk = rel_attention_triton(qk, offs_m_curr[:, None], (offs_n[None, :]), off_hz%H, H)
+            elif BIAS_CHOICE == BiasMode.alibi:
+                qk = alibi_attention_triton(qk, offs_m_curr[:, None], (offs_n[None, :]), off_hz%H, H)
+            
             qk += tl.dot(q, tl.trans(k))
-            qk *= qk_scale
+            # qk *= qk_scale
             m = tl.load(m_ptrs + offs_m_curr)
-            p = tl.math.exp2(qk - m[:, None])
+            p = tl.math.exp(qk - m[:, None])
             # compute dv
             do = tl.load(do_ptrs)
             dv += tl.dot(tl.trans(p.to(Q.dtype.element_ty)), do)
@@ -377,6 +397,7 @@ class _attention(torch.autograd.Function):
         ctx.BLOCK_DMODEL = Lk
         ctx.causal = causal
         ctx.bias_choice = bias_choice
+        ctx.debug_mask = debug_mask
         return o, scratch_space
 
     @staticmethod
@@ -384,26 +405,33 @@ class _attention(torch.autograd.Function):
         BLOCK = 128
         q, k, v, o, l, m = ctx.saved_tensors
         do = do.contiguous()
+        # Higher precision, weird?
         dq = torch.zeros_like(q, dtype=torch.float32)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
         do_scaled = torch.empty_like(do)
         delta = torch.empty_like(l)
+        mask = torch.empty_like(dmask)
         if ctx.causal:
             mode = 1
         else:
             mode = 0
+        # launch kernel to pre process
+        # grid = (triton.cdiv(seq_len_qv, 128), batch_size * num_heads, 1)
+        # is full flattened
         _bwd_preprocess[(ctx.grid[0] * ctx.grid[1], )](
             o, do, l,
             do_scaled, delta,
             BLOCK_M=BLOCK, D_HEAD=ctx.BLOCK_DMODEL,
         )
+        # Launch over batch_size * num_heads
+        # Num_blocks (blocks to cover seq_len_qv is passed in)
         _bwd_kernel[(ctx.grid[1],)](
             q, k, v, ctx.sm_scale,
             o, do_scaled,
             dq, dk, dv,
             l, m,
-            delta,
+            delta, mask,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
@@ -412,6 +440,8 @@ class _attention(torch.autograd.Function):
             BLOCK_M=BLOCK, BLOCK_N=BLOCK,
             BLOCK_DMODEL=ctx.BLOCK_DMODEL, num_warps=8,
             MODE=mode,
+            BIAS_CHOICE=ctx.bias_choice.value,
+            DEBUG_MASK=ctx.debug_mask,
             num_stages=1,
         )
         return dq, dk, dv, None, None, None, None
