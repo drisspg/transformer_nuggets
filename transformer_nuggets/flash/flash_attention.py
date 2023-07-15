@@ -329,6 +329,8 @@ def _bwd_kernel(
             # compute dq
             dq = tl.load(dq_ptrs)
             dq += tl.dot(ds.to(Q.dtype.element_ty), k)
+            # Find from: https://github.com/openai/triton/issues/1806
+            # dq += tl.trans(tl.dot(tl.trans(k), tl.trans(ds.to(Q.dtype.element_ty))))
             tl.store(dq_ptrs, dq)
             # increment pointers
             dq_ptrs += BLOCK_M * stride_qm
