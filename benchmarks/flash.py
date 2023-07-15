@@ -1,16 +1,19 @@
 import argparse
 import csv
+import enum
 import itertools
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
-from tqdm import tqdm
 
 import torch
 import triton
+from torch.nn.functional import scaled_dot_product_attention
+from tqdm import tqdm
 
 from transformer_nuggets.flash import BiasMode, attention, build_alibi_mask
 from transformer_nuggets.utils import benchmark_torch_function_in_microseconds
+
 device = torch.device("cuda")
 
 BATCH, N_HEADS, D_HEAD = 4, 16, 64
@@ -61,7 +64,7 @@ def bench_flash_attention(BATCH, H, N_CTX, D_HEAD, mode, causal, bias_choice, pr
         # reference implementation
         attn_bias = build_mask(bias_choice, BATCH, H, N_CTX, causal, dtype)
         is_causal = causal if (bias_choice == BiasMode.none) else False
-        fn = lambda: torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=is_causal, attn_mask=attn_bias, scale=sm_scale)
+        fn = lambda: scaled_dot_product_attention(q, k, v, is_causal=is_causal, attn_mask=attn_bias, scale=sm_scale)
         if mode == 'bwd':
             o = fn()
             do = torch.randn_like(o)
@@ -90,8 +93,11 @@ class ExperimentConfig:
 
 @dataclass
 class ExperimentResult:
-    triton: float
-    pytorch: float
+    triton_torchtimer: float
+    triton_do_bench: float
+    pytorch_torchtimer: float
+    pytorch_do_bench: float
+
 
 def gen_configs() -> List[ExperimentConfig]:
     bszs = [8, 16, 32]
@@ -122,32 +128,73 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
     causal = config.causal
     sm_scale = 1
     bias_choice = config.bias_choice
+    is_causal = causal if (bias_choice == BiasMode.none) else False
     warmup = 5
     if config.direction == "fwd":
         for _ in range(warmup):
             attention(q, k, v, causal, sm_scale, bias_choice)
-        triton_ms = benchmark_torch_function_in_microseconds(attention, q, k, v, causal, sm_scale, bias_choice)
-    else:
-        o, mask = attention(q, k, v, causal, sm_scale, bias_choice)
-        do = torch.randn_like(o)
-        for _ in range(warmup):
-            o.backward(do, retain_graph=True)
-        triton_ms = benchmark_torch_function_in_microseconds(o.backward, do, retain_graph=True)
-    print(triton_ms)
-    return ExperimentResult(triton_ms, triton_ms)
+            scaled_dot_product_attention(q, k, v, is_causal=is_causal, attn_mask=mask, scale=sm_scale)
+        triton_torchtimer = benchmark_torch_function_in_microseconds(attention, q, k, v, causal, sm_scale, bias_choice)
+        pytorch_torchtimer = benchmark_torch_function_in_microseconds(scaled_dot_product_attention, q, k, v, is_causal=is_causal, attn_mask=mask, scale=sm_scale)
+        fn_triton = lambda: attention(q, k, v, causal, sm_scale, bias_choice)
+        # do_bench is in ms
+        triton_do_bench = triton.testing.do_bench(fn_triton, warmup=warmup, rep=100)*1000
+        fn_torch = lambda: scaled_dot_product_attention(q, k, v, is_causal=is_causal, attn_mask=mask, scale=sm_scale)
+        pytorch_do_bench = triton.testing.do_bench(fn_torch, warmup=warmup, rep=100)*1000
 
-def my_main():
+    elif config.direction == "bwd":
+        out_triton, _ = attention(q, k, v, causal, sm_scale, bias_choice)
+        out_torch = scaled_dot_product_attention(q, k, v, is_causal=is_causal, attn_mask=mask, scale=sm_scale)
+        dOut = torch.randn_like(out_triton)
+        for _ in range(warmup):
+            out_triton.backward(dOut, retain_graph=True)
+            out_torch.backward(dOut, retain_graph=True)
+       
+        triton_torchtimer = benchmark_torch_function_in_microseconds(out_triton.backward, dOut, retain_graph=True)
+        pytorch_torchtimer = benchmark_torch_function_in_microseconds(out_torch.backward, dOut, retain_graph=True)
+        fn_triton = lambda: out_triton.backward(dOut, retain_graph=True)
+        triton_do_bench = triton.testing.do_bench(fn_triton, warmup=warmup, rep=100)*1000
+        fn_torch = lambda: out_torch.backward(dOut, retain_graph=True)
+        pytorch_do_bench = triton.testing.do_bench(fn_torch, warmup=warmup, rep=100)*1000
+    else:
+        raise ValueError("Invalid direction")
+
+    return ExperimentResult(triton_torchtimer, triton_do_bench, pytorch_torchtimer, pytorch_do_bench)
+
+def main(output_file: Optional[Path]):
     configs = gen_configs()
     results = []
-    for config in tqdm(configs):
-        results.append(run_experiment(config))
-    # with open("flash.csv", "w") as f:
-    #     writer = csv.DictWriter(f, fieldnames=ExperimentResult.__dataclass_fields__.keys())
-    #     writer.writeheader()
-    #     for result in results:
-    #         writer.writerow(asdict(result))
+    for experiment_config in tqdm(configs, unit="Experiment"):
+        experiment_result = run_experiment(experiment_config)
+        merged = asdict(experiment_config) | asdict(experiment_result)
+        results.append(merged)
+    if output_file is not None:
+         print(f"Writing results to {output_path}")
+         with open(output_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=results[0].keys())
+                writer.writeheader()
+                writer.writerows(results)
 
 if __name__ == '__main__':
+    """Sample usage:
+    # Running sweep
+    python benchmarks/flash.py -o benchmarks/data/flash_attention_sweep.csv
+
     # only works on post-Ampere GPUs right now
     # bench_flash_attention.run(save_path=None, print_data=True)
-    my_main()
+    """
+    parser = argparse.ArgumentParser(description="Run experiments and output results to file")
+    parser.add_argument(
+        "-o",
+        "--output_file",
+        type=str,
+        help="Path to write out CSV file for experiment results.",
+        default=None,
+    )
+
+    args = parser.parse_args()
+    output_path = None
+    if args.output_file is not None:
+        output_path = Path(args.output_file)
+
+    main(output_path)
