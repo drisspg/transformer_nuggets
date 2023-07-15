@@ -3,6 +3,8 @@ import pytest
 import triton
 from transformer_nuggets.flash import BiasMode, build_alibi_mask, attention
 
+device = torch.device("cuda:7")
+
 BATCH, N_HEADS, N_CTX, D_HEAD = 4, 48, 4096, 64
 # vary seq length for fixed head and batch=4
 configs = [triton.testing.Benchmark(
@@ -23,22 +25,22 @@ def bench_flash_attention(BATCH, H, N_CTX, D_HEAD, causal, mode, provider, dtype
     assert mode in ['fwd', 'bwd']
     warmup = 25
     rep = 100
+    sm_scale = 1
     if provider == "triton":
-        q = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
-        k = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
-        v = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
-        sm_scale = 1.3
-        fn = lambda: attention(q, k, v, causal, sm_scale)
+        q = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device=device, requires_grad=True)
+        k = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device=device, requires_grad=True)
+        v = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device=device, requires_grad=True)
+        fn = lambda: attention(q, k, v, causal, sm_scale, BiasMode.none)
         if mode == 'bwd':
-            o = fn()
+            o, mask = fn()
             do = torch.randn_like(o)
             fn = lambda: o.backward(do, retain_graph=True)
         ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
     if provider == 'pytorch':
-        q = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
-        k = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
-        v = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
-        fn = lambda: torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=1.3)
+        q = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device=device, requires_grad=True)
+        k = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device=device, requires_grad=True)
+        v = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device=device, requires_grad=True)
+        fn = lambda: torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=sm_scale)
         if mode == 'bwd':
             o = fn()
             do = torch.randn_like(o)
@@ -56,4 +58,3 @@ def bench_flash_attention(BATCH, H, N_CTX, D_HEAD, causal, mode, provider, dtype
 if __name__ == '__main__':
     # only works on post-Ampere GPUs right now
     bench_flash_attention.run(save_path=None, print_data=True)
-    # pytest.main([__file__])

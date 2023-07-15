@@ -115,14 +115,15 @@ def _fwd_kernel(
         block_shape=(BLOCK_M, BLOCK_DMODEL),
         order=(1, 0)
     )
-    mask_block_ptr = tl.make_block_ptr(
-        base = mask_scratch_space + off_hz*N_CTX*N_CTX,
-        shape=(N_CTX, N_CTX),
-        strides=(N_CTX, 1),
-        offsets=(start_m * BLOCK_M, 0),
-        block_shape=(BLOCK_M, BLOCK_N),
-        order=(1, 0)
-    )
+    if DEBUG_MASK and BIAS_CHOICE != BiasMode.none:
+        mask_block_ptr = tl.make_block_ptr(
+            base = mask_scratch_space + off_hz*N_CTX*N_CTX,
+            shape=(N_CTX, N_CTX),
+            strides=(N_CTX, 1),
+            offsets=(start_m * BLOCK_M, 0),
+            block_shape=(BLOCK_M, BLOCK_N),
+            order=(1, 0)
+        )
 
     # initialize offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -156,8 +157,6 @@ def _fwd_kernel(
     # advance block pointers to first iteration of the loop
     K_block_ptr = tl.advance(K_block_ptr, (0, lo))
     V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
-
-    # mask_block_ptr = tl.advance(mask_block_ptr, (lo, lo))
     # loop over k, v and update accumulator
     for start_n in range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
@@ -203,7 +202,8 @@ def _fwd_kernel(
         # update pointers
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
-        mask_block_ptr = tl.advance(mask_block_ptr, (0, BLOCK_N))
+        if DEBUG_MASK and BIAS_CHOICE != BiasMode.none:
+            mask_block_ptr = tl.advance(mask_block_ptr, (0, BLOCK_N))
     # write back l and m
     l_ptrs = L + off_hz * N_CTX + offs_m
     m_ptrs = M + off_hz * N_CTX + offs_m
@@ -239,7 +239,7 @@ def _bwd_kernel(
     Q, K, V, sm_scale, Out, DO,
     DQ, DK, DV,
     L, M,
-    D, mask_scratch_space,
+    D,
     stride_qz, stride_qh, stride_qm, stride_qk,
     stride_kz, stride_kh, stride_kn, stride_kk,
     stride_vz, stride_vh, stride_vk, stride_vn,
@@ -249,7 +249,6 @@ def _bwd_kernel(
     BLOCK_N: tl.constexpr,
     MODE: tl.constexpr,
     BIAS_CHOICE: tl.constexpr,
-    DEBUG_MASK: tl.constexpr
 ):
     off_hz = tl.program_id(0)
     off_z = off_hz // H
@@ -265,8 +264,6 @@ def _bwd_kernel(
     DQ += off_z * stride_qz + off_h * stride_qh
     DK += off_z * stride_qz + off_h * stride_qh
     DV += off_z * stride_qz + off_h * stride_qh
-    if DEBUG_MASK:
-        mask_scratch_space += off_hz * N_CTX * N_CTX
     for start_n in range(0, num_block):
         if MODE == 0:
             # if non_causal
@@ -285,8 +282,6 @@ def _bwd_kernel(
         v_ptrs = V + (offs_n[:, None] * stride_qm + offs_k[None, :] * stride_qk)
         do_ptrs = DO + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
         dq_ptrs = DQ + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
-        if DEBUG_MASK:
-            mask_ptrs = mask_scratch_space + (offs_qm[:, None] * N_CTX + offs_n[None, :])
         # pointer to row-wise quantities in value-like data
         D_ptrs = D + off_hz * N_CTX
         m_ptrs = M + off_hz * N_CTX
@@ -346,8 +341,6 @@ def _bwd_kernel(
         tl.store(dk_ptrs, dk)
 
 
-empty = torch.empty(128, device="cuda")
-
 
 class _attention(torch.autograd.Function):
 
@@ -372,8 +365,11 @@ class _attention(torch.autograd.Function):
         else:
             modes = [0]
         # TODO delete when we are good
-        scratch_space = torch.zeros((batch_size, num_heads, seq_len_qv, seq_len_qv), device=q.device, dtype=torch.float32)
-    
+        if debug_mask:
+            scratch_space = torch.zeros((batch_size, num_heads, seq_len_qv, seq_len_qv), device=q.device, dtype=torch.float32)
+        else:
+            scratch_space = None
+
         for mode in modes:
             _fwd_kernel[grid](
                 q, k, v, sm_scale,
@@ -411,7 +407,6 @@ class _attention(torch.autograd.Function):
         dv = torch.empty_like(v)
         do_scaled = torch.empty_like(do)
         delta = torch.empty_like(l)
-        mask = torch.empty_like(dmask)
         if ctx.causal:
             mode = 1
         else:
@@ -431,7 +426,7 @@ class _attention(torch.autograd.Function):
             o, do_scaled,
             dq, dk, dv,
             l, m,
-            delta, mask,
+            delta,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
@@ -441,7 +436,6 @@ class _attention(torch.autograd.Function):
             BLOCK_DMODEL=ctx.BLOCK_DMODEL, num_warps=8,
             MODE=mode,
             BIAS_CHOICE=ctx.bias_choice.value,
-            DEBUG_MASK=ctx.debug_mask,
             num_stages=1,
         )
         return dq, dk, dv, None, None, None, None
