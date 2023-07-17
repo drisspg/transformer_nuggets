@@ -48,29 +48,6 @@ class ExperimentResult:
     pytorch_time: float
 
 
-def gen_configs() -> List[ExperimentConfig]:
-    bszs = [4]
-    num_heads = [
-        48,
-    ]
-    seqlens = [
-        4096,
-    ]
-    head_dim = [64]
-    bias_choices = [BiasMode.none, BiasMode.rel_pos, BiasMode.alibi]
-    causal = [
-        True,
-    ]
-    dtypes = [torch.float16]
-    directions = ["fwd", "bwd"]
-    configs = []
-    for item in itertools.product(
-        bszs, num_heads, seqlens, head_dim, bias_choices, causal, dtypes, directions
-    ):
-        configs.append(ExperimentConfig(*item))
-    return configs
-
-
 def get_input(
     config: ExperimentConfig,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
@@ -92,7 +69,7 @@ def get_input(
         device=device,
         requires_grad=True,
     )
-    if config.bias_choice != BiasMode.none:
+    if config.bias_choice != BiasMode.none and config.seqlen < 8192:
         mask = build_mask(
             config.bias_choice,
             config.bsz,
@@ -112,42 +89,38 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
     sm_scale = 1
     bias_choice = config.bias_choice
     is_causal = causal if (bias_choice == BiasMode.none) else False
-    warmup = 5
     if config.direction == "fwd":
-        for _ in range(warmup):
-            attention(q, k, v, causal, sm_scale, bias_choice)
-            scaled_dot_product_attention(
-                q, k, v, is_causal=is_causal, attn_mask=mask, scale=sm_scale
+        if config.seqlen >= 8192 and config.bias_choice != BiasMode.none:
+            # Skip PyTorch for large seq_len because of OOM
+            pytorch_time = float("nan")
+        else:
+            pytorch_time = benchmark_torch_function_in_microseconds(
+                scaled_dot_product_attention,
+                q,
+                k,
+                v,
+                is_causal=is_causal,
+                attn_mask=mask,
+                scale=sm_scale,
             )
         triton_time = benchmark_torch_function_in_microseconds(
             attention, q, k, v, causal, sm_scale, bias_choice
         )
-        pytorch_time = benchmark_torch_function_in_microseconds(
-            scaled_dot_product_attention,
-            q,
-            k,
-            v,
-            is_causal=is_causal,
-            attn_mask=mask,
-            scale=sm_scale,
-        )
 
     elif config.direction == "bwd":
         out_triton, _ = attention(q, k, v, causal, sm_scale, bias_choice)
-        out_torch = scaled_dot_product_attention(
-            q, k, v, is_causal=is_causal, attn_mask=mask, scale=sm_scale
-        )
         dOut = torch.randn_like(out_triton)
-        for _ in range(warmup):
-            out_triton.backward(dOut, retain_graph=True)
-            out_torch.backward(dOut, retain_graph=True)
-
         triton_time = benchmark_torch_function_in_microseconds(
             out_triton.backward, dOut, retain_graph=True
         )
-        pytorch_time = benchmark_torch_function_in_microseconds(
-            out_torch.backward, dOut, retain_graph=True
-        )
+        if config.seqlen >= 8192 and config.bias_choice != BiasMode.none:
+            # Skip PyTorch for large seq_len because of OOM
+            pytorch_time = float("nan")
+        else:
+            out_torch = scaled_dot_product_attention(q, k, v, is_causal=is_causal, attn_mask=mask, scale=sm_scale)   
+            pytorch_time = benchmark_torch_function_in_microseconds(
+                out_torch.backward, dOut, retain_graph=True
+            )
     else:
         raise ValueError("Invalid direction")
 
@@ -179,6 +152,29 @@ def profile_experiment(
     )
     utils.profile_function(profile_config, fn)
 
+def gen_configs() -> List[ExperimentConfig]:
+    seqlens = [512, 1024, 2048, 4096, 8192, 16384]
+    head_dim = [64, 128]
+    bias_choices = [BiasMode.none, BiasMode.rel_pos, BiasMode.alibi]
+    causal = [True, False]
+    dtypes = [torch.float16]
+    directions = ["fwd", "bwd"]
+    configs = []
+    def get_bsz_num_heads(hidden_dim, seq_len, head_dim, max_tokens=2**14):
+        # Default max_tokens = 2**14 = 16384
+        assert hidden_dim % head_dim == 0, "hidden_dim must be divisible by head_dim"
+        assert max_tokens % seq_len == 0, "max_tokens must be divisible by seq_len"
+        num_heads = hidden_dim / head_dim
+        batch_size = max_tokens / seq_len
+        return int(batch_size), int(num_heads)
+
+    for item in itertools.product(
+        seqlens, head_dim, bias_choices, causal, dtypes, directions
+    ):
+        # 2048, chosen from FlashV2 Paper
+        bsz, num_heads = get_bsz_num_heads(2048, *item[:2])
+        configs.append(ExperimentConfig(bsz, num_heads, *item))
+    return configs
 
 def main(output_file: Optional[Path], profile_path: Optional[Path]):
     if output_file is not None:
