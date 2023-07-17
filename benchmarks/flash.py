@@ -335,9 +335,11 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     output_path = None
+    profile_path = None
     if args.output_file is not None:
         output_path = Path(args.output_file)
     if args.profile_path is not None:
         profile_path = Path(args.profile_path)
-
+    if output_path is None and profile_path is None:
+        raise ValueError("Must specify at least one of output_file or profile_path")
     main(output_path, profile_path)
