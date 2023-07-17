@@ -177,20 +177,15 @@ def _fwd_kernel(
         if MODE == 1 or MODE == 3:
             qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk, float("-inf"))
         # -- compute m_ij, p, l_ij
-        m_ij = tl.max(qk, 1)
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
         p = tl.math.exp(qk - m_ij[:, None])
         l_ij = tl.sum(p, 1)
         # -- update m_i and l_i
-        m_i_new = tl.maximum(m_i, m_ij)
-        alpha = tl.math.exp(m_i - m_i_new)
-        beta = tl.math.exp(m_ij - m_i_new)
+        alpha = tl.math.exp(m_i - m_ij)
         l_i *= alpha
-        l_i_new = l_i + beta * l_ij
-        # scale p
-        p_scale = beta / l_i_new
-        p = p * p_scale[:, None]
+        l_i_new = l_i + l_ij
         # scale acc
-        acc_scale = l_i / l_i_new
+        acc_scale = l_i * 0 + alpha
         acc = acc * acc_scale[:, None]
         # update acc
         v = tl.load(V_block_ptr)
@@ -198,13 +193,14 @@ def _fwd_kernel(
         acc += tl.dot(p, v)
         # update m_i and l_i
         l_i = l_i_new
-        m_i = m_i_new
+        m_i = m_ij
         # update pointers
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
         if DEBUG_MASK and BIAS_CHOICE != BiasMode.none:
             mask_block_ptr = tl.advance(mask_block_ptr, (0, BLOCK_N))
     # write back l and m
+    acc = acc / l_i[:, None]
     l_ptrs = L + off_hz * N_CTX + offs_m
     m_ptrs = M + off_hz * N_CTX + offs_m
     tl.store(l_ptrs, l_i)
