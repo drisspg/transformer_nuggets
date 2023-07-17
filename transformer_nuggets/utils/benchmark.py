@@ -28,7 +28,7 @@ def benchmark_torch_function_in_microseconds(func: Callable, *args, **kwargs) ->
     t0 = benchmark.Timer(
         stmt="func(*args, **kwargs)", globals={"args": args, "kwargs": kwargs, "func": func}
     )
-    return t0.blocked_autorange().mean * 1e6
+    return t0.blocked_autorange().median * 1e6
 
 
 def profile_function(
