@@ -46,7 +46,8 @@ def profile_function(
     if config.warmup_iters >= 0:
         for _ in range(config.warmup_iters):
             func(*args, **kwargs)
-
+    if config.sync:
+        torch.cuda.synchronize()
     name_context = nullcontext() if config.name is None else record_function(config.name)
     profile_memory = config.memory_profile_path is not None
     with profile(
