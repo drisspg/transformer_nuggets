@@ -133,7 +133,7 @@ def _fwd_kernel(
     # don't work as expected with `exp` in the loop
     # TODO fix this
     # qk_scale = sm_scale * 1.44269504
-    qk_scale = 1
+    qk_scale = sm_scale
     # load q: it will stay in SRAM throughout
     q = tl.load(Q_block_ptr)
     q = (q * qk_scale).to(tl.float16)
@@ -204,12 +204,13 @@ def _bwd_preprocess(
     Delta,
     BLOCK_M: tl.constexpr, D_HEAD: tl.constexpr,
 ):
+    # Batch x Head postion * BLOCK_M
     off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     off_n = tl.arange(0, D_HEAD)
-    # load
+    # load a slice of rows from O and do
     o = tl.load(Out + off_m[:, None] * D_HEAD + off_n[None, :]).to(tl.float32)
     do = tl.load(DO + off_m[:, None] * D_HEAD + off_n[None, :]).to(tl.float32)
-    # compute
+    # compute dot prod 
     delta = tl.sum(o * do, axis=1)
     # write-back
     tl.store(Delta + off_m, delta)
@@ -236,11 +237,11 @@ def _bwd_kernel(
     off_h = off_hz % H
     # TODO fix me
     # qk_scale = sm_scale * 1.44269504
-    qk_scale = 1
+    qk_scale = sm_scale
     # offset pointers for batch/head
     Q += off_z * stride_qz + off_h * stride_qh
-    K += off_z * stride_qz + off_h * stride_qh
-    V += off_z * stride_qz + off_h * stride_qh
+    K += off_z * stride_kz + off_h * stride_kh
+    V += off_z * stride_vz + off_h * stride_vh
     DO += off_z * stride_qz + off_h * stride_qh
     DQ += off_z * stride_qz + off_h * stride_qh
     DK += off_z * stride_qz + off_h * stride_qh
@@ -280,14 +281,14 @@ def _bwd_kernel(
                 qk = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), float(0.), float("-inf"))
             else:
                 qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+            qk += tl.dot(q, tl.trans(k))
+            qk *= qk_scale
             # ~~~~~~~~~~~~~~~~~~~ This is all mask stuff ~~~~~~~~~~~~~~~~~~~
             if BIAS_CHOICE == BiasMode.rel_pos:
                 qk = rel_attention_triton(qk, offs_m_curr[:, None], (offs_n[None, :]), off_hz%H, H)
             elif BIAS_CHOICE == BiasMode.alibi:
                 qk = alibi_attention_triton(qk, offs_m_curr[:, None], (offs_n[None, :]), off_hz%H, H)
             # ~~~~~~~~~~~~~~~~~~~ This is the end of mask stuff ~~~~~~~~~~~~~~~~~~~
-            qk += tl.dot(q, tl.trans(k))
-            qk *= qk_scale
             l_i = tl.load(l_ptrs + offs_m_curr)
             # TODO fix me
             # p = tl.math.exp2(qk - l_i[:, None])
@@ -372,6 +373,7 @@ class _attention(torch.autograd.Function):
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
         delta = torch.empty_like(L)
+        # Launch Grid of Batch * Num_heads
         _bwd_preprocess[(ctx.grid[0] * ctx.grid[1], )](
             o, do,
             delta,

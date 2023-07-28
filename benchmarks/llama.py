@@ -308,6 +308,7 @@ class NF4MLP(nn.Module):
         x = linear_nf4(x, self.w3)
         return x
 
+
 class QloraMLP(nn.Module):
     # This very notably doesn't save on backward compute
     def __init__(self, config: LLaMAConfig) -> None:

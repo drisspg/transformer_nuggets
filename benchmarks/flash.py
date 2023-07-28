@@ -117,7 +117,9 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
             # Skip PyTorch for large seq_len because of OOM
             pytorch_time = float("nan")
         else:
-            out_torch = scaled_dot_product_attention(q, k, v, is_causal=is_causal, attn_mask=mask, scale=sm_scale)   
+            out_torch = scaled_dot_product_attention(
+                q, k, v, is_causal=is_causal, attn_mask=mask, scale=sm_scale
+            )
             pytorch_time = benchmark_torch_function_in_microseconds(
                 out_torch.backward, dOut, retain_graph=True
             )
@@ -152,6 +154,7 @@ def profile_experiment(
     )
     utils.profile_function(profile_config, fn)
 
+
 def gen_configs() -> List[ExperimentConfig]:
     seqlens = [512, 1024, 2048, 4096, 8192, 16384]
     head_dim = [64, 128]
@@ -160,6 +163,7 @@ def gen_configs() -> List[ExperimentConfig]:
     dtypes = [torch.float16]
     directions = ["fwd", "bwd"]
     configs = []
+
     def get_bsz_num_heads(hidden_dim, seq_len, head_dim, max_tokens=2**14):
         # Default max_tokens = 2**14 = 16384
         assert hidden_dim % head_dim == 0, "hidden_dim must be divisible by head_dim"
@@ -168,13 +172,12 @@ def gen_configs() -> List[ExperimentConfig]:
         batch_size = max_tokens / seq_len
         return int(batch_size), int(num_heads)
 
-    for item in itertools.product(
-        seqlens, head_dim, bias_choices, causal, dtypes, directions
-    ):
+    for item in itertools.product(seqlens, head_dim, bias_choices, causal, dtypes, directions):
         # 2048, chosen from FlashV2 Paper
         bsz, num_heads = get_bsz_num_heads(2048, *item[:2])
         configs.append(ExperimentConfig(bsz, num_heads, *item))
     return configs
+
 
 def main(output_file: Optional[Path], profile_path: Optional[Path]):
     if output_file is not None:

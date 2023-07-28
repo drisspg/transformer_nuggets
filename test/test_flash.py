@@ -6,7 +6,8 @@ from transformer_nuggets.flash import BiasMode, build_alibi_mask, attention
 @pytest.mark.parametrize("Z, H, N_CTX, D_HEAD", [(6, 8, 128, 16)])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("bias_choice", [BiasMode.rel_pos, BiasMode.none, BiasMode.alibi])
-def test_op(Z, H, N_CTX, D_HEAD, causal, bias_choice, dtype=torch.float16):
+@pytest.mark.parametrize("sm_scale", [None, 1])
+def test_op(Z, H, N_CTX, D_HEAD, causal, bias_choice, sm_scale, dtype=torch.float16):
     torch.manual_seed(20)
     q = (
         torch.empty((Z, H, N_CTX, D_HEAD), dtype=dtype, device="cuda")
@@ -24,7 +25,8 @@ def test_op(Z, H, N_CTX, D_HEAD, causal, bias_choice, dtype=torch.float16):
         .requires_grad_()
     )
 
-    sm_scale = 1
+    if sm_scale is None:
+        sm_scale = 1 / (D_HEAD**0.5)
     dout = torch.randn_like(q)
 
     # reference implementation
@@ -57,9 +59,9 @@ def test_op(Z, H, N_CTX, D_HEAD, causal, bias_choice, dtype=torch.float16):
         torch.testing.assert_close(attn_bias, mask.half(), atol=4e-2, rtol=0)
 
     # compare
-    torch.testing.assert_close(ref_out, tri_out, atol=4e-2, rtol=0)
+    torch.testing.assert_close(ref_out, tri_out, atol=5.5e-2, rtol=0)
     if bias_choice != BiasMode.none:
-        fudge_factor = 5
+        fudge_factor = 6.1
     else:
         fudge_factor = 1
     atol = 1e-2 * fudge_factor

@@ -9,6 +9,7 @@ import math
 
 bnb_available = False
 
+
 def get_block_absmax(inpt_tensor: torch.Tensor, block_size: int) -> torch.Tensor:
     """Iterate through a flattened tensor getting the absmax scalers for each block
 
@@ -449,7 +450,7 @@ def build_input_weight(embed_dim: int, device: torch.device):
 
 def build_bitsandbytes_linear(input_weight: torch.Tensor, device: torch.device):
     global bnb
-    if 'bnb' not in globals():
+    if "bnb" not in globals():
         import bitsandbytes as bnb
     param = bnb.nn.Params4bit(input_weight, requires_grad=False, quant_type="nf4").cuda(device)
     bnb_linear = bnb.nn.LinearNF4(input_weight.size(0), input_weight.size(1), bias=False)
@@ -566,4 +567,3 @@ class QloraLinear(nn.Module):
             self.lora_dropout(x) @ self.lora_A.transpose(0, 1) @ self.lora_B.transpose(0, 1)
         ) * self.scaling
         return result
-
