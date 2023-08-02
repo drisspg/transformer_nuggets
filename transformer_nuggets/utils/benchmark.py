@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 from contextlib import contextmanager
 from pickle import dump
+from pathlib import Path
 
 import torch
 import torch.utils.benchmark as benchmark
@@ -88,11 +89,22 @@ def print_cuda_memory_usage():
 
 
 @contextmanager
-def save_memory_snapshot(file_path):
+def save_memory_snapshot(file_path: Path):
+    """Save a memory snapshot information to a folder
+
+    Args:
+        file_path: The path to the folder to save the snapshot to
+                    will create the folder if it doesn't exist
+    """
+    file_path.mkdir(parents=True, exist_ok=True)
     torch.cuda.memory._record_memory_history()
     try:
         yield
     finally:
-        snapshot = torch.cuda.memory._snapshot()
-        with open(file_path, "wb") as f:
-            dump(snapshot, f)
+        s = torch.cuda.memory._snapshot()
+        with open(f"{file_path}/snapshot.pickle", "wb") as f:
+            dump(s, f)
+        with open(f"{file_path}/trace_plot.html", "w") as f:
+            f.write(torch.cuda.memory.trace_plot(s))
+        with open(f"{file_path}/segment_plot.html", "w") as f:
+            f.write(torch.cuda.memory.segment_plot(s))

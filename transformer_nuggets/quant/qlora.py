@@ -36,6 +36,7 @@ class NF4Tensor:
     """NF4Tensor class for converting a weight to the QLoRA NF4 format"""
 
     @classmethod
+    @torch.no_grad()
     def from_tensor(
         cls,
         inpt_tensor: torch.Tensor,
@@ -556,6 +557,8 @@ class QloraLinear(nn.Module):
             self.lora_dropout = nn.Dropout(p=lora_dropout)
         else:
             self.lora_dropout = lambda x: x
+
+        self.reset_parameters()
 
     def reset_parameters(self):
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
