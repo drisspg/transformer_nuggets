@@ -164,7 +164,7 @@ class NF4Tensor:
 
         # This is needed to make sure that quantization_factor remains a repeated view of n_scaler_blocks
         # For some reason the 127/scaler_absmax realizes n_scaler entries when only n_scaler_blocks are needed
-        # The following will graph the first entry for the n_scaler_blocks which is the same accrose the scaler_block_size
+        # The following will grab the first entry for the n_scaler_blocks which is the same across the scaler_block_size
         quantization_factor = quantization_factor[:, 0]
 
         return (
@@ -431,7 +431,7 @@ class LinearNF4(torch.autograd.Function):
     def forward(ctx, input: torch.Tensor, weight: NF4Tensor):
         ctx.nf4_weight = weight
         return F.linear(input, weight.get_original_weight())
-
+    
     @staticmethod
     def backward(ctx, grad_output):
         weight: NF4Tensor = ctx.nf4_weight
@@ -566,7 +566,7 @@ class QloraLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         result = linear_nf4(x, self.weight)
-        result += (
+        result2 = result + (
             self.lora_dropout(x) @ self.lora_A.transpose(0, 1) @ self.lora_B.transpose(0, 1)
         ) * self.scaling
-        return result
+        return result2
