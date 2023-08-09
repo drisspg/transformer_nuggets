@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import torch
-import triton
 from torch.nn.functional import scaled_dot_product_attention
 from tqdm import tqdm
 
