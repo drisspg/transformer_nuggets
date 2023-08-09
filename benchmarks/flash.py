@@ -135,7 +135,7 @@ class KernelChoice(enum.Enum):
 
 def profile_experiment(
     kernel, config: ExperimentConfig, profile_config: utils.ProfileConfig
-) -> ExperimentResult:
+) -> None:
     q, k, v, mask = get_input(config)
     sm_scale = 1
     causal = config.causal
