@@ -105,6 +105,4 @@ def save_memory_snapshot(file_path: Path):
         with open(f"{file_path}/snapshot.pickle", "wb") as f:
             dump(s, f)
         with open(f"{file_path}/trace_plot.html", "w") as f:
-            f.write(torch.cuda.memory.trace_plot(s))
-        with open(f"{file_path}/segment_plot.html", "w") as f:
-            f.write(torch.cuda.memory.segment_plot(s))
+            f.write(torch.cuda._memory_viz.trace_plot(s))
