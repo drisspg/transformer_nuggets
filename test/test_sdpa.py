@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch.nn.functional import scaled_dot_product_attention
 from transformer_nuggets.sdpa import sdpa_prototype
+from transformer_nuggets.sdpa.attn_mask import CausalMask, CausalVariant, LambdaMask, TensorMask
 
 
 def query_key_value_clones(
@@ -98,6 +99,38 @@ def test_base_case():
     )
     sdpa_output = sdpa_prototype(
         query_prototype, key_prototype, value_prototype, None, False, dropout_p=0.0
+    )
+
+    dOut = torch.randn_like(pytorch_output)
+    pytorch_output.backward(dOut)
+    sdpa_output.backward(dOut)
+
+    torch.testing.assert_close(pytorch_output, sdpa_output, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(query.grad, query_prototype.grad, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(key.grad, key_prototype.grad, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(value.grad, value_prototype.grad, rtol=1e-5, atol=1e-5)
+
+
+def test_materialized_case():
+    # Bsz, num_heads, seq_len, head_dim
+    bsz = 16
+    num_heads = 16
+    seq_len = 128
+    head_dim = 16
+    shape = (bsz, num_heads, seq_len, 16)
+    make_tensor = partial(
+        rand_sdpa_tensor, shape, "cuda", torch.float16, "dense", requires_grad=True
+    )
+    query, key, value = make_tensor(), make_tensor(), make_tensor()
+    query_prototype, key_prototype, value_prototype = query_key_value_clones(query, key, value)
+    mask = torch.rand(bsz, num_heads, seq_len, seq_len, dtype=torch.float16, device="cuda")
+    attn_mask = TensorMask(mask)
+
+    pytorch_output = scaled_dot_product_attention(
+        query, key, value, attn_mask=mask, dropout_p=0.0, is_causal=False
+    )
+    sdpa_output = sdpa_prototype(
+        query_prototype, key_prototype, value_prototype, attn_mask = attn_mask, scale=None, causal=False, dropout_p=0.0
     )
 
     dOut = torch.randn_like(pytorch_output)

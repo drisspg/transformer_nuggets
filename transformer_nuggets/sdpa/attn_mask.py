@@ -10,6 +10,9 @@ class AttnMask(ABC):
     def materialize(self) -> torch.Tensor:
         raise NotImplementedError("This is an abstract base class")
 
+    @abstractmethod
+    def needs_materialization(self) -> bool:
+        raise NotImplementedError("This is an abstract base class")
 
 class TensorMask(AttnMask):
     """ A mask that is a tensor """
@@ -20,6 +23,9 @@ class TensorMask(AttnMask):
     def materialize(self) -> torch.Tensor:
         return self.mask
 
+    def needs_materialization(self) -> bool:
+        return True
+
 class LambdaMask(AttnMask):
     """ A mask that is a function """
 
@@ -29,6 +35,8 @@ class LambdaMask(AttnMask):
     def materialize(self) -> torch.Tensor:
         return self.mask_fn()
 
+    def needs_materialization(self) -> bool:
+        return False
 
 class CausalVariant(Enum):
     """ Enum for causal causal varients """
@@ -59,3 +67,6 @@ class CausalMask(TensorMask):
             return self._upper_left()
         elif self.variant == CausalVariant.LOWER_RIGHT:
             return self._lower_right()
+
+    def needs_materialization(self) -> bool:
+        return True

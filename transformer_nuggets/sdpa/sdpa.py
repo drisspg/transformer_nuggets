@@ -21,4 +21,7 @@ def sdpa_prototype(
     if not attn_mask:
         return scaled_dot_product_attention(query, key, value, dropout_p=dropout_p, is_causal=causal, scale=scale)
     else:
-        raise("slow down chief")
+        if attn_mask.needs_materialization():
+            return scaled_dot_product_attention(query, key, value, attn_mask=attn_mask.materialize(), dropout_p=dropout_p, is_causal=causal, scale=scale)
+        else:
+            raise("slow down chief")
