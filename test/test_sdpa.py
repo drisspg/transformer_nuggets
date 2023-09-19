@@ -6,7 +6,8 @@ import pytest
 import torch
 from torch.nn.functional import scaled_dot_product_attention
 from transformer_nuggets.sdpa import sdpa_prototype
-from transformer_nuggets.sdpa.attn_mask import CausalMask, CausalVariant, LambdaMask, TensorMask
+from transformer_nuggets.sdpa.attn_mask import (CausalMask, CausalVariant,
+                                                LambdaMask, TensorMask)
 
 
 def query_key_value_clones(
@@ -117,7 +118,7 @@ def test_materialized_case():
     num_heads = 16
     seq_len = 128
     head_dim = 16
-    shape = (bsz, num_heads, seq_len, 16)
+    shape = (bsz, num_heads, seq_len, head_dim)
     make_tensor = partial(
         rand_sdpa_tensor, shape, "cuda", torch.float16, "dense", requires_grad=True
     )
@@ -130,7 +131,13 @@ def test_materialized_case():
         query, key, value, attn_mask=mask, dropout_p=0.0, is_causal=False
     )
     sdpa_output = sdpa_prototype(
-        query_prototype, key_prototype, value_prototype, attn_mask = attn_mask, scale=None, causal=False, dropout_p=0.0
+        query_prototype,
+        key_prototype,
+        value_prototype,
+        attn_mask=attn_mask,
+        scale=None,
+        causal=False,
+        dropout_p=0.0,
     )
 
     dOut = torch.randn_like(pytorch_output)
@@ -141,3 +148,43 @@ def test_materialized_case():
     torch.testing.assert_close(query.grad, query_prototype.grad, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(key.grad, key_prototype.grad, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(value.grad, value_prototype.grad, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("causal_variant", [CausalVariant.UPPER_LEFT, CausalVariant.LOWER_RIGHT])
+def test_causal_variants(causal_variant: CausalVariant):
+    # Bsz, num_heads, seq_len, head_dim
+    bsz = 16
+    num_heads = 16
+    seq_len = 128
+    head_dim = 16
+    shape = (bsz, num_heads, seq_len, head_dim)
+    device = torch.device("cuda")
+    make_tensor = partial(
+        rand_sdpa_tensor, shape, device, torch.float16, "dense", requires_grad=True
+    )
+    query, key, value = make_tensor(), make_tensor(), make_tensor()
+    query_prototype, key_prototype, value_prototype = query_key_value_clones(query, key, value)
+    attn_mask = CausalMask(causal_variant, seq_len, seq_len)
+
+    pytorch_output = scaled_dot_product_attention(
+        query, key, value, attn_mask=attn_mask.materialize(device), dropout_p=0.0, is_causal=False
+    )
+    sdpa_output = sdpa_prototype(
+        query_prototype,
+        key_prototype,
+        value_prototype,
+        attn_mask=attn_mask,
+        scale=None,
+        causal=False,
+        dropout_p=0.0,
+    )
+
+    dOut = torch.randn_like(pytorch_output)
+    pytorch_output.backward(dOut)
+    sdpa_output.backward(dOut)
+    atol, rtol = 5e-4, 5e-4
+    grad_atol, grad_rtol = 5e-3, 5e-3
+    torch.testing.assert_close(pytorch_output, sdpa_output, atol=atol, rtol=rtol)
+    torch.testing.assert_close(query.grad, query_prototype.grad, atol=grad_atol, rtol=grad_rtol)
+    torch.testing.assert_close(key.grad, key_prototype.grad, atol=grad_atol, rtol=grad_rtol)
+    torch.testing.assert_close(value.grad, value_prototype.grad, atol=grad_atol, rtol=grad_rtol)
