@@ -1,13 +1,13 @@
-""" Lets define some things """
+""" Define Base class as well as some crowd favorites """
 from abc import ABC, abstractmethod
-from enum import Enum
+from enum import IntEnum
 from typing import Optional
+from warnings import warn
 
 import torch
+from torch.backends.cuda import SDPAParams, can_use_efficient_attention
 from torch.nn.functional import scaled_dot_product_attention
-from torch.backends.cuda import 
 from transformer_nuggets.sdpa.utils import input_requires_grad
-
 
 
 class AttnMask(ABC):
@@ -27,11 +27,11 @@ class AttnMask(ABC):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_mask: "AttnMask" = None,
-        causal: bool = False,
-        scale: Optional[float] = None,
-        dropout_p: float = 0.0,
-    ):
+        attn_mask: "AttnMask",
+        causal: bool,
+        scale: Optional[float],
+        dropout_p: float,
+    ) -> torch.Tensor:
         raise NotImplementedError("This is an abstract base class")
 
 
@@ -52,14 +52,17 @@ class TensorMask(AttnMask):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_mask: "TensorMask" = None,
-        causal: bool = False,
-        scale: Optional[float] = None,
-        dropout_p: float = 0.0,
-    ):
+        attn_mask: "TensorMask",
+        causal: bool,
+        scale: Optional[float],
+        dropout_p: float,
+    ) -> torch.Tensor:
         raise NotImplementedError(
             "TensorMask requires materialization, so this should never be called!"
         )
+
+    def __repr__(self) -> str:
+        return f"TensorMask(mask={self.mask})"
 
 
 class LambdaMask(AttnMask):
@@ -79,16 +82,16 @@ class LambdaMask(AttnMask):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_mask: "LambdaMask" = None,
-        causal: bool = False,
-        scale: Optional[float] = None,
-        dropout_p: float = 0.0,
-    ):
+        attn_mask: "LambdaMask",
+        causal: bool,
+        scale: Optional[float],
+        dropout_p: float,
+    ) -> torch.Tensor:
         raise NotImplementedError("TODO FIGURE OUT!")
 
 
-class CausalVariant(Enum):
-    """Enum for causal causal varients"""
+class CausalVariant(IntEnum):
+    """Enum for causal variants"""
 
     UPPER_LEFT = 1
     LOWER_RIGHT = 2
@@ -102,6 +105,10 @@ class CausalMask(TensorMask):
         self.variant = variant
         self.seq_len_q = seq_len_q
         self.seq_len_kv = seq_len_kv
+        if seq_len_q > seq_len_kv and variant == CausalVariant.LOWER_RIGHT:
+            warn(
+                "Lower right causal mask will produce NaNs in the output when seq_len_q > seq_len_kv!"
+            )
 
     def _upper_left(self, device: torch.device) -> torch.Tensor:
         """Upper left causal mask"""
@@ -133,11 +140,14 @@ class CausalMask(TensorMask):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_mask: "CausalMask" = None,
-        causal: bool = False,
-        scale: Optional[float] = None,
-        dropout_p: float = 0.0,
-    ):
+        attn_mask: "CausalMask",
+        causal: bool,
+        scale: Optional[float],
+        dropout_p: float,
+    ) -> torch.Tensor:
+        if causal:
+            raise ValueError("CausalMask should not be used with causal=True")
+
         if attn_mask.seq_len_q == attn_mask.seq_len_kv:
             return scaled_dot_product_attention(
                 query,
@@ -159,21 +169,42 @@ class CausalMask(TensorMask):
                 scale=scale,
             )
         elif attn_mask.variant == CausalVariant.LOWER_RIGHT:
-            
-            compute_log_sumexp = False
-            if input_requires_grad(query, key, value):
-                compute_log_sumexp = True
-            print("running efficient attention")
-            return torch._efficient_attention_forward(
-                query,
-                key,
-                value,
-                attn_mask=None,
-                dropout_p=dropout_p,
-                is_causal=True,
-                scale=scale,
-                compute_log_sumexp=compute_log_sumexp,
-                custom_mask_type=attn_mask.variant,
-            )[0]
+            sdpa_params = SDPAParams(query, key, value, None, dropout_p, causal)
+            if can_use_efficient_attention(sdpa_params):
+                compute_log_sumexp = False
+                if input_requires_grad(query, key, value):
+                    compute_log_sumexp = True
+                return torch.ops.aten._efficient_attention_forward(
+                    query.transpose(1, 2),
+                    key.transpose(1, 2),
+                    value.transpose(1, 2),
+                    bias=None,
+                    cu_seqlens_q=None,
+                    cu_seqlens_k=None,
+                    max_seqlen_q=None,
+                    dropout_p=dropout_p,
+                    custom_mask_type=int(attn_mask.variant),
+                    compute_log_sumexp=compute_log_sumexp,
+                    scale=scale,
+                    causal_diagonal=None,
+                    seqlen_k=None,
+                )[0].transpose(1, 2)
+            else:
+                # TODO This will warn with the reason why we cant use efficient attention
+                # Should this default to on?
+                can_use_efficient_attention(sdpa_params, True)
+                # We cant use efficient attention the only support for lower right is via materialization
+                return scaled_dot_product_attention(
+                    query,
+                    key,
+                    value,
+                    attn_mask=attn_mask.materialize(query.device),
+                    dropout_p=dropout_p,
+                    is_causal=False,
+                    scale=scale,
+                )
         else:
             raise ValueError("Invalid causal variant")
+
+    def __repr__(self) -> str:
+        return f"CausalMask(variant={self.variant.name}, seq_len_q={self.seq_len_q}, seq_len_kv={self.seq_len_kv})"

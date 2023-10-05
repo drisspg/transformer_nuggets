@@ -151,20 +151,22 @@ def test_materialized_case():
 
 
 @pytest.mark.parametrize("causal_variant", [CausalVariant.UPPER_LEFT, CausalVariant.LOWER_RIGHT])
-def test_causal_variants(causal_variant: CausalVariant):
+@pytest.mark.parametrize("shapes", [(16, 16, 128, 128, 16), (16, 16, 128, 256, 32), (16, 16, 256, 128, 32), (1, 1, 23, 56, 15)])
+def test_causal_variants(causal_variant: CausalVariant, shapes: List[Tuple[int]]):
     # Bsz, num_heads, seq_len, head_dim
-    bsz = 16
-    num_heads = 16
-    seq_len = 128
-    head_dim = 16
-    shape = (bsz, num_heads, seq_len, head_dim)
+    bsz, num_heads, seq_len_q, seq_len_kv, head_dim = shapes
+    if causal_variant == CausalVariant.LOWER_RIGHT and seq_len_q > seq_len_kv:
+        pytest.skip("Lower right causal mask will produce NaNs in the output when seq_len_q > seq_len_kv!")
     device = torch.device("cuda")
-    make_tensor = partial(
-        rand_sdpa_tensor, shape, device, torch.float16, "dense", requires_grad=True
+    make_q_tensor = partial(
+        rand_sdpa_tensor, (bsz, num_heads, seq_len_q, head_dim), device, torch.float16, "dense", requires_grad=True
     )
-    query, key, value = make_tensor(), make_tensor(), make_tensor()
+    make_kv_tensor = partial(
+        rand_sdpa_tensor, (bsz, num_heads, seq_len_kv, head_dim), device, torch.float16, "dense", requires_grad=True
+    )
+    query, key, value = make_q_tensor(), make_kv_tensor(), make_kv_tensor()
     query_prototype, key_prototype, value_prototype = query_key_value_clones(query, key, value)
-    attn_mask = CausalMask(causal_variant, seq_len, seq_len)
+    attn_mask = CausalMask(causal_variant, seq_len_q, seq_len_kv)
 
     pytorch_output = scaled_dot_product_attention(
         query, key, value, attn_mask=attn_mask.materialize(device), dropout_p=0.0, is_causal=False
@@ -223,3 +225,6 @@ def test_tensor_mask(shape: List[Tuple[int]]):
     torch.testing.assert_close(query.grad, query_prototype.grad, atol=grad_atol, rtol=grad_rtol)
     torch.testing.assert_close(key.grad, key_prototype.grad, atol=grad_atol, rtol=grad_rtol)
     torch.testing.assert_close(value.grad, value_prototype.grad, atol=grad_atol, rtol=grad_rtol)
+
+if __name__ == "__main__":
+    pytest.main([__file__])
