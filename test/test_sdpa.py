@@ -188,3 +188,38 @@ def test_causal_variants(causal_variant: CausalVariant):
     torch.testing.assert_close(query.grad, query_prototype.grad, atol=grad_atol, rtol=grad_rtol)
     torch.testing.assert_close(key.grad, key_prototype.grad, atol=grad_atol, rtol=grad_rtol)
     torch.testing.assert_close(value.grad, value_prototype.grad, atol=grad_atol, rtol=grad_rtol)
+
+
+@pytest.mark.parametrize("shape", [(16, 16, 128, 16), (16, 16, 52, 32)])
+def test_tensor_mask(shape: List[Tuple[int]]):
+    bsz, num_heads, seq_len, head_dim = shape
+    device = torch.device("cuda")
+    make_tensor = partial(
+        rand_sdpa_tensor, shape, device, torch.float16, "dense", requires_grad=True
+    )
+    query, key, value = make_tensor(), make_tensor(), make_tensor()
+    query_prototype, key_prototype, value_prototype = query_key_value_clones(query, key, value)
+    attn_mask = TensorMask(torch.rand(bsz, num_heads, seq_len, seq_len, dtype=torch.float16, device=device))
+
+    pytorch_output = scaled_dot_product_attention(
+        query, key, value, attn_mask=attn_mask.materialize(device), dropout_p=0.0, is_causal=False
+    )
+    sdpa_output = sdpa_prototype(
+        query_prototype,
+        key_prototype,
+        value_prototype,
+        attn_mask=attn_mask,
+        scale=None,
+        causal=False,
+        dropout_p=0.0,
+    )
+
+    dOut = torch.randn_like(pytorch_output)
+    pytorch_output.backward(dOut)
+    sdpa_output.backward(dOut)
+    atol, rtol = 5e-4, 5e-4
+    grad_atol, grad_rtol = 5e-3, 5e-3
+    torch.testing.assert_close(pytorch_output, sdpa_output, atol=atol, rtol=rtol)
+    torch.testing.assert_close(query.grad, query_prototype.grad, atol=grad_atol, rtol=grad_rtol)
+    torch.testing.assert_close(key.grad, key_prototype.grad, atol=grad_atol, rtol=grad_rtol)
+    torch.testing.assert_close(value.grad, value_prototype.grad, atol=grad_atol, rtol=grad_rtol)

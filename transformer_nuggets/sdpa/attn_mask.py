@@ -1,8 +1,13 @@
 """ Lets define some things """
 from abc import ABC, abstractmethod
-import torch
 from enum import Enum
 from typing import Optional
+
+import torch
+from torch.nn.functional import scaled_dot_product_attention
+from torch.backends.cuda import 
+from transformer_nuggets.sdpa.utils import input_requires_grad
+
 
 
 class AttnMask(ABC):
@@ -14,6 +19,19 @@ class AttnMask(ABC):
 
     @abstractmethod
     def needs_materialization(self) -> bool:
+        raise NotImplementedError("This is an abstract base class")
+
+    @staticmethod
+    @abstractmethod
+    def dispatch(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_mask: "AttnMask" = None,
+        causal: bool = False,
+        scale: Optional[float] = None,
+        dropout_p: float = 0.0,
+    ):
         raise NotImplementedError("This is an abstract base class")
 
 
@@ -29,6 +47,20 @@ class TensorMask(AttnMask):
     def needs_materialization(self) -> bool:
         return True
 
+    @staticmethod
+    def dispatch(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_mask: "TensorMask" = None,
+        causal: bool = False,
+        scale: Optional[float] = None,
+        dropout_p: float = 0.0,
+    ):
+        raise NotImplementedError(
+            "TensorMask requires materialization, so this should never be called!"
+        )
+
 
 class LambdaMask(AttnMask):
     """A mask that is a function"""
@@ -41,6 +73,18 @@ class LambdaMask(AttnMask):
 
     def needs_materialization(self) -> bool:
         return False
+
+    @staticmethod
+    def dispatch(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_mask: "LambdaMask" = None,
+        causal: bool = False,
+        scale: Optional[float] = None,
+        dropout_p: float = 0.0,
+    ):
+        raise NotImplementedError("TODO FIGURE OUT!")
 
 
 class CausalVariant(Enum):
@@ -83,3 +127,53 @@ class CausalMask(TensorMask):
 
     def needs_materialization(self) -> bool:
         return False
+
+    @staticmethod
+    def dispatch(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_mask: "CausalMask" = None,
+        causal: bool = False,
+        scale: Optional[float] = None,
+        dropout_p: float = 0.0,
+    ):
+        if attn_mask.seq_len_q == attn_mask.seq_len_kv:
+            return scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=None,
+                dropout_p=dropout_p,
+                is_causal=True,
+                scale=scale,
+            )
+        if attn_mask.variant == CausalVariant.UPPER_LEFT:
+            return scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=None,
+                dropout_p=dropout_p,
+                is_causal=True,
+                scale=scale,
+            )
+        elif attn_mask.variant == CausalVariant.LOWER_RIGHT:
+            
+            compute_log_sumexp = False
+            if input_requires_grad(query, key, value):
+                compute_log_sumexp = True
+            print("running efficient attention")
+            return torch._efficient_attention_forward(
+                query,
+                key,
+                value,
+                attn_mask=None,
+                dropout_p=dropout_p,
+                is_causal=True,
+                scale=scale,
+                compute_log_sumexp=compute_log_sumexp,
+                custom_mask_type=attn_mask.variant,
+            )[0]
+        else:
+            raise ValueError("Invalid causal variant")
