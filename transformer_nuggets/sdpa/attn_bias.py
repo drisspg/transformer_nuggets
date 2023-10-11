@@ -10,8 +10,8 @@ from torch.nn.functional import scaled_dot_product_attention
 from transformer_nuggets.sdpa.utils import input_requires_grad
 
 
-class AttnMask(ABC):
-    """Abstract base class for attention masks"""
+class AttnBias(ABC):
+    """Abstract base class for attention biases"""
 
     @abstractmethod
     def materialize(self, device: Optional[torch.device] = None) -> torch.Tensor:
@@ -27,7 +27,7 @@ class AttnMask(ABC):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_mask: "AttnMask",
+        attn_bias: "AttnBias",
         causal: bool,
         scale: Optional[float],
         dropout_p: float,
@@ -35,14 +35,14 @@ class AttnMask(ABC):
         raise NotImplementedError("This is an abstract base class")
 
 
-class TensorMask(AttnMask):
-    """A mask that is a tensor"""
+class TensorBias(AttnBias):
+    """A bias that is a tensor"""
 
-    def __init__(self, mask: torch.Tensor):
-        self.mask = mask
+    def __init__(self, bias: torch.Tensor):
+        self.bias = bias
 
     def materialize(self, device: Optional[torch.device] = None) -> torch.Tensor:
-        return self.mask
+        return self.bias
 
     def needs_materialization(self) -> bool:
         return True
@@ -52,27 +52,27 @@ class TensorMask(AttnMask):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_mask: "TensorMask",
+        attn_bias: "TensorBias",
         causal: bool,
         scale: Optional[float],
         dropout_p: float,
     ) -> torch.Tensor:
         raise NotImplementedError(
-            "TensorMask requires materialization, so this should never be called!"
+            "TensorBias requires materialization, so this should never be called!"
         )
 
     def __repr__(self) -> str:
-        return f"TensorMask(mask={self.mask})"
+        return f"TensorBias(bias={self.bias})"
 
 
-class LambdaMask(AttnMask):
-    """A mask that is a function"""
+class LambdaBias(AttnBias):
+    """A bias that is a function"""
 
-    def __init__(self, mask_fn):
-        self.mask_fn = mask_fn
+    def __init__(self, bias_fn):
+        self.bias_fn = bias_fn
 
     def materialize(self, device: Optional[torch.device] = None) -> torch.Tensor:
-        return self.mask_fn()
+        return self.bias_fn()
 
     def needs_materialization(self) -> bool:
         return False
@@ -82,7 +82,7 @@ class LambdaMask(AttnMask):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_mask: "LambdaMask",
+        attn_bias: "LambdaBias",
         causal: bool,
         scale: Optional[float],
         dropout_p: float,
@@ -97,8 +97,8 @@ class CausalVariant(IntEnum):
     LOWER_RIGHT = 2
 
 
-class CausalMask(TensorMask):
-    """A mask representing causal attention patterns"""
+class CausalBias(AttnBias):
+    """A bias representing causal attention patterns"""
 
     def __init__(self, variant: CausalVariant, seq_len_q: int, seq_len_kv: int):
         assert isinstance(variant, CausalVariant)
@@ -107,17 +107,17 @@ class CausalMask(TensorMask):
         self.seq_len_kv = seq_len_kv
         if seq_len_q > seq_len_kv and variant == CausalVariant.LOWER_RIGHT:
             warn(
-                "Lower right causal mask will produce NaNs in the output when seq_len_q > seq_len_kv!"
+                "Lower right causal bias will produce NaNs in the output when seq_len_q > seq_len_kv!"
             )
 
     def _upper_left(self, device: torch.device) -> torch.Tensor:
-        """Upper left causal mask"""
+        """Upper left causal bias"""
         return torch.tril(
             torch.ones(self.seq_len_q, self.seq_len_kv, device=device, dtype=torch.bool)
         )
 
     def _lower_right(self, device: torch.device) -> torch.Tensor:
-        """Lower right causal mask"""
+        """Lower right causal bias"""
         diagonal_offset = self.seq_len_kv - self.seq_len_q
         return torch.tril(
             torch.ones(self.seq_len_q, self.seq_len_kv, device=device, dtype=torch.bool),
@@ -140,15 +140,15 @@ class CausalMask(TensorMask):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_mask: "CausalMask",
+        attn_bias: "CausalBias",
         causal: bool,
         scale: Optional[float],
         dropout_p: float,
     ) -> torch.Tensor:
         if causal:
-            raise ValueError("CausalMask should not be used with causal=True")
+            raise ValueError("CausalBias should not be used with causal=True")
 
-        if attn_mask.seq_len_q == attn_mask.seq_len_kv:
+        if attn_bias.seq_len_q == attn_bias.seq_len_kv:
             return scaled_dot_product_attention(
                 query,
                 key,
@@ -158,7 +158,7 @@ class CausalMask(TensorMask):
                 is_causal=True,
                 scale=scale,
             )
-        if attn_mask.variant == CausalVariant.UPPER_LEFT:
+        if attn_bias.variant == CausalVariant.UPPER_LEFT:
             return scaled_dot_product_attention(
                 query,
                 key,
@@ -168,7 +168,7 @@ class CausalMask(TensorMask):
                 is_causal=True,
                 scale=scale,
             )
-        elif attn_mask.variant == CausalVariant.LOWER_RIGHT:
+        elif attn_bias.variant == CausalVariant.LOWER_RIGHT:
             sdpa_params = SDPAParams(query, key, value, None, dropout_p, causal)
             if can_use_efficient_attention(sdpa_params):
                 compute_log_sumexp = False
@@ -183,7 +183,7 @@ class CausalMask(TensorMask):
                     cu_seqlens_k=None,
                     max_seqlen_q=None,
                     dropout_p=dropout_p,
-                    custom_mask_type=int(attn_mask.variant),
+                    custom_mask_type=int(attn_bias.variant),
                     compute_log_sumexp=compute_log_sumexp,
                     scale=scale,
                     causal_diagonal=None,
@@ -198,7 +198,7 @@ class CausalMask(TensorMask):
                     query,
                     key,
                     value,
-                    attn_mask=attn_mask.materialize(query.device),
+                    attn_mask=attn_bias.materialize(query.device),
                     dropout_p=dropout_p,
                     is_causal=False,
                     scale=scale,
@@ -207,4 +207,4 @@ class CausalMask(TensorMask):
             raise ValueError("Invalid causal variant")
 
     def __repr__(self) -> str:
-        return f"CausalMask(variant={self.variant.name}, seq_len_q={self.seq_len_q}, seq_len_kv={self.seq_len_kv})"
+        return f"CausalBias(variant={self.variant.name}, seq_len_q={self.seq_len_q}, seq_len_kv={self.seq_len_kv})"

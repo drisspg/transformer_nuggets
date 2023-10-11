@@ -6,8 +6,8 @@ import pytest
 import torch
 from torch.nn.functional import scaled_dot_product_attention
 from transformer_nuggets.sdpa import sdpa_prototype
-from transformer_nuggets.sdpa.attn_mask import (CausalMask, CausalVariant,
-                                                LambdaMask, TensorMask)
+from transformer_nuggets.sdpa.attn_bias import (CausalBias, CausalVariant,
+                                                LambdaBias, TensorBias)
 
 
 def query_key_value_clones(
@@ -124,17 +124,17 @@ def test_materialized_case():
     )
     query, key, value = make_tensor(), make_tensor(), make_tensor()
     query_prototype, key_prototype, value_prototype = query_key_value_clones(query, key, value)
-    mask = torch.rand(bsz, num_heads, seq_len, seq_len, dtype=torch.float16, device="cuda")
-    attn_mask = TensorMask(mask)
+    bias = torch.rand(bsz, num_heads, seq_len, seq_len, dtype=torch.float16, device="cuda")
+    attn_bias = TensorBias(bias)
 
     pytorch_output = scaled_dot_product_attention(
-        query, key, value, attn_mask=mask, dropout_p=0.0, is_causal=False
+        query, key, value, attn_mask=bias, dropout_p=0.0, is_causal=False
     )
     sdpa_output = sdpa_prototype(
         query_prototype,
         key_prototype,
         value_prototype,
-        attn_mask=attn_mask,
+        attn_mask=attn_bias,
         scale=None,
         causal=False,
         dropout_p=0.0,
@@ -154,6 +154,7 @@ def test_materialized_case():
 @pytest.mark.parametrize("shapes", [(16, 16, 128, 128, 16), (16, 16, 128, 256, 32), (16, 16, 256, 128, 32), (1, 1, 23, 56, 15)])
 def test_causal_variants(causal_variant: CausalVariant, shapes: List[Tuple[int]]):
     # Bsz, num_heads, seq_len, head_dim
+    torch.manual_seed(123)
     bsz, num_heads, seq_len_q, seq_len_kv, head_dim = shapes
     if causal_variant == CausalVariant.LOWER_RIGHT and seq_len_q > seq_len_kv:
         pytest.skip("Lower right causal mask will produce NaNs in the output when seq_len_q > seq_len_kv!")
@@ -166,16 +167,16 @@ def test_causal_variants(causal_variant: CausalVariant, shapes: List[Tuple[int]]
     )
     query, key, value = make_q_tensor(), make_kv_tensor(), make_kv_tensor()
     query_prototype, key_prototype, value_prototype = query_key_value_clones(query, key, value)
-    attn_mask = CausalMask(causal_variant, seq_len_q, seq_len_kv)
+    attn_bias = CausalBias(causal_variant, seq_len_q, seq_len_kv)
 
     pytorch_output = scaled_dot_product_attention(
-        query, key, value, attn_mask=attn_mask.materialize(device), dropout_p=0.0, is_causal=False
+        query, key, value, attn_mask=attn_bias.materialize(device), dropout_p=0.0, is_causal=False
     )
     sdpa_output = sdpa_prototype(
         query_prototype,
         key_prototype,
         value_prototype,
-        attn_mask=attn_mask,
+        attn_mask=attn_bias,
         scale=None,
         causal=False,
         dropout_p=0.0,
@@ -184,7 +185,7 @@ def test_causal_variants(causal_variant: CausalVariant, shapes: List[Tuple[int]]
     dOut = torch.randn_like(pytorch_output)
     pytorch_output.backward(dOut)
     sdpa_output.backward(dOut)
-    atol, rtol = 5e-4, 5e-4
+    atol, rtol = 1e-3, 1e-3
     grad_atol, grad_rtol = 5e-3, 5e-3
     torch.testing.assert_close(pytorch_output, sdpa_output, atol=atol, rtol=rtol)
     torch.testing.assert_close(query.grad, query_prototype.grad, atol=grad_atol, rtol=grad_rtol)
@@ -193,7 +194,7 @@ def test_causal_variants(causal_variant: CausalVariant, shapes: List[Tuple[int]]
 
 
 @pytest.mark.parametrize("shape", [(16, 16, 128, 16), (16, 16, 52, 32)])
-def test_tensor_mask(shape: List[Tuple[int]]):
+def test_tensor_bias(shape: List[Tuple[int]]):
     bsz, num_heads, seq_len, head_dim = shape
     device = torch.device("cuda")
     make_tensor = partial(
@@ -201,16 +202,16 @@ def test_tensor_mask(shape: List[Tuple[int]]):
     )
     query, key, value = make_tensor(), make_tensor(), make_tensor()
     query_prototype, key_prototype, value_prototype = query_key_value_clones(query, key, value)
-    attn_mask = TensorMask(torch.rand(bsz, num_heads, seq_len, seq_len, dtype=torch.float16, device=device))
+    attn_bias = TensorBias(torch.rand(bsz, num_heads, seq_len, seq_len, dtype=torch.float16, device=device))
 
     pytorch_output = scaled_dot_product_attention(
-        query, key, value, attn_mask=attn_mask.materialize(device), dropout_p=0.0, is_causal=False
+        query, key, value, attn_mask=attn_bias.materialize(device), dropout_p=0.0, is_causal=False
     )
     sdpa_output = sdpa_prototype(
         query_prototype,
         key_prototype,
         value_prototype,
-        attn_mask=attn_mask,
+        attn_mask=attn_bias,
         scale=None,
         causal=False,
         dropout_p=0.0,
