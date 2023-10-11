@@ -21,20 +21,16 @@ def sdpa_prototype(
         warn("Passing a tensor as an attn_mask is deprecated. Please use TensorBias instead.")
         return scaled_dot_product_attention(query, key, value, attn_mask, dropout_p, causal, scale)
 
-    if not attn_mask:
-        return scaled_dot_product_attention(
-            query, key, value, dropout_p=dropout_p, is_causal=causal, scale=scale
-        )
-
-    if attn_mask.needs_materialization():
+    if attn_mask is None or attn_mask.needs_materialization():
         return scaled_dot_product_attention(
             query,
             key,
             value,
-            attn_mask=attn_mask.materialize(query.device),
+            attn_mask=attn_mask.materialize(query.device) if attn_mask else None,
             dropout_p=dropout_p,
             is_causal=causal,
             scale=scale,
         )
-    # After this point all AttnMask are required to have defined their own dispatching logic
+
+    # After this point all AttnBias are required to have defined their own dispatching logic
     return attn_mask.dispatch(query, key, value, attn_mask, causal, scale, dropout_p)
