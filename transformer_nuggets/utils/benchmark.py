@@ -26,6 +26,9 @@ class ProfileConfig:
 
 
 def benchmark_torch_function_in_microseconds(func: Callable, *args, **kwargs) -> float:
+    # warmup
+    for _ in range(5):
+        func(*args, **kwargs)
     t0 = benchmark.Timer(
         stmt="func(*args, **kwargs)", globals={"args": args, "kwargs": kwargs, "func": func}
     )
@@ -91,6 +94,9 @@ def print_cuda_memory_usage():
 @contextmanager
 def save_memory_snapshot(file_path: Path):
     """Save a memory snapshot information to a folder
+    Usage:
+        with save_memory_snapshot(file_path):
+            # code to profile
 
     Args:
         file_path: The path to the folder to save the snapshot to
