@@ -85,8 +85,10 @@ def rand_sdpa_tensor(
         )
         return torch.randn(size, device=device, dtype=dtype, requires_grad=requires_grad)
 
-
-def test_base_case():
+@pytest.mark.parametrize("compile", [True, False])
+def test_base_case(compile: bool):
+    if compile:
+        torch._dynamo.reset()
     # Bsz, num_heads, seq_len, head_dim
     shape = (16, 16, 128, 16)
     make_tensor = partial(
@@ -98,7 +100,9 @@ def test_base_case():
     pytorch_output = scaled_dot_product_attention(
         query, key, value, dropout_p=0.0, is_causal=False
     )
-    sdpa_output = sdpa_prototype(
+
+    sdpa_op = torch.compile(sdpa_prototype, fullgraph=True) if compile else sdpa_prototype
+    sdpa_output = sdpa_op(
         query_prototype, key_prototype, value_prototype, None, False, dropout_p=0.0
     )
 
@@ -111,8 +115,10 @@ def test_base_case():
     torch.testing.assert_close(key.grad, key_prototype.grad, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(value.grad, value_prototype.grad, rtol=1e-5, atol=1e-5)
 
-
-def test_materialized_case():
+@pytest.mark.parametrize("compile", [True, False])
+def test_materialized_case(compile: bool):
+    if compile:
+        torch._dynamo.reset()
     # Bsz, num_heads, seq_len, head_dim
     bsz = 16
     num_heads = 16
@@ -130,7 +136,9 @@ def test_materialized_case():
     pytorch_output = scaled_dot_product_attention(
         query, key, value, attn_mask=bias, dropout_p=0.0, is_causal=False
     )
-    sdpa_output = sdpa_prototype(
+
+    sdpa_op = torch.compile(sdpa_prototype, fullgraph=True) if compile else sdpa_prototype
+    sdpa_output = sdpa_op(
         query_prototype,
         key_prototype,
         value_prototype,
@@ -152,7 +160,10 @@ def test_materialized_case():
 
 @pytest.mark.parametrize("causal_variant", [CausalVariant.UPPER_LEFT, CausalVariant.LOWER_RIGHT])
 @pytest.mark.parametrize("shapes", [(16, 16, 128, 128, 16), (16, 16, 128, 256, 32), (16, 16, 256, 128, 32), (1, 1, 23, 56, 15)])
-def test_causal_variants(causal_variant: CausalVariant, shapes: List[Tuple[int]]):
+@pytest.mark.parametrize("compile", [True, False])
+def test_causal_variants(causal_variant: CausalVariant, shapes: List[Tuple[int]], compile: bool):
+    if compile:
+        torch._dynamo.reset()
     # Bsz, num_heads, seq_len, head_dim
     torch.manual_seed(123)
     bsz, num_heads, seq_len_q, seq_len_kv, head_dim = shapes
@@ -172,7 +183,8 @@ def test_causal_variants(causal_variant: CausalVariant, shapes: List[Tuple[int]]
     pytorch_output = scaled_dot_product_attention(
         query, key, value, attn_mask=attn_bias.materialize(device), dropout_p=0.0, is_causal=False
     )
-    sdpa_output = sdpa_prototype(
+    sdpa_op = torch.compile(sdpa_prototype, fullgraph=True) if compile else sdpa_prototype
+    sdpa_output = sdpa_op(
         query_prototype,
         key_prototype,
         value_prototype,
@@ -194,7 +206,10 @@ def test_causal_variants(causal_variant: CausalVariant, shapes: List[Tuple[int]]
 
 
 @pytest.mark.parametrize("shape", [(16, 16, 128, 16), (16, 16, 52, 32)])
-def test_tensor_bias(shape: List[Tuple[int]]):
+@pytest.mark.parametrize("compile", [True, False])
+def test_tensor_bias(shape: List[Tuple[int]], compile: bool):
+    if compile:
+        torch._dynamo.reset()
     bsz, num_heads, seq_len, head_dim = shape
     device = torch.device("cuda")
     make_tensor = partial(
@@ -207,7 +222,9 @@ def test_tensor_bias(shape: List[Tuple[int]]):
     pytorch_output = scaled_dot_product_attention(
         query, key, value, attn_mask=attn_bias.materialize(device), dropout_p=0.0, is_causal=False
     )
-    sdpa_output = sdpa_prototype(
+
+    sdpa_op = torch.compile(sdpa_prototype, fullgraph=True) if compile else sdpa_prototype
+    sdpa_output = sdpa_op(
         query_prototype,
         key_prototype,
         value_prototype,
