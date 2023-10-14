@@ -5,8 +5,10 @@ import pytest
 
 import torch
 from torch.nn.functional import scaled_dot_product_attention
-from transformer_nuggets.sdpa import sdpa_prototype
-from transformer_nuggets.sdpa.attn_bias import CausalBias, CausalVariant, LambdaBias, TensorBias
+# from transformer_nuggets.sdpa import sdpa_prototype
+from transformer_nuggets.sdpa.attn_bias_subclass import (CausalBias,
+                                                         CausalVariant,
+                                                         TensorBias)
 
 
 def query_key_value_clones(
@@ -101,9 +103,13 @@ def test_base_case(compile: bool):
         query, key, value, dropout_p=0.0, is_causal=False
     )
 
-    sdpa_op = torch.compile(sdpa_prototype, fullgraph=True) if compile else sdpa_prototype
+    sdpa_op = (
+        torch.compile(scaled_dot_product_attention, fullgraph=True)
+        if compile
+        else scaled_dot_product_attention
+    )
     sdpa_output = sdpa_op(
-        query_prototype, key_prototype, value_prototype, attn_mask=None, is_causal=False, dropout_p=0.0
+        query_prototype, key_prototype, value_prototype, None, is_causal=False, dropout_p=0.0
     )
 
     dOut = torch.randn_like(pytorch_output)
@@ -138,15 +144,19 @@ def test_materialized_case(compile: bool):
         query, key, value, attn_mask=bias, dropout_p=0.0, is_causal=False
     )
 
-    sdpa_op = torch.compile(sdpa_prototype, fullgraph=True) if compile else sdpa_prototype
+    sdpa_op = (
+        torch.compile(scaled_dot_product_attention, fullgraph=True)
+        if compile
+        else scaled_dot_product_attention
+    )
     sdpa_output = sdpa_op(
         query_prototype,
         key_prototype,
         value_prototype,
         attn_mask=attn_bias,
-        dropout_p=0.0,
-        is_causal=False,
         scale=None,
+        is_causal=False,
+        dropout_p=0.0,
     )
 
     dOut = torch.randn_like(pytorch_output)
@@ -199,15 +209,19 @@ def test_causal_variants(causal_variant: CausalVariant, shapes: List[Tuple[int]]
     pytorch_output = scaled_dot_product_attention(
         query, key, value, attn_mask=attn_bias.materialize(device), dropout_p=0.0, is_causal=False
     )
-    sdpa_op = torch.compile(sdpa_prototype, fullgraph=True) if compile else sdpa_prototype
+    sdpa_op = (
+        torch.compile(scaled_dot_product_attention, fullgraph=True)
+        if compile
+        else scaled_dot_product_attention
+    )
     sdpa_output = sdpa_op(
         query_prototype,
         key_prototype,
         value_prototype,
         attn_mask=attn_bias,
-        dropout_p=0.0,
-        is_causal=False,
         scale=None,
+        is_causal=False,
+        dropout_p=0.0,
     )
 
     dOut = torch.randn_like(pytorch_output)
@@ -241,7 +255,11 @@ def test_tensor_bias(shape: List[Tuple[int]], compile: bool):
         query, key, value, attn_mask=attn_bias.materialize(device), dropout_p=0.0, is_causal=False
     )
 
-    sdpa_op = torch.compile(sdpa_prototype, fullgraph=True) if compile else sdpa_prototype
+    sdpa_op = (
+        torch.compile(scaled_dot_product_attention, fullgraph=True)
+        if compile
+        else scaled_dot_product_attention
+    )
     sdpa_output = sdpa_op(
         query_prototype,
         key_prototype,

@@ -9,8 +9,15 @@ from torch.backends.cuda import SDPAParams, can_use_efficient_attention
 from torch.nn.functional import scaled_dot_product_attention
 from transformer_nuggets.sdpa.utils import input_requires_grad
 
+from torch.utils import _pytree as pytree
 
-class AttnBias(ABC):
+
+def materialize_if_needed(bias: "AttnBiasMixin", device: Optional[torch.device] = None) -> torch.Tensor:
+    if bias.needs_materialization():
+        return bias.materialize(device)
+    return bias
+
+class AttnBiasMixin(ABC):
     """Abstract base class for attention biases"""
 
     @abstractmethod
@@ -27,7 +34,7 @@ class AttnBias(ABC):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_bias: "AttnBias",
+        attn_mask: "AttnBiasMixin",
         dropout_p: float,
         is_causal: bool,
         scale: Optional[float],
@@ -35,7 +42,7 @@ class AttnBias(ABC):
         raise NotImplementedError("This is an abstract base class")
 
 
-class TensorBias(AttnBias):
+class TensorBias(AttnBiasMixin):
     """A bias that is a tensor"""
 
     def __init__(self, bias: torch.Tensor):
@@ -52,7 +59,7 @@ class TensorBias(AttnBias):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_bias: "TensorBias",
+        attn_mask: "TensorBias",
         dropout_p: float,
         is_causal: bool,
         scale: Optional[float],
@@ -64,30 +71,16 @@ class TensorBias(AttnBias):
     def __repr__(self) -> str:
         return f"TensorBias(bias={self.bias})"
 
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        if kwargs is None:
+            kwargs = {}
+        if func != torch.nn.functional.scaled_dot_product_attention:
+            return NotImplemented
+        args = pytree.tree_map_only(TensorBias, lambda x: materialize_if_needed(x), args)
+        kwargs = pytree.tree_map_only(TensorBias, lambda x: materialize_if_needed(x), kwargs)
+        return func(*args, **kwargs)
 
-class LambdaBias(AttnBias):
-    """A bias that is a function"""
-
-    def __init__(self, bias_fn):
-        self.bias_fn = bias_fn
-
-    def materialize(self, device: Optional[torch.device] = None) -> torch.Tensor:
-        return self.bias_fn()
-
-    def needs_materialization(self) -> bool:
-        return False
-
-    @staticmethod
-    def dispatch(
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attn_bias: "LambdaBias",
-        dropout_p: float,
-        is_causal: bool,
-        scale: Optional[float],
-    ) -> torch.Tensor:
-        raise NotImplementedError("TODO FIGURE OUT!")
 
 
 class CausalVariant(IntEnum):
@@ -97,7 +90,7 @@ class CausalVariant(IntEnum):
     LOWER_RIGHT = 2
 
 
-class CausalBias(AttnBias):
+class CausalBias(AttnBiasMixin):
     """A bias representing causal attention patterns"""
 
     def __init__(self, variant: CausalVariant, seq_len_q: int, seq_len_kv: int):
@@ -140,7 +133,7 @@ class CausalBias(AttnBias):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_bias: "CausalBias",
+        attn_mask: "CausalBias",
         dropout_p: float,
         is_causal: bool,
         scale: Optional[float],
@@ -148,7 +141,7 @@ class CausalBias(AttnBias):
         if is_causal:
             raise ValueError("CausalBias should not be used with causal=True")
 
-        if attn_bias.seq_len_q == attn_bias.seq_len_kv:
+        if attn_mask.seq_len_q == attn_mask.seq_len_kv:
             return scaled_dot_product_attention(
                 query,
                 key,
@@ -158,7 +151,7 @@ class CausalBias(AttnBias):
                 is_causal=True,
                 scale=scale,
             )
-        if attn_bias.variant == CausalVariant.UPPER_LEFT:
+        if attn_mask.variant == CausalVariant.UPPER_LEFT:
             return scaled_dot_product_attention(
                 query,
                 key,
@@ -168,7 +161,7 @@ class CausalBias(AttnBias):
                 is_causal=True,
                 scale=scale,
             )
-        elif attn_bias.variant == CausalVariant.LOWER_RIGHT:
+        elif attn_mask.variant == CausalVariant.LOWER_RIGHT:
             sdpa_params = SDPAParams(query, key, value, None, dropout_p, is_causal)
             if can_use_efficient_attention(sdpa_params):
                 compute_log_sumexp = False
@@ -183,7 +176,7 @@ class CausalBias(AttnBias):
                     cu_seqlens_k=None,
                     max_seqlen_q=None,
                     dropout_p=dropout_p,
-                    custom_mask_type=int(attn_bias.variant),
+                    custom_mask_type=int(attn_mask.variant),
                     compute_log_sumexp=compute_log_sumexp,
                     scale=scale,
                     causal_diagonal=None,
@@ -198,7 +191,7 @@ class CausalBias(AttnBias):
                     query,
                     key,
                     value,
-                    attn_mask=attn_bias.materialize(query.device),
+                    attn_mask=attn_mask.materialize(query.device),
                     dropout_p=dropout_p,
                     is_causal=False,
                     scale=scale,
@@ -208,3 +201,11 @@ class CausalBias(AttnBias):
 
     def __repr__(self) -> str:
         return f"CausalBias(variant={self.variant.name}, seq_len_q={self.seq_len_q}, seq_len_kv={self.seq_len_kv})"
+
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        if kwargs is None:
+            kwargs = {}
+        if func != torch.nn.functional.scaled_dot_product_attention:
+            return NotImplemented
+        return cls.dispatch( *args, **kwargs)
