@@ -27,7 +27,7 @@ class AttnBias(ABC):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_bias: "AttnBias",
+        attn_mask: "AttnBias",
         dropout_p: float,
         is_causal: bool,
         scale: Optional[float],
@@ -52,7 +52,7 @@ class TensorBias(AttnBias):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_bias: "TensorBias",
+        attn_mask: "TensorBias",
         dropout_p: float,
         is_causal: bool,
         scale: Optional[float],
@@ -82,7 +82,7 @@ class LambdaBias(AttnBias):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_bias: "LambdaBias",
+        attn_mask: "LambdaBias",
         dropout_p: float,
         is_causal: bool,
         scale: Optional[float],
@@ -140,7 +140,7 @@ class CausalBias(AttnBias):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_bias: "CausalBias",
+        attn_mask: "CausalBias",
         dropout_p: float,
         is_causal: bool,
         scale: Optional[float],
@@ -148,7 +148,7 @@ class CausalBias(AttnBias):
         if is_causal:
             raise ValueError("CausalBias should not be used with causal=True")
 
-        if attn_bias.seq_len_q == attn_bias.seq_len_kv:
+        if attn_mask.seq_len_q == attn_mask.seq_len_kv:
             return scaled_dot_product_attention(
                 query,
                 key,
@@ -158,7 +158,7 @@ class CausalBias(AttnBias):
                 is_causal=True,
                 scale=scale,
             )
-        if attn_bias.variant == CausalVariant.UPPER_LEFT:
+        if attn_mask.variant == CausalVariant.UPPER_LEFT:
             return scaled_dot_product_attention(
                 query,
                 key,
@@ -168,7 +168,7 @@ class CausalBias(AttnBias):
                 is_causal=True,
                 scale=scale,
             )
-        elif attn_bias.variant == CausalVariant.LOWER_RIGHT:
+        elif attn_mask.variant == CausalVariant.LOWER_RIGHT:
             sdpa_params = SDPAParams(query, key, value, None, dropout_p, is_causal)
             if can_use_efficient_attention(sdpa_params):
                 compute_log_sumexp = False
@@ -183,7 +183,7 @@ class CausalBias(AttnBias):
                     cu_seqlens_k=None,
                     max_seqlen_q=None,
                     dropout_p=dropout_p,
-                    custom_mask_type=int(attn_bias.variant),
+                    custom_mask_type=int(attn_mask.variant),
                     compute_log_sumexp=compute_log_sumexp,
                     scale=scale,
                     causal_diagonal=None,
@@ -198,7 +198,7 @@ class CausalBias(AttnBias):
                     query,
                     key,
                     value,
-                    attn_mask=attn_bias.materialize(query.device),
+                    attn_mask=attn_mask.materialize(query.device),
                     dropout_p=dropout_p,
                     is_causal=False,
                     scale=scale,

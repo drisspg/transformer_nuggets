@@ -5,10 +5,9 @@ import pytest
 
 import torch
 from torch.nn.functional import scaled_dot_product_attention
-# from transformer_nuggets.sdpa import sdpa_prototype
-from transformer_nuggets.sdpa.attn_bias_subclass import (CausalBias,
-                                                         CausalVariant,
-                                                         TensorBias)
+from transformer_nuggets.sdpa.attn_bias_subclass import (CausalBiasSubclass,
+                                                         TensorBiasSubclass)
+from transformer_nuggets.sdpa.attn_bias import CausalVariant
 
 
 def query_key_value_clones(
@@ -138,7 +137,7 @@ def test_materialized_case(compile: bool):
     query, key, value = make_tensor(), make_tensor(), make_tensor()
     query_prototype, key_prototype, value_prototype = query_key_value_clones(query, key, value)
     bias = torch.rand(bsz, num_heads, seq_len, seq_len, dtype=torch.float16, device="cuda")
-    attn_bias = TensorBias(bias)
+    attn_bias = TensorBiasSubclass(bias)
 
     pytorch_output = scaled_dot_product_attention(
         query, key, value, attn_mask=bias, dropout_p=0.0, is_causal=False
@@ -204,7 +203,7 @@ def test_causal_variants(causal_variant: CausalVariant, shapes: List[Tuple[int]]
     )
     query, key, value = make_q_tensor(), make_kv_tensor(), make_kv_tensor()
     query_prototype, key_prototype, value_prototype = query_key_value_clones(query, key, value)
-    attn_bias = CausalBias(causal_variant, seq_len_q, seq_len_kv)
+    attn_bias = CausalBiasSubclass(causal_variant, seq_len_q, seq_len_kv)
 
     pytorch_output = scaled_dot_product_attention(
         query, key, value, attn_mask=attn_bias.materialize(device), dropout_p=0.0, is_causal=False
@@ -247,7 +246,7 @@ def test_tensor_bias(shape: List[Tuple[int]], compile: bool):
     )
     query, key, value = make_tensor(), make_tensor(), make_tensor()
     query_prototype, key_prototype, value_prototype = query_key_value_clones(query, key, value)
-    attn_bias = TensorBias(
+    attn_bias = TensorBiasSubclass(
         torch.rand(bsz, num_heads, seq_len, seq_len, dtype=torch.float16, device=device)
     )
 
