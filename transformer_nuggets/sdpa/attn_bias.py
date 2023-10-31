@@ -5,7 +5,7 @@ from typing import Optional
 from warnings import warn
 
 import torch
-from torch.backends.cuda import SDPAParams, can_use_efficient_attention
+from torch.backends.cuda import SDPAParams, can_use_efficient_attention, can_use_flash_attention
 from torch.nn.functional import scaled_dot_product_attention
 from transformer_nuggets.sdpa.utils import input_requires_grad
 
@@ -170,6 +170,25 @@ class CausalBias(AttnBias):
             )
         elif attn_mask.variant == CausalVariant.LOWER_RIGHT:
             sdpa_params = SDPAParams(query, key, value, None, dropout_p, is_causal)
+            if can_use_flash_attention(sdpa_params):
+                needs_slicing = query.size(-1)%8 != 0
+                og_head_size = query.size(-1)
+                if needs_slicing:
+                    query = torch.nn.functional.pad(query, (0, 8 - query.size(-1)%8))
+                    key = torch.nn.functional.pad(key, (0, 8 - key.size(-1)%8))
+                    value = torch.nn.functional.pad(value, (0, 8 - value.size(-1)%8))
+                out = torch.ops.aten._scaled_dot_product_flash_attention(
+                    query,
+                    key,
+                    value,
+                    dropout_p,
+                    is_causal=True,
+                    return_debug_mask=False,
+                    scale=scale,
+                )[0]
+                if needs_slicing:
+                    out = out[..., :og_head_size]
+                return out
             if can_use_efficient_attention(sdpa_params):
                 compute_log_sumexp = False
                 if input_requires_grad(query, key, value):
