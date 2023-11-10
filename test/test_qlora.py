@@ -172,3 +172,6 @@ def test_qlora_linear(embed_dim: int, compile: bool, r: int, dropout: float, run
         out.sum().backward()
         assert nugs_qlora_linear.lora_A.grad is not None
         assert nugs_qlora_linear.lora_B.grad is not None
+
+if __name__ == "__main__":
+    pytest.main([__file__])
