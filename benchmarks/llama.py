@@ -5,17 +5,17 @@ Based on the nanoGPT implementation: https://github.com/karpathy/nanoGPT.
 # mypy: ignore-errors
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
 from enum import Enum
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
-from typing_extensions import Self
 
 import transformer_nuggets.quant.qlora as qlora
-from transformer_nuggets.quant import linear_nf4
 import transformer_nuggets.utils.benchmark as benchmark_utils
+from torch.nn import functional as F
+from transformer_nuggets.quant import linear_nf4
+from typing_extensions import Self
 
 MaskCache = torch.Tensor
 RoPECache = torch.Tensor

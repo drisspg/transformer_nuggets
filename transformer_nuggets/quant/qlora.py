@@ -1,9 +1,9 @@
+import math
 from typing import Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 
 bnb_available = False
 
@@ -292,12 +292,13 @@ class NF4Tensor:
     def __str__(self):
         return f"NF4Tensor({self.original_shape}, {self.block_size})"
 
+
 class LinearNF4(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input: torch.Tensor, weight: NF4Tensor):
         ctx.nf4_weight = weight
         return F.linear(input, weight.get_original_weight())
-    
+
     @staticmethod
     def backward(ctx, grad_output):
         weight: NF4Tensor = ctx.nf4_weight
@@ -432,7 +433,9 @@ class QloraLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         result = linear_nf4(x, self.weight)
-        result2 = result + (
-            self.lora_dropout(x) @ self.lora_A.transpose(0, 1) @ self.lora_B.transpose(0, 1)
-        ) * self.scaling
+        result2 = (
+            result
+            + (self.lora_dropout(x) @ self.lora_A.transpose(0, 1) @ self.lora_B.transpose(0, 1))
+            * self.scaling
+        )
         return result2

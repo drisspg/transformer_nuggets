@@ -7,12 +7,12 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import torch
+import transformer_nuggets.utils as utils
 from torch.nn.functional import scaled_dot_product_attention
 from tqdm import tqdm
 
-from transformer_nuggets.flash import BiasMode, attention, build_alibi_mask
+from transformer_nuggets.flash import attention, BiasMode, build_alibi_mask
 from transformer_nuggets.utils import benchmark_torch_function_in_microseconds
-import transformer_nuggets.utils as utils
 
 device = torch.device("cuda")
 

@@ -1,6 +1,6 @@
-import torch
 import pytest
-from transformer_nuggets.flash import BiasMode, build_alibi_mask, attention
+import torch
+from transformer_nuggets.flash import attention, BiasMode, build_alibi_mask
 
 
 @pytest.mark.parametrize("Z, H, N_CTX, D_HEAD", [(6, 8, 128, 16)])

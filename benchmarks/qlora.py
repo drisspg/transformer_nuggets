@@ -1,19 +1,19 @@
 import argparse
 import csv
 import gc
-from dataclasses import asdict, dataclass
 import itertools
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from tqdm import tqdm
 
 import transformer_nuggets as nugs
-from transformer_nuggets.quant import NF4Tensor
 import transformer_nuggets.quant.qlora as qlora
+from tqdm import tqdm
+from transformer_nuggets.quant import NF4Tensor
 
 bnb_available = False
 try:
