@@ -24,11 +24,23 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["black", "bumpver", "isort", "pip-tools", "pytest"]
+dev = [
+    "black",
+    "usort",
+    "libcst",
+    "bumpver",
+    "pip-tools",
+    "pytest"
+]
+
 qlora = ['bitsandbytes']
 flash = ['triton']
 
+[tool.usort]
+first_party_detection = false
+
 [tool.black]
+target-version = ["py38"]
 line-length = 99
 include = '\.pyi?$'
 exclude = '''

@@ -7,7 +7,8 @@ import torch.nn.functional as F
 
 
 import transformer_nuggets.quant.qlora as qlora
-from transformer_nuggets.quant import NF4Tensor, NF4TensorDebug, linear_nf4
+from transformer_nuggets.quant.qlora_debug import NF4TensorDebug
+from transformer_nuggets.quant import NF4Tensor, linear_nf4
 
 bnb_available = False
 try:
