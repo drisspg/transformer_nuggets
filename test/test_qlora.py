@@ -12,7 +12,6 @@ from transformer_nuggets.quant import NF4Tensor, NF4TensorDebug, linear_nf4
 bnb_available = False
 try:
     import bitsandbytes as bnb
-
     bnb_available = True
 except ImportError:
     print("Could not import bitsandbytes")
@@ -55,7 +54,7 @@ def test_reconstruction_qlora_vs_bnb(embed_dim: int):
     assert nugs_diff < 1
     assert (nugs_diff - bnb_diff).abs() < 2e-1
 
-
+@unittest.skipIf(not bnb_available, "Bitsandbytes not available")
 @pytest.mark.parametrize("embed_dim", [256, 4096, 5120, 6656, 8192])
 def test_binning_distribution(embed_dim: int):
     device = "cuda:0"
@@ -98,6 +97,7 @@ def test_autograd_func_to_eager(embed_dim: int, compile: bool, requires_grad: bo
         out.sum().backward()
 
 
+@unittest.skipIf(not bnb_available, "Bitsandbytes not available")
 @pytest.mark.parametrize("embed_dim", [256, 4096, 5120, 6656, 8192])
 @pytest.mark.parametrize("compile", [True, False])
 def test_bitsandbytes_linear_parity(embed_dim, compile):
@@ -124,7 +124,7 @@ def test_bitsandbytes_linear_parity(embed_dim, compile):
     assert nugs_difference.max() < 0.5 * embed_dim
     assert bnb_difference.max() < 0.5 * embed_dim
 
-
+@unittest.skipIf(not bnb_available, "Bitsandbytes not available")
 @pytest.mark.parametrize("embed_dim", [256, 4096, 5120, 6656, 8192])
 @pytest.mark.parametrize("compile", [True, False])
 def test_bitsandbytes_mlp_parity(embed_dim, compile):
