@@ -1,17 +1,7 @@
 import pytest
 import torch
 
-from transformer_nuggets.fp8.scaled_quant import scaled_quant
-
-
-def eager_scaled_quant(a, scale, abs_max, fp8_dtype, saturated=False):
-    out = a * scale
-    if saturated:
-        out = torch.where(out > torch.finfo(fp8_dtype).max, torch.finfo(fp8_dtype).max, out)
-        out = torch.where(
-            out < -1 * torch.finfo(fp8_dtype).max, -1 * torch.finfo(fp8_dtype).max, out
-        )
-    return out.to(fp8_dtype), torch.max(torch.abs(out))
+from transformer_nuggets.fp8.scaled_quant import eager_scaled_quant, scaled_quant
 
 
 @pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
@@ -35,7 +25,8 @@ def test_saturated(fp8_dtype):
     scale = torch.tensor([4.0], dtype=torch.float32, device="cuda")
     abs_max = torch.tensor([-1.0], dtype=torch.float32, device="cuda")
     output = scaled_quant(a, scale, abs_max, fp8_dtype, saturated=True)
-    eager_output, eager_abs_max = eager_scaled_quant(a, scale, abs_max, fp8_dtype, saturated=True)
+    eager_abs_max = torch.clone(abs_max)
+    eager_output = eager_scaled_quant(a, scale, eager_abs_max, fp8_dtype, saturated=True)
     torch.testing.assert_close(output, eager_output)
     torch.testing.assert_close(
         abs_max,
