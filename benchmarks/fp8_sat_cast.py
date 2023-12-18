@@ -82,16 +82,18 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
         config.low_precision_dtype,
         config.saturated,
     )
-    compiled_pytorch_fn = torch.compile(eager_scaled_quant, fullgraph=True)
-    compiled_pytorch_time = benchmark_torch_function_in_microseconds(
-        compiled_pytorch_fn,
-        high_precision_tensor,
-        scale,
-        eager_abs_max,
-        config.low_precision_dtype,
-        config.saturated,
+    # compiled_pytorch_fn = torch.compile(eager_scaled_quant, fullgraph=True)
+    # compiled_pytorch_time = benchmark_torch_function_in_microseconds(
+    #     compiled_pytorch_fn,
+    #     high_precision_tensor,
+    #     scale,
+    #     eager_abs_max,
+    #     config.low_precision_dtype,
+    #     config.saturated,
+    # )
+    return ExperimentResult(
+        triton_time=triton_time, pytorch_time=pytorch_time, compiled_pytorch_time=0
     )
-    return ExperimentResult(triton_time=triton_time, pytorch_time=pytorch_time, compiled_pytorch_time=compiled_pytorch_time)
 
 
 def print_results(experiments: List[Experiment]):
@@ -102,7 +104,7 @@ def print_results(experiments: List[Experiment]):
         "saturated",
         "triton_time",
         "pytorch_time",
-        "compiled_pytorch_time"
+        "compiled_pytorch_time",
     ]
     rows = []
     for experiment in experiments:

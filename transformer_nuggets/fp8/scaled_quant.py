@@ -17,6 +17,7 @@ def scaled_cast(
     """Quantize tensor to fp8 using a delayed scaled and calculate abs_max"""
     offset = tl.program_id(0) * XBLOCK
     index = offset + tl.arange(0, XBLOCK)[:]
+    index = tl.max_contiguous(tl.multiple_of(index, XBLOCK), XBLOCK)
     mask = index < numel
     inpt = tl.load(inpt_ptr + (index), mask=mask)
     block_max = tl.max(tl.abs(inpt))
