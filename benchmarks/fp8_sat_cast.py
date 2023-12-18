@@ -26,6 +26,7 @@ class ExperimentConfig:
 class ExperimentResult:
     triton_time: float
     pytorch_time: float
+    compiled_pytorch_time: float
 
 
 @dataclass(frozen=True)
@@ -35,8 +36,8 @@ class Experiment:
 
 
 def get_configs() -> List[ExperimentConfig]:
-    sizes = [2**i for i in range(5, 20)]
-    high_precision_dtypes = [torch.bfloat16, torch.float16, torch.float32]
+    sizes = [2**21, 2**22, 2**23, 2**24]
+    high_precision_dtypes = [torch.bfloat16, torch.float32]
     low_precision_dtypes = [torch.float8_e4m3fn, torch.float8_e5m2]
     saturated = [True, False]
     configs = []
@@ -81,7 +82,16 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
         config.low_precision_dtype,
         config.saturated,
     )
-    return ExperimentResult(triton_time=triton_time, pytorch_time=pytorch_time)
+    compiled_pytorch_fn = torch.compile(eager_scaled_quant, fullgraph=True)
+    compiled_pytorch_time = benchmark_torch_function_in_microseconds(
+        compiled_pytorch_fn,
+        high_precision_tensor,
+        scale,
+        eager_abs_max,
+        config.low_precision_dtype,
+        config.saturated,
+    )
+    return ExperimentResult(triton_time=triton_time, pytorch_time=pytorch_time, compiled_pytorch_time=compiled_pytorch_time)
 
 
 def print_results(experiments: List[Experiment]):
@@ -92,6 +102,7 @@ def print_results(experiments: List[Experiment]):
         "saturated",
         "triton_time",
         "pytorch_time",
+        "compiled_pytorch_time"
     ]
     rows = []
     for experiment in experiments:
@@ -103,6 +114,7 @@ def print_results(experiments: List[Experiment]):
                 experiment.config.saturated,
                 experiment.result.triton_time,
                 experiment.result.pytorch_time,
+                experiment.result.compiled_pytorch_time,
             ]
         )
     print(tabulate(rows, headers=headers))
