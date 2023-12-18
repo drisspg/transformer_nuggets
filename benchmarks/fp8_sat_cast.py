@@ -13,6 +13,9 @@ from transformer_nuggets.utils import benchmark_torch_function_in_microseconds
 
 device = torch.device("cuda")
 
+# Needed since changing args to function causes recompiles
+torch._dynamo.config.cache_size_limit = 1000
+
 
 @dataclass(frozen=True)
 class ExperimentConfig:
@@ -82,17 +85,19 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
         config.low_precision_dtype,
         config.saturated,
     )
-    # compiled_pytorch_fn = torch.compile(eager_scaled_quant, fullgraph=True)
-    # compiled_pytorch_time = benchmark_torch_function_in_microseconds(
-    #     compiled_pytorch_fn,
-    #     high_precision_tensor,
-    #     scale,
-    #     eager_abs_max,
-    #     config.low_precision_dtype,
-    #     config.saturated,
-    # )
+    compiled_pytorch_fn = torch.compile(eager_scaled_quant, fullgraph=True)
+    compiled_pytorch_time = benchmark_torch_function_in_microseconds(
+        compiled_pytorch_fn,
+        high_precision_tensor,
+        scale,
+        eager_abs_max,
+        config.low_precision_dtype,
+        config.saturated,
+    )
     return ExperimentResult(
-        triton_time=triton_time, pytorch_time=pytorch_time, compiled_pytorch_time=0
+        triton_time=triton_time,
+        pytorch_time=pytorch_time,
+        compiled_pytorch_time=compiled_pytorch_time,
     )
 
 
