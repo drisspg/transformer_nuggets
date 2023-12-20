@@ -14,9 +14,12 @@ from transformer_nuggets.llama.tokenizer import Tokenizer
 
 
 logging.basicConfig(level=logging.INFO)
+
+
 @dataclass
 class DataConfig:
     """Data configuration for pretraining"""
+
     tokenizer_path: Path
     output_dir: Path
     dataset_name: str = "openwebtext"
@@ -43,9 +46,7 @@ def main(tokenizer_path: str, output_dir: str):
     split_dataset["val"] = split_dataset.pop("test")
 
     def process(example):
-        ids = tokenizer.encode(example["text"], bos=True, eos=True).tolist()
-        # Not sure why wouldn't just set eos to True
-        # ids.append(tokenizer.eos_id)
+        ids = tokenizer.encode(example["text"], bos=True, eos=True)
         return {"ids": ids, "len": len(ids)}
 
     tokenized = split_dataset.map(
@@ -76,6 +77,6 @@ def main(tokenizer_path: str, output_dir: str):
 
     logging.info("Wrote pretraining dataset to %s", data_config.output_dir)
 
+
 if __name__ == "__main__":
     Fire(main)
-

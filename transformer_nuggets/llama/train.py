@@ -8,12 +8,13 @@ import os
 import random
 import time
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import torch
+from fire import Fire
 from float8_experimental.dynamic_linear import Float8DynamicLinear
 from float8_experimental.float8_linear import Float8Linear
 
@@ -36,12 +37,13 @@ LINEAR_TYPE_MAP = {
 
 logging.basicConfig(level=logging.INFO)
 
+
 @dataclass
 class Hyperparameters:
     learning_rate: float = 6e-4
     batch_size: int = 128
     micro_batch_size: int = 1
-    max_sequence_length: int = 4096
+    max_seq_length: int = 4096
     gradient_accumulation_iters: int = batch_size // micro_batch_size
     assert gradient_accumulation_iters > 0
     max_iters: int = 600000  # train dataset size
@@ -57,8 +59,8 @@ class Hyperparameters:
 
     # Float8 Specific Config
     # We want to skip the first embedding layer since scaled_mm needs to multiple of 16
-    float8_skip_list: List[str] = ["lm_head"]
-    fp8_linear_type: LinearType = None
+    float8_skip_list: List[str] = field(default_factory=lambda: ["lm_head"])
+    fp8_linear_type: Optional[str] = None
 
 
 @dataclass
@@ -76,9 +78,10 @@ class TrainingConfig:
     compile: bool = False
     model_name: str = "7B"
     dataset_name: str = "openwebtext"
-    out_dir: Path = Path("out") / dataset_name
-    data_dir: Path = Path("data") / dataset_name
-    log_dir: Path = Path("logs") / dataset_name
+    base_path = Path("transformer_nuggets/llama/data")
+    out_dir: Path = base_path / "out"
+    data_dir: Path = base_path
+    log_dir: Path = out_dir / "logs"
 
     device: torch.device = torch.device("cuda:0")
     # If true we will profile iters 100-102 of the model training
@@ -102,11 +105,11 @@ def write_loss_to_file(config: TrainingConfig, step: int, loss: float):
         writer.writerow([step, loss])
 
 
-def get_profile_context(train_config: TrainingConfig):
+def get_profile_context(hyper_params: Hyperparameters, train_config: TrainingConfig):
     """Returns a context manager that can be used to profile the model."""
 
     def trace_handler(prof):
-        fp8_linear_type = train_config.hyperparameters.fp8_linear_type
+        fp8_linear_type = hyper_params.fp8_linear_type
 
         dtype_str = fp8_linear_type if fp8_linear_type else "bf16"
         output_str = f"/tmp/trace_llama_7b_hf_{dtype_str}.json"
@@ -136,8 +139,8 @@ def log_num_params(model: Transformer):
 
 
 def main(
-    hyper_params: Hyperparameters = Hyperparameters(),
-    training_config: TrainingConfig = TrainingConfig(),
+    hyper_params: Hyperparameters,
+    training_config: TrainingConfig,
 ):
     random.seed(1337)
     np.random.seed(1337)
@@ -145,6 +148,7 @@ def main(
     torch.cuda.manual_seed_all(1337)
 
     os.makedirs(training_config.out_dir, exist_ok=True)
+    os.makedirs(training_config.log_dir, exist_ok=True)
 
     # Setup Model
     model_args = ModelArgs.from_name(training_config.model_name)
@@ -152,6 +156,7 @@ def main(
     with training_config.device:
         model = Transformer(model_args).to(torch.bfloat16)
         model.init_parameters()
+    model.setup_caches(hyper_params.micro_batch_size, hyper_params.max_seq_length)
 
     logging.info("Setting up the dataloaders")
     train_data, val_data = load_datasets(hyper_params, training_config)
@@ -207,7 +212,7 @@ def train(
     progress_bar = tqdm(total=hyper_params.max_iters)
 
     model.train()
-    profile_context = get_profile_context(training_config.profile, hyper_params.fp8_linear_type)
+    profile_context = get_profile_context(hyper_params.fp8_linear_type, training_config)
     train_iter = iter(train_data)
 
     # Sanity check
@@ -232,7 +237,7 @@ def train(
     )
     with profile_context as p:
         for iter_num in range(hyper_params.max_iters):
-            lr = get_lr(iter_num) if hyper_params.decay_lr else hyper_params.learning_rate
+            lr = get_lr(iter_num, hyper_params)
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr
 
@@ -355,6 +360,8 @@ class Dataset(IterableDataset):
 
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it, hyper_params: Hyperparameters):
+    if not hyper_params.decay_lr:
+        return hyper_params.learning_rate
     # 1) linear warmup for warmup_iters steps
     if it < hyper_params.warmup_iters:
         return hyper_params.learning_rate * it / hyper_params.warmup_iters
@@ -370,11 +377,17 @@ def get_lr(it, hyper_params: Hyperparameters):
     return hyper_params.min_lr + coeff * (hyper_params.learning_rate - hyper_params.min_lr)
 
 
+def entrypoint(
+    fp8_linear_type: LinearType = None,
+    compile: bool = False,
+    overfit: bool = False,
+    profile: bool = False,
+):
+    hyper_params = Hyperparameters(fp8_linear_type=fp8_linear_type)
+    training_config = TrainingConfig(compile=compile, overfit=overfit, profile=profile)
+    main(hyper_params, training_config)
+
+
 if __name__ == "__main__":
     torch.set_float32_matmul_precision("high")
-
-    from jsonargparse import CLI
-
-    # Example usage:
-    # python pretrain/fp8_openweb.py --fp8_linear_type "dynamic" --compile True
-    CLI(main)
+    Fire(entrypoint)
