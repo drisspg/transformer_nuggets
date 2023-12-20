@@ -44,7 +44,7 @@ class Hyperparameters:
     batch_size: int = 128
     micro_batch_size: int = 1
     gradient_accumulation_iters: int = field(init=False)
-    max_seq_length: int = 2048
+    max_seq_length: int = 4096
     max_iters: int = 600000  # train dataset size
     weight_decay: float = 0.01
     beta1: float = 0.9
@@ -74,7 +74,7 @@ class TrainingConfig:
     eval_interval: int = 500
     save_interval: int = 10000
     eval_iters: int = 100
-    log_interval: int = 1
+    log_interval: int = 200
     val_step_count: int = 0
 
     # This overfit param is used to test numerical issues by overfitting
@@ -218,7 +218,7 @@ def train(
     progress_bar = tqdm(total=hyper_params.max_iters)
 
     model.train()
-    profile_context = get_profile_context(hyper_params.fp8_linear_type, training_config)
+    profile_context = get_profile_context(hyper_params, training_config)
     train_iter = iter(train_data)
 
     # Sanity check
@@ -272,7 +272,7 @@ def train(
 
             if not is_accumulating and step_count % training_config.eval_interval == 0:
                 t0 = time.time()
-                val_loss = validate(model, val_data, val_loss_file)
+                val_loss = validate(model, val_data, val_loss_file, training_config, step_count)
                 t1 = time.time() - t0
                 logging.info(
                     f"step {iter_num}: val loss {val_loss:.4f}, val time: {t1 * 1000:.2f}ms"
@@ -303,10 +303,13 @@ def calculate_loss(logits, targets):
 @torch.no_grad()
 @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
 def validate(
-    model: Transformer, val_data: DataLoader, loss_file: Path, training_config: TrainingConfig
+    model: Transformer,
+    val_data: DataLoader,
+    loss_file: Path,
+    training_config: TrainingConfig,
+    training_iter: int,
 ) -> torch.Tensor:
     logging.info("Validating ...")
-    global val_step_count
     model.eval()
     val_iter = iter(val_data)
     losses = torch.zeros(training_config.eval_iters)
@@ -320,8 +323,7 @@ def validate(
 
     val_loss = losses.mean()
     model.train()
-    write_loss_to_file(loss_file, val_step_count, loss.item())
-    val_step_count += 1
+    write_loss_to_file(loss_file, training_iter, loss.item())
     return val_loss.item()
 
 

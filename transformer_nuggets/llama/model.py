@@ -117,7 +117,7 @@ class Transformer(nn.Module):
         self.max_batch_size = max_batch_size
 
         self.freqs_cis = precompute_freqs_cis(
-            self.config.block_size,
+            max_seq_length,
             head_dim,
             device,
             self.config.rope_base,
