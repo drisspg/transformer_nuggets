@@ -20,7 +20,7 @@ jobs:
         python-version: ${{ matrix.python-version }}
     - name: Install dependencies
       run: |
-        pip install ufmt
+        pip install ufmt==2.1.0
     - name: Analyzing the code with ufmt
       run: |
         ufmt check .

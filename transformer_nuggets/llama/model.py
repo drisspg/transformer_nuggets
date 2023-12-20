@@ -108,7 +108,7 @@ class Transformer(nn.Module):
         self.max_batch_size = -1
         self.max_seq_length = -1
 
-    def setup_caches(self, max_batch_size, max_seq_length):
+    def setup_caches(self, max_batch_size, max_seq_length, device: torch.device):
         if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
             return
         head_dim = self.config.dim // self.config.n_head
@@ -117,7 +117,10 @@ class Transformer(nn.Module):
         self.max_batch_size = max_batch_size
 
         self.freqs_cis = precompute_freqs_cis(
-            self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base
+            self.config.block_size,
+            head_dim,
+            device,
+            self.config.rope_base,
         )
 
     def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
@@ -236,13 +239,15 @@ class RMSNorm(nn.Module):
         return output * self.weight
 
 
-def precompute_freqs_cis(seq_len: int, n_elem: int, base: int = 10000) -> Tensor:
+def precompute_freqs_cis(
+    seq_len: int, n_elem: int, device: torch.device, base: int = 10000
+) -> Tensor:
     freqs = 1.0 / (base ** (torch.arange(0, n_elem, 2)[: (n_elem // 2)].float() / n_elem))
     t = torch.arange(seq_len, device=freqs.device)
     freqs = torch.outer(t, freqs)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
     cache = torch.stack([freqs_cis.real, freqs_cis.imag], dim=-1)
-    return cache.to(dtype=torch.bfloat16)
+    return cache.to(dtype=torch.bfloat16, device=device)
 
 
 def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:

@@ -43,9 +43,8 @@ class Hyperparameters:
     learning_rate: float = 6e-4
     batch_size: int = 128
     micro_batch_size: int = 1
-    max_seq_length: int = 4096
-    gradient_accumulation_iters: int = batch_size // micro_batch_size
-    assert gradient_accumulation_iters > 0
+    gradient_accumulation_iters: int = field(init=False)
+    max_seq_length: int = 2048
     max_iters: int = 600000  # train dataset size
     weight_decay: float = 0.01
     beta1: float = 0.9
@@ -53,14 +52,19 @@ class Hyperparameters:
     grad_clip: float = 1.0
     decay_lr: bool = True
     warmup_iters: int = 2000
-    lr_decay_iters: int = max_iters
+    lr_decay_iters: int = field(init=False)
     min_lr: float = 6e-5
     foreach_optimizer: bool = False
 
     # Float8 Specific Config
     # We want to skip the first embedding layer since scaled_mm needs to multiple of 16
-    float8_skip_list: List[str] = field(default_factory=lambda: ["lm_head"])
-    fp8_linear_type: Optional[str] = None
+    float8_skip_list: List[str] = field(default_factory=lambda: ["tok_embeddings"])
+    fp8_linear_type: Optional[LinearType] = None
+
+    def __post_init__(self):
+        self.gradient_accumulation_iters = self.batch_size // self.micro_batch_size
+        self.lr_decay_iters = self.max_iters
+        assert self.gradient_accumulation_iters > 0
 
 
 @dataclass
@@ -68,7 +72,7 @@ class TrainingConfig:
     eval_interval: int = 500
     save_interval: int = 10000
     eval_iters: int = 100
-    log_interval: int = 500
+    log_interval: int = 1
     val_step_count: int = 0
 
     # This overfit param is used to test numerical issues by overfitting
@@ -81,21 +85,20 @@ class TrainingConfig:
     base_path = Path("transformer_nuggets/llama/data")
     out_dir: Path = base_path / "out"
     data_dir: Path = base_path
-    log_dir: Path = out_dir / "logs"
+    log_dir: Path = base_path / "logs"
 
     device: torch.device = torch.device("cuda:0")
     # If true we will profile iters 100-102 of the model training
     profile: bool = False
 
 
-def write_loss_to_file(config: TrainingConfig, step: int, loss: float):
+def write_loss_to_file(loss_file: Path, step: int, loss: float):
     """Writes the loss to a csv file for later plotting
     Args:
         loss_file: The file to write the loss to
         step: The current step
         loss: The loss to write
     """
-    loss_file = config.log_dir / "loss.csv"
     if not loss_file.exists():
         with open(loss_file, "w") as f:
             writer = csv.writer(f)
@@ -156,7 +159,9 @@ def main(
     with training_config.device:
         model = Transformer(model_args).to(torch.bfloat16)
         model.init_parameters()
-    model.setup_caches(hyper_params.micro_batch_size, hyper_params.max_seq_length)
+    model.setup_caches(
+        hyper_params.micro_batch_size, hyper_params.max_seq_length, training_config.device
+    )
 
     logging.info("Setting up the dataloaders")
     train_data, val_data = load_datasets(hyper_params, training_config)
@@ -167,10 +172,10 @@ def main(
 
     fp8_linear_type = hyper_params.fp8_linear_type
     if fp8_linear_type is not None:
-        fp8_linear_type = LinearType[fp8_linear_type.upper()]
-    if fp8_linear_type is not None:
         fp8_module = LINEAR_TYPE_MAP[fp8_linear_type]
-        swap_linear_with_float8_linear(model, fp8_module)
+        swap_linear_with_float8_linear(
+            model, fp8_module, skip_fqn_list=hyper_params.float8_skip_list
+        )
 
     log_num_params(model)
 
@@ -245,7 +250,6 @@ def train(
             if linear_requires_sync(fp8_linear_type):
                 sync_func(model)
 
-            t0 = time.perf_counter()
             input_ids, targets = next(train_iter)
             input_ids = input_ids.pin_memory().to(training_config.device)
             targets = targets.pin_memory().to(training_config.device)
@@ -264,8 +268,6 @@ def train(
                 optimizer.step()
                 optimizer.zero_grad()
                 step_count += 1
-
-            dt = time.perf_counter() - t0
             total_lengths += input_ids.size(1)
 
             if not is_accumulating and step_count % training_config.eval_interval == 0:
@@ -283,9 +285,7 @@ def train(
             if iter_num % training_config.log_interval == 0:
                 # loss.item causes a sync so we update the progress bar sporadically
                 write_loss_to_file(train_loss_file, step_count, loss.item())
-                progress_bar.set_postfix_str(
-                    f"Iter {iter_num}: Loss {loss.item():.4f}, Time: {dt*1000:.2f}ms"
-                )
+                progress_bar.set_postfix_str(f"Iter {iter_num}: Loss {loss.item():.4f}")
             progress_bar.update(1)
 
             if training_config.profile and iter_num < 103:
@@ -383,7 +383,13 @@ def entrypoint(
     overfit: bool = False,
     profile: bool = False,
 ):
-    hyper_params = Hyperparameters(fp8_linear_type=fp8_linear_type)
+    if fp8_linear_type is not None:
+        fp8_linear_type = LinearType[fp8_linear_type.upper()]
+    if overfit:
+        batch_size = 1
+    else:
+        batch_size = 128
+    hyper_params = Hyperparameters(batch_size=batch_size, fp8_linear_type=fp8_linear_type)
     training_config = TrainingConfig(compile=compile, overfit=overfit, profile=profile)
     main(hyper_params, training_config)
 

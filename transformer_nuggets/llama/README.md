@@ -7,6 +7,12 @@ The Tokenizer is from the original [LLama repo](https://github.com/facebookresea
 The training loop can be found in `train.py`. It expects that the `prepare_data.py` script has been run to generate the training data. The training data is expected to be in the `data/` directory.
 
 ### Usage
+
+#### Install dependencies
+``` Shell
+pip install -e .
+pip install -e ".[llama]"
+```
 Get the Llama2 tokenizer, file and place inside the `llama/data` directory.
 
 The following paths are assumed you are in the top level `transformer_nuggets/` directory.
@@ -23,7 +29,7 @@ This should take around 3 minutes to run and prepare the training data.
 
 #### Train Model
 To edit the training configs take a look at `transformer_nuggets/llama/train.py`. The `entrypoint` function constructs the hyperparam configs as well as the
-training configs. By default this will train a 7b model and and save the checkpoints to `transformer_nuggets/llama/data/out/`. It will also save the loss 
+training configs. By default this will train a 7b model and and save the checkpoints to `transformer_nuggets/llama/data/out/`. It will also save the loss
 logs to `transformer_nuggets/llama/data/logs`.
 
 
@@ -32,8 +38,6 @@ To tain the model using delayed scaling with torch compile run the command
 python transformer_nuggets/llama/train.py \
     --fp8_linear_type "delayed" --compile True
 ```
-
-
 
 
  ### Notes
