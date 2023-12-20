@@ -30,6 +30,7 @@ dev = [
     "usort==1.0.6",
     "ufmt==2.1.0",
     "libcst==1.0.1",
+    "pre-commit-3.6.0",
     "bumpver",
     "pip-tools",
     "pytest"
