@@ -18,6 +18,7 @@ Get the Llama2 tokenizer, file and place inside the `llama/data` directory.
 The following paths are assumed you are in the top level `transformer_nuggets/` directory.
 
 #### Prepare Data
+Following the [nanogpt](https://github.com/karpathy/nanoGPT) repo we using huggingface's dataset library to grab openweb data and convert into long strings of tokens that can be used for pretraining.
 
 Then run the following command:
 
