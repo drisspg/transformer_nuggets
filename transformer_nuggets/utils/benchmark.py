@@ -107,7 +107,17 @@ def save_memory_snapshot(file_path: Path):
         yield
     finally:
         s = torch.cuda.memory._snapshot()
-        with open(f"{file_path}/snapshot.pickle", "wb") as f:
-            dump(s, f)
-        with open(f"{file_path}/trace_plot.html", "w") as f:
+        dist_avail = False
+        try:
+            import torch.distributed as dist
+
+            dist_avail = True
+        except ImportError:
+            pass
+        if dist_avail and dist.is_initialized():
+            local_rank = dist.get_rank()
+            output_path = file_path / f"trace_plot_rank_{local_rank}.html"
+        else:
+            output_path = file_path / "trace_plot.html"
+        with open(output_path, "w") as f:
             f.write(torch.cuda._memory_viz.trace_plot(s))
