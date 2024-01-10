@@ -5,7 +5,7 @@ from functools import partial
 import torch
 import torch.overrides
 from torch.utils._python_dispatch import TorchDispatchMode
-from torch.utils._pytree import tree_map
+from torch.utils._pytree import tree_flatten, tree_map, tree_map_only
 from torch.utils.weak import WeakIdRef
 
 dtype_abbrs = {
@@ -93,3 +93,45 @@ class LoggingMode(TorchDispatchMode):
         else:
             print(log_msg)
         return rs
+
+
+def get_error_string(func, types, args, kwargs, output_has_nan, output_has_inf):
+    error_string = f"Function {func}(*{args}, **{kwargs}) returned "
+    if output_has_nan:
+        error_string += "a NaN"
+    if output_has_inf:
+        if output_has_nan:
+            error_string += " and an Inf"
+        else:
+            error_string += "an Inf"
+    return error_string
+
+
+class NanInfDetect(TorchDispatchMode):
+    """This mode can be helpful for debugging NaNs or Infs in your code.
+    Example usage:
+    ```Python
+        >>> a = torch.tensor([0.,])
+        >>> with NanDetect():
+        >>>    print(torch.div(a, a)
+        RuntimeError: Function aten.div.Tensor(*(tensor([0.]), tensor([0.])), **{}) returned a NaN
+    ```
+    """
+
+    def __init__(self, do_breakpoint: bool = False):
+        super().__init__()
+        self.do_breakpoint = do_breakpoint
+
+    def __torch_dispatch__(self, func, types, args, kwargs=None):
+        kwargs = kwargs or {}
+        res = func(*args, **kwargs)
+
+        output_has_nan = tree_map_only(torch.Tensor, lambda x: torch.isnan(x), res).any()
+        output_has_inf = tree_map_only(torch.Tensor, lambda x: torch.isinf(x), res).any()
+        if output_has_nan or output_has_inf:
+            if self.do_breakpoint:
+                breakpoint()
+            raise RuntimeError(
+                get_error_string(func, types, args, kwargs, output_has_nan, output_has_inf)
+            )
+        return res
