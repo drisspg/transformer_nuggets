@@ -116,6 +116,8 @@ class NanInfDetect(TorchDispatchMode):
         >>>    print(torch.div(a, a)
         RuntimeError: Function aten.div.Tensor(*(tensor([0.]), tensor([0.])), **{}) returned a NaN
     ```
+    Args:
+        do_breakpoint: If True, will call `breakpoint()` when a NaN or Inf is detected.
     """
 
     def __init__(self, do_breakpoint: bool = False):
