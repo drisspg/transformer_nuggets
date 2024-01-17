@@ -80,6 +80,14 @@ def profile_function(
 
 
 @contextmanager
+def print_max_memory_usage():
+    try:
+        yield
+    finally:
+        print(f"Max Cuda Memory Used: {torch.cuda.max_memory_allocated() / (1024**3):.4f} GiB")
+
+
+@contextmanager
 def print_cuda_memory_usage():
     initial_memory = torch.cuda.memory_allocated()
     try:
