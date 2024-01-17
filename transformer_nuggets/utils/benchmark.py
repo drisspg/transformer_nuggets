@@ -101,7 +101,11 @@ def save_memory_snapshot(file_path: Path):
         file_path: The path to the folder to save the snapshot to
                     will create the folder if it doesn't exist
     """
-    file_path.mkdir(parents=True, exist_ok=True)
+    if file_path.is_dir():
+        raise ValueError(f"{file_path} is a directory")
+
+    # make parent dir
+    file_path.parent.mkdir(parents=True, exist_ok=True)
     torch.cuda.memory._record_memory_history()
     try:
         yield
@@ -116,8 +120,8 @@ def save_memory_snapshot(file_path: Path):
             pass
         if dist_avail and dist.is_initialized():
             local_rank = dist.get_rank()
-            output_path = file_path / f"trace_plot_rank_{local_rank}.html"
+            output_path = file_path / f"_rank_{local_rank}.html"
         else:
-            output_path = file_path / "trace_plot.html"
+            output_path = file_path.with_suffix(".html")
         with open(output_path, "w") as f:
             f.write(torch.cuda._memory_viz.trace_plot(s))
