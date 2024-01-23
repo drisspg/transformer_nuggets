@@ -109,8 +109,21 @@ def save_memory_snapshot(file_path: Path):
         file_path: The path to the folder to save the snapshot to
                     will create the folder if it doesn't exist
     """
-    if file_path.is_dir():
-        raise ValueError(f"{file_path} is a directory")
+    try:
+        import torch.distributed as dist
+
+        dist_avail = True
+    except ImportError:
+        pass
+
+    if dist_avail and dist.is_initialized():
+        if not file_path.is_dir():
+            raise ValueError(
+                f"{file_path} is not a directory, but is required for distributed profiling"
+            )
+    else:
+        if file_path.is_dir():
+            raise ValueError(f"{file_path} is a directory")
 
     # make parent dir
     file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -120,12 +133,6 @@ def save_memory_snapshot(file_path: Path):
     finally:
         s = torch.cuda.memory._snapshot()
         dist_avail = False
-        try:
-            import torch.distributed as dist
-
-            dist_avail = True
-        except ImportError:
-            pass
         if dist_avail and dist.is_initialized():
             local_rank = dist.get_rank()
             output_path = file_path / f"_rank_{local_rank}.html"
