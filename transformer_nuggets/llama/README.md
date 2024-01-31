@@ -43,9 +43,14 @@ python transformer_nuggets/llama/train.py \
     --fp8_linear_type "delayed" --compile True
 ```
 
-To finetune model with qlora
+To finetune model with qlora on single GPU
 ``` Shell
 python transformer_nuggets/llama/finetune.py
+```
+
+To finetune model with qlora + FSDP on 2 GPUs
+``` Shell
+python transformer_nuggets/llama/finetune.py --fsdp_num_gpus 2
 ```
 
  ### Notes
