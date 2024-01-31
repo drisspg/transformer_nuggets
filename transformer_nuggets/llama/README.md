@@ -45,7 +45,7 @@ python transformer_nuggets/llama/train.py \
 
 To finetune model with qlora
 ``` Shell
-python transformer_nuggets/llama/train.py --enable_qlora True
+python transformer_nuggets/llama/finetune.py
 ```
 
  ### Notes

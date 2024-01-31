@@ -57,12 +57,6 @@ class Hyperparameters:
     min_lr: float = 6e-5
     foreach_optimizer: bool = False
 
-    # qlora config
-    enable_qlora: bool = False
-    lora_r: int = 8
-    lora_alpha: int = 16
-    lora_dropout: float = 0.05
-
     # Float8 Specific Config
     # We want to skip the first embedding layer since scaled_mm needs to multiple of 16
     float8_skip_list: List[str] = field(default_factory=lambda: ["tok_embeddings"])
@@ -170,14 +164,6 @@ def main(
         model = Transformer(model_args).to(torch.bfloat16)
         model.init_parameters()
 
-        if hyper_params.enable_qlora:
-            qlora_config = qlora.QloraConfig(
-                hyper_params.lora_r,
-                hyper_params.lora_alpha,
-                hyper_params.lora_dropout,
-            )
-            qlora.swap_for_qlora(model, qlora_config, torch.bfloat16)
-
     model.setup_caches(
         hyper_params.micro_batch_size, hyper_params.max_seq_length, training_config.device
     )
@@ -199,7 +185,7 @@ def main(
     log_num_params(model)
 
     optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
+        model.parameters(),
         lr=hyper_params.learning_rate,
         weight_decay=hyper_params.weight_decay,
         betas=(hyper_params.beta1, hyper_params.beta2),
@@ -412,7 +398,6 @@ def entrypoint(
     compile: bool = False,
     overfit: bool = False,
     profile: bool = False,
-    enable_qlora: bool = False,
 ):
     assert (
         isinstance(fp8_linear_type, str) or fp8_linear_type is None
@@ -420,17 +405,12 @@ def entrypoint(
     assert isinstance(compile, bool), "compile must be bool"
     assert isinstance(overfit, bool), "overfit must be bool"
     assert isinstance(profile, bool), "profile must be bool"
-    assert isinstance(enable_qlora, bool), "enable_qlora must be bool"
 
     if overfit:
         batch_size = 1
     else:
         batch_size = 128
-    hyper_params = Hyperparameters(
-        batch_size=batch_size,
-        fp8_linear_type=fp8_linear_type,
-        enable_qlora=enable_qlora,
-    )
+    hyper_params = Hyperparameters(batch_size=batch_size, fp8_linear_type=fp8_linear_type)
     training_config = TrainingConfig(compile=compile, overfit=overfit, profile=profile)
     main(hyper_params, training_config)
 
