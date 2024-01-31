@@ -180,7 +180,7 @@ def main(
     # Setup Model
     model_args = ModelArgs.from_name(training_config.model_name)
     if rank == 0:
-        logging.info("Initializing model")
+        logging.info(f"Initializing model: {training_config.model_name}")
     with training_config.device:
         model = Transformer(model_args).to(torch.bfloat16)
         model.init_parameters()
