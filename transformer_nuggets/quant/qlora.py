@@ -6,6 +6,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass, field
 from tqdm import tqdm
+import logging
+
+logging.basicConfig(level=logging.INFO)
 
 bnb_available = False
 
@@ -465,20 +468,20 @@ class QloraMLP(nn.Module):
         self.qlora_w3 = QloraLinear(weight3.shape[1], weight3.shape[0], weight3, lora_r, lora_alpha, lora_dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.silu(self.qlora_w1(x)) * self.qlora_w2(x)
-        x = self.qlora_w3(x)
+        x = F.silu(self.qlora_w1(x)) * self.qlora_w3(x)
+        x = self.qlora_w2(x)
         return x
 
-def swap_for_qlora_jank(model: torch.nn.Module, qlora_config: QloraConfig, dtype) -> None:
-    print("Swapping for Qlora...")
+def swap_for_qlora(model: torch.nn.Module, qlora_config: QloraConfig, dtype) -> None:
+    logging.info("Swapping for Qlora...")
     for module in tqdm(model.layers):
         feed_forward = module.feed_forward
-        # it's not a typo to match QloraMLP.w2 with FeedForward.w3
-        # FeedForward forward: w2(silu(w1) * w3)
-        # QloraMLP forward: w3(silu(w1) * w2)
         w1 = feed_forward.w1.weight.to(dtype=dtype)
-        w2 = feed_forward.w3.weight.to(dtype=dtype)
-        w3 = feed_forward.w2.weight.to(dtype=dtype)
+        w2 = feed_forward.w2.weight.to(dtype=dtype)
+        w3 = feed_forward.w3.weight.to(dtype=dtype)
         new_mod = QloraMLP(w1, w2, w3, qlora_config)
         module.feed_forward = new_mod
-        del feed_forward
+
+    for name, param in model.named_parameters():
+        if "lora_" not in name:
+            param.requires_grad = False
