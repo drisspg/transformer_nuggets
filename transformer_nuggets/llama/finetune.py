@@ -19,13 +19,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import transformer_nuggets.llama.train
 import transformer_nuggets.quant.qlora as qlora
-from fire import Fire
-from float8_experimental.float8_linear_utils import (
-    linear_requires_sync,
-    LinearType,
-    swap_linear_with_float8_linear,
-    sync_float8_amax_and_scale_history,
-)
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 from torch.utils.data import DataLoader, IterableDataset
@@ -36,6 +29,7 @@ from transformer_nuggets.llama.train import (
     get_lr,
     get_profile_context,
     log_num_params,
+    write_loss_to_file,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -61,13 +55,6 @@ class Hyperparameters:
     lr_decay_iters: int = field(init=False)
     min_lr: float = 6e-5
     foreach_optimizer: bool = False
-    use_te_linear: bool = False
-
-    # Float8 Specific Config
-    # We want to skip the first embedding layer since scaled_mm needs to multiple of 16
-    float8_skip_list: List[str] = field(default_factory=lambda: ["tok_embeddings"])
-    fp8_linear_type: Optional[LinearType] = None
-    weight_caching: bool = False
 
     # qlora config
     lora_r: int = 8
@@ -78,17 +65,6 @@ class Hyperparameters:
         self.gradient_accumulation_iters = self.batch_size // self.micro_batch_size
         self.lr_decay_iters = self.max_iters
         assert self.gradient_accumulation_iters > 0
-        if self.fp8_linear_type is not None:
-            self.fp8_linear_type = LinearType[self.fp8_linear_type.upper()]
-        if self.use_te_linear:
-            import transformer_engine.pytorch as te
-            from transformer_engine.common import recipe
-            from transformer_engine.common.recipe import DelayedScaling, Format
-
-            fp8_format = Format.HYBRID
-            self.fp8_recipe = DelayedScaling(
-                fp8_format=fp8_format, amax_history_len=16, amax_compute_algo="max"
-            )
 
 
 @dataclass
@@ -119,6 +95,7 @@ class TrainingConfig:
     track_max_memory: bool = False
 
 
+# copied from https://github.com/pytorch-labs/ao_benchmarks/tree/main/llama
 class Dataset(IterableDataset):
     def __init__(
         self,
@@ -139,24 +116,13 @@ class Dataset(IterableDataset):
 
     def __iter__(self):
         data = np.memmap(self.data_file, dtype=np.uint16, mode="r")
-
-        # TODO(later): look into whether map dataset will work here, to clean
-        # up the slicing logic
-
-        # ensure multiple Datasets in distributed training all get different data
-        # slices when deterministic data loading is enabled
         per_rank = int(TRAIN_DATASET_SIZE / float(self.world_size))
         rank_offset = self.rank * per_rank
-
-        # ensure multiple workers all get different data slices when deterministic
-        # data loading is enabled
-        # source: https://pytorch.org/docs/stable/data.html#torch.utils.data.IterableDataset
         worker_info = torch.utils.data.get_worker_info()
         assert worker_info is not None, "single process data loading not implemented yet"
         per_worker = int(per_rank / float(worker_info.num_workers))
         worker_id = worker_info.id
         worker_offset = worker_id * per_worker
-
         while True:
             if self.overfit:
                 i = 0
@@ -171,6 +137,7 @@ class Dataset(IterableDataset):
             yield x, y
 
 
+# copied from https://github.com/pytorch-labs/ao_benchmarks/tree/main/llama
 def load_datasets(
     hyper_params: Hyperparameters,
     training_config: TrainingConfig,
@@ -238,29 +205,12 @@ def main(
     )
     val_dataloader = DataLoader(val_data, batch_size=hyper_params.micro_batch_size, num_workers=2)
 
-    fp8_linear_type = hyper_params.fp8_linear_type
-    if fp8_linear_type is not None:
-        fp8_module = LINEAR_TYPE_MAP[fp8_linear_type]
-        if hyper_params.weight_caching:
-            if rank == 0:
-                logging.info("Using weight caching")
-            fp8_config.allocate_float8_weight_cache_buffers = True
-        swap_linear_with_float8_linear(
-            model, fp8_module, skip_fqn_list=hyper_params.float8_skip_list
-        )
-    if hyper_params.use_te_linear:
-        swap_linear_with_te_linear(model, hyper_params, training_config)
-
     log_num_params(model)
 
     if world_size > 1:
-        # if we are in distributed, assume we want FSDP
         model = FSDP(
             model,
-            # use_orig_params is required for torch.compile
             use_orig_params=True,
-            # for a quick and dirty wrapping strategy, just wrap
-            # each transformer block
             auto_wrap_policy=ModuleWrapPolicy([TransformerBlock]),
         )
 
@@ -271,7 +221,7 @@ def main(
         print(model)
 
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        [p for p in model.parameters() if p.requires_grad],
         lr=hyper_params.learning_rate,
         weight_decay=hyper_params.weight_decay,
         betas=(hyper_params.beta1, hyper_params.beta2),
@@ -307,9 +257,7 @@ def train(
     profile_context = get_profile_context(hyper_params, training_config)
     train_iter = iter(train_data)
 
-    # Sanity check
-    fp8_linear_type = hyper_params.fp8_linear_type
-    dtype_str = fp8_linear_type if fp8_linear_type else "bf16"
+    dtype_str = "bf16"
 
     val_loss_file = (
         training_config.log_dir
@@ -323,12 +271,6 @@ def train(
         logging.info(f"val_loss_file: {val_loss_file}")
         logging.info(f"train_loss_file: {train_loss_file}")
 
-    sync_func = (
-        torch.compile(sync_float8_amax_and_scale_history)
-        if training_config.compile
-        else sync_float8_amax_and_scale_history
-    )
-
     this_batch_loss = torch.tensor(0.0, device=training_config.device)
     this_batch_n = 0
     fsdp_loss = torch.zeros(2, device=training_config.device)
@@ -338,10 +280,6 @@ def train(
             lr = get_lr(iter_num, hyper_params)
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr
-
-            # Sync the amax and scale history for the fp8 linear layers at the start of every iteration
-            if linear_requires_sync(fp8_linear_type):
-                sync_func(model)
 
             input_ids, targets = next(train_iter)
             input_ids = input_ids.pin_memory().to(training_config.device)
@@ -354,23 +292,7 @@ def train(
                 this_batch_n = 0
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                if hyper_params.use_te_linear:
-                    import transformer_engine.pytorch as te
-
-                    if hyper_params.weight_caching:
-                        global WEIGHT_CACHING_ON
-                        if (
-                            iter_num > 0
-                            and (iter_num % hyper_params.gradient_accumulation_iters) != 0
-                        ):
-                            WEIGHT_CACHING_ON = True
-                        else:
-                            WEIGHT_CACHING_ON = False
-
-                    with te.fp8_autocast(enabled=True, fp8_recipe=hyper_params.fp8_recipe):
-                        logits = model(input_ids)
-                else:
-                    logits = model(input_ids)
+                logits = model(input_ids)
 
             # Calculate the loss
             loss = calculate_loss(logits, targets)
@@ -385,13 +307,6 @@ def train(
                 optimizer.step()
                 optimizer.zero_grad()
                 step_count += 1
-                # We have just updated the weights so we disable weight_caching for the next iteration
-                if hyper_params.weight_caching:
-                    fp8_config.weight_cache_enabled = False
-
-            if is_accumulating and hyper_params.weight_caching:
-                # We want to enable weight caching for the next iteration
-                fp8_config.weight_cache_enabled = True
 
             # TODO(future): fix this condition, eval currently only happens
             # if eval_interval and batch_size are multiples of each other
@@ -443,22 +358,6 @@ def train(
             torch.cuda.reset_peak_memory_stats()
 
 
-def write_loss_to_file(loss_file: Path, step: int, loss: float):
-    """Writes the loss to a csv file for later plotting
-    Args:
-        loss_file: The file to write the loss to
-        step: The current step
-        loss: The loss to write
-    """
-    if not loss_file.exists():
-        with open(loss_file, "w") as f:
-            writer = csv.writer(f)
-            writer.writerow(["step", "loss"])
-    with open(loss_file, "a") as f:
-        writer = csv.writer(f)
-        writer.writerow([step, loss])
-
-
 def entrypoint(
     profile: bool = False,
     rank: int = 0,
@@ -466,10 +365,7 @@ def entrypoint(
 ):
     batch_size = int(128 / world_size)
     assert isinstance(profile, bool), "profile must be bool"
-    hyper_params = Hyperparameters(
-        batch_size=batch_size,
-        max_iters=int(TRAIN_DATASET_SIZE / world_size),
-    )
+    hyper_params = Hyperparameters(batch_size=batch_size)
     training_config = TrainingConfig(
         profile=profile,
         device=torch.device(f"cuda:{rank}"),
@@ -499,10 +395,8 @@ if __name__ == "__main__":
     fsdp_num_gpus = args.fsdp_num_gpus
     inner_args = (args.profile,)
 
-    if fsdp_num_gpus is None:
-        # single host single GPU
+    if fsdp_num_gpus is None or fsdp_num_gpus == 1:
         entrypoint(*inner_args)
     else:
-        # single host multi GPU FSDP
         assert fsdp_num_gpus <= torch.cuda.device_count()
         mp.spawn(fsdp_main, args=(fsdp_num_gpus, inner_args), nprocs=fsdp_num_gpus, join=True)
