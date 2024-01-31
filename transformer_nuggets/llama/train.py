@@ -15,7 +15,7 @@ from typing import List, Optional
 import numpy as np
 import torch
 from fire import Fire
-from float8_experimental.dynamic_linear import Float8DynamicLinear
+# from float8_experimental.dynamic_linear import Float8DynamicLinear
 from float8_experimental.float8_linear import Float8Linear
 
 # Float8 imports
@@ -32,7 +32,7 @@ from transformer_nuggets.llama.model import ModelArgs, Transformer
 
 LINEAR_TYPE_MAP = {
     LinearType.DELAYED: Float8Linear,
-    LinearType.DYNAMIC: Float8DynamicLinear,
+    LinearType.DYNAMIC: Float8Linear,
 }
 
 logging.basicConfig(level=logging.INFO)
