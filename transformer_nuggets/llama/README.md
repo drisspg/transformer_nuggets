@@ -43,5 +43,10 @@ python transformer_nuggets/llama/train.py \
     --fp8_linear_type "delayed" --compile True
 ```
 
+To finetune model with qlora
+``` Shell
+python transformer_nuggets/llama/finetune.py
+```
+
  ### Notes
 To get the Llama2 tokenizer go to https://huggingface.co/meta-llama/Llama-2-7b and go through steps to obtain access. This will get you pretrained weights as well as the tokenizer.

@@ -15,7 +15,7 @@ from typing import List, Optional
 import numpy as np
 import torch
 from fire import Fire
-from float8_experimental.dynamic_linear import Float8DynamicLinear
+from float8_experimental.float8_dynamic_linear import Float8DynamicLinear
 from float8_experimental.float8_linear import Float8Linear
 
 # Float8 imports
@@ -158,10 +158,11 @@ def main(
 
     # Setup Model
     model_args = ModelArgs.from_name(training_config.model_name)
-    logging.info("Initializing model")
+    logging.info(f"Initializing model: {training_config.model_name}")
     with training_config.device:
         model = Transformer(model_args).to(torch.bfloat16)
         model.init_parameters()
+
     model.setup_caches(
         hyper_params.micro_batch_size, hyper_params.max_seq_length, training_config.device
     )
@@ -226,13 +227,18 @@ def train(
     fp8_linear_type = hyper_params.fp8_linear_type
     dtype_str = fp8_linear_type if fp8_linear_type else "bf16"
 
+    if not hasattr(hyper_params, "lora_r"):
+        loss_file_prefix = "pretrain"
+    else:
+        loss_file_prefix = "qlora"
+
     val_loss_file = (
         training_config.log_dir
-        / f"pretrain_validation_loss_{dtype_str}_overfit_{training_config.overfit}_compile_{training_config.compile}.csv"
+        / f"{loss_file_prefix}_validation_loss_{dtype_str}_overfit_{training_config.overfit}_compile_{training_config.compile}.csv"
     )
     train_loss_file = (
         training_config.log_dir
-        / f"pretrain_train_loss_{dtype_str}_overfit_{training_config.overfit}_compile_{training_config.compile}.csv"
+        / f"{loss_file_prefix}_train_loss_{dtype_str}_overfit_{training_config.overfit}_compile_{training_config.compile}.csv"
     )
     logging.info(f"val_loss_file: {val_loss_file}")
     logging.info(f"train_loss_file: {train_loss_file}")
