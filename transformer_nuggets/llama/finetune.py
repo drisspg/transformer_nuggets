@@ -14,23 +14,16 @@ from typing import List, Optional
 
 import numpy as np
 import torch
-from fire import Fire
+import transformer_nuggets.llama.train
 import transformer_nuggets.quant.qlora as qlora
+from fire import Fire
 from torch.utils.data import DataLoader, IterableDataset
 from tqdm import tqdm
-import transformer_nuggets.llama.train
-from transformer_nuggets.llama.model import (
-    ModelArgs,
-    Transformer,
-)
-from transformer_nuggets.llama.train import (
-    TrainingConfig,
-    log_num_params,
-    train,
-    load_datasets,
-)
+from transformer_nuggets.llama.model import ModelArgs, Transformer
+from transformer_nuggets.llama.train import load_datasets, log_num_params, train, TrainingConfig
 
 logging.basicConfig(level=logging.INFO)
+
 
 @dataclass
 class Hyperparameters(transformer_nuggets.llama.train.Hyperparameters):
@@ -38,6 +31,7 @@ class Hyperparameters(transformer_nuggets.llama.train.Hyperparameters):
     lora_r: int = 8
     lora_alpha: int = 16
     lora_dropout: float = 0.05
+
 
 def main(
     hyper_params: Hyperparameters,
@@ -95,6 +89,7 @@ def main(
         training_config,
     )
 
+
 def entrypoint(
     profile: bool = False,
 ):
@@ -102,6 +97,7 @@ def entrypoint(
     hyper_params = Hyperparameters()
     training_config = TrainingConfig(profile=profile)
     main(hyper_params, training_config)
+
 
 if __name__ == "__main__":
     torch.set_float32_matmul_precision("high")
