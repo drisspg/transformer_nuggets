@@ -35,130 +35,16 @@ from transformer_nuggets.llama.train import (
 logging.basicConfig(level=logging.INFO)
 
 
-TRAIN_DATASET_SIZE = 60000
-
-
 @dataclass
-class Hyperparameters:
-    learning_rate: float = 6e-4
-    batch_size: int = 128
-    micro_batch_size: int = 1
-    gradient_accumulation_iters: int = field(init=False)
-    max_seq_length: int = 4096
-    max_iters: int = TRAIN_DATASET_SIZE  # train dataset size
-    weight_decay: float = 0.01
-    beta1: float = 0.9
-    beta2: float = 0.95
-    grad_clip: float = 1.0
-    decay_lr: bool = True
-    warmup_iters: int = 2000
-    lr_decay_iters: int = field(init=False)
-    min_lr: float = 6e-5
-    foreach_optimizer: bool = False
-
-    # qlora config
+class Hyperparameters(transformer_nuggets.llama.train.Hyperparameters):
     lora_r: int = 8
     lora_alpha: int = 16
     lora_dropout: float = 0.05
 
-    def __post_init__(self):
-        self.gradient_accumulation_iters = self.batch_size // self.micro_batch_size
-        self.lr_decay_iters = self.max_iters
-        assert self.gradient_accumulation_iters > 0
-
 
 @dataclass
-class TrainingConfig:
-    eval_interval: int = 60
-    save_interval: int = 100
-    eval_iters: int = 40
-    # it's convenient for log_interval to equal batch_size
-    log_interval: int = 20
-    val_step_count: int = 0
-    deterministic_data_loading: bool = True
-
-    # This overfit param is used to test numerical issues by overfitting
-    # on a single batch. It should be set to False for normal training.
-    overfit: bool = False
-
-    compile: bool = False
-    model_name: str = "7B"
-    dataset_name: str = "openwebtext"
-    base_path = Path("transformer_nuggets/llama/data")
-    out_dir: Path = base_path / "out"
-    data_dir: Path = base_path
-    log_dir: Path = base_path / "logs"
-
-    device: torch.device = torch.device("cuda:0")
-    # If true we will profile iters 100-102 of the model training
-    profile: bool = False
+class TrainingConfig(transformer_nuggets.llama.train.TrainingConfig):
     track_max_memory: bool = False
-
-
-# copied from https://github.com/pytorch-labs/ao_benchmarks/tree/main/llama
-class Dataset(IterableDataset):
-    def __init__(
-        self,
-        data_file: Path,
-        max_seq_length: int,
-        training_config: TrainingConfig,
-        rank: int = 0,
-        world_size: int = 1,
-    ):
-        super().__init__()
-        self.data_file = data_file
-        self.max_seq_length = max_seq_length
-        self.overfit = training_config.overfit
-        self.deterministic_data_loading = training_config.deterministic_data_loading
-        self.index = 0
-        self.rank = rank
-        self.world_size = world_size
-
-    def __iter__(self):
-        data = np.memmap(self.data_file, dtype=np.uint16, mode="r")
-        per_rank = int(TRAIN_DATASET_SIZE / float(self.world_size))
-        rank_offset = self.rank * per_rank
-        worker_info = torch.utils.data.get_worker_info()
-        assert worker_info is not None, "single process data loading not implemented yet"
-        per_worker = int(per_rank / float(worker_info.num_workers))
-        worker_id = worker_info.id
-        worker_offset = worker_id * per_worker
-        while True:
-            if self.overfit:
-                i = 0
-            else:
-                if self.deterministic_data_loading:
-                    i = self.index + rank_offset + worker_offset
-                    self.index += self.max_seq_length
-                else:
-                    i = torch.randint(len(data) - self.max_seq_length, (1,)).item()
-            x = torch.from_numpy((data[i : i + self.max_seq_length]).astype(np.int64))
-            y = torch.from_numpy((data[i + 1 : i + 1 + self.max_seq_length]).astype(np.int64))
-            yield x, y
-
-
-# copied from https://github.com/pytorch-labs/ao_benchmarks/tree/main/llama
-def load_datasets(
-    hyper_params: Hyperparameters,
-    training_config: TrainingConfig,
-    rank: int,
-    world_size: int,
-):
-    train_data = Dataset(
-        str(training_config.data_dir / "train.bin"),
-        max_seq_length=hyper_params.max_seq_length,
-        training_config=training_config,
-        rank=rank,
-        world_size=world_size,
-    )
-    val_data = Dataset(
-        str(training_config.data_dir / "val.bin"),
-        max_seq_length=hyper_params.max_seq_length,
-        training_config=training_config,
-        rank=rank,
-        world_size=world_size,
-    )
-    return train_data, val_data
 
 
 def main(
@@ -379,6 +265,73 @@ def fsdp_main(rank, world_size, args):
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     entrypoint(*args, rank=rank, world_size=world_size)
     dist.destroy_process_group()
+
+
+# copied from https://github.com/pytorch-labs/ao_benchmarks/tree/main/llama
+class Dataset(IterableDataset):
+    def __init__(
+        self,
+        data_file: Path,
+        hyper_params: Hyperparameters,
+        training_config: TrainingConfig,
+        rank: int = 0,
+        world_size: int = 1,
+    ):
+        super().__init__()
+        self.data_file = data_file
+        self.max_seq_length = hyper_params.max_seq_length
+        self.max_iters = hyper_params.max_iters
+        self.overfit = training_config.overfit
+        self.deterministic_data_loading = training_config.deterministic_data_loading
+        self.index = 0
+        self.rank = rank
+        self.world_size = world_size
+
+    def __iter__(self):
+        data = np.memmap(self.data_file, dtype=np.uint16, mode="r")
+        per_rank = int(self.max_iters / float(self.world_size))
+        rank_offset = self.rank * per_rank
+        worker_info = torch.utils.data.get_worker_info()
+        assert worker_info is not None, "single process data loading not implemented yet"
+        per_worker = int(per_rank / float(worker_info.num_workers))
+        worker_id = worker_info.id
+        worker_offset = worker_id * per_worker
+        while True:
+            if self.overfit:
+                i = 0
+            else:
+                if self.deterministic_data_loading:
+                    i = self.index + rank_offset + worker_offset
+                    self.index += self.max_seq_length
+                else:
+                    i = torch.randint(len(data) - self.max_seq_length, (1,)).item()
+            x = torch.from_numpy((data[i : i + self.max_seq_length]).astype(np.int64))
+            y = torch.from_numpy((data[i + 1 : i + 1 + self.max_seq_length]).astype(np.int64))
+            yield x, y
+
+
+# copied from https://github.com/pytorch-labs/ao_benchmarks/tree/main/llama
+def load_datasets(
+    hyper_params: Hyperparameters,
+    training_config: TrainingConfig,
+    rank: int,
+    world_size: int,
+):
+    train_data = Dataset(
+        str(training_config.data_dir / "train.bin"),
+        hyper_params=hyper_params,
+        training_config=training_config,
+        rank=rank,
+        world_size=world_size,
+    )
+    val_data = Dataset(
+        str(training_config.data_dir / "val.bin"),
+        hyper_params=hyper_params,
+        training_config=training_config,
+        rank=rank,
+        world_size=world_size,
+    )
+    return train_data, val_data
 
 
 if __name__ == "__main__":
