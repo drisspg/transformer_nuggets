@@ -15,6 +15,7 @@ from typing import List, Optional
 import numpy as np
 import torch
 from fire import Fire
+import transformer_nuggets.quant.qlora as qlora
 from float8_experimental.float8_dynamic_linear import Float8DynamicLinear
 from float8_experimental.float8_linear import Float8Linear
 
@@ -81,6 +82,11 @@ class TrainingConfig:
     # This overfit param is used to test numerical issues by overfitting
     # on a single batch. It should be set to False for normal training.
     overfit: bool = False
+
+    enable_qlora: bool = False
+    lora_r: int = 8
+    lora_alpha: int = 16
+    lora_dropout: float = 0.05
 
     compile: bool = False
     model_name: str = "7B"
@@ -158,10 +164,22 @@ def main(
 
     # Setup Model
     model_args = ModelArgs.from_name(training_config.model_name)
-    logging.info("Initializing model")
+    logging.info(f"Initializing model: {training_config.model_name}")
     with training_config.device:
         model = Transformer(model_args).to(torch.bfloat16)
         model.init_parameters()
+
+        if training_config.enable_qlora:
+            qlora_config = qlora.QloraConfig(
+                training_config.lora_r,
+                training_config.lora_alpha,
+                training_config.lora_dropout,
+            )
+            qlora.swap_for_qlora_jank(model, qlora_config, torch.bfloat16)
+            for name, param in model.named_parameters():
+                if "lora_" not in name:
+                    param.requires_grad = False
+
     model.setup_caches(
         hyper_params.micro_batch_size, hyper_params.max_seq_length, training_config.device
     )
@@ -183,7 +201,7 @@ def main(
     log_num_params(model)
 
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        [p for p in model.parameters() if p.requires_grad],
         lr=hyper_params.learning_rate,
         weight_decay=hyper_params.weight_decay,
         betas=(hyper_params.beta1, hyper_params.beta2),
@@ -391,6 +409,7 @@ def entrypoint(
     compile: bool = False,
     overfit: bool = False,
     profile: bool = False,
+    enable_qlora: bool = False,
 ):
     assert (
         isinstance(fp8_linear_type, str) or fp8_linear_type is None
@@ -398,13 +417,14 @@ def entrypoint(
     assert isinstance(compile, bool), "compile must be bool"
     assert isinstance(overfit, bool), "overfit must be bool"
     assert isinstance(profile, bool), "profile must be bool"
+    assert isinstance(enable_qlora, bool), "enable_qlora must be bool"
 
     if overfit:
         batch_size = 1
     else:
         batch_size = 128
     hyper_params = Hyperparameters(batch_size=batch_size, fp8_linear_type=fp8_linear_type)
-    training_config = TrainingConfig(compile=compile, overfit=overfit, profile=profile)
+    training_config = TrainingConfig(compile=compile, overfit=overfit, profile=profile, enable_qlora=enable_qlora)
     main(hyper_params, training_config)
 
 

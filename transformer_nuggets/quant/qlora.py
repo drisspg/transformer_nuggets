@@ -4,6 +4,8 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from dataclasses import dataclass, field
+from tqdm import tqdm
 
 bnb_available = False
 
@@ -439,3 +441,44 @@ class QloraLinear(nn.Module):
             * self.scaling
         )
         return result2
+
+
+@dataclass
+class QloraConfig:
+    lora_r: int = 2
+    lora_alpha: int = 1
+    lora_dropout: float = 0.0
+
+class QloraMLP(nn.Module):
+    # This very notably doesn't save on backward compute
+    def __init__(self, weight1: torch.Tensor, weight2: torch.Tensor, weight3: torch.Tensor, QloraConfig: QloraConfig = None) -> None:
+        super().__init__()
+        if QloraConfig is None:
+            QloraConfig = QloraConfig()
+
+        lora_r = QloraConfig.lora_r
+        lora_alpha = QloraConfig.lora_alpha
+        lora_dropout = QloraConfig.lora_dropout
+
+        self.qlora_w1 = QloraLinear(weight1.shape[1], weight1.shape[0], weight1, lora_r, lora_alpha, lora_dropout)
+        self.qlora_w2 = QloraLinear(weight2.shape[1], weight2.shape[0], weight2, lora_r, lora_alpha, lora_dropout)
+        self.qlora_w3 = QloraLinear(weight3.shape[1], weight3.shape[0], weight3, lora_r, lora_alpha, lora_dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.silu(self.qlora_w1(x)) * self.qlora_w2(x)
+        x = self.qlora_w3(x)
+        return x
+
+def swap_for_qlora_jank(model: torch.nn.Module, qlora_config: QloraConfig, dtype) -> None:
+    print("Swapping for Qlora...")
+    for module in tqdm(model.layers):
+        feed_forward = module.feed_forward
+        # it's not a typo to match QloraMLP.w2 with FeedForward.w3
+        # FeedForward forward: w2(silu(w1) * w3)
+        # QloraMLP forward: w3(silu(w1) * w2)
+        w1 = feed_forward.w1.weight.to(dtype=dtype)
+        w2 = feed_forward.w3.weight.to(dtype=dtype)
+        w3 = feed_forward.w2.weight.to(dtype=dtype)
+        new_mod = QloraMLP(w1, w2, w3, qlora_config)
+        module.feed_forward = new_mod
+        del feed_forward
