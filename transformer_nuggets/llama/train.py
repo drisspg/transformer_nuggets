@@ -227,13 +227,18 @@ def train(
     fp8_linear_type = hyper_params.fp8_linear_type
     dtype_str = fp8_linear_type if fp8_linear_type else "bf16"
 
+    if not hasattr(hyper_params, "lora_r"):
+        loss_file_prefix = "pretrain"
+    else:
+        loss_file_prefix = "qlora"
+
     val_loss_file = (
         training_config.log_dir
-        / f"pretrain_validation_loss_{dtype_str}_overfit_{training_config.overfit}_compile_{training_config.compile}.csv"
+        / f"{loss_file_prefix}_validation_loss_{dtype_str}_overfit_{training_config.overfit}_compile_{training_config.compile}.csv"
     )
     train_loss_file = (
         training_config.log_dir
-        / f"pretrain_train_loss_{dtype_str}_overfit_{training_config.overfit}_compile_{training_config.compile}.csv"
+        / f"{loss_file_prefix}_train_loss_{dtype_str}_overfit_{training_config.overfit}_compile_{training_config.compile}.csv"
     )
     logging.info(f"val_loss_file: {val_loss_file}")
     logging.info(f"train_loss_file: {train_loss_file}")

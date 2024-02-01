@@ -32,6 +32,7 @@ from transformer_nuggets.llama.train import (
     write_loss_to_file,
 )
 
+
 logging.basicConfig(level=logging.INFO)
 
 
@@ -40,6 +41,7 @@ class Hyperparameters(transformer_nuggets.llama.train.Hyperparameters):
     lora_r: int = 8
     lora_alpha: int = 16
     lora_dropout: float = 0.05
+
 
 
 @dataclass
@@ -80,6 +82,7 @@ def main(
     model.setup_caches(
         hyper_params.micro_batch_size, hyper_params.max_seq_length, training_config.device
     )
+
 
     if rank == 0:
         logging.info("Setting up the dataloaders")
