@@ -126,6 +126,30 @@ def main(
     )
 
 
+def entrypoint(
+    profile: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+):
+    batch_size = int(128 / world_size)
+    assert isinstance(profile, bool), "profile must be bool"
+    hyper_params = Hyperparameters(batch_size=batch_size)
+    training_config = TrainingConfig(
+        profile=profile,
+        device=torch.device(f"cuda:{rank}"),
+    )
+    main(hyper_params, training_config, rank, world_size)
+
+
+def fsdp_main(rank, world_size, args):
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    entrypoint(*args, rank=rank, world_size=world_size)
+    dist.destroy_process_group()
+
+
+# copied from https://github.com/pytorch-labs/ao_benchmarks/tree/main/llama
 def train(
     model: Transformer,
     optimizer: torch.optim.Optimizer,
@@ -242,29 +266,6 @@ def train(
                     float(torch.cuda.max_memory_allocated()) / 1024 / 1024 / 1024,
                 )
             torch.cuda.reset_peak_memory_stats()
-
-
-def entrypoint(
-    profile: bool = False,
-    rank: int = 0,
-    world_size: int = 1,
-):
-    batch_size = int(128 / world_size)
-    assert isinstance(profile, bool), "profile must be bool"
-    hyper_params = Hyperparameters(batch_size=batch_size)
-    training_config = TrainingConfig(
-        profile=profile,
-        device=torch.device(f"cuda:{rank}"),
-    )
-    main(hyper_params, training_config, rank, world_size)
-
-
-def fsdp_main(rank, world_size, args):
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12355"
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    entrypoint(*args, rank=rank, world_size=world_size)
-    dist.destroy_process_group()
 
 
 # copied from https://github.com/pytorch-labs/ao_benchmarks/tree/main/llama
