@@ -106,7 +106,7 @@ def main(
         model = torch.compile(model)
 
     if rank == 0:
-        print(model)
+        logging.info(model)
 
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -260,10 +260,10 @@ def train(
                 p.step()
 
             if training_config.track_max_memory and rank == 0:
-                print(
+                logging.info(
                     "iter_num",
                     iter_num,
-                    "mem usage GB",
+                    "mem usage GiB",
                     float(torch.cuda.max_memory_allocated()) / 1024 / 1024 / 1024,
                 )
             torch.cuda.reset_peak_memory_stats()
