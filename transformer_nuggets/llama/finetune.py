@@ -43,9 +43,9 @@ class Hyperparameters(transformer_nuggets.llama.train.Hyperparameters):
     lora_dropout: float = 0.05
 
 
-
 @dataclass
 class TrainingConfig(transformer_nuggets.llama.train.TrainingConfig):
+    log_interval: int = 10
     track_max_memory: bool = False
 
 
@@ -82,7 +82,6 @@ def main(
     model.setup_caches(
         hyper_params.micro_batch_size, hyper_params.max_seq_length, training_config.device
     )
-
 
     if rank == 0:
         logging.info("Setting up the dataloaders")
@@ -152,7 +151,6 @@ def fsdp_main(rank, world_size, args):
     dist.destroy_process_group()
 
 
-# copied from https://github.com/pytorch-labs/ao_benchmarks/tree/main/llama
 def train(
     model: Transformer,
     optimizer: torch.optim.Optimizer,
@@ -271,7 +269,6 @@ def train(
             torch.cuda.reset_peak_memory_stats()
 
 
-# copied from https://github.com/pytorch-labs/ao_benchmarks/tree/main/llama
 class Dataset(IterableDataset):
     def __init__(
         self,
@@ -314,7 +311,6 @@ class Dataset(IterableDataset):
             yield x, y
 
 
-# copied from https://github.com/pytorch-labs/ao_benchmarks/tree/main/llama
 def load_datasets(
     hyper_params: Hyperparameters,
     training_config: TrainingConfig,
