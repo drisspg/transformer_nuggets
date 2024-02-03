@@ -3,6 +3,7 @@ Used to train a model from scratch on big dense blocks of text data using causal
 """
 import argparse
 import csv
+import functools
 import logging
 import math
 import os
@@ -19,6 +20,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import transformer_nuggets.llama.train
 import transformer_nuggets.quant.qlora as qlora
+from torch.distributed._composable.fsdp import fully_shard
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 from torch.utils.data import DataLoader, IterableDataset
@@ -47,6 +49,7 @@ class Hyperparameters(transformer_nuggets.llama.train.Hyperparameters):
 class TrainingConfig(transformer_nuggets.llama.train.TrainingConfig):
     log_interval: int = 10
     track_max_memory: bool = False
+    use_fsdp2: bool = False
 
 
 def main(
@@ -96,11 +99,20 @@ def main(
     log_num_params(model)
 
     if world_size > 1:
-        model = FSDP(
-            model,
-            use_orig_params=True,
-            auto_wrap_policy=ModuleWrapPolicy([TransformerBlock]),
-        )
+        if training_config.use_fsdp2:
+            fully_shard_fn = functools.partial(
+                fully_shard,
+                reshard_after_forward=True,
+            )
+            for layer in model.layers:
+                fully_shard_fn(layer)
+            fully_shard_fn(model)
+        else:
+            model = FSDP(
+                model,
+                use_orig_params=True,
+                auto_wrap_policy=ModuleWrapPolicy([TransformerBlock]),
+            )
 
     if training_config.compile:
         model = torch.compile(model)
@@ -130,6 +142,7 @@ def main(
 
 def entrypoint(
     profile: bool = False,
+    use_fsdp2: bool = False,
     rank: int = 0,
     world_size: int = 1,
 ):
@@ -139,6 +152,7 @@ def entrypoint(
     training_config = TrainingConfig(
         profile=profile,
         device=torch.device(f"cuda:{rank}"),
+        use_fsdp2=use_fsdp2,
     )
     main(hyper_params, training_config, rank, world_size)
 
@@ -344,9 +358,10 @@ if __name__ == "__main__":
         default=1,
         help="if specified, runs FSDP with this many GPUs on a single host",
     )
+    parser.add_argument("--use_fsdp2", action=argparse.BooleanOptionalAction, default=False)
     args = parser.parse_args()
     fsdp_num_gpus = args.fsdp_num_gpus
-    inner_args = (args.profile,)
+    inner_args = (args.profile, args.use_fsdp2)
 
     if fsdp_num_gpus is None or fsdp_num_gpus == 1:
         entrypoint(*inner_args)
