@@ -142,6 +142,7 @@ def main(
 def entrypoint(
     profile: bool = False,
     use_fsdp2: bool = False,
+    model_name: str = "7B",
     rank: int = 0,
     world_size: int = 1,
 ):
@@ -154,6 +155,7 @@ def entrypoint(
         profile=profile,
         device=torch.device(f"cuda:{rank}"),
         use_fsdp2=use_fsdp2,
+        model_name=model_name,
     )
     main(hyper_params, training_config, rank, world_size)
 
@@ -281,7 +283,7 @@ def train(
                     # check memory during both init and train
                     memory_trace_path = str(
                         training_config.log_dir
-                        / f"mem_trace_llama_7b_{dtype_str}_rank_{rank}.pickle"
+                        / f"mem_trace_llama_{training_config.model_name}_{dtype_str}_rank_{rank}.pickle"
                     )
                     torch.cuda.memory._dump_snapshot(f"{memory_trace_path}")
                     torch.cuda.memory._record_memory_history(enabled=None)
@@ -364,9 +366,10 @@ if __name__ == "__main__":
         help="if specified, runs FSDP with this many GPUs on a single host",
     )
     parser.add_argument("--use_fsdp2", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument('--model', default="7B")
     args = parser.parse_args()
     fsdp_num_gpus = args.fsdp_num_gpus
-    inner_args = (args.profile, args.use_fsdp2)
+    inner_args = (args.profile, args.use_fsdp2, args.model)
 
     if fsdp_num_gpus is None or fsdp_num_gpus == 1:
         entrypoint(*inner_args)
