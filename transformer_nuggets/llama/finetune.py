@@ -20,7 +20,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import transformer_nuggets.llama.train
 import transformer_nuggets.quant.qlora as qlora
-from torch.distributed._composable.fsdp import fully_shard
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 from torch.utils.data import DataLoader, IterableDataset
@@ -99,6 +98,8 @@ def main(
 
     if world_size > 1:
         if training_config.use_fsdp2:
+            # move import to top when fsdp2 is landed
+            from torch.distributed._composable.fsdp import fully_shard
             fully_shard_fn = functools.partial(
                 fully_shard,
                 reshard_after_forward=True,
