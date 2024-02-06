@@ -100,6 +100,7 @@ def main(
         if training_config.use_fsdp2:
             # move import to top when fsdp2 is landed
             from torch.distributed._composable.fsdp import fully_shard
+
             fully_shard_fn = functools.partial(
                 fully_shard,
                 reshard_after_forward=True,
@@ -367,7 +368,7 @@ if __name__ == "__main__":
         help="if specified, runs FSDP with this many GPUs on a single host",
     )
     parser.add_argument("--use_fsdp2", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument('--model', default="7B")
+    parser.add_argument("--model", default="7B")
     args = parser.parse_args()
     fsdp_num_gpus = args.fsdp_num_gpus
     inner_args = (args.profile, args.use_fsdp2, args.model)
