@@ -34,7 +34,8 @@ dev = [
     "bumpver",
     "pip-tools",
     "pytest",
-    "flake8-pyproject"
+    "flake8==6.1.0",
+    "flake8-pyproject",
 ]
 
 qlora = ['bitsandbytes']

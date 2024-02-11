@@ -7,6 +7,7 @@ from transformer_nuggets.flash import attention, BiasMode, build_alibi_mask
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("bias_choice", [BiasMode.rel_pos, BiasMode.none, BiasMode.alibi])
 @pytest.mark.parametrize("sm_scale", [None, 1])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 def test_op(Z, H, N_CTX, D_HEAD, causal, bias_choice, sm_scale, dtype=torch.float16):
     torch.manual_seed(20)
     q = (
