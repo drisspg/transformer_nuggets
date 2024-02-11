@@ -92,6 +92,7 @@ def test_binning_distribution(embed_dim: int):
 @pytest.mark.parametrize("embed_dim", [256, 4096, 5120, 6656, 8192])
 @pytest.mark.parametrize("compile", [True, False])
 @pytest.mark.parametrize("requires_grad", [True, False])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 def test_autograd_func_to_eager(embed_dim: int, compile: bool, requires_grad: bool):
     torch._dynamo.reset()
     torch.manual_seed(0)
