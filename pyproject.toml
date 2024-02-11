@@ -20,20 +20,22 @@ classifiers = [
 dependencies = [
     "torch >= 2.1.1",
     "scipy >= 1.9.1",
-    "tqdm",
-    "tabulate"
+    "tqdm >= 4.66",
+    "tabulate >= 0.8"
 ]
 
 [project.optional-dependencies]
 dev = [
     "black==23.3.0",
     "usort==1.0.6",
-    "ufmt==2.1.0",
-    "libcst==1.0.1",
+    "ufmt==2.3.0",
+    "libcst==1.1.0",
     "pre-commit==3.6.0",
     "bumpver",
     "pip-tools",
-    "pytest"
+    "pytest",
+    "flake8==6.1.0",
+    "flake8-pyproject",
 ]
 
 qlora = ['bitsandbytes']
@@ -44,6 +46,14 @@ llama = [
     "datasets==2.15.0",
     "fire==0.5.0",
     "float8_experimental",
+]
+
+# ---------- TOOL CONFIGURATIONS ------------
+[tool.flake8]
+max-line-length = 99
+ignore = ['E231', 'E241', 'E501', 'C408', 'E261', 'E731', 'G004', 'W503', 'E203']
+per-file-ignores = [
+    '__init__.py:F401',
 ]
 
 [tool.usort]
