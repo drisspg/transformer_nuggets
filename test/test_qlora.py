@@ -6,7 +6,8 @@ import torch
 import torch.nn.functional as F
 
 import transformer_nuggets.quant.qlora as qlora
-from transformer_nuggets.quant import linear_nf4, NF4Tensor
+from transformer_nuggets.quant import linear_nf4
+from transformer_nuggets.quant.nf4_tensor import NF4Tensor
 from transformer_nuggets.quant.qlora_debug import NF4TensorDebug
 
 bnb_available = False
@@ -91,8 +92,8 @@ def test_binning_distribution(embed_dim: int):
 @pytest.mark.parametrize("embed_dim", [256, 4096, 5120, 6656, 8192])
 @pytest.mark.parametrize("compile", [True, False])
 @pytest.mark.parametrize("requires_grad", [True, False])
-@pytest.mark.xfail(reason="TORCH COMPILE No longer works here")
 def test_autograd_func_to_eager(embed_dim: int, compile: bool, requires_grad: bool):
+    torch._dynamo.reset()
     torch.manual_seed(0)
     device = "cuda"
     input_weight = qlora.build_input_weight(embed_dim, device)
