@@ -1,6 +1,7 @@
 import itertools
-from dataclasses import dataclass
 
+from contextlib import suppress
+from dataclasses import dataclass
 from typing import List
 
 import torch
@@ -80,10 +81,8 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
         high_precision_tensor, eager_abs_max, scale, config.low_precision_dtype, config.saturated
     ).to(config.high_precision_dtype)
     eager_out_hp = eager_out.to(config.high_precision_dtype)
-    try:
+    with suppress(AssertionError):
         torch.testing.assert_close(nuggets_out_hp, eager_out_hp, rtol=1e-3, atol=1e-3)
-    except AssertionError as e:
-        pass
         # investigate why we are seeing small deviations
         # Mismatched elements: 62577 / 2097152 (3.0%)
         # Greatest absolute difference: 2.0 at index (11111,) (up to 0.001 allowed)

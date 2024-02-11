@@ -71,11 +71,11 @@ def test_binning_distribution(embed_dim: int):
     bnb_first_elements = (bnb_data >> 4).to(torch.long)
     bnb_second_elements = (bnb_data & 0b1111).to(torch.long)
 
-    bnb_first_counts = torch.unique(bnb_first_elements, return_counts=True)[1]
-    bnb_second_counts = torch.unique(bnb_second_elements, return_counts=True)[1]
+    bnb_first_counts = torch.unique(bnb_first_elements, return_counts=True)[1]  # noqa: F841
+    bnb_second_counts = torch.unique(bnb_second_elements, return_counts=True)[1]  # noqa: F841
 
-    first_counts = torch.unique(first_elements, return_counts=True)[1]
-    second_counts = torch.unique(second_elements, return_counts=True)[1]
+    first_counts = torch.unique(first_elements, return_counts=True)[1]  # noqa: F841
+    second_counts = torch.unique(second_elements, return_counts=True)[1]  # noqa: F841
 
     # Why are these normally distributed and not uniform?
 
