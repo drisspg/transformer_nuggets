@@ -1,13 +1,13 @@
 import argparse
 import csv
-import gc
 import itertools
+
+import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 import transformer_nuggets as nugs
@@ -16,12 +16,16 @@ from tqdm import tqdm
 from transformer_nuggets.quant import NF4Tensor
 
 bnb_available = False
+
+
+logging.getLogger(__name__).addHandler(logging.NullHandler())
+
 try:
-    import bitsandbytes as bnb
+    import bitsandbytes as bnb  # noqa: F401
 
     bnb_available = True
 except ImportError:
-    raise (
+    logging.warning(
         "Could not import bitsandbytes, make sure you have installed it `pip install bitsandbytes` "
     )
 
@@ -137,7 +141,7 @@ def main(output_path: Optional[Path], profile_path: Optional[Path], dynamic: boo
         results = []
         for experiment_config in tqdm(gen_configs()):
             # Since we are changing between dynamic and not
-            import torch._dynamo
+            import torch._dynamo  # noqa: F402
 
             torch._dynamo.reset()
             experiment = experiment_types[experiment_config.op]

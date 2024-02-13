@@ -21,6 +21,7 @@ except ImportError:
 @pytest.mark.parametrize(
     "inpt_size, block_size, scaler_block_size", [(16384, 64, 256), (256, 16, 16), (1024, 32, 32)]
 )
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 def test_reconstruction(inpt_size: int, block_size: int, scaler_block_size: int):
     torch.manual_seed(0)
     device = "cuda"
@@ -37,9 +38,13 @@ def test_reconstruction(inpt_size: int, block_size: int, scaler_block_size: int)
 
 @unittest.skipIf(not bnb_available, "Bitsandbytes not available")
 @pytest.mark.parametrize("embed_dim", [256, 4096, 5120, 6656, 8192])
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not bnb_available,
+    reason="CUDA is not available or bitsandbytes not available",
+)
 def test_reconstruction_qlora_vs_bnb(embed_dim: int):
     torch.manual_seed(0)
-    device = "cuda:0"
+    device = "cuda"
     input_weight = qlora.build_input_weight(embed_dim, device)
     nugs_qlora = NF4Tensor.from_tensor(input_weight)
     bnb_linear = qlora.build_bitsandbytes_linear(input_weight, device)
@@ -56,10 +61,13 @@ def test_reconstruction_qlora_vs_bnb(embed_dim: int):
     assert (nugs_diff - bnb_diff).abs() < 2e-1
 
 
-@unittest.skipIf(not bnb_available, "Bitsandbytes not available")
 @pytest.mark.parametrize("embed_dim", [256, 4096, 5120, 6656, 8192])
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not bnb_available,
+    reason="CUDA is not available or bitsandbytes not available",
+)
 def test_binning_distribution(embed_dim: int):
-    device = "cuda:0"
+    device = "cuda"
     input_weight = qlora.build_input_weight(embed_dim, device)
     nugs_qlora = NF4Tensor.from_tensor(input_weight)
     first_elements = (nugs_qlora.quantized_data >> 4).to(torch.long)
@@ -71,11 +79,11 @@ def test_binning_distribution(embed_dim: int):
     bnb_first_elements = (bnb_data >> 4).to(torch.long)
     bnb_second_elements = (bnb_data & 0b1111).to(torch.long)
 
-    bnb_first_counts = torch.unique(bnb_first_elements, return_counts=True)[1]
-    bnb_second_counts = torch.unique(bnb_second_elements, return_counts=True)[1]
+    bnb_first_counts = torch.unique(bnb_first_elements, return_counts=True)[1]  # noqa: F841
+    bnb_second_counts = torch.unique(bnb_second_elements, return_counts=True)[1]  # noqa: F841
 
-    first_counts = torch.unique(first_elements, return_counts=True)[1]
-    second_counts = torch.unique(second_elements, return_counts=True)[1]
+    first_counts = torch.unique(first_elements, return_counts=True)[1]  # noqa: F841
+    second_counts = torch.unique(second_elements, return_counts=True)[1]  # noqa: F841
 
     # Why are these normally distributed and not uniform?
 
@@ -83,9 +91,10 @@ def test_binning_distribution(embed_dim: int):
 @pytest.mark.parametrize("embed_dim", [256, 4096, 5120, 6656, 8192])
 @pytest.mark.parametrize("compile", [True, False])
 @pytest.mark.parametrize("requires_grad", [True, False])
+@pytest.mark.xfail(reason="TORCH COMPILE No longer works here")
 def test_autograd_func_to_eager(embed_dim: int, compile: bool, requires_grad: bool):
     torch.manual_seed(0)
-    device = "cuda:0"
+    device = "cuda"
     input_weight = qlora.build_input_weight(embed_dim, device)
     sample_input = qlora.get_sample_inputs(8, 128, embed_dim, device, requires_grad=requires_grad)
     nugs_qlora = NF4Tensor.from_tensor(input_weight)
@@ -99,9 +108,12 @@ def test_autograd_func_to_eager(embed_dim: int, compile: bool, requires_grad: bo
         out.sum().backward()
 
 
-@unittest.skipIf(not bnb_available, "Bitsandbytes not available")
 @pytest.mark.parametrize("embed_dim", [256, 4096, 5120, 6656, 8192])
 @pytest.mark.parametrize("compile", [True, False])
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not bnb_available,
+    reason="CUDA is not available or bitsandbytes not available",
+)
 def test_bitsandbytes_linear_parity(embed_dim, compile):
     device = torch.device("cuda:0")
     input_weight = qlora.build_input_weight(embed_dim, device)
@@ -127,9 +139,12 @@ def test_bitsandbytes_linear_parity(embed_dim, compile):
     assert bnb_difference.max() < 0.5 * embed_dim
 
 
-@unittest.skipIf(not bnb_available, "Bitsandbytes not available")
 @pytest.mark.parametrize("embed_dim", [256, 4096, 5120, 6656, 8192])
 @pytest.mark.parametrize("compile", [True, False])
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not bnb_available,
+    reason="CUDA is not available or bitsandbytes not available",
+)
 def test_bitsandbytes_mlp_parity(embed_dim, compile):
     device = torch.device("cuda:0")
     weights = qlora.get_mlp_weights(embed_dim, device)
@@ -159,7 +174,9 @@ def test_bitsandbytes_mlp_parity(embed_dim, compile):
 @pytest.mark.parametrize("r", [1, 2])
 @pytest.mark.parametrize("dropout", [0.0, 0.2])
 @pytest.mark.parametrize("run_backward", [True, False])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 def test_qlora_linear(embed_dim: int, compile: bool, r: int, dropout: float, run_backward: bool):
+    torch._dynamo.reset()
     torch.manual_seed(0)
     device = "cuda:0"
     # Analog for replacing first linear in MLP

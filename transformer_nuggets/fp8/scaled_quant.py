@@ -90,5 +90,5 @@ def eager_scaled_quant(
         out = torch.where(
             out < -1 * torch.finfo(fp8_dtype).max, -1 * torch.finfo(fp8_dtype).max, out
         )
-    abs_max = torch.max(torch.abs(out))
+    _ = torch.max(torch.abs(out))
     return out.to(fp8_dtype)

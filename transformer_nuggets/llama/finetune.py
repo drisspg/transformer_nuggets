@@ -5,14 +5,10 @@ import argparse
 import csv
 import functools
 import logging
-import math
 import os
 import random
-import time
-from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
 
 import numpy as np
 import torch
@@ -23,7 +19,6 @@ import transformer_nuggets.quant.qlora as qlora
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 from torch.utils.data import DataLoader, IterableDataset
-from tqdm import tqdm
 from transformer_nuggets.llama.model import ModelArgs, Transformer, TransformerBlock
 from transformer_nuggets.llama.train import (
     calculate_loss,
@@ -241,15 +236,17 @@ def train(
             # TODO(future): fix this condition, eval currently only happens
             # if eval_interval and batch_size are multiples of each other
             if not is_accumulating and step_count % training_config.eval_interval == 0:
-                t0 = time.time()
-                val_loss = validate(
-                    model, val_data, val_loss_file, training_config, step_count, rank, world_size
-                )
-                t1 = time.time() - t0
-                if rank == 0:
-                    logging.info(
-                        f"step {iter_num}: val loss {val_loss:.4f}, val time: {t1 * 1000:.2f}ms"
-                    )
+                pass
+                # TODO: add validation loop
+                # t0 = time.time()
+                # val_loss = validate(
+                #     model, val_data, val_loss_file, training_config, step_count, rank, world_size
+                # )
+                # t1 = time.time() - t0
+                # if rank == 0:
+                #     logging.info(
+                #         f"step {iter_num}: val loss {val_loss:.4f}, val time: {t1 * 1000:.2f}ms"
+                #     )
 
             if not is_accumulating and step_count % training_config.save_interval == 0:
                 checkpoint_path = training_config.out_dir / f"iter-{iter_num:06d}-ckpt.pth"

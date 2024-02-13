@@ -5,7 +5,7 @@ from functools import partial
 import torch
 import torch.overrides
 from torch.utils._python_dispatch import TorchDispatchMode
-from torch.utils._pytree import tree_flatten, tree_map, tree_map_only
+from torch.utils._pytree import tree_map, tree_map_only
 from torch.utils.weak import WeakIdRef
 
 dtype_abbrs = {

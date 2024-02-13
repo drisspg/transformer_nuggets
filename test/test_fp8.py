@@ -5,6 +5,7 @@ from transformer_nuggets.fp8.scaled_quant import eager_scaled_quant, scaled_quan
 
 
 @pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 def test_basic_quant(fp8_dtype):
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
@@ -17,6 +18,7 @@ def test_basic_quant(fp8_dtype):
 
 
 @pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 def test_saturated(fp8_dtype):
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
