@@ -208,7 +208,6 @@ def main(output_path: Optional[Path], profile_path: Optional[Path], dynamic: boo
 if __name__ == "__main__":
     """Sample usage:
     # Running sweep
-    python benchmarks/qlora.py -o benchmarks/data/qlora_sweep.csv
-    python benchmarks/qlora.py -p benchmarks/data/4096_8_128_qlora.json
+    python benchmarks/qlora.py false --output_path benchmarks/data/qlora_sweep.csv
     """
     CLI(main)
