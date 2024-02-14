@@ -36,6 +36,8 @@ dev = [
     "pytest",
     "flake8==6.1.0",
     "flake8-pyproject",
+    "jsonargparse",
+    "docstring-parser"
 ]
 
 qlora = ['bitsandbytes']
