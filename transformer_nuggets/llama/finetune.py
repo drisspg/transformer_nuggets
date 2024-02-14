@@ -2,11 +2,11 @@
 Used to train a model from scratch on big dense blocks of text data using causal attention.
 """
 import argparse
-import csv
 import functools
 import logging
 import os
 import random
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +19,7 @@ import transformer_nuggets.quant.qlora as qlora
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 from torch.utils.data import DataLoader, IterableDataset
+from tqdm import tqdm
 from transformer_nuggets.llama.model import ModelArgs, Transformer, TransformerBlock
 from transformer_nuggets.llama.train import (
     calculate_loss,
