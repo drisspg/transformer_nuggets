@@ -2,9 +2,11 @@
 Used to train a model from scratch on big dense blocks of text data using causal attention.
 """
 import argparse
+import functools
 import logging
 import os
 import random
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,11 +19,11 @@ import transformer_nuggets.quant.qlora as qlora
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 from torch.utils.data import DataLoader, IterableDataset
+from tqdm import tqdm
 from transformer_nuggets.llama.model import ModelArgs, Transformer, TransformerBlock
 from transformer_nuggets.llama.train import (
     calculate_loss,
     get_lr,
-    get_profile_context,
     log_num_params,
     write_loss_to_file,
 )
@@ -41,6 +43,7 @@ class Hyperparameters(transformer_nuggets.llama.train.Hyperparameters):
 class TrainingConfig(transformer_nuggets.llama.train.TrainingConfig):
     log_interval: int = 10
     track_max_memory: bool = False
+    use_fsdp2: bool = False
 
 
 def main(
@@ -90,11 +93,23 @@ def main(
     log_num_params(model)
 
     if world_size > 1:
-        model = FSDP(
-            model,
-            use_orig_params=True,
-            auto_wrap_policy=ModuleWrapPolicy([TransformerBlock]),
-        )
+        if training_config.use_fsdp2:
+            # move import to top when fsdp2 is landed
+            from torch.distributed._composable.fsdp import fully_shard
+
+            fully_shard_fn = functools.partial(
+                fully_shard,
+                reshard_after_forward=True,
+            )
+            for layer in model.layers:
+                fully_shard_fn(layer)
+            fully_shard_fn(model)
+        else:
+            model = FSDP(
+                model,
+                use_orig_params=True,
+                auto_wrap_policy=ModuleWrapPolicy([TransformerBlock]),
+            )
 
     if training_config.compile:
         model = torch.compile(model)
@@ -124,15 +139,21 @@ def main(
 
 def entrypoint(
     profile: bool = False,
+    use_fsdp2: bool = False,
+    model_name: str = "7B",
     rank: int = 0,
     world_size: int = 1,
 ):
+    if profile:
+        torch.cuda.memory._record_memory_history(max_entries=100000)
     batch_size = int(128 / world_size)
     assert isinstance(profile, bool), "profile must be bool"
     hyper_params = Hyperparameters(batch_size=batch_size)
     training_config = TrainingConfig(
         profile=profile,
         device=torch.device(f"cuda:{rank}"),
+        use_fsdp2=use_fsdp2,
+        model_name=model_name,
     )
     main(hyper_params, training_config, rank, world_size)
 
@@ -159,7 +180,7 @@ def train(
     step_count = 0
 
     model.train()
-    profile_context = get_profile_context(hyper_params, training_config)
+    profile_context = get_profile_context(hyper_params, training_config, rank)
     train_iter = iter(train_data)
 
     dtype_str = "bf16"
@@ -247,22 +268,26 @@ def train(
                 write_loss_to_file(train_loss_file, step_count, loss_val)
 
                 if rank == 0:
+                    mem_stats = torch.cuda.memory_stats()
+                    peak_active = mem_stats["active_bytes.all.peak"] / (1024 * 1024)
+                    peak_reserved = mem_stats["reserved_bytes.all.peak"] / (1024 * 1024)
                     logging.info(
-                        f"iter={iter_num} max_iters={hyper_params.max_iters} loss={loss_val:.4f}"
+                        f"iter={iter_num} max_iters={hyper_params.max_iters} loss={loss_val:.4f} Peak Active Memory: {peak_active} MB, Peak Reserve Memory: {peak_reserved} MB"
                     )
 
-            if training_config.profile and iter_num < 103:
-                # We want to profile iters 100-102 of the model training
-                p.step()
-
-            if training_config.track_max_memory and rank == 0:
-                logging.info(
-                    "iter_num",
-                    iter_num,
-                    "mem usage GiB",
-                    float(torch.cuda.max_memory_allocated()) / 1024 / 1024 / 1024,
-                )
-            torch.cuda.reset_peak_memory_stats()
+            if training_config.profile:
+                if iter_num < 103:
+                    # dump profile traces in iters 100-102
+                    p.step()
+                if iter_num == 1:
+                    # check memory during both init and train
+                    memory_trace_path = str(
+                        training_config.log_dir
+                        / f"mem_trace_llama_{training_config.model_name}_{dtype_str}_rank_{rank}.pickle"
+                    )
+                    torch.cuda.memory._dump_snapshot(f"{memory_trace_path}")
+                    torch.cuda.memory._record_memory_history(enabled=None)
+                    logging.info(f"Wrote memory traces to: {memory_trace_path}")
 
 
 class Dataset(IterableDataset):
@@ -340,12 +365,85 @@ if __name__ == "__main__":
         default=1,
         help="if specified, runs FSDP with this many GPUs on a single host",
     )
+    parser.add_argument("--use_fsdp2", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--model", default="7B")
     args = parser.parse_args()
     fsdp_num_gpus = args.fsdp_num_gpus
-    inner_args = (args.profile,)
+    inner_args = (args.profile, args.use_fsdp2, args.model)
 
     if fsdp_num_gpus is None or fsdp_num_gpus == 1:
         entrypoint(*inner_args)
     else:
         assert fsdp_num_gpus <= torch.cuda.device_count()
         mp.spawn(fsdp_main, args=(fsdp_num_gpus, inner_args), nprocs=fsdp_num_gpus, join=True)
+
+
+@torch.no_grad()
+@torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+def validate(
+    model: Transformer,
+    val_data: DataLoader,
+    loss_file: Path,
+    training_config: TrainingConfig,
+    training_iter: int,
+    rank: int,
+    world_size: int,
+) -> torch.Tensor:
+    if rank == 0:
+        logging.info("Validating ...")
+    model.eval()
+    val_iter = iter(val_data)
+    losses = torch.zeros(training_config.eval_iters).to(rank)
+    iterator = range(training_config.eval_iters)
+    if rank == 0:
+        iterator = tqdm(iterator)
+    for k in iterator:
+        input_ids, targets = next(val_iter)
+        input_ids = input_ids.pin_memory().to(training_config.device)
+        targets = targets.pin_memory().to(training_config.device)
+        logits = model(input_ids)
+        loss = calculate_loss(logits, targets)
+        losses[k] = loss
+
+    if world_size > 1:
+        dist.all_reduce(losses, op=dist.ReduceOp.SUM)
+        losses = losses / world_size
+
+    val_loss = losses.mean()
+    model.train()
+    write_loss_to_file(loss_file, training_iter, loss.item())
+    return val_loss.item()
+
+
+def get_profile_context(
+    hyper_params: Hyperparameters, train_config: TrainingConfig, rank: int = 0
+):
+    """Returns a context manager that can be used to profile the model."""
+
+    def trace_handler(prof):
+        fp8_linear_type = hyper_params.fp8_linear_type
+
+        dtype_str = fp8_linear_type if fp8_linear_type else "bf16"
+        output_str = str(train_config.log_dir / f"trace_llama_7b_hf_{dtype_str}_rank_{rank}.json")
+        prof.export_chrome_trace(output_str)
+        logging.info(f"Wrote profile to: {output_str}")
+
+    if train_config.profile:
+        context = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(wait=100, warmup=1, active=2, repeat=1),
+            record_shapes=True,
+            with_stack=True,
+            on_trace_ready=trace_handler,
+            with_flops=True,
+            profile_memory=True,
+            experimental_config=torch.profiler._ExperimentalConfig(
+                enable_cuda_sync_events=True,
+            ),
+        )
+        return context
+    else:
+        return nullcontext()
