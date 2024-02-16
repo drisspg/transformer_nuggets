@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
+from transformer_nuggets.quant.deqaunt_kernel import dequant_nf4_tensor
 from transformer_nuggets.quant.nf4_tensor import NF4Tensor
 
 logging.basicConfig(level=logging.INFO)
@@ -18,12 +19,12 @@ class LinearNF4(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input: torch.Tensor, weight: NF4Tensor):
         ctx.nf4_weight = weight
-        return F.linear(input, weight.get_original_weight())
+        return F.linear(input, dequant_nf4_tensor(weight))
 
     @staticmethod
     def backward(ctx, grad_output):
         weight: NF4Tensor = ctx.nf4_weight
-        return grad_output @ weight.get_original_weight(), None
+        return grad_output @ dequant_nf4_tensor(weight), None
 
 
 def linear_nf4(input: torch.Tensor, weight: NF4Tensor) -> torch.Tensor:

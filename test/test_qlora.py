@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 import transformer_nuggets.quant.qlora as qlora
 from transformer_nuggets.quant import linear_nf4
+from transformer_nuggets.quant.deqaunt_kernel import dequant_nf4_tensor
 from transformer_nuggets.quant.nf4_tensor import NF4Tensor
 from transformer_nuggets.quant.qlora_debug import NF4TensorDebug
 
@@ -35,6 +36,24 @@ def test_reconstruction(inpt_size: int, block_size: int, scaler_block_size: int)
     diff = (nugs_qlora.get_original_weight() - input_weight).abs()
 
     assert abs(debug_diff.max() - diff.max()) < 1e-2
+
+
+@pytest.mark.parametrize(
+    "inpt_size, block_size, scaler_block_size", [(16384, 64, 256), (256, 16, 16), (1024, 32, 32)]
+)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_reconstruction_triton_kernel(inpt_size: int, block_size: int, scaler_block_size: int):
+    torch.manual_seed(0)
+    device = "cuda"
+    input_weight = torch.empty(1, inpt_size, device=device, dtype=torch.bfloat16)
+    input_weight = input_weight.normal_(0, 1)
+
+    nugs_qlora = NF4Tensor.from_tensor(input_weight, block_size, scaler_block_size)
+    pytorch_diff = (nugs_qlora.get_original_weight() - input_weight).abs()
+    triton_diff = (dequant_nf4_tensor(nugs_qlora) - input_weight).abs()
+
+    assert abs(pytorch_diff.max() - triton_diff.max()) < 1e-2
+    assert (pytorch_diff - triton_diff).abs().max() < 1e-2
 
 
 @unittest.skipIf(not bnb_available, "Bitsandbytes not available")

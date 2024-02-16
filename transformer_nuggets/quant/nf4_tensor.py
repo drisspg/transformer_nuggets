@@ -214,6 +214,7 @@ class NF4Tensor(torch.Tensor):
         scaler_absmax = scaler_absmax.unsqueeze(-1).expand(n_scaler_blocks, scaler_block_size)
 
         quantization_factor = 256 / (2 * scaler_absmax)
+        # Length equal to weight numel // block_size
         quantized_scaler_blocks = scaler_blocks * quantization_factor
         quantized_scaler_blocks = quantized_scaler_blocks.round()
         quantized_scaler_blocks = quantized_scaler_blocks.clamp(-128, 127)
@@ -282,6 +283,9 @@ class NF4Tensor(torch.Tensor):
         quantized_blocks = NF4Tensor.quantize_tensor_nearest(scaled_blocks.flatten(), nf4)
 
         # Combine the quantized elements into uint8 values
+        # This lays out two consecutive elements in the same byte
+        # [0, 1, 2, 3] -> [01, 23], the first element is the most significant
+        # The size of combined blocks will be half the size of the original tensor
         combined_blocks = quantized_blocks[::2] << 4 | quantized_blocks[1::2]
 
         return combined_blocks.to(torch.uint8)
@@ -298,7 +302,7 @@ class NF4Tensor(torch.Tensor):
         dequantized_second = self.dequantize(second_elements, self.nf4)
 
         # Build up matrix of scalers repeated for each element in the block
-        # Since first and second elements make up a full block, so
+        # Since first and second elements make up a full block
         # we expand out to half the size of the full block
         scalers = self.dequantize_scalers(
             self.quantized_scalers, self.quantization_factor, self.scaler_block_size
