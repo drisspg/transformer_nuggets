@@ -19,6 +19,22 @@ class LinearNF4(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input: torch.Tensor, weight: NF4Tensor):
         ctx.nf4_weight = weight
+        return F.linear(input, weight.get_original_weight())
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        weight: NF4Tensor = ctx.nf4_weight
+        return grad_output @ weight.get_original_weight(), None
+
+
+def linear_nf4(input: torch.Tensor, weight: NF4Tensor) -> torch.Tensor:
+    return LinearNF4.apply(input, weight)
+
+
+class LinearNF4Triton(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input: torch.Tensor, weight: NF4Tensor):
+        ctx.nf4_weight = weight
         return F.linear(input, dequant_nf4_tensor(weight))
 
     @staticmethod
@@ -27,8 +43,8 @@ class LinearNF4(torch.autograd.Function):
         return grad_output @ dequant_nf4_tensor(weight), None
 
 
-def linear_nf4(input: torch.Tensor, weight: NF4Tensor) -> torch.Tensor:
-    return LinearNF4.apply(input, weight)
+def linear_nf4_trtion(input: torch.Tensor, weight: NF4Tensor) -> torch.Tensor:
+    return LinearNF4Triton.apply(input, weight)
 
 
 def build_input_weight(embed_dim: int, device: torch.device):
@@ -105,6 +121,19 @@ class NF4MLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.silu(linear_nf4(x, self.w1)) * linear_nf4(x, self.w2)
         x = linear_nf4(x, self.w3)
+        return x
+
+
+class NF4MLPTriton(nn.Module):
+    def __init__(self, weight1, weight2, weight3) -> None:
+        super().__init__()
+        self.w1 = NF4Tensor.from_tensor(weight1)
+        self.w2 = NF4Tensor.from_tensor(weight2)
+        self.w3 = NF4Tensor.from_tensor(weight3)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.silu(linear_nf4_trtion(x, self.w1)) * linear_nf4_trtion(x, self.w2)
+        x = linear_nf4_trtion(x, self.w3)
         return x
 
 
