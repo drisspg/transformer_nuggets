@@ -9,7 +9,6 @@ from transformer_nuggets.quant.nf4_tensor import NF4Tensor
 def dequantize(inputs, nf4_lut):
     """Dequantizes the nf4 data to bfloat16"""
     return tl.load(nf4_lut + inputs)
-    # return nf4_lut[inputs]
 
 
 @triton.jit

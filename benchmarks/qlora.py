@@ -47,6 +47,7 @@ class ExperimentResult:
     eager_qlora: float
     compiled_qlora: float
     bnb_time: float
+    triton_eager_time: float
 
 
 def linear_experiment(config: ExperimentConfig) -> ExperimentResult:
@@ -67,6 +68,7 @@ def linear_experiment(config: ExperimentConfig) -> ExperimentResult:
         F.linear(sample_input, input_weight)
         qlora.linear_nf4(sample_input, qlora_weight)
         compiled_qlora_linear(sample_input, qlora_weight)
+        qlora.linear_nf4_trtion(sample_input, qlora_weight)
         if bnb_available:
             bnb_linear(sample_input)
 
@@ -79,6 +81,10 @@ def linear_experiment(config: ExperimentConfig) -> ExperimentResult:
     compiled_qlora_linear_time = nugs.utils.benchmark_torch_function_in_microseconds(
         compiled_qlora_linear, sample_input, qlora_weight
     )
+    qlora_triton_linear_time = nugs.utils.benchmark_torch_function_in_microseconds(
+        qlora.linear_nf4_trtion, sample_input, qlora_weight
+    )
+
     if bnb_available:
         bnb_linear_time = nugs.utils.benchmark_torch_function_in_microseconds(
             bnb_linear, sample_input
@@ -87,7 +93,11 @@ def linear_experiment(config: ExperimentConfig) -> ExperimentResult:
         bnb_linear_time = -1.0
 
     return ExperimentResult(
-        linear_time, qlora_linear_time, compiled_qlora_linear_time, bnb_linear_time
+        linear_time,
+        qlora_linear_time,
+        compiled_qlora_linear_time,
+        bnb_linear_time,
+        qlora_triton_linear_time,
     )
 
 
@@ -101,6 +111,7 @@ def mlp_experiment(config: ExperimentConfig) -> ExperimentResult:
     )
     mlp = qlora.MLP(*weights)
     nf4_mlp = qlora.NF4MLP(*weights)
+    nf4_mlp_triton = qlora.NF4MLPTriton(*weights)
     compiled_qlora_mlp = torch.compile(nf4_mlp, fullgraph=True, dynamic=config.dynamic)
     if bnb_available:
         bnb_mlp = qlora.BnbQloraMLP(*weights, config.device)
@@ -110,6 +121,7 @@ def mlp_experiment(config: ExperimentConfig) -> ExperimentResult:
         mlp(sample_input)
         nf4_mlp(sample_input)
         compiled_qlora_mlp(sample_input)
+        nf4_mlp_triton(sample_input)
         if bnb_available:
             bnb_mlp(sample_input)
 
@@ -118,12 +130,17 @@ def mlp_experiment(config: ExperimentConfig) -> ExperimentResult:
     compiled_qlora_mlp_time = nugs.utils.benchmark_torch_function_in_microseconds(
         compiled_qlora_mlp, sample_input
     )
+    qlora_mlp_triton_time = nugs.utils.benchmark_torch_function_in_microseconds(
+        nf4_mlp_triton, sample_input
+    )
     if bnb_available:
         bnb_mlp_time = nugs.utils.benchmark_torch_function_in_microseconds(bnb_mlp, sample_input)
     else:
         bnb_mlp_time = -1.0
 
-    return ExperimentResult(mlp_time, qlora_mlp_time, compiled_qlora_mlp_time, bnb_mlp_time)
+    return ExperimentResult(
+        mlp_time, qlora_mlp_time, compiled_qlora_mlp_time, bnb_mlp_time, qlora_mlp_triton_time
+    )
 
 
 experiment_types = {
@@ -137,7 +154,7 @@ def gen_configs() -> List[ExperimentConfig]:
     # LLama 7b, 13b, 33b, 65b
     embed_dims = [4096, 5120, 6656, 8192]
     bszs = [8, 16, 32]
-    seqlens = [128, 256, 512]
+    seqlens = [256, 512]
     devices = [torch.device("cuda:0")]
     types = ["linear", "mlp"]
     # NotImplementedError: could not find kernel for aten.__rshift__.Scalar at dispatch key DispatchKey.Meta with dynamic shapes
