@@ -1,5 +1,9 @@
 """
-Used to train a model from scratch on big dense blocks of text data using causal attention.
+# full finetuning on single gpu without FSDP
+python transformer_nuggets/llama/finetune.py --profile --model 7B --enable_ac --full_finetune --optim_in_bwd
+
+# qlora on 2 gpus with FSDP
+python transformer_nuggets/llama/finetune.py --profile --model 7B --fsdp_num_gpus 2 --use_fsdp2 --enable_ac --cpu_offload
 """
 import argparse
 import functools
@@ -9,6 +13,8 @@ import random
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+from torch.distributed._composable import checkpoint
+from torch.distributed.optim import _apply_optimizer_in_backward
 
 import numpy as np
 import torch
@@ -44,6 +50,45 @@ class TrainingConfig(transformer_nuggets.llama.train.TrainingConfig):
     log_interval: int = 10
     track_max_memory: bool = False
     use_fsdp2: bool = False
+    enable_ac: bool = False
+    qlora_debug: bool = False
+    full_finetune: bool = False
+    optim_in_bwd: bool = False
+    cpu_offload: bool = False
+
+
+def get_profile_context(
+    hyper_params: Hyperparameters, train_config: TrainingConfig, rank: int = 0
+):
+    """Returns a context manager that can be used to profile the model."""
+
+    def trace_handler(prof):
+        fp8_linear_type = hyper_params.fp8_linear_type
+
+        dtype_str = fp8_linear_type if fp8_linear_type else "bf16"
+        output_str = str(train_config.log_dir / f"trace_llama_7b_hf_{dtype_str}_rank_{rank}.json")
+        prof.export_chrome_trace(output_str)
+        logging.info(f"Wrote profile to: {output_str}")
+
+    if train_config.profile:
+        context = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(wait=100, warmup=1, active=2, repeat=1),
+            record_shapes=True,
+            with_stack=True,
+            on_trace_ready=trace_handler,
+            with_flops=True,
+            profile_memory=True,
+            experimental_config=torch.profiler._ExperimentalConfig(
+                enable_cuda_sync_events=True,
+            ),
+        )
+        return context
+    else:
+        return nullcontext()
 
 
 def main(
@@ -67,7 +112,8 @@ def main(
     if rank == 0:
         logging.info(f"Initializing model: {training_config.model_name}")
     with training_config.device:
-        model = Transformer(model_args).to(torch.bfloat16)
+        torch.set_default_dtype(torch.bfloat16)
+        model = Transformer(model_args)
         model.init_parameters()
 
         qlora_config = qlora.QloraConfig(
@@ -75,7 +121,11 @@ def main(
             hyper_params.lora_alpha,
             hyper_params.lora_dropout,
         )
-        qlora.swap_for_qlora(model, qlora_config, torch.bfloat16)
+
+        if training_config.qlora_debug:
+            qlora.swap_for_qlora_debug(model, qlora_config, torch.bfloat16)
+        elif not training_config.full_finetune:
+            qlora.swap_for_qlora(model, qlora_config, torch.bfloat16)
     model.setup_caches(
         hyper_params.micro_batch_size, hyper_params.max_seq_length, training_config.device
     )
@@ -92,18 +142,23 @@ def main(
 
     log_num_params(model)
 
+    if training_config.enable_ac:
+        for layer in model.layers:
+            checkpoint(layer)
+
     if world_size > 1:
         if training_config.use_fsdp2:
             # move import to top when fsdp2 is landed
-            from torch.distributed._composable.fsdp import fully_shard
+            from torch.distributed._composable.fsdp import fully_shard, OffloadPolicy
 
             fully_shard_fn = functools.partial(
                 fully_shard,
                 reshard_after_forward=True,
             )
+            offload_policy = OffloadPolicy("cpu" if training_config.cpu_offload else None)
             for layer in model.layers:
-                fully_shard_fn(layer)
-            fully_shard_fn(model)
+                fully_shard_fn(layer, offload_policy=offload_policy)
+            fully_shard_fn(model, offload_policy=offload_policy)
         else:
             model = FSDP(
                 model,
@@ -111,19 +166,25 @@ def main(
                 auto_wrap_policy=ModuleWrapPolicy([TransformerBlock]),
             )
 
+    torch.cuda.reset_peak_memory_stats()
+
     if training_config.compile:
         model = torch.compile(model)
 
     if rank == 0:
         logging.info(model)
 
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=hyper_params.learning_rate,
-        weight_decay=hyper_params.weight_decay,
-        betas=(hyper_params.beta1, hyper_params.beta2),
-        foreach=hyper_params.foreach_optimizer,
-    )
+    if training_config.optim_in_bwd:
+        optimizer = None
+        _apply_optimizer_in_backward(optimizer_class=torch.optim.SGD, params=[p for p in model.parameters() if p.requires_grad], optimizer_kwargs={"lr": 2e-5})
+    else:
+        optimizer = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=hyper_params.learning_rate,
+            weight_decay=hyper_params.weight_decay,
+            betas=(hyper_params.beta1, hyper_params.beta2),
+            foreach=hyper_params.foreach_optimizer,
+        )
 
     train(
         model,
@@ -141,6 +202,11 @@ def entrypoint(
     profile: bool = False,
     use_fsdp2: bool = False,
     model_name: str = "7B",
+    enable_ac: bool = False,
+    qlora_debug: bool = False,
+    full_finetune: bool = False,
+    optim_in_bwd: bool = False,
+    cpu_offload: bool = False,
     rank: int = 0,
     world_size: int = 1,
 ):
@@ -154,6 +220,11 @@ def entrypoint(
         device=torch.device(f"cuda:{rank}"),
         use_fsdp2=use_fsdp2,
         model_name=model_name,
+        enable_ac=enable_ac,
+        qlora_debug=qlora_debug,
+        full_finetune=full_finetune,
+        optim_in_bwd=optim_in_bwd,
+        cpu_offload=cpu_offload,
     )
     main(hyper_params, training_config, rank, world_size)
 
@@ -204,8 +275,9 @@ def train(
     with profile_context as p:
         for iter_num in range(hyper_params.max_iters):
             lr = get_lr(iter_num, hyper_params)
-            for param_group in optimizer.param_groups:
-                param_group["lr"] = lr
+            if optimizer is not None:
+                for param_group in optimizer.param_groups:
+                    param_group["lr"] = lr
 
             input_ids, targets = next(train_iter)
             input_ids = input_ids.pin_memory().to(training_config.device)
@@ -229,7 +301,7 @@ def train(
             # Scale the loss by grad_accumulation iters
             (loss / hyper_params.gradient_accumulation_iters).backward()
 
-            if not is_accumulating:
+            if not is_accumulating and optimizer is not None:
                 optimizer.step()
                 optimizer.zero_grad()
                 step_count += 1
@@ -269,8 +341,8 @@ def train(
 
                 if rank == 0:
                     mem_stats = torch.cuda.memory_stats()
-                    peak_active = mem_stats["active_bytes.all.peak"] / (1024 * 1024)
-                    peak_reserved = mem_stats["reserved_bytes.all.peak"] / (1024 * 1024)
+                    peak_active = mem_stats["active_bytes.all.peak"] / (1000 * 1000)
+                    peak_reserved = mem_stats["reserved_bytes.all.peak"] / (1000 * 1000)
                     logging.info(
                         f"iter={iter_num} max_iters={hyper_params.max_iters} loss={loss_val:.4f} Peak Active Memory: {peak_active} MB, Peak Reserve Memory: {peak_reserved} MB"
                     )
@@ -366,10 +438,15 @@ if __name__ == "__main__":
         help="if specified, runs FSDP with this many GPUs on a single host",
     )
     parser.add_argument("--use_fsdp2", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--enable_ac", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--model", default="7B")
+    parser.add_argument("--qlora_debug", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--full_finetune", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--optim_in_bwd", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--cpu_offload", action=argparse.BooleanOptionalAction, default=False)
     args = parser.parse_args()
     fsdp_num_gpus = args.fsdp_num_gpus
-    inner_args = (args.profile, args.use_fsdp2, args.model)
+    inner_args = (args.profile, args.use_fsdp2, args.model, args.enable_ac, args.qlora_debug, args.full_finetune, args.optim_in_bwd, args.cpu_offload)
 
     if fsdp_num_gpus is None or fsdp_num_gpus == 1:
         entrypoint(*inner_args)
@@ -413,37 +490,3 @@ def validate(
     model.train()
     write_loss_to_file(loss_file, training_iter, loss.item())
     return val_loss.item()
-
-
-def get_profile_context(
-    hyper_params: Hyperparameters, train_config: TrainingConfig, rank: int = 0
-):
-    """Returns a context manager that can be used to profile the model."""
-
-    def trace_handler(prof):
-        fp8_linear_type = hyper_params.fp8_linear_type
-
-        dtype_str = fp8_linear_type if fp8_linear_type else "bf16"
-        output_str = str(train_config.log_dir / f"trace_llama_7b_hf_{dtype_str}_rank_{rank}.json")
-        prof.export_chrome_trace(output_str)
-        logging.info(f"Wrote profile to: {output_str}")
-
-    if train_config.profile:
-        context = torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
-            schedule=torch.profiler.schedule(wait=100, warmup=1, active=2, repeat=1),
-            record_shapes=True,
-            with_stack=True,
-            on_trace_ready=trace_handler,
-            with_flops=True,
-            profile_memory=True,
-            experimental_config=torch.profiler._ExperimentalConfig(
-                enable_cuda_sync_events=True,
-            ),
-        )
-        return context
-    else:
-        return nullcontext()

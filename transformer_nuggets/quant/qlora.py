@@ -245,3 +245,93 @@ def swap_for_qlora(model: torch.nn.Module, qlora_config: QloraConfig, dtype) -> 
     for name, param in model.named_parameters():
         if "lora_" not in name:
             param.requires_grad = False
+
+class QloraLinearDebug(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        weight: torch.Tensor,
+        r: int,
+        lora_alpha: int = 1,
+        lora_dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(weight.new_zeros((weight.shape[0], int(weight.shape[1]/4))), requires_grad=False)
+        # self.weight = weight.new_zeros((weight.shape[0], int(weight.shape[1]/4)))
+        # self.weight.requires_grad = False
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        self.r = r
+        self.lora_alpha = lora_alpha
+        self.in_features = in_features
+        self.out_features = out_features
+        self.lora_A = nn.Parameter(weight.new_zeros((r, in_features)))
+        self.lora_B = nn.Parameter(weight.new_zeros((out_features, r)))
+        self.scaling = self.lora_alpha / self.r
+
+        # Optional dropout
+        if lora_dropout > 0.0:
+            self.lora_dropout = nn.Dropout(p=lora_dropout)
+        else:
+            self.lora_dropout = lambda x: x
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        result = F.linear(x, self.weight.repeat(1, 4))
+        result2 = (
+            result
+            + (self.lora_dropout(x) @ self.lora_A.transpose(0, 1) @ self.lora_B.transpose(0, 1))
+            * self.scaling
+        )
+        return result2
+
+class QloraMLPDebug(nn.Module):
+    # This very notably doesn't save on backward compute
+    def __init__(
+        self,
+        weight1: torch.Tensor,
+        weight2: torch.Tensor,
+        weight3: torch.Tensor,
+        QloraConfig: QloraConfig = None,
+    ) -> None:
+        super().__init__()
+        if QloraConfig is None:
+            QloraConfig = QloraConfig()
+
+        lora_r = QloraConfig.lora_r
+        lora_alpha = QloraConfig.lora_alpha
+        lora_dropout = QloraConfig.lora_dropout
+
+        self.qlora_w1 = QloraLinearDebug(
+            weight1.shape[1], weight1.shape[0], weight1, lora_r, lora_alpha, lora_dropout
+        )
+        self.qlora_w2 = QloraLinearDebug(
+            weight2.shape[1], weight2.shape[0], weight2, lora_r, lora_alpha, lora_dropout
+        )
+        self.qlora_w3 = QloraLinearDebug(
+            weight3.shape[1], weight3.shape[0], weight3, lora_r, lora_alpha, lora_dropout
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.silu(self.qlora_w1(x)) * self.qlora_w3(x)
+        x = self.qlora_w2(x)
+        return x
+
+def swap_for_qlora_debug(model: torch.nn.Module, qlora_config: QloraConfig, dtype) -> None:
+    logging.info("Swapping for Qlora...")
+    for module in tqdm(model.layers):
+        feed_forward = module.feed_forward
+        w1 = feed_forward.w1.weight.to(dtype=dtype)
+        w2 = feed_forward.w2.weight.to(dtype=dtype)
+        w3 = feed_forward.w3.weight.to(dtype=dtype)
+        new_mod = QloraMLPDebug(w1, w2, w3, qlora_config)
+        module.feed_forward = new_mod
+
+    for name, param in model.named_parameters():
+        if "lora_" not in name:
+            param.requires_grad = False
