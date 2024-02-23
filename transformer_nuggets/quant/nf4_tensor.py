@@ -319,8 +319,9 @@ class NF4Tensor(torch.Tensor):
         return torch.stack([scaled_first, scaled_second], dim=-1).reshape(self.shape)
 
     @staticmethod
-    def quantize_tensor_nearest(value: torch.float16, nf4: torch.Tensor) -> torch.Tensor:
+    def quantize_tensor_nearest(value: torch.Tensor, nf4: torch.Tensor) -> torch.Tensor:
         """Quantize a float16 tensor to nf4 format to nearest and not rounded up"""
+        assert value.dtype == torch.float16, f"Expect fp16 tensor, got {value.dtype}!"
         value = value.unsqueeze(-1)  # (numel, 1)
         # Compare the value tensor with the nf4 tensor element-wise
         diff = (value - nf4).abs()
