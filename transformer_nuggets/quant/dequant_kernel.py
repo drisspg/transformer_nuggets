@@ -74,17 +74,10 @@ def dequant_nf4_tensor_kernel(
     scaled_first = dequantized_first * block_scaler
     scaled_second = dequantized_second * block_scaler
 
-    # Slicing the indices didn't work
-    # Calculate base indices for the entire block
-    base_indices = offset * 2 + tl.arange(0, XBLOCK) * 2
-    # For even (first) indices: Keep as is from the base calculation
-    out_index_first = base_indices
-    # For odd (second) indices: Add 1 to the base calculation to get the next index
-    out_index_second = base_indices + 1
-
-    # Cating didn't work, but need to interleave anyways
-    tl.store(output_ptr + out_index_first, scaled_first)
-    tl.store(output_ptr + out_index_second, scaled_second)
+    #  Lets hope this function stays 🤞
+    store_indices = offset * 2 + tl.arange(0, XBLOCK * 2)[:]
+    interleaved = tl._experimental_interleave(scaled_first, scaled_second)
+    tl.store(output_ptr + store_indices, interleaved)
 
 
 def dequant_nf4_tensor(weight: NF4Tensor):

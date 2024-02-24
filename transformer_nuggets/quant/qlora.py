@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
-from transformer_nuggets.quant.deqaunt_kernel import dequant_nf4_tensor
+from transformer_nuggets.quant.dequant_kernel import dequant_nf4_tensor
 from transformer_nuggets.quant.nf4_tensor import NF4Tensor
 
 logging.basicConfig(level=logging.INFO)
