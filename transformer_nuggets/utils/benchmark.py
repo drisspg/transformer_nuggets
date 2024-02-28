@@ -11,6 +11,18 @@ from torch.cuda._memory_viz import profile_plot
 from torch.profiler import profile, ProfilerActivity, record_function
 
 
+class bcolors:
+    HEADER = "\033[95m"
+    OKBLUE = "\033[94m"
+    OKCYAN = "\033[96m"
+    OKGREEN = "\033[92m"
+    WARNING = "\033[93m"
+    FAIL = "\033[91m"
+    ENDC = "\033[0m"
+    BOLD = "\033[1m"
+    UNDERLINE = "\033[4m"
+
+
 @dataclass
 class ProfileConfig:
     file_path: Optional[str] = None
@@ -66,7 +78,9 @@ def profile_function(
                     torch.cuda.synchronize()
 
     if config.file_path is not None:
-        prof.export_chrome_trace(config.file_path)
+        trace_path = Path(config.file_path).with_suffix(".json")
+        prof.export_chrome_trace(str(trace_path))
+        print(f"💾 Trace file 📄 saved to: {bcolors.OKGREEN}{trace_path}{bcolors.ENDC}")
 
     if profile_memory:
         with open(config.memory_profile_path, "w") as f:
