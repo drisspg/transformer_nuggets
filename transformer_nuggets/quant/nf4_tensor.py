@@ -1,12 +1,28 @@
 import logging
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Any, Dict, Tuple
 
 import torch
 
 logging.basicConfig(level=logging.INFO)
 
 bnb_available = False
+
+
+aten = torch.ops.aten
+c10d_functional = torch.ops.c10d_functional
+NF4_OPS_TABLE: Dict[Any, Any] = {}
+
+
+def implements(aten_ops):
+    """Use this decorator to implement a function for an aten op in __torch_dispatch__"""
+
+    def decorator(func):
+        for op in aten_ops:
+            NF4_OPS_TABLE[op] = func
+        return func
+
+    return decorator
 
 
 @dataclass
