@@ -409,7 +409,24 @@ class NF4Tensor(torch.Tensor):
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args, kwargs=None):
-        raise NotImplementedError("NF4Tensor does not support torch dispatch")
+        # All ops in the  NF4_OPS_TABLE expect NF4 Tensors as inputs
+        # And don't support mixed tensor subclasses. This will trigger the handler for
+        # the next type in the dispatch list
+        def allowed_subclasses(type):
+            return (
+                issubclass(cls, type)
+                or issubclass(torch._subclasses.fake_tensor.FakeTensor, type)
+                or issubclass(torch._subclasses.functional_tensor.FunctionalTensor, type)
+            )
+
+        if not all(allowed_subclasses(t) for t in types):
+            return NotImplemented("Up to the next one to handle")
+
+        if func in NF4_OPS_TABLE:
+            return NF4_OPS_TABLE[func](func, args, kwargs)
+        raise NotImplementedError(
+            f"NF4Tensor dispatch: attempting to run {func}, this is not supported"
+        )
 
     # Do not force the Float8Tensor type on the returned tensor
     __torch_function__ = torch._C._disabled_torch_function_impl
