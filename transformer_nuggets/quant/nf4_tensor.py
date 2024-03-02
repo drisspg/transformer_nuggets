@@ -33,6 +33,22 @@ class SubclassTensorArgs:
     requires_grad: bool
 
 
+@implements([aten.mm.default])
+def nf4_mm(aten_op, args, kwargs=None):
+    """Matrix multiply for NF4 Tensors"""
+    input, weight = args
+    assert isinstance(weight, NF4Tensor), "Weight must be a NF4Tensor"
+    return torch.mm(input, weight.get_original_weight())
+
+
+@implements([aten.addmm.default])
+def nf4_addmm(aten_op, args, kwargs=None):
+    """Add matrix multiply for NF4 Tensors"""
+    input, weight, bias = args
+    assert isinstance(weight, NF4Tensor), "Weight must be a NF4Tensor"
+    return torch.addmm(bias, input, weight.get_original_weight())
+
+
 def get_block_absmax(inpt_tensor: torch.Tensor, block_size: int) -> torch.Tensor:
     """Iterate through a flattened tensor getting the absmax scalers for each block
 

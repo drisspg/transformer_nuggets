@@ -213,3 +213,15 @@ def test_qlora_linear(embed_dim: int, compile: bool, r: int, dropout: float, run
         out.sum().backward()
         assert nugs_qlora_linear.lora_A.grad is not None
         assert nugs_qlora_linear.lora_B.grad is not None
+
+
+def test_linear_dispatch():
+    device = "cuda:0"
+    inpt_tensor = torch.rand(256, 512, device=device, dtype=torch.bfloat16)
+    weight = NF4Tensor.from_tensor(inpt_tensor)
+
+    x = torch.rand(32, 512, device=device, dtype=torch.bfloat16)
+    out_dispatch = F.linear(x, weight)
+    out_autograd_func = qlora.linear_nf4(x, weight)
+    # E       NotImplementedError: NF4Tensor dispatch: attempting to run aten.t.default, this is not supported
+    assert all(out_dispatch == out_autograd_func)
