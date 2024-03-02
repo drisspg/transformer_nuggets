@@ -1,3 +1,4 @@
+import logging
 import random
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
@@ -9,6 +10,9 @@ import torch.utils.benchmark as benchmark
 
 from torch.cuda._memory_viz import profile_plot
 from torch.profiler import profile, ProfilerActivity, record_function
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 
 class bcolors:
@@ -80,7 +84,7 @@ def profile_function(
     if config.file_path is not None:
         trace_path = Path(config.file_path).with_suffix(".json")
         prof.export_chrome_trace(str(trace_path))
-        print(f"💾 Trace file 📄 saved to: {bcolors.OKGREEN}{trace_path}{bcolors.ENDC}")
+        logger.info(f"💾 Trace file 📄 saved to: {bcolors.OKGREEN}{trace_path}{bcolors.ENDC}")
 
     if profile_memory:
         with open(config.memory_profile_path, "w") as f:
@@ -153,3 +157,4 @@ def save_memory_snapshot(file_path: Path):
             output_path = file_path.with_suffix(".html")
         with open(output_path, "w") as f:
             f.write(torch.cuda._memory_viz.trace_plot(s))
+            logger.info(f"💾 Trace file 📄 saved to: {bcolors.OKGREEN}{output_path}{bcolors.ENDC}")
