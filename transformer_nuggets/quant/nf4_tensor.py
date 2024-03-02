@@ -1,10 +1,8 @@
-import logging
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple
 
 import torch
 
-logging.basicConfig(level=logging.INFO)
 
 bnb_available = False
 

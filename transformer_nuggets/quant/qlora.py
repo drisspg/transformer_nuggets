@@ -10,7 +10,8 @@ from tqdm import tqdm
 from transformer_nuggets.quant.dequant_kernel import dequant_nf4_tensor
 from transformer_nuggets.quant.nf4_tensor import NF4Tensor
 
-logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 bnb_available = False
 
@@ -103,7 +104,9 @@ def get_mlp_weights(
 class MLP(nn.Module):
     def __init__(self, weight1, weight2, weight3) -> None:
         super().__init__()
-        self.w1, self.w2, self.w3 = weight1, weight2, weight3
+        self.w1 = nn.Parameter(weight1)
+        self.w2 = nn.Parameter(weight2)
+        self.w3 = nn.Parameter(weight3)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.silu(F.linear(x, self.w1)) * F.linear(x, self.w2)
@@ -206,15 +209,15 @@ class QloraMLP(nn.Module):
         weight1: torch.Tensor,
         weight2: torch.Tensor,
         weight3: torch.Tensor,
-        QloraConfig: QloraConfig = None,
+        qlora_config: QloraConfig = None,
     ) -> None:
         super().__init__()
-        if QloraConfig is None:
-            QloraConfig = QloraConfig()
+        if qlora_config is None:
+            qlora_config = QloraConfig()
 
-        lora_r = QloraConfig.lora_r
-        lora_alpha = QloraConfig.lora_alpha
-        lora_dropout = QloraConfig.lora_dropout
+        lora_r = qlora_config.lora_r
+        lora_alpha = qlora_config.lora_alpha
+        lora_dropout = qlora_config.lora_dropout
 
         self.qlora_w1 = QloraLinear(
             weight1.shape[1], weight1.shape[0], weight1, lora_r, lora_alpha, lora_dropout
@@ -227,13 +230,13 @@ class QloraMLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.silu(self.qlora_w1(x)) * self.qlora_w3(x)
-        x = self.qlora_w2(x)
+        x = F.silu(self.qlora_w1(x)) * self.qlora_w2(x)
+        x = self.qlora_w3(x)
         return x
 
 
 def swap_for_qlora(model: torch.nn.Module, qlora_config: QloraConfig, dtype) -> None:
-    logging.info("Swapping for Qlora...")
+    logger.info("Swapping for Qlora...")
     for module in tqdm(model.layers):
         feed_forward = module.feed_forward
         w1 = feed_forward.w1.weight.to(dtype=dtype)
