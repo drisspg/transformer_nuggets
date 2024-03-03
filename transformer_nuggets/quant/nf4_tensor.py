@@ -33,12 +33,27 @@ class SubclassTensorArgs:
     requires_grad: bool
 
 
+@implements([aten.t.default])
+def nf4_transpose(aten_op, args, kwargs=None):
+    """Transpose for NF4 Tensors"""
+    # We are arused the input is 2 dimensional otherwise we would
+    # have dispatched to aten.transpose.default
+    nf4_tensor = args[0]
+    tensors, ctx = nf4_tensor.__tensor_flatten__()
+    inner_tensors = {t: getattr(nf4_tensor, t) for t in tensors}
+    out = NF4Tensor.__tensor_unflatten__(inner_tensors, ctx, nf4_tensor.shape, nf4_tensor.stride())
+    out.needs_transpose = True
+    return out
+
+
 @implements([aten.mm.default])
 def nf4_mm(aten_op, args, kwargs=None):
     """Matrix multiply for NF4 Tensors"""
     input, weight = args
     assert isinstance(weight, NF4Tensor), "Weight must be a NF4Tensor"
-    return torch.mm(input, weight.get_original_weight())
+    original_weight = weight.get_original_weight()
+    transposed_weight = original_weight.t() if weight.needs_transpose else original_weight
+    return torch.mm(input, transposed_weight)
 
 
 @implements([aten.addmm.default])
@@ -46,7 +61,9 @@ def nf4_addmm(aten_op, args, kwargs=None):
     """Add matrix multiply for NF4 Tensors"""
     input, weight, bias = args
     assert isinstance(weight, NF4Tensor), "Weight must be a NF4Tensor"
-    return torch.addmm(bias, input, weight.get_original_weight())
+    original_weight = weight.get_original_weight()
+    transposed_weight = original_weight.t() if weight.needs_transpose else original_weight
+    return torch.addmm(bias, input, transposed_weight)
 
 
 def get_block_absmax(inpt_tensor: torch.Tensor, block_size: int) -> torch.Tensor:
@@ -124,6 +141,7 @@ class NF4Tensor(torch.Tensor):
         scaler_mean: torch.Tensor,
         quantized_data: torch.Tensor,
         nf4: torch.Tensor,
+        transposed: bool = False,
     ):
         """Initialize the NF4Tensor class"""
         self.block_size = block_size

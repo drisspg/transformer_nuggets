@@ -223,5 +223,4 @@ def test_linear_dispatch():
     x = torch.rand(32, 512, device=device, dtype=torch.bfloat16)
     out_dispatch = F.linear(x, weight)
     out_autograd_func = qlora.linear_nf4(x, weight)
-    # E       NotImplementedError: NF4Tensor dispatch: attempting to run aten.t.default, this is not supported
-    assert all(out_dispatch == out_autograd_func)
+    assert torch.sum(out_dispatch - out_autograd_func) == 0
