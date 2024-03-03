@@ -41,8 +41,8 @@ def nf4_transpose(aten_op, args, kwargs=None):
     nf4_tensor = args[0]
     tensors, ctx = nf4_tensor.__tensor_flatten__()
     inner_tensors = {t: getattr(nf4_tensor, t) for t in tensors}
+    ctx["needs_transpose"] = True
     out = NF4Tensor.__tensor_unflatten__(inner_tensors, ctx, nf4_tensor.shape, nf4_tensor.stride())
-    out.needs_transpose = True
     return out
 
 
@@ -104,6 +104,7 @@ class NF4Tensor(torch.Tensor):
         scaler_mean: torch.Tensor,
         quantized_data: torch.Tensor,
         nf4: torch.Tensor,
+        needs_transpose: bool = False,
     ):
         """Create a new NF4Tensor object
         Args:
@@ -141,7 +142,7 @@ class NF4Tensor(torch.Tensor):
         scaler_mean: torch.Tensor,
         quantized_data: torch.Tensor,
         nf4: torch.Tensor,
-        transposed: bool = False,
+        needs_transpose: bool = False,
     ):
         """Initialize the NF4Tensor class"""
         self.block_size = block_size
@@ -152,6 +153,7 @@ class NF4Tensor(torch.Tensor):
         self.scaler_mean = scaler_mean
         self.quantized_data = quantized_data
         self.nf4 = nf4
+        self.needs_transpose = needs_transpose
 
     @classmethod
     @torch.no_grad()
@@ -415,6 +417,7 @@ class NF4Tensor(torch.Tensor):
             "n_blocks": self.n_blocks,
             "scaler_block_size": self.scaler_block_size,
             "tensor_meta": tensor_meta,
+            "needs_transpose": self.needs_transpose,
         }
         return [
             "quantized_data",
@@ -437,6 +440,7 @@ class NF4Tensor(torch.Tensor):
             inner_tensors["scaler_mean"],
             inner_tensors["quantized_data"],
             inner_tensors["nf4"],
+            metadata["needs_transpose"],
         )
 
     @classmethod
