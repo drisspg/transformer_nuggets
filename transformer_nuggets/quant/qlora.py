@@ -1,14 +1,14 @@
 import logging
 import math
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Tuple, Dict, Any, Optional, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 from transformer_nuggets.quant.deqaunt_kernel import dequant_nf4_tensor
-from transformer_nuggets.quant.nf4_tensor import NF4Tensor
+from transformer_nuggets.quant.nf4_tensor import NF4Tensor, SubclassTensorArgs
 
 logging.basicConfig(level=logging.INFO)
 
@@ -159,9 +159,13 @@ class QloraLinear(nn.Module):
         r: int,
         lora_alpha: int = 1,
         lora_dropout: float = 0.0,
+        register_nf4_param: bool = False,
     ) -> None:
         super().__init__()
-        self.weight = NF4Tensor.from_tensor(weight)
+        if register_nf4_param:
+            self.weight = nn.Parameter(NF4Tensor.from_tensor(weight), requires_grad=False)
+        else:
+            self.weight = NF4Tensor.from_tensor(weight)
         self.r = r
         self.lora_alpha = lora_alpha
         self.in_features = in_features
@@ -191,12 +195,91 @@ class QloraLinear(nn.Module):
         )
         return result2
 
+    def fsdp_extensions(self) -> Dict[str, Any]:
+        from torch.distributed._composable.fsdp import FSDPTensorExtensions
+
+        weight_extensions = FSDPTensorExtensions(
+            self._fsdp_pre_all_gather, self._fsdp_post_all_gather
+        )
+        return {"weight": weight_extensions}
+
+    def _fsdp_pre_all_gather(self, sharded_param: torch.Tensor):
+        # TODO: shard Tensor-type params
+        return (sharded_param.quantized_data, ), (
+            SubclassTensorArgs(
+                sharded_param.size(),
+                sharded_param.stride(),
+                sharded_param.storage_offset(),
+                sharded_param.dtype,
+                sharded_param.device,
+                sharded_param.requires_grad,
+            ),
+            sharded_param.block_size,
+            sharded_param.n_blocks,
+            sharded_param.scaler_block_size,
+            sharded_param.quantized_scalers,
+            sharded_param.quantization_factor,
+            sharded_param.scaler_mean,
+            sharded_param.nf4,
+        )
+
+    # def fsdp_post_all_gather(
+    #     self,
+    #     all_gather_outputs: Tuple[torch.Tensor, ...],
+    #     metadata: Any,
+    #     param_dtype: torch.dtype,
+    #     *,
+    #     out: Optional[torch.Tensor] = None,
+    # ) -> Union[Tuple[Tuple[torch.Tensor, ...]], None]:
+    #     (quantized_scalers, quantization_factor, scaler_mean, quantized_data, nf4) = all_gather_outputs
+    #     (tensor_meta, block_size, n_blocks, scaler_block_size) = metadata
+    #     if out is not None:
+    #         return
+    #     return (quantized_scalers, quantization_factor, scaler_mean, quantized_data, nf4), ()
+
+    # def _fsdp_pre_all_gather(self, sharded_param: torch.Tensor):
+    #     float8_tensor = self.cast_to_float8_e4m3fn(sharded_param, reduce_amax=True)
+    #     return (float8_tensor._data,), (float8_tensor._scale,)
+
+    def _fsdp_post_all_gather(
+        self,
+        all_gather_outputs: Tuple[torch.Tensor, ...],
+        metadata: Any,
+        param_dtype: torch.dtype,
+        *,
+        out: Optional[torch.Tensor] = None,
+    ) -> Union[Tuple[NF4Tensor, Tuple[torch.Tensor, ...]], None]:
+        (quantized_data, ) = all_gather_outputs
+        (tensor_meta, block_size, n_blocks, scaler_block_size, quantized_scalers, quantization_factor, scaler_mean, nf4)  = metadata
+        # TODO: figure out x 2
+        tensor_meta.original_shape = (tensor_meta.original_shape[0] * 2, tensor_meta.original_shape[1])
+        if out is not None:
+            assert isinstance(out, NF4Tensor), f"{type(out)}"
+            assert (
+                quantized_data.untyped_storage().data_ptr()
+                == out.quantized_data.untyped_storage().data_ptr()
+            ), f"Expects out's data to be the all-gather output"
+            return
+
+        return NF4Tensor(
+            tensor_meta,
+            block_size,
+            n_blocks,
+            scaler_block_size,
+            quantized_scalers,
+            quantization_factor,
+            scaler_mean,
+            quantized_data,
+            nf4,
+        ), (quantized_data, )
+
 
 @dataclass
 class QloraConfig:
     lora_r: int = 2
     lora_alpha: int = 1
     lora_dropout: float = 0.0
+    register_nf4_param: bool = False
 
 
 class QloraMLP(nn.Module):
@@ -215,15 +298,16 @@ class QloraMLP(nn.Module):
         lora_r = QloraConfig.lora_r
         lora_alpha = QloraConfig.lora_alpha
         lora_dropout = QloraConfig.lora_dropout
+        register_nf4_param = QloraConfig.register_nf4_param
 
         self.qlora_w1 = QloraLinear(
-            weight1.shape[1], weight1.shape[0], weight1, lora_r, lora_alpha, lora_dropout
+            weight1.shape[1], weight1.shape[0], weight1, lora_r, lora_alpha, lora_dropout, register_nf4_param
         )
         self.qlora_w2 = QloraLinear(
-            weight2.shape[1], weight2.shape[0], weight2, lora_r, lora_alpha, lora_dropout
+            weight2.shape[1], weight2.shape[0], weight2, lora_r, lora_alpha, lora_dropout, register_nf4_param
         )
         self.qlora_w3 = QloraLinear(
-            weight3.shape[1], weight3.shape[0], weight3, lora_r, lora_alpha, lora_dropout
+            weight3.shape[1], weight3.shape[0], weight3, lora_r, lora_alpha, lora_dropout, register_nf4_param
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -233,8 +317,8 @@ class QloraMLP(nn.Module):
 
 
 def swap_for_qlora(model: torch.nn.Module, qlora_config: QloraConfig, dtype) -> None:
-    logging.info("Swapping for Qlora...")
-    for module in tqdm(model.layers):
+    # logging.info("Swapping for Qlora...")
+    for module in model.layers:
         feed_forward = module.feed_forward
         w1 = feed_forward.w1.weight.to(dtype=dtype)
         w2 = feed_forward.w2.weight.to(dtype=dtype)

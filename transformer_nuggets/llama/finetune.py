@@ -47,7 +47,7 @@ class Hyperparameters(transformer_nuggets.llama.train.Hyperparameters):
 
 @dataclass
 class TrainingConfig(transformer_nuggets.llama.train.TrainingConfig):
-    log_interval: int = 10
+    log_interval: int = 1
     track_max_memory: bool = False
     use_fsdp2: bool = False
     enable_ac: bool = False
@@ -55,6 +55,7 @@ class TrainingConfig(transformer_nuggets.llama.train.TrainingConfig):
     full_finetune: bool = False
     optim_in_bwd: bool = False
     cpu_offload: bool = False
+    register_nf4_param: bool = False
 
 
 def get_profile_context(
@@ -109,8 +110,8 @@ def main(
 
     # Setup Model
     model_args = ModelArgs.from_name(training_config.model_name)
-    if rank == 0:
-        logging.info(f"Initializing model: {training_config.model_name}")
+    # if rank == 0:
+    #     logging.info(f"Initializing model: {training_config.model_name}")
     with training_config.device:
         torch.set_default_dtype(torch.bfloat16)
         model = Transformer(model_args)
@@ -120,6 +121,7 @@ def main(
             hyper_params.lora_r,
             hyper_params.lora_alpha,
             hyper_params.lora_dropout,
+            training_config.register_nf4_param,
         )
 
         if training_config.qlora_debug:
@@ -130,8 +132,8 @@ def main(
         hyper_params.micro_batch_size, hyper_params.max_seq_length, training_config.device
     )
 
-    if rank == 0:
-        logging.info("Setting up the dataloaders")
+    # if rank == 0:
+    #     logging.info("Setting up the dataloaders")
     train_data, val_data = load_datasets(hyper_params, training_config, rank, world_size)
     train_dataloader = DataLoader(
         train_data,
@@ -140,7 +142,7 @@ def main(
     )
     val_dataloader = DataLoader(val_data, batch_size=hyper_params.micro_batch_size, num_workers=2)
 
-    log_num_params(model)
+    # log_num_params(model)
 
     if training_config.enable_ac:
         for layer in model.layers:
@@ -149,16 +151,19 @@ def main(
     if world_size > 1:
         if training_config.use_fsdp2:
             # move import to top when fsdp2 is landed
-            from torch.distributed._composable.fsdp import fully_shard, OffloadPolicy
+            from torch.distributed._composable.fsdp import fully_shard
 
             fully_shard_fn = functools.partial(
                 fully_shard,
                 reshard_after_forward=True,
             )
-            offload_policy = OffloadPolicy("cpu" if training_config.cpu_offload else None)
+            fsdp_kwargs = {}
+            if training_config.cpu_offload:
+                from torch.distributed._composable.fsdp import OffloadPolicy
+                fsdp_kwargs["offload_policy"] = OffloadPolicy("cpu")
             for layer in model.layers:
-                fully_shard_fn(layer, offload_policy=offload_policy)
-            fully_shard_fn(model, offload_policy=offload_policy)
+                fully_shard_fn(layer, **fsdp_kwargs)
+            fully_shard_fn(model, **fsdp_kwargs)
         else:
             model = FSDP(
                 model,
@@ -171,8 +176,8 @@ def main(
     if training_config.compile:
         model = torch.compile(model)
 
-    if rank == 0:
-        logging.info(model)
+    # if rank == 0:
+    #     logging.info(model)
 
     if training_config.optim_in_bwd:
         optimizer = None
@@ -207,6 +212,7 @@ def entrypoint(
     full_finetune: bool = False,
     optim_in_bwd: bool = False,
     cpu_offload: bool = False,
+    register_nf4_param: bool = False,
     rank: int = 0,
     world_size: int = 1,
 ):
@@ -225,6 +231,7 @@ def entrypoint(
         full_finetune=full_finetune,
         optim_in_bwd=optim_in_bwd,
         cpu_offload=cpu_offload,
+        register_nf4_param=register_nf4_param,
     )
     main(hyper_params, training_config, rank, world_size)
 
@@ -264,9 +271,9 @@ def train(
         training_config.log_dir
         / f"qlora_train_loss_{dtype_str}_overfit_{training_config.overfit}_compile_{training_config.compile}_{rank}.csv"
     )
-    if rank == 0:
-        logging.info(f"val_loss_file: {val_loss_file}")
-        logging.info(f"train_loss_file: {train_loss_file}")
+    # if rank == 0:
+    #     logging.info(f"val_loss_file: {val_loss_file}")
+    #     logging.info(f"train_loss_file: {train_loss_file}")
 
     this_batch_loss = torch.tensor(0.0, device=training_config.device)
     this_batch_n = 0
@@ -344,7 +351,7 @@ def train(
                     peak_active = mem_stats["active_bytes.all.peak"] / (1000 * 1000)
                     peak_reserved = mem_stats["reserved_bytes.all.peak"] / (1000 * 1000)
                     logging.info(
-                        f"iter={iter_num} max_iters={hyper_params.max_iters} loss={loss_val:.4f} Peak Active Memory: {peak_active} MB, Peak Reserve Memory: {peak_reserved} MB"
+                        f"iter={iter_num} max_iters={hyper_params.max_iters} step_count={step_count} loss={loss_val:.4f} Peak Active Memory: {peak_active} MB, Peak Reserve Memory: {peak_reserved} MB"
                     )
 
             if training_config.profile:
@@ -360,6 +367,8 @@ def train(
                     torch.cuda.memory._dump_snapshot(f"{memory_trace_path}")
                     torch.cuda.memory._record_memory_history(enabled=None)
                     logging.info(f"Wrote memory traces to: {memory_trace_path}")
+            if iter_num == 260:
+                break
 
 
 class Dataset(IterableDataset):
@@ -444,9 +453,10 @@ if __name__ == "__main__":
     parser.add_argument("--full_finetune", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--optim_in_bwd", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--cpu_offload", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--register_nf4_param", action=argparse.BooleanOptionalAction, default=False)
     args = parser.parse_args()
     fsdp_num_gpus = args.fsdp_num_gpus
-    inner_args = (args.profile, args.use_fsdp2, args.model, args.enable_ac, args.qlora_debug, args.full_finetune, args.optim_in_bwd, args.cpu_offload)
+    inner_args = (args.profile, args.use_fsdp2, args.model, args.enable_ac, args.qlora_debug, args.full_finetune, args.optim_in_bwd, args.cpu_offload, args.register_nf4_param)
 
     if fsdp_num_gpus is None or fsdp_num_gpus == 1:
         entrypoint(*inner_args)
