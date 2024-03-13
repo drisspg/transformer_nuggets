@@ -26,6 +26,8 @@ dtype_abbrs = {
     torch.float8_e5m2: "f8e5m2",
 }
 
+abbr_to_dtype = {v: k for k, v in dtype_abbrs.items()}
+
 
 class Lit:
     def __init__(self, s):
