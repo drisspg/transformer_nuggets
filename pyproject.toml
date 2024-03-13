@@ -21,7 +21,8 @@ dependencies = [
     "torch >= 2.1.1",
     "scipy >= 1.9.1",
     "tqdm >= 4.66",
-    "tabulate >= 0.8"
+    "tabulate >= 0.8",
+    "rich==13.7.1"
 ]
 
 [project.optional-dependencies]
