@@ -75,6 +75,39 @@ class SubclassTensorArgs:
     requires_grad: bool
 
 
+@implements([aten.t.default])
+def nf4_transpose(aten_op, args, kwargs=None):
+    """Transpose for NF4 Tensors"""
+    # We are arused the input is 2 dimensional otherwise we would
+    # have dispatched to aten.transpose.default
+    nf4_tensor = args[0]
+    tensors, ctx = nf4_tensor.__tensor_flatten__()
+    inner_tensors = {t: getattr(nf4_tensor, t) for t in tensors}
+    ctx["needs_transpose"] = True
+    out = NF4Tensor.__tensor_unflatten__(inner_tensors, ctx, nf4_tensor.shape, nf4_tensor.stride())
+    return out
+
+
+@implements([aten.mm.default])
+def nf4_mm(aten_op, args, kwargs=None):
+    """Matrix multiply for NF4 Tensors"""
+    input, weight = args
+    assert isinstance(weight, NF4Tensor), "Weight must be a NF4Tensor"
+    original_weight = weight.get_original_weight()
+    transposed_weight = original_weight.t() if weight.needs_transpose else original_weight
+    return torch.mm(input, transposed_weight)
+
+
+@implements([aten.addmm.default])
+def nf4_addmm(aten_op, args, kwargs=None):
+    """Add matrix multiply for NF4 Tensors"""
+    input, weight, bias = args
+    assert isinstance(weight, NF4Tensor), "Weight must be a NF4Tensor"
+    original_weight = weight.get_original_weight()
+    transposed_weight = original_weight.t() if weight.needs_transpose else original_weight
+    return torch.addmm(bias, input, transposed_weight)
+
+
 def get_block_absmax(inpt_tensor: torch.Tensor, block_size: int) -> torch.Tensor:
     """Iterate through a flattened tensor getting the absmax scalers for each block
 
@@ -113,6 +146,7 @@ class NF4Tensor(torch.Tensor):
         scaler_mean: torch.Tensor,
         quantized_data: torch.Tensor,
         nf4: torch.Tensor,
+        needs_transpose: bool = False,
     ):
         """Create a new NF4Tensor object
         Args:
@@ -150,6 +184,7 @@ class NF4Tensor(torch.Tensor):
         scaler_mean: torch.Tensor,
         quantized_data: torch.Tensor,
         nf4: torch.Tensor,
+        needs_transpose: bool = False,
     ):
         """Initialize the NF4Tensor class"""
         self.block_size = block_size
@@ -160,6 +195,7 @@ class NF4Tensor(torch.Tensor):
         self.scaler_mean = scaler_mean
         self.quantized_data = quantized_data
         self.nf4 = nf4
+        self.needs_transpose = needs_transpose
 
     @classmethod
     @torch.no_grad()
@@ -421,6 +457,7 @@ class NF4Tensor(torch.Tensor):
             "n_blocks": self.n_blocks,
             "scaler_block_size": self.scaler_block_size,
             "tensor_meta": tensor_meta,
+            "needs_transpose": self.needs_transpose,
         }
         return [
             "quantized_data",
@@ -443,6 +480,7 @@ class NF4Tensor(torch.Tensor):
             inner_tensors["scaler_mean"],
             inner_tensors["quantized_data"],
             inner_tensors["nf4"],
+            metadata["needs_transpose"],
         )
 
     @classmethod
