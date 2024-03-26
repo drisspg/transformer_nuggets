@@ -48,9 +48,9 @@ def linear_nf4_trtion(input: torch.Tensor, weight: NF4Tensor) -> torch.Tensor:
     return LinearNF4Triton.apply(input, weight)
 
 
-def build_input_weight(embed_dim: int, device: torch.device):
+def build_input_weight(embed_dim: int, device: torch.device, dtype=torch.bfloat16):
     torch.manual_seed(0)
-    input_weight = torch.empty(embed_dim, embed_dim, device=device, dtype=torch.bfloat16)
+    input_weight = torch.empty(embed_dim, embed_dim, device=device, dtype=dtype)
     input_weight.normal_(0, 1)
     return input_weight
 
@@ -67,17 +67,22 @@ def build_bitsandbytes_linear(input_weight: torch.Tensor, device: torch.device):
 
 
 def get_sample_inputs(
-    bsz: int, seqlen: int, embed_dim: int, device: torch.device, requires_grad: bool = False
+    bsz: int,
+    seqlen: int,
+    embed_dim: int,
+    device: torch.device,
+    requires_grad: bool = False,
+    dtype=torch.bfloat16,
 ) -> torch.Tensor:
     sample_input = torch.rand(
-        bsz, seqlen, embed_dim, device=device, dtype=torch.bfloat16, requires_grad=requires_grad
+        bsz, seqlen, embed_dim, device=device, dtype=dtype, requires_grad=requires_grad
     )
     sample_input = sample_input.view(bsz * seqlen, embed_dim)
     return sample_input
 
 
 def get_mlp_weights(
-    embed_dim: int, device: torch.dtype = "cuda"
+    embed_dim: int, device: torch.device = "cuda", dtype=torch.bfloat16
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """These three weights take up
     3 * (embed_dim * n_hidden) * 2 bytes of memory
@@ -94,9 +99,9 @@ def get_mlp_weights(
     hidden_dim = 4 * embed_dim
     n_hidden = int(2 * hidden_dim / 3)
     n_hidden = find_multiple(n_hidden, 256)
-    weight1 = torch.empty((n_hidden, embed_dim), dtype=torch.bfloat16, device=device).normal_(0, 1)
-    weight2 = torch.empty((n_hidden, embed_dim), dtype=torch.bfloat16, device=device).normal_(0, 1)
-    weight3 = torch.empty((embed_dim, n_hidden), dtype=torch.bfloat16, device=device).normal_(0, 1)
+    weight1 = torch.empty((n_hidden, embed_dim), dtype=dtype, device=device).normal_(0, 1)
+    weight2 = torch.empty((n_hidden, embed_dim), dtype=dtype, device=device).normal_(0, 1)
+    weight3 = torch.empty((embed_dim, n_hidden), dtype=dtype, device=device).normal_(0, 1)
 
     return weight1, weight2, weight3
 
