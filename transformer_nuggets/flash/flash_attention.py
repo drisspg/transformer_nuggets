@@ -6,38 +6,33 @@ This is a Triton implementation of the Flash Attention algorithm
 (see: Dao et al., https://arxiv.org/pdf/2205.14135v2.pdf; Rabe and Staats https://arxiv.org/pdf/2112.05682v2.pdf)
 """
 
-import enum
-
 import torch
 
 import triton
 import triton.language as tl
-
-import torch
-import enum
 from transformer_nuggets.flash.masks import (
-    alibi_attention_triton, rel_attention_triton, inverse_causal_mask_triton
+    alibi_attention_triton,
+    BiasMode,
+    inverse_causal_mask_triton,
+    rel_attention_triton,
 )
 
-class BiasMode(enum.Enum):
-    none = 0
-    rel_pos = 1
-    alibi = 2
-    inverse_causal = 3
 
 @triton.jit
 def max_fn(x, y):
     return tl.math.max(x, y)
 
+
 @triton.jit
 def masked_row(rows):
-    """ rows is BLOCK_M slice of the QK score
+    """rows is BLOCK_M slice of the QK score
     Returns:
         BLOCK_M vector of boolean values indicating whether this
         Query x Key position is fully masked
 
     """
     return rows == float("-inf")
+
 
 @triton.jit
 def _fwd_kernel(
@@ -138,12 +133,18 @@ def _fwd_kernel(
         qk += tl.dot(q, k)
         # ~~~~~~~~~~~~~~~~~~~ This is all mask stuff ~~~~~~~~~~~~~~~~~~~
         if BIAS_CHOICE == 1:
-            qk = rel_attention_triton(qk, offs_m[:, None], (start_n + offs_n[None, :]), off_hz%H, H)
+            qk = rel_attention_triton(
+                qk, offs_m[:, None], (start_n + offs_n[None, :]), off_hz % H, H
+            )
         elif BIAS_CHOICE == 2:
-            qk = alibi_attention_triton(qk, offs_m[:, None], (start_n + offs_n[None, :]), off_hz%H, H)
+            qk = alibi_attention_triton(
+                qk, offs_m[:, None], (start_n + offs_n[None, :]), off_hz % H, H
+            )
         elif BIAS_CHOICE == 3:
             # This should only be used for debugging
-            qk = inverse_causal_mask_triton(qk, offs_m[:, None], (start_n + offs_n[None, :]), off_hz%H, H)
+            qk = inverse_causal_mask_triton(
+                qk, offs_m[:, None], (start_n + offs_n[None, :]), off_hz % H, H
+            )
         if DEBUG_MASK and BIAS_CHOICE != BiasMode.none:
             mask = qk - tl.dot(q, k)
             if IS_CAUSAL:
@@ -304,16 +305,22 @@ def _bwd_kernel(
             qk *= qk_scale
             # ~~~~~~~~~~~~~~~~~~~ This is all mask stuff ~~~~~~~~~~~~~~~~~~~
             if BIAS_CHOICE == 1:
-                qk = rel_attention_triton(qk, offs_m_curr[:, None], (offs_n[None, :]), off_hz%H, H)
+                qk = rel_attention_triton(
+                    qk, offs_m_curr[:, None], (offs_n[None, :]), off_hz % H, H
+                )
             elif BIAS_CHOICE == 2:
-                qk = alibi_attention_triton(qk, offs_m_curr[:, None], (offs_n[None, :]), off_hz%H, H)
+                qk = alibi_attention_triton(
+                    qk, offs_m_curr[:, None], (offs_n[None, :]), off_hz % H, H
+                )
             elif BIAS_CHOICE == 3:
                 # This should only be used for debugging
-                qk = inverse_causal_mask_triton(qk, offs_m[:, None], (start_n + offs_n[None, :]), off_hz%H, H)
+                qk = inverse_causal_mask_triton(
+                    qk, offs_m[:, None], (start_n + offs_n[None, :]), off_hz % H, H
+                )
             # ~~~~~~~~~~~~~~~~~~~ This is the end of mask stuff ~~~~~~~~~~~~~~~~~~~
             l_i = tl.load(l_ptrs + offs_m_curr)
             row_max = tl.max(qk, 1)
-            masked_out_rows= masked_row(row_max)
+            masked_out_rows = masked_row(row_max)
             # TODO fix me
             # p = tl.math.exp2(qk - l_i[:, None])
             p = tl.math.exp(qk - l_i[:, None])
@@ -356,7 +363,9 @@ class _attention(torch.autograd.Function):
         BLOCK_M = 128
         BLOCK_N = 64
         grid = (triton.cdiv(seq_len_qv, BLOCK_M), batch_size * num_heads, 1)
-        L = torch.empty((q.shape[0] * q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
+        L = torch.empty(
+            (q.shape[0] * q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32
+        )
 
         scratch_space = None
         if debug_mask:

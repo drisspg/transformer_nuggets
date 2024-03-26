@@ -58,7 +58,6 @@ def test_flash_all(Z, H, N_CTX, D_HEAD, causal, bias_choice, sm_scale, dtype=tor
     # Check attn_bias equivalence
     if bias_choice != BiasMode.none:
         BLOCK_M = 128
-        BLOCK_N = 64
         mask = mask.half()
         if N_CTX > BLOCK_M and causal:
             # Since the kernel will not iterate over all seq_len_kv when causal
@@ -107,7 +106,7 @@ def test_flash_masked_block(dtype=torch.float16):
     ref_mask.masked_fill_(temp_mask, float("-inf"))
     ref_mask = ref_mask.to(q.device).to(q.dtype)
     dout = torch.randn_like(q)
-    with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False):
+    with sdpa_kernel(SDPBackend.MATH):
         ref_out = torch.nn.functional.scaled_dot_product_attention(
             q, k, v, scale=sm_scale, is_causal=False, attn_mask=ref_mask
         )
@@ -116,7 +115,7 @@ def test_flash_masked_block(dtype=torch.float16):
     ref_dv, v.grad = v.grad.clone(), None
     ref_dk, k.grad = k.grad.clone(), None
     ref_dq, q.grad = q.grad.clone(), None
-    
+
     tri_out, mask = attention(q, k, v, False, sm_scale, BiasMode.inverse_causal, True)  # type: ignore
 
     tri_out.half()
@@ -128,10 +127,11 @@ def test_flash_masked_block(dtype=torch.float16):
     atol = 2e-2 * 6
     torch.testing.assert_close(ref_out, tri_out, atol=5.8e-2, rtol=0)
     torch.testing.assert_close(ref_mask, mask.half(), atol=4e-2, rtol=0)
-    breakpoint()
+
     torch.testing.assert_close(ref_dv, tri_dv, atol=atol, rtol=0)
     torch.testing.assert_close(ref_dk, tri_dk, atol=atol, rtol=0)
     torch.testing.assert_close(ref_dq, tri_dq, atol=atol, rtol=0)
+
 
 if __name__ == "__main__":
     pytest.main([__file__])

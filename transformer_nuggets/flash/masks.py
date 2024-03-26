@@ -1,6 +1,16 @@
+import enum
+
 import torch
+
 import triton
 import triton.language as tl
+
+
+class BiasMode(enum.Enum):
+    none = 0
+    rel_pos = 1
+    alibi = 2
+    inverse_causal = 3
 
 
 def build_causal_mask(seq_len_q, seq_len_kv):
@@ -10,23 +20,38 @@ def build_causal_mask(seq_len_q, seq_len_kv):
     return mask
 
 
-def build_alibi_mask(n_queries, n_keys, n_heads, scale=None, causal=True):
-    if scale is None:
+def build_rel_mask(
+    n_queries: int,
+    n_keys: int,
+    n_heads: int,
+    mode: BiasMode,
+    causal=True,
+):
+    """Builds torch equivalent mask
+    Args:
+        n_queries: Number of queries.
+        n_keys: Number of keys.
+        n_heads: Number of attention heads.
+        mode: Bias mode for the attention mask.
+        causal: Whether to include causal mask. Defaults to True.
+
+    Returns:
+        torch.Tensor: The alibi attention mask.
+    """
+    if mode == BiasMode.alibi:
         assert n_heads % 8 == 0
     m_0 = 2.0 ** (-8.0 / n_heads)
     slopes = torch.pow(m_0, torch.arange(1, 1 + n_heads))[:, None, None]
     base = -1 * (torch.arange(n_queries)[:, None] - torch.arange(n_keys)[None, :])
-    if scale is not None:
-        alibi_base = base * scale
-    else:
-        alibi_base = base * slopes
-    alibi_base = alibi_base.expand(n_heads, n_queries, n_keys)
+    mask = base
+    mask = mask * slopes if mode == BiasMode.alibi else mask
+    mask = mask.expand(n_heads, n_queries, n_keys)
     if causal:
         causal_mask = build_causal_mask(n_queries, n_keys)
         causal_mask = causal_mask.expand(n_heads, n_queries, n_keys)
-        full_mask = alibi_base + causal_mask
+        full_mask = mask + causal_mask
     else:
-        full_mask = alibi_base
+        full_mask = mask
     return full_mask
 
 
