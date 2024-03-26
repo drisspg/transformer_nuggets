@@ -79,7 +79,6 @@ class NF4TensorDebug:
         return torch.tensor(block_scalers)
 
     def __init__(self, inpt_tensor: torch.Tensor, block_size=64):
-        assert inpt_tensor.dtype == torch.bfloat16
         assert (
             inpt_tensor.numel() % block_size == 0
         ), "Input tensor must be divisible by block size"
@@ -88,6 +87,7 @@ class NF4TensorDebug:
         self.scalers = self.get_scalers(inpt_tensor, self.block_size)
         self.norm_float_weight = self.get_norm_float_weight(inpt_tensor.clone())
         self.original_shape = inpt_tensor.shape
+        self.dtype = inpt_tensor.dtype
 
     def get_norm_float_weight(self, inpt_tensor: torch.Tensor) -> torch.Tensor:
         nkf = self.get_nf4()
@@ -118,7 +118,7 @@ class NF4TensorDebug:
     def get_original_weight(self):
         # since we are using uint8 we will decode 2 entries per byte
         nkf = self.get_nf4()
-        original_weight = torch.empty(2 * (self.norm_float_weight.numel()), dtype=torch.bfloat16)
+        original_weight = torch.empty(2 * (self.norm_float_weight.numel()), dtype=self.dtype)
         # Scalers is a proxy for num_blocks
         for i in range(len(self.scalers)):
             block_start = i * self.block_size

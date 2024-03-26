@@ -23,11 +23,14 @@ except ImportError:
 @pytest.mark.parametrize(
     "inpt_size, block_size, scaler_block_size", [(16384, 64, 256), (256, 16, 16), (1024, 32, 32)]
 )
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_reconstruction(inpt_size: int, block_size: int, scaler_block_size: int):
+def test_reconstruction(
+    inpt_size: int, block_size: int, scaler_block_size: int, dtype: torch.dtype
+):
     torch.manual_seed(0)
     device = "cuda"
-    input_weight = torch.empty(1, inpt_size, device=device, dtype=torch.bfloat16)
+    input_weight = torch.empty(1, inpt_size, device=device, dtype=dtype)
     input_weight = input_weight.normal_(0, 1)
 
     qlora_debug = NF4TensorDebug(input_weight, block_size)
@@ -41,8 +44,11 @@ def test_reconstruction(inpt_size: int, block_size: int, scaler_block_size: int)
 @pytest.mark.parametrize(
     "inpt_size, block_size, scaler_block_size", [(16384, 64, 256), (256, 16, 16), (1024, 32, 32)]
 )
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_reconstruction_triton_kernel(inpt_size: int, block_size: int, scaler_block_size: int):
+def test_reconstruction_triton_kernel(
+    inpt_size: int, block_size: int, scaler_block_size: int, dtype: torch.dtype
+):
     torch.manual_seed(0)
     device = "cuda"
     input_weight = torch.empty(1, inpt_size, device=device, dtype=torch.bfloat16)
@@ -58,20 +64,19 @@ def test_reconstruction_triton_kernel(inpt_size: int, block_size: int, scaler_bl
 
 @unittest.skipIf(not bnb_available, "Bitsandbytes not available")
 @pytest.mark.parametrize("embed_dim", [256, 4096, 5120, 6656, 8192])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not bnb_available,
     reason="CUDA is not available or bitsandbytes not available",
 )
-def test_reconstruction_qlora_vs_bnb(embed_dim: int):
+def test_reconstruction_qlora_vs_bnb(embed_dim: int, dtype: torch.dtype):
     torch.manual_seed(0)
     device = "cuda"
-    input_weight = qlora.build_input_weight(embed_dim, device)
+    input_weight = qlora.build_input_weight(embed_dim, device, dtype)
     nugs_qlora = NF4Tensor.from_tensor(input_weight)
     bnb_linear = qlora.build_bitsandbytes_linear(input_weight, device)
     # This is sneaky but don't know if there is a better way to get the reconstruction
-    bnb_reconstruction = bnb_linear(
-        torch.eye(embed_dim, embed_dim, dtype=torch.bfloat16, device=device)
-    )
+    bnb_reconstruction = bnb_linear(torch.eye(embed_dim, embed_dim, dtype=dtype, device=device))
     bnb_diff = (bnb_reconstruction.T - input_weight).abs().max()
     nugs_diff = (nugs_qlora.get_original_weight() - input_weight).abs().max()
     # Since we are subtle different we assume that we both reconstruct with
@@ -111,13 +116,18 @@ def test_binning_distribution(embed_dim: int):
 @pytest.mark.parametrize("embed_dim", [256, 4096, 5120, 6656, 8192])
 @pytest.mark.parametrize("compile", [True, False])
 @pytest.mark.parametrize("requires_grad", [True, False])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_autograd_func_to_eager(embed_dim: int, compile: bool, requires_grad: bool):
+def test_autograd_func_to_eager(
+    embed_dim: int, compile: bool, requires_grad: bool, dtype: torch.dtype
+):
     torch._dynamo.reset()
     torch.manual_seed(0)
     device = "cuda"
-    input_weight = qlora.build_input_weight(embed_dim, device)
-    sample_input = qlora.get_sample_inputs(8, 128, embed_dim, device, requires_grad=requires_grad)
+    input_weight = qlora.build_input_weight(embed_dim, device, dtype)
+    sample_input = qlora.get_sample_inputs(
+        8, 128, embed_dim, device, requires_grad=requires_grad, dtype=dtype
+    )
     nugs_qlora = NF4Tensor.from_tensor(input_weight)
 
     if compile:
@@ -131,13 +141,14 @@ def test_autograd_func_to_eager(embed_dim: int, compile: bool, requires_grad: bo
 
 @pytest.mark.parametrize("embed_dim", [256, 4096, 5120, 6656, 8192])
 @pytest.mark.parametrize("compile", [True, False])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not bnb_available,
     reason="CUDA is not available or bitsandbytes not available",
 )
-def test_bitsandbytes_linear_parity(embed_dim, compile):
+def test_bitsandbytes_linear_parity(embed_dim, compile, dtype):
     device = torch.device("cuda:0")
-    input_weight = qlora.build_input_weight(embed_dim, device)
+    input_weight = qlora.build_input_weight(embed_dim, device, dtype)
     sample_input = qlora.get_sample_inputs(8, 128, embed_dim, device)
     bnb_linear = qlora.build_bitsandbytes_linear(input_weight, device)
     qlora_weight = NF4Tensor.from_tensor(input_weight)
@@ -162,14 +173,15 @@ def test_bitsandbytes_linear_parity(embed_dim, compile):
 
 @pytest.mark.parametrize("embed_dim", [256, 4096, 5120, 6656, 8192])
 @pytest.mark.parametrize("compile", [True, False])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not bnb_available,
     reason="CUDA is not available or bitsandbytes not available",
 )
-def test_bitsandbytes_mlp_parity(embed_dim, compile):
+def test_bitsandbytes_mlp_parity(embed_dim, compile, dtype):
     device = torch.device("cuda:0")
-    weights = qlora.get_mlp_weights(embed_dim, device)
-    sample_input = qlora.get_sample_inputs(8, 128, embed_dim, device)
+    weights = qlora.get_mlp_weights(embed_dim, device, dtype)
+    sample_input = qlora.get_sample_inputs(8, 128, embed_dim, device, dtype)
 
     qlora_mlp = qlora.NF4MLP(*weights)
     bnb_mlp = qlora.BnbQloraMLP(*weights, device)
@@ -195,19 +207,22 @@ def test_bitsandbytes_mlp_parity(embed_dim, compile):
 @pytest.mark.parametrize("r", [1, 2])
 @pytest.mark.parametrize("dropout", [0.0, 0.2])
 @pytest.mark.parametrize("run_backward", [True, False])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_qlora_linear(embed_dim: int, compile: bool, r: int, dropout: float, run_backward: bool):
+def test_qlora_linear(
+    embed_dim: int, compile: bool, r: int, dropout: float, run_backward: bool, dtype: torch.dtype
+):
     torch._dynamo.reset()
     torch.manual_seed(0)
     device = "cuda:0"
     # Analog for replacing first linear in MLP
-    weight = qlora.get_mlp_weights(embed_dim, device)[0]
+    weight = qlora.get_mlp_weights(embed_dim, device, dtype)[0]
     n_hidden = weight.size(0)  # hardcode llama 7b
     nugs_qlora_linear = qlora.QloraLinear(embed_dim, n_hidden, weight, r, lora_dropout=dropout)
     func = nugs_qlora_linear
     if compile:
         func = torch.compile(nugs_qlora_linear, fullgraph=True)
-    sample_input = qlora.get_sample_inputs(8, 128, embed_dim, device)
+    sample_input = qlora.get_sample_inputs(8, 128, embed_dim, device, dtype=dtype)
     out = func(sample_input)
     if run_backward:
         out.sum().backward()
