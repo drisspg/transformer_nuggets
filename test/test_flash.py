@@ -1,6 +1,8 @@
 import pytest
 import torch
-from transformer_nuggets.flash import attention, BiasMode, build_alibi_mask
+
+from torch.nn.attention import sdpa_kernel, SDPBackend
+from transformer_nuggets.flash import attention, BiasMode, build_rel_mask
 
 
 @pytest.mark.parametrize("Z, H, N_CTX, D_HEAD", [(6, 8, 128, 16)])
@@ -31,16 +33,14 @@ def test_op(Z, H, N_CTX, D_HEAD, causal, bias_choice, sm_scale, dtype=torch.floa
     dout = torch.randn_like(q)
 
     # reference implementation
-    if bias_choice == BiasMode.rel_pos:
-        attn_bias = build_alibi_mask(N_CTX, N_CTX, H, scale=1, causal=causal)
-        attn_bias = attn_bias.expand(Z, H, N_CTX, N_CTX).to(q.device).to(q.dtype)
-    elif bias_choice == BiasMode.alibi:
-        attn_bias = build_alibi_mask(N_CTX, N_CTX, H, scale=None, causal=causal)
-        attn_bias = attn_bias.expand(Z, H, N_CTX, N_CTX).to(q.device).to(q.dtype)
-    elif bias_choice == BiasMode.none:
+    if bias_choice == BiasMode.none:
         attn_bias = None
+    else:
+        attn_bias = build_rel_mask(N_CTX, N_CTX, H, bias_choice, causal=causal)
+        attn_bias = attn_bias.expand(Z, H, N_CTX, N_CTX).to(q.device).to(q.dtype)
+
     is_causal = causal if (bias_choice == BiasMode.none) else False
-    with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False):
+    with sdpa_kernel(SDPBackend.MATH):
         ref_out = torch.nn.functional.scaled_dot_product_attention(
             q, k, v, scale=sm_scale, is_causal=is_causal, attn_mask=attn_bias
         )

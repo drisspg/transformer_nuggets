@@ -14,6 +14,12 @@ import triton
 import triton.language as tl
 
 
+class BiasMode(enum.Enum):
+    none = 0
+    rel_pos = 1
+    alibi = 2
+
+
 def build_causal_mask(seq_len_q, seq_len_kv):
     temp_mask = torch.ones((seq_len_q, seq_len_kv)).tril_().bool()
     mask = torch.zeros_like(temp_mask, dtype=torch.float32)
@@ -21,23 +27,38 @@ def build_causal_mask(seq_len_q, seq_len_kv):
     return mask
 
 
-def build_alibi_mask(n_queries, n_keys, n_heads, scale=None, causal=True):
-    if scale is None:
+def build_rel_mask(
+    n_queries: int,
+    n_keys: int,
+    n_heads: int,
+    mode: BiasMode,
+    causal=True,
+):
+    """Builds torch equivalent mask
+    Args:
+        n_queries: Number of queries.
+        n_keys: Number of keys.
+        n_heads: Number of attention heads.
+        mode: Bias mode for the attention mask.
+        causal: Whether to include causal mask. Defaults to True.
+
+    Returns:
+        torch.Tensor: The alibi attention mask.
+    """
+    if mode == BiasMode.alibi:
         assert n_heads % 8 == 0
     m_0 = 2.0 ** (-8.0 / n_heads)
     slopes = torch.pow(m_0, torch.arange(1, 1 + n_heads))[:, None, None]
     base = -1 * (torch.arange(n_queries)[:, None] - torch.arange(n_keys)[None, :])
-    if scale is not None:
-        alibi_base = base * scale
-    else:
-        alibi_base = base * slopes
-    alibi_base = alibi_base.expand(n_heads, n_queries, n_keys)
+    mask = base
+    mask = mask * slopes if mode == BiasMode.alibi else mask
+    mask = mask.expand(n_heads, n_queries, n_keys)
     if causal:
         causal_mask = build_causal_mask(n_queries, n_keys)
         causal_mask = causal_mask.expand(n_heads, n_queries, n_keys)
-        full_mask = alibi_base + causal_mask
+        full_mask = mask + causal_mask
     else:
-        full_mask = alibi_base
+        full_mask = mask
     return full_mask
 
 
@@ -55,12 +76,6 @@ def alibi_attention_triton(cur, m, n, head_num, num_heads):
     bias = n - m
     cur = cur + (alibi_scale * bias)
     return cur
-
-
-class BiasMode(enum.Enum):
-    none = 0
-    rel_pos = 1
-    alibi = 2
 
 
 @triton.jit
@@ -166,11 +181,11 @@ def _fwd_kernel(
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, k)
         # ~~~~~~~~~~~~~~~~~~~ This is all mask stuff ~~~~~~~~~~~~~~~~~~~
-        if BIAS_CHOICE == BiasMode.rel_pos:
+        if BIAS_CHOICE == 1:
             qk = rel_attention_triton(
                 qk, offs_m[:, None], (start_n + offs_n[None, :]), off_hz % H, H
             )
-        elif BIAS_CHOICE == BiasMode.alibi:
+        elif BIAS_CHOICE == 2:
             qk = alibi_attention_triton(
                 qk, offs_m[:, None], (start_n + offs_n[None, :]), off_hz % H, H
             )
@@ -329,11 +344,11 @@ def _bwd_kernel(
             qk += tl.dot(q, tl.trans(k))
             qk *= qk_scale
             # ~~~~~~~~~~~~~~~~~~~ This is all mask stuff ~~~~~~~~~~~~~~~~~~~
-            if BIAS_CHOICE == BiasMode.rel_pos:
+            if BIAS_CHOICE == 1:
                 qk = rel_attention_triton(
                     qk, offs_m_curr[:, None], (offs_n[None, :]), off_hz % H, H
                 )
-            elif BIAS_CHOICE == BiasMode.alibi:
+            elif BIAS_CHOICE == 2:
                 qk = alibi_attention_triton(
                     qk, offs_m_curr[:, None], (offs_n[None, :]), off_hz % H, H
                 )
