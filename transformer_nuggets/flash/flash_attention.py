@@ -84,6 +84,103 @@ def max_fn(x, y):
 
 
 @triton.jit
+def score_modification(
+    qk,
+    offs_m,
+    start_n,
+    offs_n,
+    off_hz,
+    H,
+    q,
+    k,
+    mask_block_ptr,
+    BIAS_CHOICE: tl.constexpr,
+    DEBUG_MASK: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+):
+    # ~~~~~~~~~~~~~~~~~~~ This is all mask stuff ~~~~~~~~~~~~~~~~~~~
+    if BIAS_CHOICE == 1:
+        qk = rel_attention_triton(qk, offs_m[:, None], (start_n + offs_n[None, :]), off_hz % H, H)
+    elif BIAS_CHOICE == 2:
+        qk = alibi_attention_triton(
+            qk, offs_m[:, None], (start_n + offs_n[None, :]), off_hz % H, H
+        )
+    if DEBUG_MASK and BIAS_CHOICE != BiasMode.none:
+        mask = qk - tl.dot(q, k)
+        if IS_CAUSAL:
+            mask = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), mask, float("-inf"))
+        tl.store(mask_block_ptr, mask)
+    # ~~~~~~~~~~~~~~~~~~~ This is the end of mask stuff ~~~~~~~~~~~~~~~~~~~
+    return qk
+
+
+@triton.jit
+def _attn_fwd_inner(
+    acc,
+    l_i,
+    m_i,
+    q,
+    K_block_ptr,
+    V_block_ptr,
+    start_m,
+    qk_scale,
+    BLOCK_M: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    STAGE: tl.constexpr,
+    offs_m: tl.constexpr,
+    offs_n: tl.constexpr,
+    N_CTX: tl.constexpr,
+    fp8_v: tl.constexpr,
+):
+    """When STAGE == 3 no casual attention will happpen"""
+    # range of values handled by this stage
+    if STAGE == 1:
+        lo, hi = 0, start_m * BLOCK_M
+    elif STAGE == 2:
+        lo, hi = start_m * BLOCK_M, (start_m + 1) * BLOCK_M
+        lo = tl.multiple_of(lo, BLOCK_M)
+    # causal = False
+    else:
+        lo, hi = 0, N_CTX
+    K_block_ptr = tl.advance(K_block_ptr, (0, lo))
+    V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
+    # loop over k, v and update accumulator
+    for start_n in range(lo, hi, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        # -- compute qk ----
+        k = tl.load(K_block_ptr)
+        qk = tl.dot(q, k)
+        if STAGE == 2:
+            mask = offs_m[:, None] >= (start_n + offs_n[None, :])
+            qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
+            m_ij = tl.maximum(m_i, tl.max(qk, 1))
+            qk -= m_ij[:, None]
+        else:
+            m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+            qk = qk * qk_scale - m_ij[:, None]
+        p = tl.math.exp2(qk)
+        l_ij = tl.sum(p, 1)
+        # -- update m_i and l_i
+        alpha = tl.math.exp2(m_i - m_ij)
+        l_i = l_i * alpha + l_ij
+        # -- update output accumulator --
+        acc = acc * alpha[:, None]
+        # update acc
+        v = tl.load(V_block_ptr)
+        if fp8_v:
+            p = p.to(tl.float8e5)
+        else:
+            p = p.to(tl.float16)
+        acc = tl.dot(p, v, acc)
+        # update m_i and l_i
+        m_i = m_ij
+        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
+        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
+    return acc, l_i, m_i
+
+
+@triton.jit
 def _fwd_kernel(
     Q,
     K,
@@ -120,9 +217,17 @@ def _fwd_kernel(
 ):
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
-    qvk_offset = off_hz * stride_qh
+    off_z = off_hz // H
+    off_h = off_hz % H
+
+    q_batch_head_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
+    k_batch_head_offset = off_z.to(tl.int64) * stride_kz + off_h.to(tl.int64) * stride_kh
+    v_batch_head_offset = off_z.to(tl.int64) * stride_vz + off_h.to(tl.int64) * stride_vh
+
+    out_batch_head_offset = off_z.to(tl.int64) * stride_oz + off_h.to(tl.int64) * stride_oh
+
     Q_block_ptr = tl.make_block_ptr(
-        base=Q + qvk_offset,
+        base=Q + q_batch_head_offset,
         shape=(N_CTX, BLOCK_DMODEL),
         strides=(stride_qm, stride_qk),
         offsets=(start_m * BLOCK_M, 0),
@@ -130,7 +235,7 @@ def _fwd_kernel(
         order=(1, 0),
     )
     K_block_ptr = tl.make_block_ptr(
-        base=K + qvk_offset,
+        base=K + k_batch_head_offset,
         shape=(BLOCK_DMODEL, N_CTX),
         strides=(stride_kk, stride_kn),
         offsets=(0, 0),
@@ -138,13 +243,23 @@ def _fwd_kernel(
         order=(0, 1),
     )
     V_block_ptr = tl.make_block_ptr(
-        base=V + qvk_offset,
+        base=V + v_batch_head_offset,
         shape=(N_CTX, BLOCK_DMODEL),
         strides=(stride_vk, stride_vn),
         offsets=(0, 0),
         block_shape=(BLOCK_N, BLOCK_DMODEL),
         order=(1, 0),
     )
+
+    O_block_ptr = tl.make_block_ptr(
+        base=Out + out_batch_head_offset,
+        shape=(N_CTX, BLOCK_DMODEL),
+        strides=(stride_om, stride_on),
+        offsets=(start_m * BLOCK_M, 0),
+        block_shape=(BLOCK_M, BLOCK_DMODEL),
+        order=(1, 0),
+    )
+
     if DEBUG_MASK and BIAS_CHOICE != BiasMode.none:
         mask_block_ptr = tl.make_block_ptr(
             base=mask_scratch_space + off_hz * N_CTX * N_CTX,
@@ -159,7 +274,7 @@ def _fwd_kernel(
     offs_n = tl.arange(0, BLOCK_N)
     # initialize pointer to m and l
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
     # scale sm_scale by log_2(e) and use
     # 2^x instead of exp in the loop because CSE and LICM
@@ -180,23 +295,20 @@ def _fwd_kernel(
         # -- compute qk ---
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, k)
-        # ~~~~~~~~~~~~~~~~~~~ This is all mask stuff ~~~~~~~~~~~~~~~~~~~
-        if BIAS_CHOICE == 1:
-            qk = rel_attention_triton(
-                qk, offs_m[:, None], (start_n + offs_n[None, :]), off_hz % H, H
-            )
-        elif BIAS_CHOICE == 2:
-            qk = alibi_attention_triton(
-                qk, offs_m[:, None], (start_n + offs_n[None, :]), off_hz % H, H
-            )
-        if DEBUG_MASK and BIAS_CHOICE != BiasMode.none:
-            mask = qk - tl.dot(q, k)
-            if IS_CAUSAL:
-                mask = tl.where(
-                    offs_m[:, None] >= (start_n + offs_n[None, :]), mask, float("-inf")
-                )
-            tl.store(mask_block_ptr, mask)
-        # ~~~~~~~~~~~~~~~~~~~ This is the end of mask stuff ~~~~~~~~~~~~~~~~~~~
+        qk = score_modification(
+            qk,
+            offs_m,
+            start_n,
+            offs_n,
+            off_hz,
+            H,
+            q,
+            k,
+            mask_block_ptr,
+            BIAS_CHOICE,
+            DEBUG_MASK,
+            IS_CAUSAL,
+        )
         if IS_CAUSAL:
             qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk, float("-inf"))
         # -- compute scaling constant ---
@@ -226,14 +338,6 @@ def _fwd_kernel(
     # tl.store(l_ptrs, m_i + tl.math.log2(l_i))
     tl.store(l_ptrs, m_i + tl.math.log(l_i))
     # write back O
-    O_block_ptr = tl.make_block_ptr(
-        base=Out + qvk_offset,
-        shape=(N_CTX, BLOCK_DMODEL),
-        strides=(stride_om, stride_on),
-        offsets=(start_m * BLOCK_M, 0),
-        block_shape=(BLOCK_M, BLOCK_DMODEL),
-        order=(1, 0),
-    )
     tl.store(O_block_ptr, acc.to(tl.float16))
 
 
