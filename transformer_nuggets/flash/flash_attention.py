@@ -97,6 +97,7 @@ def score_modification(
     BIAS_CHOICE: tl.constexpr,
     DEBUG_MASK: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
+    MATMUL_PRECISION: tl.constexpr,
 ):
     # ~~~~~~~~~~~~~~~~~~~ This is all mask stuff ~~~~~~~~~~~~~~~~~~~
     if BIAS_CHOICE == 1:
@@ -106,7 +107,7 @@ def score_modification(
             qk, offs_m[:, None], (start_n + offs_n[None, :]), off_hz % H, H
         )
     if DEBUG_MASK and BIAS_CHOICE != BiasMode.none:
-        mask = qk - tl.dot(q, k)
+        mask = qk - tl.dot(q.to(tl.bfloat16), k.to(tl.bfloat16)).to(tl.float32)
         if IS_CAUSAL:
             mask = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), mask, float("-inf"))
         tl.store(mask_block_ptr, mask)
@@ -226,6 +227,8 @@ def _fwd_kernel(
 
     out_batch_head_offset = off_z.to(tl.int64) * stride_oz + off_h.to(tl.int64) * stride_oh
 
+    MATMUL_PRECISION: tl.constexpr = tl.bfloat16
+
     Q_block_ptr = tl.make_block_ptr(
         base=Q + q_batch_head_offset,
         shape=(N_CTX, BLOCK_DMODEL),
@@ -284,7 +287,7 @@ def _fwd_kernel(
     qk_scale = sm_scale
     # load q: it will stay in SRAM throughout
     q = tl.load(Q_block_ptr)
-    q = (q * qk_scale).to(tl.float16)
+    q = q * qk_scale
     # loop over k, v and update accumulator
     lo = 0
     hi = (start_m + 1) * BLOCK_M if IS_CAUSAL else N_CTX
@@ -294,7 +297,7 @@ def _fwd_kernel(
         v = tl.load(V_block_ptr)
         # -- compute qk ---
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        qk += tl.dot(q, k)
+        qk += tl.dot(q.to(MATMUL_PRECISION), k.to(MATMUL_PRECISION))
         qk = score_modification(
             qk,
             offs_m,
@@ -308,6 +311,7 @@ def _fwd_kernel(
             BIAS_CHOICE,
             DEBUG_MASK,
             IS_CAUSAL,
+            MATMUL_PRECISION,
         )
         if IS_CAUSAL:
             qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk, float("-inf"))
@@ -321,7 +325,7 @@ def _fwd_kernel(
         # -- scale and update acc --
         acc_scale = l_i * 0 + alpha  # workaround some compiler bug
         acc *= acc_scale[:, None]
-        acc += tl.dot(p.to(tl.float16), v)
+        acc += tl.dot(p, v.to(tl.float32))
         # -- update m_i and l_i --
         l_i = l_i * alpha + tl.sum(p, 1)
         m_i = m_i_new
@@ -338,7 +342,7 @@ def _fwd_kernel(
     # tl.store(l_ptrs, m_i + tl.math.log2(l_i))
     tl.store(l_ptrs, m_i + tl.math.log(l_i))
     # write back O
-    tl.store(O_block_ptr, acc.to(tl.float16))
+    tl.store(O_block_ptr, acc.to((Out.dtype.element_ty)))
 
 
 @triton.jit
@@ -463,7 +467,7 @@ def _bwd_kernel(
             p = tl.math.exp(qk - l_i[:, None])
             # compute dv
             do = tl.load(do_ptrs)
-            dv += tl.dot(tl.trans(p.to(Q.dtype.element_ty)), do)
+            dv += tl.dot(tl.trans(p.to(V.dtype.element_ty)), do)
             # compute dp = dot(v, do)
             Di = tl.load(D_ptrs + offs_m_curr)
             dp = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32) - Di[:, None]
