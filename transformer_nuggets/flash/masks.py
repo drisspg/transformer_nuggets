@@ -11,6 +11,7 @@ class BiasMode(enum.Enum):
     rel_pos = 1
     alibi = 2
     inverse_causal = 3
+    causal = 4
 
 
 def build_causal_mask(seq_len_q, seq_len_kv):
@@ -56,28 +57,66 @@ def build_rel_mask(
 
 
 @triton.jit
-def rel_attention_triton(cur, m, n, head_num, num_heads):
-    bias = n - m
-    cur = cur + bias
-    return cur
+def rel_attention_triton(score, batch, head, seq_len_q, seq_len_kv):
+    bias = seq_len_kv - seq_len_q
+    score = score + bias
+    return score
 
 
 @triton.jit
-def alibi_attention_triton(cur, m, n, head_num, num_heads):
+def alibi_attention_triton(score, batch, head, seq_len_q, seq_len_kv, num_heads):
     # 0 Indexing
-    alibi_scale = tl.math.exp2(-((head_num + 1) * 8.0 / num_heads))
-    bias = n - m
-    cur = cur + (alibi_scale * bias)
-    return cur
+    alibi_scale = tl.math.exp2(-((head + 1) * 8.0 / num_heads))
+    bias = seq_len_kv - seq_len_q
+    score = score + (alibi_scale * bias)
+    return score
 
 
 @triton.jit
-def causal_mask_triton(cur, m, n, head_num, num_heads):
-    cur = tl.where(m >= n, cur, float("-inf"))
-    return cur
+def causal_mask_triton(score, batch, head, seq_len_q, seq_len_kv):
+    score = tl.where(seq_len_q >= seq_len_kv, score, float("-inf"))
+    return score
 
 
 @triton.jit
-def inverse_causal_mask_triton(cur, m, n, head_num, num_heads):
-    cur = tl.where(m > n, float("-inf"), cur)
-    return cur
+def inverse_causal_mask_triton(score, batch, head, seq_len_q, seq_len_kv):
+    score = tl.where(seq_len_q > seq_len_kv, float("-inf"), score)
+    return score
+
+
+@triton.jit
+def score_modification(
+    score,
+    offs_m,
+    start_n,
+    offs_n,
+    off_hz,
+    num_heads,
+    q,
+    k,
+    mask_block_ptr,
+    BIAS_CHOICE: tl.constexpr,
+    DEBUG_MASK: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    MATMUL_PRECISION: tl.constexpr = tl.float16,
+):
+    batch = off_hz // num_heads
+    head = off_hz % num_heads
+    seq_len_q = offs_m[:, None]
+    seq_len_kv = start_n + offs_n[None, :]
+    if BIAS_CHOICE == 1:
+        score = rel_attention_triton(score, batch, head, seq_len_q, seq_len_kv)
+    elif BIAS_CHOICE == 2:
+        score = alibi_attention_triton(score, batch, head, seq_len_q, seq_len_kv, num_heads)
+    elif BIAS_CHOICE == 3:
+        score = inverse_causal_mask_triton(score, batch, head, seq_len_q, seq_len_kv)
+    elif BIAS_CHOICE == 4:
+        # CAUSAL MASK
+        score = causal_mask_triton(score, batch, head, seq_len_q, seq_len_kv)
+    if DEBUG_MASK and BIAS_CHOICE != BiasMode.none:
+        mask = score - tl.dot(q, k)
+        if IS_CAUSAL:
+            mask = tl.where(seq_len_q >= seq_len_kv, mask, float("-inf"))
+        tl.store(mask_block_ptr, mask)
+
+    return score

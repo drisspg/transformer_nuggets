@@ -10,12 +10,7 @@ import torch
 
 import triton
 import triton.language as tl
-from transformer_nuggets.flash.masks import (
-    alibi_attention_triton,
-    BiasMode,
-    inverse_causal_mask_triton,
-    rel_attention_triton,
-)
+from transformer_nuggets.flash.masks import BiasMode, score_modification
 
 
 @triton.jit
@@ -131,28 +126,22 @@ def _fwd_kernel(
         # -- compute qk ---
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, k)
-        # ~~~~~~~~~~~~~~~~~~~ This is all mask stuff ~~~~~~~~~~~~~~~~~~~
-        if BIAS_CHOICE == 1:
-            qk = rel_attention_triton(
-                qk, offs_m[:, None], (start_n + offs_n[None, :]), off_hz % H, H
-            )
-        elif BIAS_CHOICE == 2:
-            qk = alibi_attention_triton(
-                qk, offs_m[:, None], (start_n + offs_n[None, :]), off_hz % H, H
-            )
-        elif BIAS_CHOICE == 3:
-            # This should only be used for debugging
-            qk = inverse_causal_mask_triton(
-                qk, offs_m[:, None], (start_n + offs_n[None, :]), off_hz % H, H
-            )
-        if DEBUG_MASK and BIAS_CHOICE != BiasMode.none:
-            mask = qk - tl.dot(q, k)
-            if IS_CAUSAL:
-                mask = tl.where(
-                    offs_m[:, None] >= (start_n + offs_n[None, :]), mask, float("-inf")
-                )
-            tl.store(mask_block_ptr, mask)
-        # ~~~~~~~~~~~~~~~~~~~ This is the end of mask stuff ~~~~~~~~~~~~~~~~~~~
+        # ~~~~~~~~~~~~~~~~~~~ Do Score Modification ~~~~~~~~~~~~~~~~~~~
+        score_modification(
+            qk,
+            offs_m,
+            start_n,
+            offs_n,
+            off_hz,
+            H,
+            q,
+            k,
+            mask_block_ptr,
+            BIAS_CHOICE,
+            DEBUG_MASK,
+            IS_CAUSAL,
+            tl.float16,
+        )
         if IS_CAUSAL:
             qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk, float("-inf"))
         # -- compute scaling constant ---
@@ -303,21 +292,23 @@ def _bwd_kernel(
                 qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
             qk += tl.dot(q, tl.trans(k))
             qk *= qk_scale
-            # ~~~~~~~~~~~~~~~~~~~ This is all mask stuff ~~~~~~~~~~~~~~~~~~~
-            if BIAS_CHOICE == 1:
-                qk = rel_attention_triton(
-                    qk, offs_m_curr[:, None], (offs_n[None, :]), off_hz % H, H
-                )
-            elif BIAS_CHOICE == 2:
-                qk = alibi_attention_triton(
-                    qk, offs_m_curr[:, None], (offs_n[None, :]), off_hz % H, H
-                )
-            elif BIAS_CHOICE == 3:
-                # This should only be used for debugging
-                qk = inverse_causal_mask_triton(
-                    qk, offs_m[:, None], (start_n + offs_n[None, :]), off_hz % H, H
-                )
-            # ~~~~~~~~~~~~~~~~~~~ This is the end of mask stuff ~~~~~~~~~~~~~~~~~~~
+            # ~~~~~~~~~~~~~~~~~~~ Do Score Modification ~~~~~~~~~~~~~~~~~~~
+            score_modification(
+                qk,
+                offs_m,
+                start_n,
+                offs_n,
+                off_hz,
+                H,
+                q,
+                k,
+                None,
+                BIAS_CHOICE,
+                False,
+                CAUSAL,
+                tl.float16,
+            )
+
             l_i = tl.load(l_ptrs + offs_m_curr)
             row_max = tl.max(qk, 1)
             masked_out_rows = masked_row(row_max)
@@ -353,7 +344,16 @@ def _bwd_kernel(
 
 class _attention(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, causal, sm_scale, bias_choice: BiasMode, debug_mask=False):
+    def forward(
+        ctx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        causal: bool,
+        sm_scale: float,
+        bias_choice: BiasMode,
+        debug_mask=False,
+    ):
         # shape constraints
         batch_size, num_heads, seq_len_qv, d_head = q.shape
         Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
