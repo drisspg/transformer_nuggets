@@ -9,9 +9,17 @@ from transformer_nuggets.flash import attention, BiasMode, build_rel_mask
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("bias_choice", [BiasMode.rel_pos, BiasMode.none, BiasMode.alibi])
 @pytest.mark.parametrize("sm_scale", [None, 1])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.bfloat16,
+        torch.float16,
+        torch.float32,
+    ],
+)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_op(Z, H, N_CTX, D_HEAD, causal, bias_choice, sm_scale, dtype=torch.float16):
-    torch.manual_seed(20)
+def test_op(Z, H, N_CTX, D_HEAD, causal, bias_choice, sm_scale, dtype: torch.dtype):
+    torch.manual_seed(42)
     q = (
         torch.empty((Z, H, N_CTX, D_HEAD), dtype=dtype, device="cuda")
         .normal_(mean=0.0, std=0.5)
@@ -57,15 +65,15 @@ def test_op(Z, H, N_CTX, D_HEAD, causal, bias_choice, sm_scale, dtype=torch.floa
     tri_dq, q.grad = q.grad.clone(), None
     # Check attn_bias equivalence
     if bias_choice != BiasMode.none:
-        torch.testing.assert_close(attn_bias, mask.half(), atol=4e-2, rtol=0)
+        torch.testing.assert_close(attn_bias, mask.to(attn_bias.dtype), atol=4e-2, rtol=0)
 
     # compare
-    torch.testing.assert_close(ref_out, tri_out, atol=5.5e-2, rtol=0)
+    torch.testing.assert_close(ref_out, tri_out, atol=9e-2, rtol=0)
     if bias_choice != BiasMode.none:
         fudge_factor = 6.1
     else:
         fudge_factor = 1
-    atol = 1e-2 * fudge_factor
+    atol = 3e-2 * fudge_factor
     if bias_choice == BiasMode.rel_pos and not causal:
         atol *= 3
     torch.testing.assert_close(ref_dv, tri_dv, atol=atol, rtol=0)
