@@ -18,7 +18,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "torch >= 2.1.1",
+    "torch >= 2.2.1",
     "scipy >= 1.9.1",
     "tqdm >= 4.66",
     "tabulate >= 0.8",
@@ -35,8 +35,7 @@ dev = [
     "bumpver",
     "pip-tools",
     "pytest",
-    "flake8==6.1.0",
-    "flake8-pyproject",
+    "ruff==0.3.0",
     "jsonargparse",
     "docstring-parser"
 ]
@@ -52,16 +51,49 @@ llama = [
 ]
 
 # ---------- TOOL CONFIGURATIONS ------------
-[tool.flake8]
-max-line-length = 99
-ignore = ['E231', 'E241', 'E501', 'C408', 'E261', 'E731', 'G004', 'W503', 'E203']
-per-file-ignores = [
-    '__init__.py:F401',
+
+# ---------- RUFF ------------
+[tool.ruff]
+ignore = ['E231', 'E731']
+# Exclude a variety of commonly ignored directories.
+exclude = [
+    ".bzr",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".git-rewrite",
+    ".hg",
+    ".ipynb_checkpoints",
+    ".mypy_cache",
+    ".nox",
+    ".pants.d",
+    ".pyenv",
+    ".pytest_cache",
+    ".pytype",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    ".venv",
+    ".vscode",
+    "__pypackages__",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+    "node_modules",
+    "site-packages",
+    "venv",
 ]
+
+[tool.ruff.per-file-ignores]
+"__init__.py" = ["F401", "F403"]
+
+# ---------- UFMT ------------
 
 [tool.usort]
 first_party_detection = false
 
+# ---------- Black ------------
 [tool.black]
 target-version = ["py38"]
 line-length = 99

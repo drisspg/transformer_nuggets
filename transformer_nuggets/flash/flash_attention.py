@@ -6,81 +6,27 @@ This is a Triton implementation of the Flash Attention algorithm
 (see: Dao et al., https://arxiv.org/pdf/2205.14135v2.pdf; Rabe and Staats https://arxiv.org/pdf/2112.05682v2.pdf)
 """
 
-import enum
-
 import torch
 
 import triton
 import triton.language as tl
-
-
-class BiasMode(enum.Enum):
-    none = 0
-    rel_pos = 1
-    alibi = 2
-
-
-def build_causal_mask(seq_len_q, seq_len_kv):
-    temp_mask = torch.ones((seq_len_q, seq_len_kv)).tril_().bool()
-    mask = torch.zeros_like(temp_mask, dtype=torch.float32)
-    mask.masked_fill_(temp_mask.logical_not(), float("-inf"))
-    return mask
-
-
-def build_rel_mask(
-    n_queries: int,
-    n_keys: int,
-    n_heads: int,
-    mode: BiasMode,
-    causal=True,
-):
-    """Builds torch equivalent mask
-    Args:
-        n_queries: Number of queries.
-        n_keys: Number of keys.
-        n_heads: Number of attention heads.
-        mode: Bias mode for the attention mask.
-        causal: Whether to include causal mask. Defaults to True.
-
-    Returns:
-        torch.Tensor: The alibi attention mask.
-    """
-    if mode == BiasMode.alibi:
-        assert n_heads % 8 == 0
-    m_0 = 2.0 ** (-8.0 / n_heads)
-    slopes = torch.pow(m_0, torch.arange(1, 1 + n_heads))[:, None, None]
-    base = -1 * (torch.arange(n_queries)[:, None] - torch.arange(n_keys)[None, :])
-    mask = base
-    mask = mask * slopes if mode == BiasMode.alibi else mask
-    mask = mask.expand(n_heads, n_queries, n_keys)
-    if causal:
-        causal_mask = build_causal_mask(n_queries, n_keys)
-        causal_mask = causal_mask.expand(n_heads, n_queries, n_keys)
-        full_mask = mask + causal_mask
-    else:
-        full_mask = mask
-    return full_mask
-
-
-@triton.jit
-def rel_attention_triton(cur, m, n, head_num, num_heads):
-    bias = n - m
-    cur = cur + bias
-    return cur
-
-
-@triton.jit
-def alibi_attention_triton(cur, m, n, head_num, num_heads):
-    # 0 Indexing
-    alibi_scale = tl.math.exp2(-((head_num + 1) * 8.0 / num_heads))
-    bias = n - m
-    cur = cur + (alibi_scale * bias)
-    return cur
+from transformer_nuggets.flash.masks import BiasMode, score_modification
 
 
 @triton.jit
 def max_fn(x, y):
     return tl.math.max(x, y)
+
+
+@triton.jit
+def masked_row(rows):
+    """rows is BLOCK_M slice of the QK score
+    Returns:
+        BLOCK_M vector of boolean values indicating whether this
+        Query x Key position is fully masked
+
+    """
+    return rows == float("-inf")
 
 
 @triton.jit
@@ -174,39 +120,42 @@ def _fwd_kernel(
     lo = 0
     hi = (start_m + 1) * BLOCK_M if IS_CAUSAL else N_CTX
     for start_n in range(lo, hi, BLOCK_N):
-        # -- load k, v --
+        # -- load k --
         k = tl.load(K_block_ptr)
-        v = tl.load(V_block_ptr)
         # -- compute qk ---
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, k)
-        # ~~~~~~~~~~~~~~~~~~~ This is all mask stuff ~~~~~~~~~~~~~~~~~~~
-        if BIAS_CHOICE == 1:
-            qk = rel_attention_triton(
-                qk, offs_m[:, None], (start_n + offs_n[None, :]), off_hz % H, H
-            )
-        elif BIAS_CHOICE == 2:
-            qk = alibi_attention_triton(
-                qk, offs_m[:, None], (start_n + offs_n[None, :]), off_hz % H, H
-            )
-        if DEBUG_MASK and BIAS_CHOICE != BiasMode.none:
-            mask = qk - tl.dot(q, k)
-            if IS_CAUSAL:
-                mask = tl.where(
-                    offs_m[:, None] >= (start_n + offs_n[None, :]), mask, float("-inf")
-                )
-            tl.store(mask_block_ptr, mask)
-        # ~~~~~~~~~~~~~~~~~~~ This is the end of mask stuff ~~~~~~~~~~~~~~~~~~~
+        # ~~~~~~~~~~~~~~~~~~~ Do Score Modification ~~~~~~~~~~~~~~~~~~~
+        qk = score_modification(
+            qk,
+            offs_m,
+            start_n,
+            offs_n,
+            off_hz,
+            H,
+            q,
+            k,
+            mask_block_ptr,
+            BIAS_CHOICE,
+            DEBUG_MASK,
+            IS_CAUSAL,
+            tl.float16,
+        )
         if IS_CAUSAL:
             qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk, float("-inf"))
         # -- compute scaling constant ---
-        m_i_new = tl.maximum(m_i, tl.max(qk, 1))
+        row_max = tl.max(qk, 1)
+        m_i_new = tl.maximum(m_i, row_max)
+        masked_out_rows = masked_row(m_i_new)
         # TODO FIX ME
         # alpha = tl.math.exp2(m_i - m_i_new)
         # p = tl.math.exp2(qk - m_i_new[:, None])
         alpha = tl.math.exp(m_i - m_i_new)
+        alpha = tl.where(masked_out_rows, 0, alpha)
         p = tl.math.exp(qk - m_i_new[:, None])
+        p = tl.where(masked_out_rows[:, None], 0, p)
         # -- scale and update acc --
+        v = tl.load(V_block_ptr)
         acc_scale = l_i * 0 + alpha  # workaround some compiler bug
         acc *= acc_scale[:, None]
         acc += tl.dot(p.to(tl.float16), v)
@@ -343,16 +292,23 @@ def _bwd_kernel(
                 qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
             qk += tl.dot(q, tl.trans(k))
             qk *= qk_scale
-            # ~~~~~~~~~~~~~~~~~~~ This is all mask stuff ~~~~~~~~~~~~~~~~~~~
-            if BIAS_CHOICE == 1:
-                qk = rel_attention_triton(
-                    qk, offs_m_curr[:, None], (offs_n[None, :]), off_hz % H, H
-                )
-            elif BIAS_CHOICE == 2:
-                qk = alibi_attention_triton(
-                    qk, offs_m_curr[:, None], (offs_n[None, :]), off_hz % H, H
-                )
-            # ~~~~~~~~~~~~~~~~~~~ This is the end of mask stuff ~~~~~~~~~~~~~~~~~~~
+            # ~~~~~~~~~~~~~~~~~~~ Do Score Modification ~~~~~~~~~~~~~~~~~~~
+            qk = score_modification(
+                qk,
+                offs_m,
+                start_n,
+                offs_n,
+                off_hz,
+                H,
+                q,
+                k,
+                None,
+                BIAS_CHOICE,
+                False,
+                CAUSAL,
+                tl.float16,
+            )
+
             l_i = tl.load(l_ptrs + offs_m_curr)
             # TODO fix me
             # p = tl.math.exp2(qk - l_i[:, None])
@@ -385,7 +341,16 @@ def _bwd_kernel(
 
 class _attention(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, causal, sm_scale, bias_choice: BiasMode, debug_mask=False):
+    def forward(
+        ctx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        causal: bool,
+        sm_scale: float,
+        bias_choice: BiasMode,
+        debug_mask=False,
+    ):
         # shape constraints
         batch_size, num_heads, seq_len_qv, d_head = q.shape
         Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
@@ -394,7 +359,7 @@ class _attention(torch.autograd.Function):
         o = torch.empty_like(q)
         BLOCK_M = 128
         BLOCK_N = 64
-        grid = (triton.cdiv(q.shape[2], BLOCK_M), q.shape[0] * q.shape[1], 1)
+        grid = (triton.cdiv(seq_len_qv, BLOCK_M), batch_size * num_heads, 1)
         L = torch.empty(
             (q.shape[0] * q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32
         )
@@ -407,6 +372,7 @@ class _attention(torch.autograd.Function):
                 dtype=torch.float32,
             )
 
+        print(f"Using a bias choice of {bias_choice} with value {bias_choice.value}")
         num_warps = 4 if Lk <= 64 else 8
         _fwd_kernel[grid](
             q,

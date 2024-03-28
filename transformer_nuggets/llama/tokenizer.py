@@ -46,7 +46,7 @@ class Tokenizer:
         Returns:
             List[int]: A list of token IDs.
         """
-        assert type(s) is str
+        assert isinstance(s, str)
         t = self.sp_model.encode(s)
         if bos:
             t = [self.bos_id] + t
