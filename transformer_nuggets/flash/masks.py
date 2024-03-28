@@ -26,7 +26,7 @@ def build_rel_mask(
     n_keys: int,
     n_heads: int,
     mode: BiasMode,
-    causal=True,
+    causal: bool,
 ):
     """Builds torch equivalent mask
     Args:
@@ -104,19 +104,19 @@ def score_modification(
     head = off_hz % num_heads
     seq_len_q = offs_m[:, None]
     seq_len_kv = start_n + offs_n[None, :]
-    if BIAS_CHOICE == 1:
+    if BIAS_CHOICE == BiasMode.rel_pos.value:
         score = rel_attention_triton(score, batch, head, seq_len_q, seq_len_kv)
-    elif BIAS_CHOICE == 2:
+    elif BIAS_CHOICE == BiasMode.alibi.value:
         score = alibi_attention_triton(score, batch, head, seq_len_q, seq_len_kv, num_heads)
-    elif BIAS_CHOICE == 3:
+    elif BIAS_CHOICE == BiasMode.inverse_causal.value:
         score = inverse_causal_mask_triton(score, batch, head, seq_len_q, seq_len_kv)
-    elif BIAS_CHOICE == 4:
+    elif BIAS_CHOICE == BiasMode.causal.value:
         # CAUSAL MASK
         score = causal_mask_triton(score, batch, head, seq_len_q, seq_len_kv)
     if DEBUG_MASK and BIAS_CHOICE != BiasMode.none:
-        mask = score - tl.dot(q, k)
-        if IS_CAUSAL:
-            mask = tl.where(seq_len_q >= seq_len_kv, mask, float("-inf"))
+        mask = score - tl.dot(q.to(MATMUL_PRECISION), k.to(MATMUL_PRECISION))
+        # if IS_CAUSAL:
+        #     mask = tl.where(seq_len_q >= seq_len_kv, mask, float("-inf"))
         tl.store(mask_block_ptr, mask)
 
     return score

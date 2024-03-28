@@ -120,14 +120,13 @@ def _fwd_kernel(
     lo = 0
     hi = (start_m + 1) * BLOCK_M if IS_CAUSAL else N_CTX
     for start_n in range(lo, hi, BLOCK_N):
-        # -- load k, v --
+        # -- load k --
         k = tl.load(K_block_ptr)
-        v = tl.load(V_block_ptr)
         # -- compute qk ---
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, k)
         # ~~~~~~~~~~~~~~~~~~~ Do Score Modification ~~~~~~~~~~~~~~~~~~~
-        score_modification(
+        qk = score_modification(
             qk,
             offs_m,
             start_n,
@@ -146,8 +145,8 @@ def _fwd_kernel(
             qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk, float("-inf"))
         # -- compute scaling constant ---
         row_max = tl.max(qk, 1)
-        masked_out_rows = masked_row(row_max)
         m_i_new = tl.maximum(m_i, row_max)
+        masked_out_rows = masked_row(m_i_new)
         # TODO FIX ME
         # alpha = tl.math.exp2(m_i - m_i_new)
         # p = tl.math.exp2(qk - m_i_new[:, None])
@@ -156,6 +155,7 @@ def _fwd_kernel(
         p = tl.math.exp(qk - m_i_new[:, None])
         p = tl.where(masked_out_rows[:, None], 0, p)
         # -- scale and update acc --
+        v = tl.load(V_block_ptr)
         acc_scale = l_i * 0 + alpha  # workaround some compiler bug
         acc *= acc_scale[:, None]
         acc += tl.dot(p.to(tl.float16), v)
@@ -293,7 +293,7 @@ def _bwd_kernel(
             qk += tl.dot(q, tl.trans(k))
             qk *= qk_scale
             # ~~~~~~~~~~~~~~~~~~~ Do Score Modification ~~~~~~~~~~~~~~~~~~~
-            score_modification(
+            qk = score_modification(
                 qk,
                 offs_m,
                 start_n,
@@ -310,12 +310,9 @@ def _bwd_kernel(
             )
 
             l_i = tl.load(l_ptrs + offs_m_curr)
-            row_max = tl.max(qk, 1)
-            masked_out_rows = masked_row(row_max)
             # TODO fix me
             # p = tl.math.exp2(qk - l_i[:, None])
             p = tl.math.exp(qk - l_i[:, None])
-            p = tl.where(masked_out_rows[:, None], 0, p)
             # compute dv
             do = tl.load(do_ptrs)
             dv += tl.dot(tl.trans(p.to(Q.dtype.element_ty)), do)
@@ -375,6 +372,7 @@ class _attention(torch.autograd.Function):
                 dtype=torch.float32,
             )
 
+        print(f"Using a bias choice of {bias_choice} with value {bias_choice.value}")
         num_warps = 4 if Lk <= 64 else 8
         _fwd_kernel[grid](
             q,
