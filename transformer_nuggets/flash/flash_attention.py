@@ -127,7 +127,7 @@ def _fwd_kernel(
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, k)
         # ~~~~~~~~~~~~~~~~~~~ Do Score Modification ~~~~~~~~~~~~~~~~~~~
-        score_modification(
+        qk = score_modification(
             qk,
             offs_m,
             start_n,
@@ -293,7 +293,7 @@ def _bwd_kernel(
             qk += tl.dot(q, tl.trans(k))
             qk *= qk_scale
             # ~~~~~~~~~~~~~~~~~~~ Do Score Modification ~~~~~~~~~~~~~~~~~~~
-            score_modification(
+            qk = score_modification(
                 qk,
                 offs_m,
                 start_n,
@@ -375,6 +375,7 @@ class _attention(torch.autograd.Function):
                 dtype=torch.float32,
             )
 
+        print(f"Using a bias choice of {bias_choice} with value {bias_choice.value}")
         num_warps = 4 if Lk <= 64 else 8
         _fwd_kernel[grid](
             q,

@@ -26,7 +26,7 @@ def build_rel_mask(
     n_keys: int,
     n_heads: int,
     mode: BiasMode,
-    causal=True,
+    causal: bool,
 ):
     """Builds torch equivalent mask
     Args:
@@ -114,9 +114,9 @@ def score_modification(
         # CAUSAL MASK
         score = causal_mask_triton(score, batch, head, seq_len_q, seq_len_kv)
     if DEBUG_MASK and BIAS_CHOICE != BiasMode.none:
-        mask = score - tl.dot(q, k)
-        if IS_CAUSAL:
-            mask = tl.where(seq_len_q >= seq_len_kv, mask, float("-inf"))
+        mask = score - tl.dot(q.to(MATMUL_PRECISION), k.to(MATMUL_PRECISION))
+        # if IS_CAUSAL:
+        #     mask = tl.where(seq_len_q >= seq_len_kv, mask, float("-inf"))
         tl.store(mask_block_ptr, mask)
 
     return score
