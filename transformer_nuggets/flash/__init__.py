@@ -1,1 +1,2 @@
-from transformer_nuggets.flash.flash_attention import *  # noqa: F403
+from transformer_nuggets.flash.flash_attention import *
+from transformer_nuggets.flash.masks import *
