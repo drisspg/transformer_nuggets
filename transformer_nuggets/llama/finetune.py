@@ -3,7 +3,7 @@
 python transformer_nuggets/llama/finetune.py --profile --model 7B --enable_ac --full_finetune --optim_in_bwd
 
 # qlora on 2 gpus with FSDP
-python transformer_nuggets/llama/finetune.py --profile --model 7B --fsdp_num_gpus 2 --use_fsdp2 --enable_ac --cpu_offload
+python transformer_nuggets/llama/finetune.py --profile --model 7B --fsdp_num_gpus 2 --use_fsdp2 --enable_ac --register_nf4_param --cpu_offload
 """
 import argparse
 import functools

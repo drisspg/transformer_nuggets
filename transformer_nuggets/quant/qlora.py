@@ -204,8 +204,11 @@ class QloraLinear(nn.Module):
         return {"weight": weight_extensions}
 
     def _fsdp_pre_all_gather(self, sharded_param: torch.Tensor):
-        # TODO: shard Tensor-type params
-        return (sharded_param.quantized_data, ), (
+        return (
+            sharded_param.quantized_scalers,
+            sharded_param.quantization_factor,
+            sharded_param.quantized_data,
+        ), (
             SubclassTensorArgs(
                 sharded_param.size(),
                 sharded_param.stride(),
@@ -217,29 +220,9 @@ class QloraLinear(nn.Module):
             sharded_param.block_size,
             sharded_param.n_blocks,
             sharded_param.scaler_block_size,
-            sharded_param.quantized_scalers,
-            sharded_param.quantization_factor,
             sharded_param.scaler_mean,
             sharded_param.nf4,
         )
-
-    # def fsdp_post_all_gather(
-    #     self,
-    #     all_gather_outputs: Tuple[torch.Tensor, ...],
-    #     metadata: Any,
-    #     param_dtype: torch.dtype,
-    #     *,
-    #     out: Optional[torch.Tensor] = None,
-    # ) -> Union[Tuple[Tuple[torch.Tensor, ...]], None]:
-    #     (quantized_scalers, quantization_factor, scaler_mean, quantized_data, nf4) = all_gather_outputs
-    #     (tensor_meta, block_size, n_blocks, scaler_block_size) = metadata
-    #     if out is not None:
-    #         return
-    #     return (quantized_scalers, quantization_factor, scaler_mean, quantized_data, nf4), ()
-
-    # def _fsdp_pre_all_gather(self, sharded_param: torch.Tensor):
-    #     float8_tensor = self.cast_to_float8_e4m3fn(sharded_param, reduce_amax=True)
-    #     return (float8_tensor._data,), (float8_tensor._scale,)
 
     def _fsdp_post_all_gather(
         self,
@@ -249,13 +232,16 @@ class QloraLinear(nn.Module):
         *,
         out: Optional[torch.Tensor] = None,
     ) -> Union[Tuple[NF4Tensor, Tuple[torch.Tensor, ...]], None]:
-        (quantized_data, ) = all_gather_outputs
-        (tensor_meta, block_size, n_blocks, scaler_block_size, quantized_scalers, quantization_factor, scaler_mean, nf4)  = metadata
-        # TODO: figure out x 2
-        tensor_meta.original_shape = (tensor_meta.original_shape[0] * 2, tensor_meta.original_shape[1])
+        (quantized_scalers, quantization_factor, quantized_data) = all_gather_outputs
+        (tensor_meta, block_size, n_blocks, scaler_block_size, scaler_mean, nf4)  = metadata
+        tensor_meta.original_shape = torch.Size([quantized_data.size(0) * 2])
         if out is not None:
             assert isinstance(out, NF4Tensor), f"{type(out)}"
             assert (
+                quantized_scalers.untyped_storage().data_ptr()
+                == out.quantized_scalers.untyped_storage().data_ptr() and
+                quantization_factor.untyped_storage().data_ptr()
+                == out.quantization_factor.untyped_storage().data_ptr() and
                 quantized_data.untyped_storage().data_ptr()
                 == out.quantized_data.untyped_storage().data_ptr()
             ), f"Expects out's data to be the all-gather output"
@@ -271,7 +257,7 @@ class QloraLinear(nn.Module):
             scaler_mean,
             quantized_data,
             nf4,
-        ), (quantized_data, )
+        ), (quantized_scalers, quantization_factor, quantized_data)
 
 
 @dataclass
