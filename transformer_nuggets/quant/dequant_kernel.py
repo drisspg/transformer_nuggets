@@ -76,7 +76,7 @@ def dequant_nf4_tensor_kernel(
 
     #  Lets hope this function stays 🤞
     store_indices = offset * 2 + tl.arange(0, XBLOCK * 2)[:]
-    interleaved = tl._experimental_interleave(scaled_first, scaled_second)
+    interleaved = tl.interleave(scaled_first, scaled_second)
     tl.store(output_ptr + store_indices, interleaved)
 
 
