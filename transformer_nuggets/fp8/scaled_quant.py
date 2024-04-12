@@ -32,6 +32,71 @@ def scaled_cast(
     tl.store(output_ptr + (index), scaled_inpt.to(float8_dtype), mask=mask)
 
 
+def scaled_quant(
+    inpt_tensor: torch.Tensor,
+    scale: torch.Tensor,
+    abs_max: torch.Tensor,
+    fp8_dtype: torch.dtype = torch.float8_e4m3fn,
+    saturated: bool = False,
+):
+    """Quantize tensor to fp8 using a delayed scaled and calculate abs_max
+    for use in the next iteration of quantization.
+
+    Args:
+        inpt_tensor: Input tensor to quantize
+        scale: Scale to apply to input tensor, calculated from previous abs_max
+        abs_max: Absolute maximum value of input tensor, will be updated
+        fp8_dtype: FP8 datatype to quantize to
+        saturated: Whether to saturate the output tensor to the maximum value
+            of the fp8 datatype
+    """
+    assert scale.dtype == torch.float32
+    assert abs_max.dtype == torch.float32
+    assert scale.numel() == 1
+    assert abs_max.numel() == 1
+    assert inpt_tensor.is_contiguous(), "Input tensor must be contiguous"
+
+    out_tensor = torch.empty_like(inpt_tensor, dtype=fp8_dtype, device="cuda")
+    numel = inpt_tensor.numel()
+    grid = lambda meta: (triton.cdiv(numel, meta["XBLOCK"]),)
+    tl_dtype = {torch.float8_e4m3fn: tl.float8e4nv, torch.float8_e5m2: tl.float8e5}[fp8_dtype]
+    max_val = torch.finfo(fp8_dtype).max if saturated else 0.0
+    scaled_cast[grid](
+        inpt_tensor, out_tensor, scale, abs_max, numel, 4096, tl_dtype, max_val, num_warps=8
+    )
+    return out_tensor
+
+
+def eager_scaled_quant(
+    a: torch.Tensor,
+    scale: torch.Tensor,
+    abs_max: torch.Tensor,
+    fp8_dtype: torch.dtype,
+    saturated: torch.dtype = False,
+):
+    """Quantize tensor to fp8 using a delayed scaled and calculate abs_max
+
+    Args:
+        a: Input tensor to quantize
+        scale: Scale to apply to input tensor, calculated from previous abs_max
+        abs_max: Absolute maximum value of input tensor, will be updated
+        fp8_dtype: FP8 datatype to quantize to
+        saturated: Whether to saturate the output tensor to the maximum value
+            of the fp8 datatype
+    """
+    out = a * scale
+    if saturated:
+        out = torch.where(out > torch.finfo(fp8_dtype).max, torch.finfo(fp8_dtype).max, out)
+        out = torch.where(
+            out < -1 * torch.finfo(fp8_dtype).max, -1 * torch.finfo(fp8_dtype).max, out
+        )
+    _ = torch.max(torch.abs(out))
+    return out.to(fp8_dtype)
+
+
+# ----------- Dynamic Scaled Quantization ------------
+
+
 @triton.jit
 def dynamic_scaled_cast(
     inpt_ptr: torch.Tensor,
@@ -93,68 +158,6 @@ def dynamic_scaled_quant(
         max_val,
     )
     return out_tensor
-
-
-def scaled_quant(
-    inpt_tensor: torch.Tensor,
-    scale: torch.Tensor,
-    abs_max: torch.Tensor,
-    fp8_dtype: torch.dtype = torch.float8_e4m3fn,
-    saturated: bool = False,
-):
-    """Quantize tensor to fp8 using a delayed scaled and calculate abs_max
-    for use in the next iteration of quantization.
-
-    Args:
-        inpt_tensor: Input tensor to quantize
-        scale: Scale to apply to input tensor, calculated from previous abs_max
-        abs_max: Absolute maximum value of input tensor, will be updated
-        fp8_dtype: FP8 datatype to quantize to
-        saturated: Whether to saturate the output tensor to the maximum value
-            of the fp8 datatype
-    """
-    assert scale.dtype == torch.float32
-    assert abs_max.dtype == torch.float32
-    assert scale.numel() == 1
-    assert abs_max.numel() == 1
-    assert inpt_tensor.is_contiguous(), "Input tensor must be contiguous"
-
-    out_tensor = torch.empty_like(inpt_tensor, dtype=fp8_dtype, device="cuda")
-    numel = inpt_tensor.numel()
-    grid = lambda meta: (triton.cdiv(numel, meta["XBLOCK"]),)
-    tl_dtype = {torch.float8_e4m3fn: tl.float8e4nv, torch.float8_e5m2: tl.float8e5}[fp8_dtype]
-    max_val = torch.finfo(fp8_dtype).max if saturated else 0.0
-    scaled_cast[grid](
-        inpt_tensor, out_tensor, scale, abs_max, numel, 4096, tl_dtype, max_val, num_warps=8
-    )
-    return out_tensor
-
-
-def eager_scaled_quant(
-    a: torch.Tensor,
-    scale: torch.Tensor,
-    abs_max: torch.Tensor,
-    fp8_dtype: torch.dtype,
-    saturated: torch.dtype = False,
-):
-    """Quantize tensor to fp8 using a delayed scaled and calculate abs_max
-
-    Args:
-        a: Input tensor to quantize
-        scale: Scale to apply to input tensor, calculated from previous abs_max
-        abs_max: Absolute maximum value of input tensor, will be updated
-        fp8_dtype: FP8 datatype to quantize to
-        saturated: Whether to saturate the output tensor to the maximum value
-            of the fp8 datatype
-    """
-    out = a * scale
-    if saturated:
-        out = torch.where(out > torch.finfo(fp8_dtype).max, torch.finfo(fp8_dtype).max, out)
-        out = torch.where(
-            out < -1 * torch.finfo(fp8_dtype).max, -1 * torch.finfo(fp8_dtype).max, out
-        )
-    _ = torch.max(torch.abs(out))
-    return out.to(fp8_dtype)
 
 
 def eager_dynamic_scaled_quant(
