@@ -56,11 +56,10 @@ def dynamic_scaled_cast(
     tl.atomic_add(spin_lock, 1)
     while tl.load(spin_lock) < n_blocks:
         pass
-    scale = max_val / (tl.load(abs_max_ptr) + 1e-12)
+    scale = max_val / (tl.clamp(tl.load(abs_max_ptr), -1e12, float("inf")))
     scaled_inpt = inpt * scale
     # Saturated casting
-    tl.where(scaled_inpt > max_val, max_val, scaled_inpt)
-    tl.where(scaled_inpt < -1 * max_val, -1 * max_val, scaled_inpt)
+    scaled_inpt = tl.clamp(scaled_inpt, -1 * max_val, max_val)
     tl.store(output_ptr + (index), scaled_inpt.to(float8_dtype), mask=mask)
 
 
@@ -92,7 +91,6 @@ def dynamic_scaled_quant(
         4096,
         tl_dtype,
         max_val,
-        num_warps=8,
     )
     return out_tensor
 
