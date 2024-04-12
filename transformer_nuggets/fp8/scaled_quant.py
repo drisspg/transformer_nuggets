@@ -37,12 +37,14 @@ def dynamic_scaled_cast(
     inpt_ptr: torch.Tensor,
     output_ptr: torch.Tensor,
     abs_max_ptr: torch.Tensor,
+    spin_lock: torch.Tensor,
     numel: int,
     XBLOCK: tl.constexpr,
     float8_dtype: tl.constexpr,
     max_val: tl.constexpr,
 ):
     """Quantize tensor to fp8 using current global absmax"""
+    n_blocks = tl.num_programs(0)
     offset = tl.program_id(0) * XBLOCK
     index = offset + tl.arange(0, XBLOCK)[:]
     index = tl.max_contiguous(tl.multiple_of(index, XBLOCK), XBLOCK)
@@ -50,8 +52,10 @@ def dynamic_scaled_cast(
     inpt = tl.load(inpt_ptr + (index), mask=mask)
     block_max = tl.max(tl.abs(inpt))
     tl.atomic_max(abs_max_ptr, block_max)
-    # TODO Need a global barrier to ensure all blocks have updated abs_max
-    # Yet the test passes...?
+    # Spinlock global barrier
+    tl.atomic_add(spin_lock, 1)
+    while tl.load(spin_lock) < n_blocks:
+        pass
     scale = max_val / (tl.load(abs_max_ptr) + 1e-12)
     scaled_inpt = inpt * scale
     # Saturated casting
@@ -78,8 +82,17 @@ def dynamic_scaled_quant(
     tl_dtype = {torch.float8_e4m3fn: tl.float8e4nv, torch.float8_e5m2: tl.float8e5}[fp8_dtype]
     max_val = torch.finfo(fp8_dtype).max
     abs_max_scratch = torch.empty((), dtype=inpt_tensor.dtype, device="cuda")
+    spin_lock = torch.zeros((), dtype=torch.int32, device="cuda")
     dynamic_scaled_cast[grid](
-        inpt_tensor, out_tensor, abs_max_scratch, numel, 4096, tl_dtype, max_val, num_warps=8
+        inpt_tensor,
+        out_tensor,
+        abs_max_scratch,
+        spin_lock,
+        numel,
+        4096,
+        tl_dtype,
+        max_val,
+        num_warps=8,
     )
     return out_tensor
 
