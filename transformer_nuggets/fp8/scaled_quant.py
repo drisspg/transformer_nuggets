@@ -92,3 +92,85 @@ def eager_scaled_quant(
         )
     _ = torch.max(torch.abs(out))
     return out.to(fp8_dtype)
+
+
+# ----------- Dynamic Scaled Quantization ------------
+
+
+@triton.jit
+def dynamic_scaled_cast(
+    inpt_ptr: torch.Tensor,
+    output_ptr: torch.Tensor,
+    abs_max_ptr: torch.Tensor,
+    spin_lock: torch.Tensor,
+    numel: int,
+    XBLOCK: tl.constexpr,
+    float8_dtype: tl.constexpr,
+    max_val: tl.constexpr,
+):
+    """Quantize tensor to fp8 using current global absmax"""
+    n_blocks = tl.num_programs(0)
+    offset = tl.program_id(0) * XBLOCK
+    index = offset + tl.arange(0, XBLOCK)[:]
+    index = tl.max_contiguous(tl.multiple_of(index, XBLOCK), XBLOCK)
+    mask = index < numel
+    inpt = tl.load(inpt_ptr + (index), mask=mask)
+    block_max = tl.max(tl.abs(inpt))
+    tl.atomic_max(abs_max_ptr, block_max)
+    # Spinlock global barrier
+    tl.atomic_add(spin_lock, 1)
+    while tl.load(spin_lock) < n_blocks:
+        pass
+    scale = max_val / (tl.clamp(tl.load(abs_max_ptr), -1e12, float("inf")))
+    scaled_inpt = inpt * scale
+    # Saturated casting
+    scaled_inpt = tl.clamp(scaled_inpt, -1 * max_val, max_val)
+    tl.store(output_ptr + (index), scaled_inpt.to(float8_dtype), mask=mask)
+
+
+def dynamic_scaled_quant(
+    inpt_tensor: torch.Tensor, fp8_dtype: torch.dtype = torch.float8_e4m3fn
+) -> torch.Tensor:
+    """Quantize tensor to fp8 using dynamic scale calculated from abs_max
+    It will do saturated casting
+
+    Args:
+        inpt_tensor: Input tensor to quantize
+        fp8_dtype: FP8 datatype to quantize to
+    """
+    assert inpt_tensor.is_contiguous(), "Input tensor must be contiguous"
+
+    out_tensor = torch.empty_like(inpt_tensor, dtype=fp8_dtype, device="cuda")
+    numel = inpt_tensor.numel()
+    grid = lambda meta: (triton.cdiv(numel, meta["XBLOCK"]),)
+    tl_dtype = {torch.float8_e4m3fn: tl.float8e4nv, torch.float8_e5m2: tl.float8e5}[fp8_dtype]
+    max_val = torch.finfo(fp8_dtype).max
+    abs_max_scratch = torch.empty((), dtype=inpt_tensor.dtype, device="cuda")
+    spin_lock = torch.zeros((), dtype=torch.int32, device="cuda")
+    dynamic_scaled_cast[grid](
+        inpt_tensor,
+        out_tensor,
+        abs_max_scratch,
+        spin_lock,
+        numel,
+        4096,
+        tl_dtype,
+        max_val,
+    )
+    return out_tensor
+
+
+def eager_dynamic_scaled_quant(
+    a: torch.Tensor,
+    fp8_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Quantize tensor to fp8 using the current amax value to generate scale
+    Args:
+        a: Input tensor to quantize
+        fp8_dtype: FP8 datatype to quantize to
+    """
+    from float8_experimental.float8_utils import tensor_to_scale, to_fp8_saturated
+
+    scale = tensor_to_scale(a, fp8_dtype)
+    a = a * scale
+    return to_fp8_saturated(a, fp8_dtype)
