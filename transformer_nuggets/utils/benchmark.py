@@ -7,6 +7,7 @@ from typing import Callable, Optional
 
 import torch
 import torch.utils.benchmark as benchmark
+from torch._inductor.utils import do_bench_using_profiling
 
 from torch.cuda._memory_viz import profile_plot
 from torch.profiler import profile, ProfilerActivity, record_function
@@ -47,6 +48,13 @@ def benchmark_torch_function_in_microseconds(func: Callable, *args, **kwargs) ->
         stmt="func(*args, **kwargs)", globals={"args": args, "kwargs": kwargs, "func": func}
     )
     return t0.adaptive_autorange(min_run_time=0.1).median * 1e6
+
+
+def benchmark_cuda_function_in_microseconds(func: Callable, *args, **kwargs) -> float:
+    """Thin wrapper around do_bench_using_profiling"""
+    no_args = lambda: func(*args, **kwargs)
+    time = do_bench_using_profiling(no_args)
+    return time * 1e6
 
 
 def profile_function(
