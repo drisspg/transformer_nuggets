@@ -110,9 +110,7 @@ def _fwd_kernel(
     # scale sm_scale by log_2(e) and use
     # 2^x instead of exp in the loop because CSE and LICM
     # don't work as expected with `exp` in the loop
-    # TODO fix this
-    # qk_scale = sm_scale * 1.44269504
-    cob = 1.44269504
+    change_of_base = 1.44269504
     qk_scale = sm_scale
     # load q: it will stay in SRAM throughout
     q = tl.load(Q_block_ptr)
@@ -142,19 +140,19 @@ def _fwd_kernel(
             IS_CAUSAL,
             tl.float16,
         )
-        qk *= cob
+        qk *= change_of_base
         if IS_CAUSAL:
             qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk, float("-inf"))
         # -- compute scaling constant ---
         row_max = tl.max(qk, 1)
         m_i_new = tl.maximum(m_i, row_max)
         masked_out_rows = masked_row(m_i_new)
-        # TODO FIX ME
+
+        # We have changed the base from e to 2
         alpha = tl.math.exp2(m_i - m_i_new)
         p = tl.math.exp2(qk - m_i_new[:, None])
-        # alpha = tl.math.exp(m_i - m_i_new)
+
         alpha = tl.where(masked_out_rows, 0, alpha)
-        # p = tl.math.exp(qk - m_i_new[:, None])
         p = tl.where(masked_out_rows[:, None], 0, p)
         # -- scale and update acc --
         v = tl.load(V_block_ptr)
@@ -173,9 +171,9 @@ def _fwd_kernel(
     # write back l and m
     acc = acc / l_i[:, None]
     l_ptrs = L + off_hz * N_CTX + offs_m
-    # TODO fix me
+
+    # Since we have changed the base from e to 2
     tl.store(l_ptrs, m_i + tl.math.log2(l_i))
-    # tl.store(l_ptrs, m_i + tl.math.log(l_i))
     # write back O
     O_block_ptr = tl.make_block_ptr(
         base=Out + qvk_offset,
@@ -246,9 +244,7 @@ def _bwd_kernel(
     off_hz = tl.program_id(0)
     off_z = off_hz // H
     off_h = off_hz % H
-    # TODO fix me
-    # qk_scale = sm_scale * 1.44269504
-    cob = 1.44269504
+    change_of_base = 1.44269504
     qk_scale = sm_scale
     # offset pointers for batch/head
     Q += off_z * stride_qz + off_h * stride_qh
@@ -311,12 +307,10 @@ def _bwd_kernel(
                 CAUSAL,
                 tl.float16,
             )
-            qk *= cob
+            qk *= change_of_base
 
             l_i = tl.load(l_ptrs + offs_m_curr)
-            # TODO fix me
             p = tl.math.exp2(qk - l_i[:, None])
-            # p = tl.math.exp(qk - l_i[:, None])
             # compute dv
             do = tl.load(do_ptrs)
             dv += tl.dot(tl.trans(p.to(Q.dtype.element_ty)), do)
