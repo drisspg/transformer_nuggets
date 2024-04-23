@@ -41,17 +41,20 @@ logging.basicConfig(level=logging.INFO)
 @dataclass
 class Hyperparameters:
     learning_rate: float = 6e-4
-    batch_size: int = 128
+    # batch_size: int = 128
+    batch_size: int = 1
     micro_batch_size: int = 1
     gradient_accumulation_iters: int = field(init=False)
     max_seq_length: int = 4096
-    max_iters: int = 600000  # train dataset size
+    # max_iters: int = 600000  # train dataset size
+    max_iters: int = 10
     weight_decay: float = 0.01
     beta1: float = 0.9
     beta2: float = 0.95
     grad_clip: float = 1.0
     decay_lr: bool = True
-    warmup_iters: int = 2000
+    # warmup_iters: int = 2000
+    warmup_iters: int = 2
     lr_decay_iters: int = field(init=False)
     min_lr: float = 6e-5
     foreach_optimizer: bool = False
@@ -273,6 +276,7 @@ def train(
             (loss / hyper_params.gradient_accumulation_iters).backward()
 
             if not is_accumulating:
+                print("I am stepping!")
                 optimizer.step()
                 optimizer.zero_grad()
                 step_count += 1
