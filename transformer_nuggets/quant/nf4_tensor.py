@@ -334,7 +334,24 @@ class NF4Tensor(torch.Tensor):
         # Is not consistent with torch.round. Example: input 1.1016 with abs max
         # scale of 2.2821 will get mapped to 1.25 while mine will get mapped to 0.9570
         # The difference for mine is 0.1445 and for bnb 0.1484
-        quantized_blocks = NF4Tensor.quantize_tensor_nearest(scaled_blocks.flatten(), nf4)
+
+        # Lets do this in chunk size
+        if True:
+            chunk_size = 1024**2
+            assert numel % chunk_size == 0, f"Number of elements must be divisible by {chunk_size}"
+            quantized_blocks = torch.empty(numel, dtype=torch.uint8)
+            flattened = scaled_blocks.flatten()
+            for chunk_num in range(numel // chunk_size):
+                start = chunk_num * chunk_size
+                end = (chunk_num + 1) * chunk_size
+
+                quantized_blocks[start:end] = NF4Tensor.quantize_tensor_nearest(
+                    flattened[start:end], nf4
+                ).to(
+                    torch.uint8
+                )  # Another memory savings since we know this in ∈[0,15]
+        else:
+            quantized_blocks = NF4Tensor.quantize_tensor_nearest(scaled_blocks.flatten(), nf4)
 
         # Combine the quantized elements into uint8 values
         # This lays out two consecutive elements in the same byte
