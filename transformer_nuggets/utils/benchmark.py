@@ -38,6 +38,7 @@ class ProfileConfig:
     sync: bool = False
     extra_kwargs: dict = field(default_factory=dict)
     memory_profile_path: Optional[str] = None
+    row_limit: int = 10
 
 
 def benchmark_torch_function_in_microseconds(func: Callable, *args, **kwargs) -> float:
@@ -99,7 +100,8 @@ def profile_function(
             f.write(profile_plot(prof))
 
     if config.file_path is None:
-        print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
+        sort_by = 'cpu_time_total' if not config.cuda else 'cuda_time_total'
+        print(prof.key_averages().table(sort_by=sort_by, row_limit=config.row_limit))
 
     return prof
 
