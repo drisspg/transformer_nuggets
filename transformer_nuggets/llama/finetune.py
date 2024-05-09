@@ -1,6 +1,7 @@
 """
 Used to train a model from scratch on big dense blocks of text data using causal attention.
 """
+
 import argparse
 import functools
 import logging
@@ -77,7 +78,9 @@ def main(
         )
         qlora.swap_for_qlora(model, qlora_config, torch.bfloat16)
     model.setup_caches(
-        hyper_params.micro_batch_size, hyper_params.max_seq_length, training_config.device
+        hyper_params.micro_batch_size,
+        hyper_params.max_seq_length,
+        training_config.device,
     )
 
     if rank == 0:

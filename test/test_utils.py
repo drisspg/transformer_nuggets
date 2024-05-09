@@ -35,9 +35,11 @@ def test_breakpoint():
             0.0,
         ]
     )
-    with pytest.raises(RuntimeError, match="returned a NaN"), mock.patch(
-        "builtins.breakpoint"
-    ) as mock_breakpoint, NanInfDetect(do_breakpoint=True):
+    with (
+        pytest.raises(RuntimeError, match="returned a NaN"),
+        mock.patch("builtins.breakpoint") as mock_breakpoint,
+        NanInfDetect(do_breakpoint=True),
+    ):
         print(torch.div(a, a))
         mock_breakpoint.assert_called_once()
 

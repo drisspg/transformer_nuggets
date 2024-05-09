@@ -1,4 +1,4 @@
-name: Ufmt
+name: Code Analysis with Ruff
 
 on:
   push:
@@ -20,7 +20,11 @@ jobs:
         python-version: ${{ matrix.python-version }}
     - name: Install dependencies
       run: |
-        pip install black==23.3.0 usort==1.0.6 ufmt==2.1.0 libcst==1.0.1
-    - name: Analyzing the code with ufmt
+        python -m pip install --upgrade pip
+        pip install ruff
+    - name: Analyzing the code with ruff
       run: |
-        ufmt check .
+        ruff check .
+    - name: Check well formatted code
+      run: |
+        ruff format --check

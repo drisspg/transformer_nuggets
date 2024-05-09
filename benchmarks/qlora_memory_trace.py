@@ -5,7 +5,12 @@ import torch
 import torch.nn as nn
 from jsonargparse import CLI
 
-from transformer_nuggets.quant.qlora import get_mlp_weights, get_sample_inputs, MLP, QloraMLP
+from transformer_nuggets.quant.qlora import (
+    get_mlp_weights,
+    get_sample_inputs,
+    MLP,
+    QloraMLP,
+)
 from transformer_nuggets.utils.benchmark import save_memory_snapshot
 
 logging.basicConfig(level=logging.INFO)

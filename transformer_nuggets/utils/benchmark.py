@@ -46,7 +46,8 @@ def benchmark_torch_function_in_microseconds(func: Callable, *args, **kwargs) ->
     for _ in range(5):
         func(*args, **kwargs)
     t0 = benchmark.Timer(
-        stmt="func(*args, **kwargs)", globals={"args": args, "kwargs": kwargs, "func": func}
+        stmt="func(*args, **kwargs)",
+        globals={"args": args, "kwargs": kwargs, "func": func},
     )
     return t0.adaptive_autorange(min_run_time=0.1).median * 1e6
 
@@ -100,7 +101,7 @@ def profile_function(
             f.write(profile_plot(prof))
 
     if config.file_path is None:
-        sort_by = 'cpu_time_total' if not config.cuda else 'cuda_time_total'
+        sort_by = "cpu_time_total" if not config.cuda else "cuda_time_total"
         print(prof.key_averages().table(sort_by=sort_by, row_limit=config.row_limit))
 
     return prof

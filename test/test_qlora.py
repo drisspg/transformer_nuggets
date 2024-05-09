@@ -21,7 +21,8 @@ except ImportError:
 
 
 @pytest.mark.parametrize(
-    "inpt_size, block_size, scaler_block_size", [(16384, 64, 256), (256, 16, 16), (1024, 32, 32)]
+    "inpt_size, block_size, scaler_block_size",
+    [(16384, 64, 256), (256, 16, 16), (1024, 32, 32)],
 )
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
@@ -42,7 +43,8 @@ def test_reconstruction(
 
 
 @pytest.mark.parametrize(
-    "inpt_size, block_size, scaler_block_size", [(16384, 64, 256), (256, 16, 16), (1024, 32, 32)]
+    "inpt_size, block_size, scaler_block_size",
+    [(16384, 64, 256), (256, 16, 16), (1024, 32, 32)],
 )
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
@@ -210,7 +212,12 @@ def test_bitsandbytes_mlp_parity(embed_dim, compile, dtype):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 def test_qlora_linear(
-    embed_dim: int, compile: bool, r: int, dropout: float, run_backward: bool, dtype: torch.dtype
+    embed_dim: int,
+    compile: bool,
+    r: int,
+    dropout: float,
+    run_backward: bool,
+    dtype: torch.dtype,
 ):
     torch._dynamo.reset()
     torch.manual_seed(0)

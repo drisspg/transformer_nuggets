@@ -1,6 +1,6 @@
-# Basic flak8 + pytest workflow for Python 3.10
+# Pytest workflow for Python 3.10
 
-name: Python Lint and Test
+name: Pytest all the things
 
 on:
   push:
@@ -27,9 +27,6 @@ jobs:
         python -m pip install --upgrade pip
         pip install -e .
         pip install -e .'[dev]'
-    - name: Lint with ruff
-      run: |
-        ruff check .
     - name: Test with pytest
       run: |
         pytest

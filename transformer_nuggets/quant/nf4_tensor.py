@@ -86,10 +86,8 @@ def get_block_absmax(inpt_tensor: torch.Tensor, block_size: int) -> torch.Tensor
     """
     assert inpt_tensor.dim() == 1, "Input tensor must be flattened"
     assert (
-        inpt_tensor.numel() % block_size
-    ) == 0, (
-        f"Input tensor must be divisible by block size, got {inpt_tensor.numel()} and {block_size}"
-    )
+        (inpt_tensor.numel() % block_size) == 0
+    ), f"Input tensor must be divisible by block size, got {inpt_tensor.numel()} and {block_size}"
 
     n_blocks = inpt_tensor.numel() // block_size
     blocks = inpt_tensor.view(n_blocks, block_size)
@@ -249,8 +247,8 @@ class NF4Tensor(torch.Tensor):
         """
         assert inpt_tensor.dim() == 1, "Input tensor must be flattened"
         assert (
-            inpt_tensor.numel() % scaler_block_size
-        ) == 0, f"Input tensor must be divisible by block size, got {inpt_tensor.numel()} and {scaler_block_size}"
+            (inpt_tensor.numel() % scaler_block_size) == 0
+        ), f"Input tensor must be divisible by block size, got {inpt_tensor.numel()} and {scaler_block_size}"
 
         # First round of quantization
         # Produces: A tensor of size (n_blocks) of inpt_tensor.dtype
@@ -285,7 +283,10 @@ class NF4Tensor(torch.Tensor):
         )
 
     def dequantize_scalers(
-        self, inpt_tensor: torch.Tensor, quantization_factor: torch.Tensor, scaler_block_size: int
+        self,
+        inpt_tensor: torch.Tensor,
+        quantization_factor: torch.Tensor,
+        scaler_block_size: int,
     ) -> torch.Tensor:
         """Used to unpack the double quantized scalers
 
@@ -298,8 +299,8 @@ class NF4Tensor(torch.Tensor):
         """
         assert inpt_tensor.dim() == 1, "Input tensor must be flattened"
         assert (
-            inpt_tensor.numel() % scaler_block_size
-        ) == 0, f"Input tensor must be divisible by block size, got {inpt_tensor.numel()} and {scaler_block_size}"
+            (inpt_tensor.numel() % scaler_block_size) == 0
+        ), f"Input tensor must be divisible by block size, got {inpt_tensor.numel()} and {scaler_block_size}"
         n_scaler_blocks = inpt_tensor.numel() // scaler_block_size
         inpt_tensor = inpt_tensor.view(n_scaler_blocks, scaler_block_size)
         dequantized = (inpt_tensor / quantization_factor.unsqueeze(-1)).flatten().to(

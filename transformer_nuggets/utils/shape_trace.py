@@ -1,4 +1,4 @@
-""" Iterate through torchbench models and collect info on shapes of inputs and outputs """
+"""Iterate through torchbench models and collect info on shapes of inputs and outputs"""
 
 import ast
 

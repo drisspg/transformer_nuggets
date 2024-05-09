@@ -9,19 +9,12 @@ repos:
     -   id: check-yaml
     -   id: check-added-large-files
 
--   repo: https://github.com/omnilib/ufmt
-    rev: v2.1.0
-    hooks:
-      - id: ufmt
-        additional_dependencies:
-          - black == 23.3.0
-          - usort == 1.0.6
-          - ufmt == 2.1.0
-          - libcst == 1.0.1
-
--   repo: https://github.com/astral-sh/ruff-pre-commit
-    # Ruff version.
-    rev: v0.3.0
-    hooks:
-        # Run the linter.
-        - id: ruff
+- repo: https://github.com/astral-sh/ruff-pre-commit
+  # Ruff version.
+  rev: v0.4.4
+  hooks:
+    # Run the linter.
+    - id: ruff
+      args: [ --fix ]
+    # Run the formatter.
+    - id: ruff-format

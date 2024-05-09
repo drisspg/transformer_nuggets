@@ -1,7 +1,12 @@
 import pytest
 import torch
 
-from transformer_nuggets.flash import attention, BiasMode, build_causal_mask, build_rel_mask
+from transformer_nuggets.flash import (
+    attention,
+    BiasMode,
+    build_causal_mask,
+    build_rel_mask,
+)
 
 
 def clone_grad_and_reset(tensor):

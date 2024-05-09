@@ -74,11 +74,19 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
 
     # Correctness check:
     nuggets_out = scaled_quant(
-        triton_hp_tensor, triton_abs_max, scale, config.low_precision_dtype, config.saturated
+        triton_hp_tensor,
+        triton_abs_max,
+        scale,
+        config.low_precision_dtype,
+        config.saturated,
     )
     nuggets_out_hp = nuggets_out.to(config.high_precision_dtype)
     eager_out = eager_scaled_quant(
-        high_precision_tensor, eager_abs_max, scale, config.low_precision_dtype, config.saturated
+        high_precision_tensor,
+        eager_abs_max,
+        scale,
+        config.low_precision_dtype,
+        config.saturated,
     ).to(config.high_precision_dtype)
     eager_out_hp = eager_out.to(config.high_precision_dtype)
     with suppress(AssertionError):

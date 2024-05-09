@@ -13,7 +13,11 @@ def dequantize(inputs, nf4_lut):
 
 @triton.jit
 def dequantize_scalers(
-    quantized_scalers_ptr, quantization_factor_ptr, scaler_mean_ptr, block_size, scaler_block_size
+    quantized_scalers_ptr,
+    quantization_factor_ptr,
+    scaler_mean_ptr,
+    block_size,
+    scaler_block_size,
 ):
     """Dequantizes the quantized scalers to bfloat16
     Args:
@@ -68,7 +72,11 @@ def dequant_nf4_tensor_kernel(
 
     # Dequantize the double quantized scalers
     block_scaler = dequantize_scalers(
-        quantized_scalers_ptr, quantization_factor_ptr, scaler_mean_ptr, XBLOCK, scaler_block_size
+        quantized_scalers_ptr,
+        quantization_factor_ptr,
+        scaler_mean_ptr,
+        XBLOCK,
+        scaler_block_size,
     )
 
     scaled_first = dequantized_first * block_scaler

@@ -1,6 +1,7 @@
 """
 Used to train a model from scratch on big dense blocks of text data using causal attention.
 """
+
 import csv
 import logging
 import math
@@ -164,7 +165,9 @@ def main(
         model.init_parameters()
 
     model.setup_caches(
-        hyper_params.micro_batch_size, hyper_params.max_seq_length, training_config.device
+        hyper_params.micro_batch_size,
+        hyper_params.max_seq_length,
+        training_config.device,
     )
 
     logging.info("Setting up the dataloaders")

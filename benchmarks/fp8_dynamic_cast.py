@@ -8,7 +8,10 @@ import torch
 from tabulate import tabulate
 from tqdm import tqdm
 
-from transformer_nuggets.fp8.scaled_quant import dynamic_scaled_quant, eager_dynamic_scaled_quant
+from transformer_nuggets.fp8.scaled_quant import (
+    dynamic_scaled_quant,
+    eager_dynamic_scaled_quant,
+)
 from transformer_nuggets.utils import benchmark_torch_function_in_microseconds
 
 device = torch.device("cuda")
