@@ -2,6 +2,7 @@
 
 Based on the nanoGPT implementation: https://github.com/karpathy/nanoGPT.
 """
+
 # mypy: ignore-errors
 import math
 from dataclasses import dataclass
@@ -163,7 +164,9 @@ class LLaMA(nn.Module):
 
     def build_mask_cache(self, idx: torch.Tensor) -> MaskCache:
         ones = torch.ones(
-            (self.config.block_size, self.config.block_size), device=idx.device, dtype=torch.bool
+            (self.config.block_size, self.config.block_size),
+            device=idx.device,
+            dtype=torch.bool,
         )
         return torch.tril(ones).unsqueeze(0).unsqueeze(0)
 
@@ -361,7 +364,11 @@ class RMSNorm(nn.Module):
 
 
 def build_rope_cache(
-    seq_len: int, n_elem: int, dtype: torch.dtype, device: torch.device, base: int = 10000
+    seq_len: int,
+    n_elem: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    base: int = 10000,
 ) -> RoPECache:
     """Enhanced Transformer with Rotary Position Embedding.
 

@@ -225,13 +225,28 @@ class QloraMLP(nn.Module):
         lora_dropout = qlora_config.lora_dropout
 
         self.qlora_w1 = QloraLinear(
-            weight1.shape[1], weight1.shape[0], weight1, lora_r, lora_alpha, lora_dropout
+            weight1.shape[1],
+            weight1.shape[0],
+            weight1,
+            lora_r,
+            lora_alpha,
+            lora_dropout,
         )
         self.qlora_w2 = QloraLinear(
-            weight2.shape[1], weight2.shape[0], weight2, lora_r, lora_alpha, lora_dropout
+            weight2.shape[1],
+            weight2.shape[0],
+            weight2,
+            lora_r,
+            lora_alpha,
+            lora_dropout,
         )
         self.qlora_w3 = QloraLinear(
-            weight3.shape[1], weight3.shape[0], weight3, lora_r, lora_alpha, lora_dropout
+            weight3.shape[1],
+            weight3.shape[0],
+            weight3,
+            lora_r,
+            lora_alpha,
+            lora_dropout,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

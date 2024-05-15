@@ -139,7 +139,11 @@ def mlp_experiment(config: ExperimentConfig) -> ExperimentResult:
         bnb_mlp_time = -1.0
 
     return ExperimentResult(
-        mlp_time, qlora_mlp_time, compiled_qlora_mlp_time, bnb_mlp_time, qlora_mlp_triton_time
+        mlp_time,
+        qlora_mlp_time,
+        compiled_qlora_mlp_time,
+        bnb_mlp_time,
+        qlora_mlp_triton_time,
     )
 
 

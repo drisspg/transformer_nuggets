@@ -62,7 +62,15 @@ def scaled_quant(
     tl_dtype = {torch.float8_e4m3fn: tl.float8e4nv, torch.float8_e5m2: tl.float8e5}[fp8_dtype]
     max_val = torch.finfo(fp8_dtype).max if saturated else 0.0
     scaled_cast[grid](
-        inpt_tensor, out_tensor, scale, abs_max, numel, 4096, tl_dtype, max_val, num_warps=8
+        inpt_tensor,
+        out_tensor,
+        scale,
+        abs_max,
+        numel,
+        4096,
+        tl_dtype,
+        max_val,
+        num_warps=8,
     )
     return out_tensor
 

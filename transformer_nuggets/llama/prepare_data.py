@@ -1,5 +1,4 @@
-""" Use the tokenizer and data to prepare pretrain dataset - Heavily inspired by Nanogpt"""
-
+"""Use the tokenizer and data to prepare pretrain dataset - Heavily inspired by Nanogpt"""
 
 import logging
 import os
