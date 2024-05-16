@@ -144,7 +144,8 @@ def save_memory_snapshot(file_path: Path):
     except ImportError:
         pass
 
-    if dist_avail and dist.is_initialized():
+    dist_avail = dist_avail and dist.is_initialized()
+    if dist_avail:
         if not file_path.is_dir():
             raise ValueError(
                 f"{file_path} is not a directory, but is required for distributed profiling"
@@ -160,8 +161,7 @@ def save_memory_snapshot(file_path: Path):
         yield
     finally:
         s = torch.cuda.memory._snapshot()
-        dist_avail = False
-        if dist_avail and dist.is_initialized():
+        if dist_avail:
             local_rank = dist.get_rank()
             output_path = file_path / f"_rank_{local_rank}.html"
         else:

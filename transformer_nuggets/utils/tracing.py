@@ -111,6 +111,13 @@ def get_error_string(func, types, args, kwargs, output_has_nan, output_has_inf):
     return error_string
 
 
+def ensure_list(x):
+    if isinstance(x, (list, tuple)):
+        return x
+    else:
+        return [x]
+
+
 class NanInfDetect(TorchDispatchMode):
     """This mode can be helpful for debugging NaNs or Infs in your code.
     Example usage:
@@ -132,8 +139,12 @@ class NanInfDetect(TorchDispatchMode):
         kwargs = kwargs or {}
         res = func(*args, **kwargs)
 
-        output_has_nan = tree_map_only(torch.Tensor, lambda x: torch.isnan(x), res).any()
-        output_has_inf = tree_map_only(torch.Tensor, lambda x: torch.isinf(x), res).any()
+        output_has_nan = any(
+            ensure_list(tree_map_only(torch.Tensor, lambda x: torch.any(torch.isnan(x)), res))
+        )
+        output_has_inf = any(
+            ensure_list(tree_map_only(torch.Tensor, lambda x: torch.any(torch.isinf(x)), res))
+        )
         if output_has_nan or output_has_inf:
             if self.do_breakpoint:
                 breakpoint()
