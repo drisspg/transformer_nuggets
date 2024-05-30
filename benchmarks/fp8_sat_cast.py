@@ -10,7 +10,7 @@ from tabulate import tabulate
 from tqdm import tqdm
 
 from transformer_nuggets.fp8.scaled_quant import eager_scaled_quant, scaled_quant
-from transformer_nuggets.utils import benchmark_torch_function_in_microseconds
+from transformer_nuggets.utils import benchmark_cuda_function_in_microseconds
 
 device = torch.device("cuda")
 
@@ -106,7 +106,7 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
         # (Pdb) nuggets_out[516343]
         # tensor(0.0020, device='cuda:0', dtype=torch.float8_e4m3fn)
 
-    triton_time = benchmark_torch_function_in_microseconds(
+    triton_time = benchmark_cuda_function_in_microseconds(
         scaled_quant,
         triton_hp_tensor,
         scale,
@@ -114,7 +114,7 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
         config.low_precision_dtype,
         config.saturated,
     )
-    pytorch_time = benchmark_torch_function_in_microseconds(
+    pytorch_time = benchmark_cuda_function_in_microseconds(
         eager_scaled_quant,
         high_precision_tensor,
         scale,
@@ -123,7 +123,7 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
         config.saturated,
     )
     compiled_pytorch_fn = torch.compile(eager_scaled_quant, fullgraph=True)
-    compiled_pytorch_time = benchmark_torch_function_in_microseconds(
+    compiled_pytorch_time = benchmark_cuda_function_in_microseconds(
         compiled_pytorch_fn,
         high_precision_tensor,
         scale,
