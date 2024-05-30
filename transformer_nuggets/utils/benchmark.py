@@ -56,7 +56,7 @@ def benchmark_cuda_function_in_microseconds(func: Callable, *args, **kwargs) -> 
     """Thin wrapper around do_bench_using_profiling"""
     no_args = lambda: func(*args, **kwargs)
     time = do_bench_using_profiling(no_args)
-    return time * 1e6
+    return time * 1e3
 
 
 def profile_function(
@@ -169,3 +169,33 @@ def save_memory_snapshot(file_path: Path):
         with open(output_path, "w") as f:
             f.write(torch.cuda._memory_viz.trace_plot(s))
             logger.info(f"💾 Trace file 📄 saved to: {bcolors.OKGREEN}{output_path}{bcolors.ENDC}")
+
+
+def profiler(
+    path: Path,
+    record_shapes: bool = True,
+    profile_memory: bool = False,
+    with_stack: bool = True,
+):
+    """Thin wrapper around torch.profiler"""
+    assert path.is_file(), f"{path} is not a file."
+    path = path.with_suffix(".json")
+    # make parent dir if it doesn't exist
+    output_dir = path.parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info(f"💾 Trace file 📄 saved to: {bcolors.OKGREEN}{output_dir}{bcolors.ENDC}")
+
+    def trace_handler(prof) -> None:
+        prof.export_chrome_trace(path.as_posix())
+
+    return torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        on_trace_ready=trace_handler,
+        record_shapes=record_shapes,
+        profile_memory=profile_memory,
+        with_stack=with_stack,
+    )
