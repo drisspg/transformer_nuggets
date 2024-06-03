@@ -177,7 +177,18 @@ def profiler(
     profile_memory: bool = False,
     with_stack: bool = True,
 ):
-    """Thin wrapper around torch.profiler"""
+    """Thin wrapper around torch.profiler
+
+    Args:
+        path: The path to save the trace file to
+        record_shapes: Record shapes of tensors
+        profile_memory: Profile memory usage
+        with_stack: Record stack traces
+
+    Usage:
+        with profiler(Path("trace.json")):
+            # code to profile
+    """
     assert path.is_file(), f"{path} is not a file."
     path = path.with_suffix(".json")
     # make parent dir if it doesn't exist
