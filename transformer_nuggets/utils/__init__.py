@@ -8,4 +8,4 @@ from transformer_nuggets.utils.benchmark import (
     save_memory_snapshot,
     profiler,
 )
-from transformer_nuggets.utils.tracing import LoggingMode
+from transformer_nuggets.utils.tracing import LoggingMode, NanInfDetect
