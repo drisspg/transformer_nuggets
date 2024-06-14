@@ -171,6 +171,57 @@ def save_memory_snapshot(file_path: Path):
             logger.info(f"💾 Trace file 📄 saved to: {bcolors.OKGREEN}{output_path}{bcolors.ENDC}")
 
 
+def _is_distributed():
+    try:
+        import torch.distributed as dist
+
+        return dist.is_initialized()
+    except ImportError:
+        pass
+    return False
+
+
+def attach_oom_observer(save_path: Path, max_entries: int = 1000000):
+    """
+    Attach an out-of-memory (OOM) observer to the CUDA device.
+    The observer will save a memory snapshot when an OOM error occurs.
+
+    Args:
+        save_path (Path): Directory where memory snapshots will be saved.
+                         If None, a default directory will be used.
+        max_entries (int): Maximum number of memory history entries to record.
+                           Default is 1000000.
+
+    """
+    import torch.cuda.memory
+
+    trace_dir = save_path
+    save_path.mkdir(parents=True, exist_ok=True)
+    assert save_path.is_dir(), "save_path must be a directory."
+
+    def oom_observer(device, alloc, device_alloc, device_free):
+        try:
+            rank = "0"
+            if _is_distributed():
+                import torch.distributed as dist
+
+                rank = dist.get_rank()
+
+            curr_trace_name = f"memory_snapshots_rank_{rank}_snapshot.html"
+            current_trace_name = trace_dir / Path(curr_trace_name)
+
+            logging.info("Saving allocated state during OOM")
+            snapshot = torch.cuda.memory._snapshot()
+            with open(current_trace_name, "w") as f:
+                f.write(torch.cuda._memory_viz.trace_plot(snapshot))
+            logging.info(f"Wrote memory snapshot to {current_trace_name}")
+        except Exception as e:
+            logging.error(f"Failed to save memory snapshot: {e}")
+
+    torch._C._cuda_attach_out_of_memory_observer(oom_observer)
+    torch.cuda.memory._record_memory_history(max_entries=max_entries)
+
+
 def profiler(
     path: Path,
     record_shapes: bool = True,

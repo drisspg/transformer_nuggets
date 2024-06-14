@@ -7,5 +7,6 @@ from transformer_nuggets.utils.benchmark import (
     ProfileConfig,
     save_memory_snapshot,
     profiler,
+    attach_oom_observer,
 )
 from transformer_nuggets.utils.tracing import LoggingMode, NanInfDetect
