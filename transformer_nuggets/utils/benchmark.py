@@ -108,7 +108,17 @@ def profile_function(
 
 
 @contextmanager
-def print_max_memory_usage():
+def print_max_memory_usage(precision: int = 2):
+    """Prints the maximum CUDA memory usage at the end of a context manager
+
+    Args:
+        precision (int): The number of decimal places to print
+
+    Usage:
+        with print_max_memory_usage():
+            # code to profile
+
+    """
     try:
         yield
     finally:
