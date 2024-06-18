@@ -116,14 +116,24 @@ def print_max_memory_usage():
 
 
 @contextmanager
-def print_cuda_memory_usage():
+def print_cuda_memory_usage(precision: int = 2):
+    """Prints the difference CUDA memory usage at the end of a context manager
+
+    Args:
+        precision (int): The number of decimal places to print
+
+    Usage:
+        with print_cuda_memory_usage():
+            # code to profile
+
+    """
     initial_memory = torch.cuda.memory_allocated()
     try:
         yield
     finally:
         memory_usage = torch.cuda.memory_allocated() - initial_memory
         memory_usage_gb = memory_usage / (1024**3)
-        print(f"CUDA memory usage: {memory_usage_gb:.2f} GB")
+        print(f"CUDA memory usage: {memory_usage_gb:.{precision}f} GB")
 
 
 @contextmanager
@@ -181,23 +191,25 @@ def _is_distributed():
     return False
 
 
-def attach_oom_observer(save_path: Path, max_entries: int = 1000000):
+def attach_oom_observer(save_path: Optional[Path] = None, max_entries: int = 1000000):
     """
     Attach an out-of-memory (OOM) observer to the CUDA device.
     The observer will save a memory snapshot when an OOM error occurs.
 
     Args:
         save_path (Path): Directory where memory snapshots will be saved.
-                         If None, a default directory will be used.
+                         The cwd will be used.
         max_entries (int): Maximum number of memory history entries to record.
                            Default is 1000000.
 
     """
     import torch.cuda.memory
 
+    if save_path is None:
+        save_path = Path.cwd() / "memory_snapshots"
     trace_dir = save_path
-    save_path.mkdir(parents=True, exist_ok=True)
-    assert save_path.is_dir(), "save_path must be a directory."
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    assert trace_dir.is_dir(), "save_path must be a directory."
 
     def oom_observer(device, alloc, device_alloc, device_free):
         try:
