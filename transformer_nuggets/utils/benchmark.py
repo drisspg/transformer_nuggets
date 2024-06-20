@@ -248,7 +248,7 @@ def profiler(
     path: Path,
     record_shapes: bool = True,
     profile_memory: bool = False,
-    with_stack: bool = True,
+    with_stack: bool = False,
 ):
     """Thin wrapper around torch.profiler
 
@@ -256,7 +256,7 @@ def profiler(
         path: The path to save the trace file to
         record_shapes: Record shapes of tensors
         profile_memory: Profile memory usage
-        with_stack: Record stack traces
+        with_stack: Record stack traces - Blows up memory
 
     Usage:
         with profiler(Path("trace.json")):
