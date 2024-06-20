@@ -262,7 +262,6 @@ def profiler(
         with profiler(Path("trace.json")):
             # code to profile
     """
-    assert path.is_file(), f"{path} is not a file."
     path = path.with_suffix(".json")
     # make parent dir if it doesn't exist
     output_dir = path.parent
