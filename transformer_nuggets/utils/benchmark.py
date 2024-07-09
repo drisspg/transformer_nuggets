@@ -115,9 +115,10 @@ def print_max_memory_usage(precision: int = 2):
         precision (int): The number of decimal places to print
 
     Usage:
+    ```
         with print_max_memory_usage():
             # code to profile
-
+    ```
     """
     try:
         yield
@@ -133,8 +134,10 @@ def print_cuda_memory_usage(precision: int = 2):
         precision (int): The number of decimal places to print
 
     Usage:
+    ```
         with print_cuda_memory_usage():
             # code to profile
+    ```
 
     """
     initial_memory = torch.cuda.memory_allocated()
@@ -149,13 +152,16 @@ def print_cuda_memory_usage(precision: int = 2):
 @contextmanager
 def save_memory_snapshot(file_path: Path):
     """Save a memory snapshot information to a folder
-    Usage:
-        with save_memory_snapshot(file_path):
-            # code to profile
 
     Args:
         file_path: The path to the folder to save the snapshot to
                     will create the folder if it doesn't exist
+
+    Usage:
+    ```
+        with save_memory_snapshot(file_path):
+            # code to profile
+    ```
     """
     try:
         import torch.distributed as dist
@@ -212,6 +218,12 @@ def attach_oom_observer(save_path: Optional[Path] = None, max_entries: int = 100
         max_entries (int): Maximum number of memory history entries to record.
                            Default is 1000000.
 
+    Usage:
+    ```
+        attach_oom_observer(Path("memory_snapshots"))
+        # All cuda cuda events from this point to OOM program termination will be recorded and saved
+        <Code that OOMS>
+    ```
     """
     import torch.cuda.memory
 
@@ -259,8 +271,10 @@ def profiler(
         with_stack: Record stack traces - Blows up memory
 
     Usage:
+    ```
         with profiler(Path("trace.json")):
             # code to profile
+    ```
     """
     path = path.with_suffix(".json")
     # make parent dir if it doesn't exist
