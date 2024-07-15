@@ -2,6 +2,7 @@ import torch
 from typing import Union, Callable, Optional
 import matplotlib.pyplot as plt
 from pathlib import Path
+import math
 from torch.nn.attention._flex_attention import (
     _score_mod_signature,
     _mask_fn_signature,
@@ -19,6 +20,7 @@ def create_score_mod(
     mod_fn: Union[_score_mod_signature, _mask_fn_signature],
     device: str = "cuda",
     _compile: bool = False,
+    scale: Optional[float] = None,
 ) -> torch.Tensor:
     (
         B,
@@ -35,6 +37,8 @@ def create_score_mod(
     m = torch.arange(0, M, device=device)
     n = torch.arange(0, N, device=device)
 
+    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
+
     if _compile:
         ctx = nullcontext()
     else:
@@ -43,6 +47,7 @@ def create_score_mod(
     with ctx:
         score_mod = _vmap_for_bhqkv(mod_fn, prefix=(0,))
         scores = query @ key.transpose(-2, -1)
+        scores *= scale_factor
         scores = scores.view(1, 1, M, N)
         out = score_mod(scores, b, h, m, n)
 
@@ -64,6 +69,7 @@ def visualize_attention_scores(
     path: Optional[Path] = None,
     batch_idx: int = 0,
     head_idx: int = 0,
+    scale: Optional[float] = None,
 ):
     """
     Generate and save a visualization of attention scores.
@@ -77,6 +83,7 @@ def visualize_attention_scores(
         path (Path): Path to save the visualization. If None, will be saved to the current working directory.
         batch_idx (int): Index of the batch to visualize (default: 0).
         head_idx (int): Index of the head to visualize (default: 0).
+        scale (float): Scale factor to apply to the attention scores. If None, will be set to 1 / sqrt(head_dim).
 
     Returns:
         None
