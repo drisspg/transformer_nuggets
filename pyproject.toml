@@ -18,11 +18,12 @@ classifiers = [
 ]
 
 dependencies = [
-    "torch >= 2.2.1",
+    "torch >= 2.3.1",
     "scipy >= 1.9.1",
     "tqdm >= 4.66",
     "tabulate >= 0.8",
-    "rich==13.7.1"
+    "rich==13.7.1",
+    "matplotlib"
 ]
 
 [project.optional-dependencies]

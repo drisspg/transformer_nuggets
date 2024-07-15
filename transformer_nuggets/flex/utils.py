@@ -1,6 +1,7 @@
 import torch
-from typing import Union, Callable
+from typing import Union, Callable, Optional
 import matplotlib.pyplot as plt
+from pathlib import Path
 from torch.nn.attention._flex_attention import (
     _score_mod_signature,
     _mask_fn_signature,
@@ -48,13 +49,19 @@ def create_score_mod(
     return out
 
 
+def _name_to_title(name: str) -> str:
+    title = name.replace("_", " ")
+    title = " ".join(word.capitalize() for word in title.split())
+    return title
+
+
 def visualize_attention_scores(
     query: Tensor,
     key: Tensor,
     mod_fn: Callable,
     device: str = "cuda",
-    filename: str = "attention_scores.png",
-    title: str = "Attention Scores Visualization",
+    name: str = "attention_scores",
+    path: Optional[Path] = None,
     batch_idx: int = 0,
     head_idx: int = 0,
 ):
@@ -62,12 +69,12 @@ def visualize_attention_scores(
     Generate and save a visualization of attention scores.
 
     Args:
-        query (Tensor): Query tensor.
-        key (Tensor): Key tensor.
+        query (Tensor): Query tensor of shape (batch_size, num_heads, seq_len_q, head_dim).
+        key (Tensor): Key tensor of shape (batch_size, num_heads, seq_len_k, head_dim).
         mod_fn (Callable): The score modification function.
         device (str): Device to run computations on (default: "cuda").
-        filename (str): Name of the file to save the visualization (default: 'attention_scores.png').
-        title (str): Title for the visualization (default: "Attention Scores Visualization").
+        name (str): Base name for the file and title (default: 'attention_scores').
+        path (Path): Path to save the visualization. If None, will be saved to the current working directory.
         batch_idx (int): Index of the batch to visualize (default: 0).
         head_idx (int): Index of the head to visualize (default: 0).
 
@@ -78,11 +85,34 @@ def visualize_attention_scores(
     key = key[batch_idx, head_idx, :, :]
     scores_viz = create_score_mod(query, key, mod_fn, device=device)
 
-    plt.figure(figsize=(10, 8))
-    plt.matshow(scores_viz.cpu().detach()[0, 0, :, :])
-    plt.colorbar()
-    plt.title(f"{title}\nBatch {batch_idx}, Head {head_idx}")
-    plt.savefig(filename, dpi=300, bbox_inches="tight")
-    plt.close()  # Close the figure to free up memory
+    suffix_title = (
+        "" if batch_idx == 0 and head_idx == 0 else f"Batch {batch_idx}, Head {head_idx}"
+    )
 
-    print(f"Visualization saved as {filename}")
+    fig, ax = plt.subplots(figsize=(12, 10))
+    im = ax.imshow(scores_viz.cpu().detach()[0, 0, :, :], aspect="auto", cmap="viridis")
+    fig.colorbar(im)
+
+    title = _name_to_title(name)
+    file_path = Path(name).with_suffix(".png") if path is None else path.with_suffix(".png")
+    ax.set_title(f"{title}\n{suffix_title}")
+
+    ax.set_xlabel("Key Tokens")
+    ax.set_ylabel("Query Tokens")
+
+    # Move y-axis ticks and labels to the top
+    ax.tick_params(axis="x", top=True, labeltop=True, bottom=False, labelbottom=False)
+
+    # Add tick labels if the number of tokens is manageable
+    num_query_tokens, num_kv_tokens = scores_viz.shape[-2:]
+    if num_query_tokens <= 32 and num_kv_tokens <= 32:
+        ax.set_xticks(range(num_kv_tokens))
+        ax.set_xticklabels([f"KV{i}" for i in range(num_kv_tokens)])
+        ax.set_yticks(range(num_query_tokens))
+        ax.set_yticklabels([f"Q{i}" for i in range(num_query_tokens)])
+
+    plt.tight_layout()
+    plt.savefig(file_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)  # Close the figure to free up memory
+
+    print(f"Visualization saved as {file_path}")
