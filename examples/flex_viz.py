@@ -17,8 +17,17 @@ def checkerboard(score, batch, head, q_idx, kv_idx):
     return score
 
 
+SLIDING_WINDOW = 2
+
+
+def sliding_window_causal(score, b, h, q_idx, kv_idx):
+    causal_mask = q_idx >= kv_idx
+    window_mask = q_idx - kv_idx <= SLIDING_WINDOW
+    return torch.where(causal_mask & window_mask, score, -float("inf"))
+
+
 if __name__ == "__main__":
-    B, H, SEQ_LEN, HEAD_DIM = 2, 2, 16, 64
+    B, H, SEQ_LEN, HEAD_DIM = 2, 2, 6, 64
     make_tensor = partial(torch.ones, B, H, SEQ_LEN, HEAD_DIM, device="cuda")
     query, key, value = make_tensor(), make_tensor(), make_tensor()
 
@@ -29,3 +38,4 @@ if __name__ == "__main__":
         name="relative_positional",
     )
     visualize_attention_scores(query, key, checkerboard, name="checkerboard")
+    visualize_attention_scores(query, key, sliding_window_causal, name="sliding_window_causal")

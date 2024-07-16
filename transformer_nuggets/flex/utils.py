@@ -2,6 +2,7 @@ import torch
 from typing import Union, Callable, Optional
 import matplotlib.pyplot as plt
 from pathlib import Path
+import numpy as np
 import math
 from torch.nn.attention._flex_attention import (
     _score_mod_signature,
@@ -117,6 +118,10 @@ def visualize_attention_scores(
         ax.set_xticklabels([f"KV{i}" for i in range(num_kv_tokens)])
         ax.set_yticks(range(num_query_tokens))
         ax.set_yticklabels([f"Q{i}" for i in range(num_query_tokens)])
+        # Align grid with pixel boundaries
+        ax.set_xticks(np.arange(-0.5, num_kv_tokens, 1), minor=True)
+        ax.set_yticks(np.arange(-0.5, num_query_tokens, 1), minor=True)
+        ax.grid(which="minor", color="black", linestyle="-", linewidth=2)
 
     plt.tight_layout()
     plt.savefig(file_path, dpi=300, bbox_inches="tight")
