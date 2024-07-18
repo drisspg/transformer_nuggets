@@ -27,13 +27,8 @@ def create_score_mod(
     batch_idx: int = 0,
     head_idx: int = 0,
 ) -> torch.Tensor:
-    (
-        B,
-        H,
-    ) = (
-        1,
-        1,
-    )
+    B = 1
+    H = 1
     M = query.shape[0]
     N = key.shape[0]
 
@@ -88,8 +83,8 @@ def visualize_attention_scores(
     Args:
         query (Tensor): Query tensor of shape (batch_size, num_heads, seq_len_q, head_dim).
         key (Tensor): Key tensor of shape (batch_size, num_heads, seq_len_k, head_dim).
-        score_mod (Optional[Callable]): Function to modify attention scores. By default no score_mod is applied.
-        mask_mod (Optional[Callable]): Function to modify attention mask. By default no mask_mod is applied.
+        score_mod (Optional[Callable]): If this is set this will take precedence over the mask_mod.
+        mask_mod (Optional[Callable]): The mask_mod function used to create block_mask
         device (str): Device to run computations on (default: "cuda").
         name (str): Base name for the file and title (default: 'attention_scores').
         path (Path): Path to save the visualization. If None, will be saved to the current working directory.
