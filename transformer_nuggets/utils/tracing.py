@@ -138,13 +138,17 @@ class NanInfDetect(TorchDispatchMode):
     def __torch_dispatch__(self, func, types, args, kwargs=None):
         kwargs = kwargs or {}
         res = func(*args, **kwargs)
-
-        output_has_nan = any(
-            ensure_list(tree_map_only(torch.Tensor, lambda x: torch.any(torch.isnan(x)), res))
-        )
-        output_has_inf = any(
-            ensure_list(tree_map_only(torch.Tensor, lambda x: torch.any(torch.isinf(x)), res))
-        )
+        if not isinstance(res, (torch.Tensor, list, tuple)):
+            return res
+        try:
+            output_has_nan = any(
+                ensure_list(tree_map_only(torch.Tensor, lambda x: torch.any(torch.isnan(x)), res))
+            )
+            output_has_inf = any(
+                ensure_list(tree_map_only(torch.Tensor, lambda x: torch.any(torch.isinf(x)), res))
+            )
+        except:  # noqa: E722
+            return res
         if output_has_nan or output_has_inf:
             if self.do_breakpoint:
                 breakpoint()

@@ -1,13 +1,14 @@
 import torch
-from typing import Union, Callable, Optional
+from typing import Optional
 import matplotlib.pyplot as plt
 from pathlib import Path
 import numpy as np
 import math
-from torch.nn.attention._flex_attention import (
+from torch.nn.attention.flex_attention import (
     _score_mod_signature,
-    _mask_fn_signature,
+    _mask_mod_signature,
     _vmap_for_bhqkv,
+    _ModificationType,
 )
 from torch._higher_order_ops.flex_attention import TransformGetItemToIndex
 from contextlib import nullcontext
@@ -18,10 +19,13 @@ Tensor = torch.Tensor
 def create_score_mod(
     query: torch.Tensor,
     key: torch.Tensor,
-    mod_fn: Union[_score_mod_signature, _mask_fn_signature],
+    score_mod: Optional[_score_mod_signature],
+    mask_mod: Optional[_mask_mod_signature],
     device: str = "cuda",
     _compile: bool = False,
     scale: Optional[float] = None,
+    batch_idx: int = 0,
+    head_idx: int = 0,
 ) -> torch.Tensor:
     (
         B,
@@ -33,24 +37,29 @@ def create_score_mod(
     M = query.shape[0]
     N = key.shape[0]
 
-    b = torch.arange(0, B, device=device)
-    h = torch.arange(0, H, device=device)
+    b = torch.arange(0, B, device=device) + batch_idx
+    h = torch.arange(0, H, device=device) + head_idx
     m = torch.arange(0, M, device=device)
     n = torch.arange(0, N, device=device)
 
     scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
-
+    type = _ModificationType.SCORE_MOD if score_mod is not None else _ModificationType.MASK_MOD
     if _compile:
         ctx = nullcontext()
     else:
         ctx = TransformGetItemToIndex()
 
     with ctx:
-        score_mod = _vmap_for_bhqkv(mod_fn, prefix=(0,))
+        mod_fn = score_mod if type == _ModificationType.SCORE_MOD else mask_mod
+        prefix = (0,) if type == _ModificationType.SCORE_MOD else ()
+        mod = _vmap_for_bhqkv(mod_fn, prefix=prefix)
         scores = query @ key.transpose(-2, -1)
         scores *= scale_factor
         scores = scores.view(1, 1, M, N)
-        out = score_mod(scores, b, h, m, n)
+        if type == _ModificationType.SCORE_MOD:
+            out = mod(scores, b, h, m, n)
+        else:
+            out = mod(b, h, m, n)
 
     return out
 
@@ -64,7 +73,8 @@ def _name_to_title(name: str) -> str:
 def visualize_attention_scores(
     query: Tensor,
     key: Tensor,
-    mod_fn: Callable,
+    score_mod: Optional[_score_mod_signature] = None,
+    mask_mod: Optional[_mask_mod_signature] = None,
     device: str = "cuda",
     name: str = "attention_scores",
     path: Optional[Path] = None,
@@ -78,7 +88,8 @@ def visualize_attention_scores(
     Args:
         query (Tensor): Query tensor of shape (batch_size, num_heads, seq_len_q, head_dim).
         key (Tensor): Key tensor of shape (batch_size, num_heads, seq_len_k, head_dim).
-        mod_fn (Callable): The score modification function.
+        score_mod (Optional[Callable]): Function to modify attention scores. By default no score_mod is applied.
+        mask_mod (Optional[Callable]): Function to modify attention mask. By default no mask_mod is applied.
         device (str): Device to run computations on (default: "cuda").
         name (str): Base name for the file and title (default: 'attention_scores').
         path (Path): Path to save the visualization. If None, will be saved to the current working directory.
@@ -89,13 +100,23 @@ def visualize_attention_scores(
     Returns:
         None
     """
+    assert (
+        score_mod is not None or mask_mod is not None
+    ), "Must provide either score_mod or mask_mod"
     query = query[batch_idx, head_idx, :, :]
     key = key[batch_idx, head_idx, :, :]
-    scores_viz = create_score_mod(query, key, mod_fn, device=device)
-
-    suffix_title = (
-        "" if batch_idx == 0 and head_idx == 0 else f"Batch {batch_idx}, Head {head_idx}"
+    scores_viz = create_score_mod(
+        query,
+        key,
+        score_mod=score_mod,
+        mask_mod=mask_mod,
+        scale=scale,
+        device=device,
+        batch_idx=batch_idx,
+        head_idx=head_idx,
     )
+
+    suffix_title = f"Batch {batch_idx}, Head {head_idx}"
 
     fig, ax = plt.subplots(figsize=(12, 10))
     im = ax.imshow(scores_viz.cpu().detach()[0, 0, :, :], aspect="auto", cmap="viridis")
