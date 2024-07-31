@@ -111,18 +111,19 @@ def visualize_attention_scores(
         head_idx=head_idx,
     )
 
-    suffix_title = f"Batch {batch_idx}, Head {head_idx}"
+    suffix_title = f"Batch {batch_idx}, Head {head_idx}" if batch_idx != 0 or head_idx != 0 else ""
 
     fig, ax = plt.subplots(figsize=(12, 10))
-    im = ax.imshow(scores_viz.cpu().detach()[0, 0, :, :], aspect="auto", cmap="viridis")
+    color = "viridis" if score_mod is not None else "cividis"
+    im = ax.imshow(scores_viz.cpu().detach()[0, 0, :, :], aspect="auto", cmap=color)
     fig.colorbar(im)
 
     title = _name_to_title(name)
     file_path = Path(name).with_suffix(".png") if path is None else path.with_suffix(".png")
-    ax.set_title(f"{title}\n{suffix_title}")
+    ax.set_title(f"{title}\n{suffix_title}", fontsize=20)
 
-    ax.set_xlabel("Key Tokens")
-    ax.set_ylabel("Query Tokens")
+    ax.set_xlabel("Key Tokens", fontsize=18)
+    ax.set_ylabel("Query Tokens", fontsize=18)
 
     # Move y-axis ticks and labels to the top
     ax.tick_params(axis="x", top=True, labeltop=True, bottom=False, labelbottom=False)
@@ -131,9 +132,9 @@ def visualize_attention_scores(
     num_query_tokens, num_kv_tokens = scores_viz.shape[-2:]
     if num_query_tokens <= 32 and num_kv_tokens <= 32:
         ax.set_xticks(range(num_kv_tokens))
-        ax.set_xticklabels([f"KV{i}" for i in range(num_kv_tokens)])
+        ax.set_xticklabels([f"KV{i}" for i in range(num_kv_tokens)], fontsize=16)
         ax.set_yticks(range(num_query_tokens))
-        ax.set_yticklabels([f"Q{i}" for i in range(num_query_tokens)])
+        ax.set_yticklabels([f"Q{i}" for i in range(num_query_tokens)], fontsize=16)
         # Align grid with pixel boundaries
         ax.set_xticks(np.arange(-0.5, num_kv_tokens, 1), minor=True)
         ax.set_yticks(np.arange(-0.5, num_query_tokens, 1), minor=True)

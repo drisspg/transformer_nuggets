@@ -36,13 +36,15 @@ def sliding_window_causal(b, h, q_idx, kv_idx):
     return causal_mask & window_mask
 
 
-document_masks = torch.full((2, 6), 0, dtype=torch.int32, device="cuda")
-document_masks[:, 3:] = 1
+def create_doc_mask_func(document_id):
+    def doc_mask_wrapper(b, h, q_idx, kv_idx):
+        return document_id[q_idx] == document_id[kv_idx]
+
+    return doc_mask_wrapper
 
 
-def doc_mask(b, h, q, kv):
-    same_doc = document_masks[b, q] == document_masks[b, kv]
-    return same_doc
+def causal_mask(b, h, q_idx, kv_idx):
+    return q_idx >= kv_idx
 
 
 # Main execution
@@ -62,7 +64,19 @@ def main():
         query, key, mask_mod=sliding_window_causal, name="sliding_window_causal"
     )
 
-    visualize_attention_scores(query, key, mask_mod=doc_mask, name="document_masks")
+    # Example usage:
+    document_id = torch.tensor([0, 0, 0, 1, 1, 2, 2, 2, 2, 2, 2], dtype=torch.int32, device="cuda")
+
+    doc_mask = create_doc_mask_func(document_id)
+
+    visualize_attention_scores(
+        torch.ones(B, H, document_id.numel(), HEAD_DIM, device="cuda"),
+        torch.ones(B, H, document_id.numel(), HEAD_DIM, device="cuda"),
+        mask_mod=doc_mask,
+        name="document_mask",
+    )
+
+    visualize_attention_scores(query, key, mask_mod=causal_mask, name="causal_mask")
 
 
 if __name__ == "__main__":
