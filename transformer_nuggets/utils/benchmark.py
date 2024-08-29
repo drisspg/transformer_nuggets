@@ -281,7 +281,7 @@ def profiler(
     output_dir = path.parent
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"💾 Trace file 📄 saved to: {bcolors.OKGREEN}{output_dir}{bcolors.ENDC}")
+    logger.info(f"💾 Trace file 📄 saved to: {bcolors.OKGREEN}{path}{bcolors.ENDC}")
 
     def trace_handler(prof) -> None:
         prof.export_chrome_trace(path.as_posix())
