@@ -197,7 +197,7 @@ def get_configs_varying_k(M: int = 8192, N: int = 8192) -> List[ExperimentConfig
         FP8Kernel.SCALED_MM,
         # FP8Kernel.PERSISTENT,
         FP8Kernel.PERSISTENT_TMA,
-        # FP8Kernel.DEVICE_TMA,
+        FP8Kernel.DEVICE_TMA,
     ]
 
     for (M, K, N), strategy, compile, kernel in itertools.product(

@@ -468,7 +468,6 @@ def matmul_tma_persistent(
 @triton.jit(launch_metadata=_matmul_launch_metadata)
 def matmul_kernel_device_tma_persistent(
     workspace_ptr,
-    tiles_per_update: tl.constexpr,
     a_ptr,
     a_scale_ptr,
     b_ptr,
@@ -532,7 +531,6 @@ def matmul_kernel_device_tma_persistent(
 
     tile_id = start_pid - NUM_SMS
     ki = -1
-    ni = -1
 
     pid_m = 0
     pid_n = 0
@@ -547,36 +545,6 @@ def matmul_kernel_device_tma_persistent(
     for _ in range(0, k_tiles * tiles_per_SM):
         ki = tl.where(ki == k_tiles - 1, 0, ki + 1)
         if ki == 0:
-            ni += 1
-
-            # Simulate a grouped gemm
-            if ni == tiles_per_update:
-                tl.extra.cuda.experimental_device_tensormap_create2d(
-                    desc_ptr=a_desc_ptr,
-                    global_address=a_ptr,
-                    load_size=[BLOCK_SIZE_M, BLOCK_SIZE_K],
-                    global_size=[M, K],
-                    element_ty=a_ptr.dtype.element_ty,
-                )
-                tl.extra.cuda.experimental_device_tensormap_create2d(
-                    desc_ptr=b_desc_ptr,
-                    global_address=b_ptr,
-                    load_size=[BLOCK_SIZE_N, BLOCK_SIZE_K],
-                    global_size=[N, K],
-                    element_ty=b_ptr.dtype.element_ty,
-                )
-                tl.extra.cuda.experimental_device_tensormap_create2d(
-                    desc_ptr=c_desc_ptr,
-                    global_address=c_ptr,
-                    load_size=[BLOCK_SIZE_M, BLOCK_SIZE_N],
-                    global_size=[M, N],
-                    element_ty=c_ptr.dtype.element_ty,
-                )
-                tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(a_desc_ptr)
-                tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(b_desc_ptr)
-                tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(c_desc_ptr)
-                ni = 0
-
             tile_id += NUM_SMS
             group_id = tile_id // num_pid_in_group
             first_pid_m = group_id * GROUP_SIZE_M
@@ -627,7 +595,6 @@ def matmul_device_tma_persistent(
     b: torch.Tensor,
     b_scale: torch.Tensor,
     output_dtype: torch.dtype,
-    tiles_per_update: int = 1,
 ) -> torch.Tensor:
     assert is_row_major(a.stride()), "a must be row major"
     assert is_col_major(b.stride()), "b must be col major"
@@ -649,7 +616,6 @@ def matmul_device_tma_persistent(
     )
     matmul_kernel_device_tma_persistent[grid](
         workspace,
-        tiles_per_update,
         a,
         a_scale,
         b,
