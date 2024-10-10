@@ -19,6 +19,7 @@ from transformer_nuggets.fp8.fp8_matmul import (
     matmul_tma_persistent,
     matmul_device_tma_persistent,
 )
+from datetime import datetime
 from enum import Enum
 import csv
 
@@ -242,7 +243,8 @@ def plot_tflops_comparison(df, save_path: Path):
     plt.tight_layout()
 
     # Generate the file name and save in the same directory as the CSV file
-    file_name = f"fp8_kernel_comparison_{m_value}_{n_value}.png"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    file_name = f"fp8_kernel_comparison_{m_value}_{n_value}_{timestamp}.png"
     graph_path = save_path.parent / file_name
     plt.savefig(graph_path, dpi=300)
     print(f"TFLOPS comparison plot saved as {graph_path}")
