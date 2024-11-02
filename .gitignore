@@ -2,6 +2,7 @@
 benchmarks/data/*
 transformer_nuggets/llama/data/*
 .vscode
+plots/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

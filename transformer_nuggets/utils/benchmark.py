@@ -255,7 +255,7 @@ def attach_oom_observer(save_path: Optional[Path] = None, max_entries: int = 100
     torch._C._cuda_attach_out_of_memory_observer(oom_observer)
     torch.cuda.memory._record_memory_history(max_entries=max_entries)
 
-
+@contextmanager
 def profiler(
     path: Path,
     record_shapes: bool = True,
@@ -286,7 +286,7 @@ def profiler(
     def trace_handler(prof) -> None:
         prof.export_chrome_trace(path.as_posix())
 
-    return torch.profiler.profile(
+    profiler = torch.profiler.profile(
         activities=[
             torch.profiler.ProfilerActivity.CPU,
             torch.profiler.ProfilerActivity.CUDA,
@@ -296,3 +296,9 @@ def profiler(
         profile_memory=profile_memory,
         with_stack=with_stack,
     )
+    
+    try:
+        profiler.start()
+        yield profiler
+    finally:
+        profiler.stop()
