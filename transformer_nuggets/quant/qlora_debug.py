@@ -79,9 +79,9 @@ class NF4TensorDebug:
         return torch.tensor(block_scalers)
 
     def __init__(self, inpt_tensor: torch.Tensor, block_size=64):
-        assert (
-            inpt_tensor.numel() % block_size == 0
-        ), "Input tensor must be divisible by block size"
+        assert inpt_tensor.numel() % block_size == 0, (
+            "Input tensor must be divisible by block size"
+        )
         self.block_size = block_size
         self.n_blocks = inpt_tensor.numel() // block_size
         self.scalers = self.get_scalers(inpt_tensor, self.block_size)
@@ -94,9 +94,9 @@ class NF4TensorDebug:
         flattened_tensor = inpt_tensor.flatten()
         #  Since we are using uint8 we will encode 2 entries per byte
         numel = inpt_tensor.numel()
-        assert (
-            numel % 2 == 0
-        ), "Number of elements must be even just to not have to think about the end"
+        assert numel % 2 == 0, (
+            "Number of elements must be even just to not have to think about the end"
+        )
         quantized_length = numel // 2
         quantized_tensor = torch.zeros(quantized_length, dtype=torch.uint8)
         for i in tqdm(range(len(self.scalers))):

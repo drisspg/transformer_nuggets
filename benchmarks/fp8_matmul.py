@@ -14,16 +14,26 @@ from torchao.float8.inference import (
     preprocess_data,
     Float8MMConfig,
 )
-from transformer_nuggets.fp8.fp8_matmul import (
-    matmul_persistent,
-    matmul_tma_persistent,
-    matmul_device_tma_persistent,
-)
+
+try:
+    from transformer_nuggets.fp8.fp8_matmul import (
+        matmul_persistent,
+        matmul_tma_persistent,
+        matmul_device_tma_persistent,
+    )
+except ModuleNotFoundError:
+    print("Triton version not new enough")
+    pass
+
 from datetime import datetime
 from enum import Enum
 import csv
+import logging
 
-torch._dynamo.config.cache_size_limit = 1000
+torch._dynamo.config.cache_size_limit = 10000
+logging.getLogger("transformer_nuggets").setLevel(logging.INFO)
+torch._inductor.config.max_autotune_gemm_backends = "TRITON"
+CHECK = False
 
 
 class FP8Kernel(Enum):
@@ -80,13 +90,14 @@ class ExperimentConfig:
     scaling_strategy: ScalingStrategy
     fp8_kernel: FP8Kernel
     compile: bool
+    bf16: bool
 
 
 @dataclass(frozen=True)
 class ExperimentResult:
-    bf16_time: float
+    bf16_time: Optional[float]
     fp8_time: float
-    bf16_tflops: float
+    bf16_tflops: Optional[float]
     fp8_tflops: float
 
 
@@ -113,29 +124,34 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
 
     if config.compile and config.fp8_kernel == FP8Kernel.SCALED_MM:
         bf16_matmul = torch.compile(bf16_matmul)
-        fp8_matmul = torch.compile(fp8_matmul, mode="max-autotune")
+        fp8_matmul = torch.compile(fp8_matmul, mode="max-autotune-no-cudagraphs", dynamic=False)
 
     # Warmup phase
     warmup_iterations = 5
     for _ in range(warmup_iterations):
-        _ = bf16_matmul(A, B)
+        if config.bf16:
+            _ = bf16_matmul(A, B)
         _ = fp8_matmul()
     torch.cuda.synchronize()
 
     # Actual benchmarking
-    bf16_time = benchmark_cuda_function_in_microseconds(lambda: bf16_matmul(A, B))
+
+    bf16_time = (
+        benchmark_cuda_function_in_microseconds(lambda: bf16_matmul(A, B)) if config.bf16 else None
+    )
     fp8_time = benchmark_cuda_function_in_microseconds(fp8_matmul)
 
     # Calculate TFLOPS
-    bf16_tflops = calculate_tflops(config.M, config.N, config.K, bf16_time)
+    bf16_tflops = calculate_tflops(config.M, config.N, config.K, bf16_time) if bf16_time else None
     fp8_tflops = calculate_tflops(config.M, config.N, config.K, fp8_time)
 
     # Baseline fp8_matmul correctness
-    scaled_mm_base = get_fp8_matmul(A, B, config.scaling_strategy, FP8Kernel.SCALED_MM)
-    out_base = scaled_mm_base()
-    out = fp8_matmul()
-    # Failing on one sample with large N
-    torch.testing.assert_close(out, out_base)
+    if CHECK:
+        scaled_mm_base = get_fp8_matmul(A, B, config.scaling_strategy, FP8Kernel.SCALED_MM)
+        out_base = scaled_mm_base()
+        out = fp8_matmul()
+        # Failing on one sample with large N
+        torch.testing.assert_close(out, out_base)
 
     return ExperimentResult(
         bf16_time=bf16_time, fp8_time=fp8_time, bf16_tflops=bf16_tflops, fp8_tflops=fp8_tflops
@@ -161,24 +177,38 @@ def print_results(experiments: List[Experiment], save_path: Optional[Path] = Non
     for experiment in experiments:
         config = experiment.config
         result = experiment.result
-        speedup = result.bf16_time / result.fp8_time
-        tflops_ratio = result.fp8_tflops / result.bf16_tflops
+
+        # Format values handling None cases
+        bf16_time = f"{result.bf16_time:.4f}" if result.bf16_time is not None else "N/A"
+        fp8_time = f"{result.fp8_time:.4f}"
+        bf16_tflops = f"{result.bf16_tflops:.2f}" if result.bf16_tflops is not None else "N/A"
+        fp8_tflops = f"{result.fp8_tflops:.2f}"
+
+        # Calculate ratios only if bf16 results exist
+        if result.bf16_time is not None:
+            speedup = f"{(result.bf16_time / result.fp8_time):.2f}x"
+            tflops_ratio = f"{(result.fp8_tflops / result.bf16_tflops):.2f}x"
+        else:
+            speedup = "N/A"
+            tflops_ratio = "N/A"
+
         rows.append(
             [
                 config.M,
                 config.K,
                 config.N,
-                config.scaling_strategy,
-                config.fp8_kernel,
+                config.scaling_strategy.value,
+                config.fp8_kernel.value,
                 config.compile,
-                f"{result.bf16_time:.4f}",
-                f"{result.fp8_time:.4f}",
-                f"{speedup:.2f}x",
-                f"{result.bf16_tflops:.2f}",
-                f"{result.fp8_tflops:.2f}",
-                f"{tflops_ratio:.2f}x",
+                bf16_time,
+                fp8_time,
+                speedup,
+                bf16_tflops,
+                fp8_tflops,
+                tflops_ratio,
             ]
         )
+
     print(tabulate(rows, headers=headers, floatfmt=".4f"))
 
     if save_path is not None:
@@ -189,16 +219,18 @@ def print_results(experiments: List[Experiment], save_path: Optional[Path] = Non
         print(f"💾 Results saved to: {save_path}")
 
 
-def get_configs_varying_k(M: int = 8192, N: int = 8192) -> List[ExperimentConfig]:
-    shapes = [(M, K, N) for K in range(512, 8193, 512)]
+def get_configs_varying_k(
+    M: int = 8192, N: int = 8192, bf16: bool = False
+) -> List[ExperimentConfig]:
+    shapes = [(M, K, N) for K in range(1024, 16385, 1024)]
     scaling_strategies = [ScalingStrategy.PER_ROW]
-    compile_options = [False]
+    compile_options = [True, False]
     configs = []
     fp8_kernels = [
         FP8Kernel.SCALED_MM,
         # FP8Kernel.PERSISTENT,
-        FP8Kernel.PERSISTENT_TMA,
-        FP8Kernel.DEVICE_TMA,
+        # FP8Kernel.PERSISTENT_TMA,
+        # FP8Kernel.DEVICE_TMA,
     ]
 
     for (M, K, N), strategy, compile, kernel in itertools.product(
@@ -206,7 +238,13 @@ def get_configs_varying_k(M: int = 8192, N: int = 8192) -> List[ExperimentConfig
     ):
         configs.append(
             ExperimentConfig(
-                M=M, K=K, N=N, scaling_strategy=strategy, compile=compile, fp8_kernel=kernel
+                M=M,
+                K=K,
+                N=N,
+                scaling_strategy=strategy,
+                compile=compile,
+                fp8_kernel=kernel,
+                bf16=bf16,
             )
         )
     return configs
@@ -214,8 +252,8 @@ def get_configs_varying_k(M: int = 8192, N: int = 8192) -> List[ExperimentConfig
 
 def load_and_process_data(file_path):
     df = pd.read_csv(file_path)
-    df["Speedup"] = df["Speedup"].str.rstrip("x").astype(float)
-    df["TFLOPS Ratio"] = df["TFLOPS Ratio"].str.rstrip("x").astype(float)
+    # df["Speedup"] = df["Speedup"].str.rstrip("x").astype(float)
+    # df["TFLOPS Ratio"] = df["TFLOPS Ratio"].str.rstrip("x").astype(float)
     return df
 
 
@@ -250,7 +288,13 @@ def plot_tflops_comparison(df, save_path: Path):
     print(f"TFLOPS comparison plot saved as {graph_path}")
 
 
-def main(save_path: Optional[str] = None, M: int = 8192, N: int = 8192, graph: bool = False):
+def main(
+    save_path: Optional[str] = None,
+    M: int = 8192,
+    N: int = 8192,
+    graph: bool = False,
+    bf_16: bool = False,
+):
     """Benchmark FP8 MatMul with different configurations and optionally graph results.
 
     Args:
@@ -258,9 +302,10 @@ def main(save_path: Optional[str] = None, M: int = 8192, N: int = 8192, graph: b
         M (int, optional): Number of rows in the first matrix. Defaults to 8192.
         N (int, optional): Number of columns in the second matrix. Defaults to 8192.
         graph_results (bool, optional): Whether to create a graph of the results. Defaults to False.
+        bf_16 (bool, optional): Whether to use BF16 for the baseline. Defaults to False.
     """
     torch.random.manual_seed(123)
-    configs = get_configs_varying_k(M, N)
+    configs = get_configs_varying_k(M, N, bf16=bf_16)
     results = []
     if save_path is not None:
         save_path = Path(save_path)

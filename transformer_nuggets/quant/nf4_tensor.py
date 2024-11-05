@@ -85,9 +85,9 @@ def get_block_absmax(inpt_tensor: torch.Tensor, block_size: int) -> torch.Tensor
         torch.Tensor: Tensor of scalers for each block
     """
     assert inpt_tensor.dim() == 1, "Input tensor must be flattened"
-    assert (
-        (inpt_tensor.numel() % block_size) == 0
-    ), f"Input tensor must be divisible by block size, got {inpt_tensor.numel()} and {block_size}"
+    assert (inpt_tensor.numel() % block_size) == 0, (
+        f"Input tensor must be divisible by block size, got {inpt_tensor.numel()} and {block_size}"
+    )
 
     n_blocks = inpt_tensor.numel() // block_size
     blocks = inpt_tensor.view(n_blocks, block_size)
@@ -167,9 +167,9 @@ class NF4Tensor(torch.Tensor):
         block_size: int = 64,
         scaler_block_size: int = 256,
     ):
-        assert (
-            inpt_tensor.numel() % block_size == 0
-        ), "Input tensor must be divisible by block size"
+        assert inpt_tensor.numel() % block_size == 0, (
+            "Input tensor must be divisible by block size"
+        )
         assert inpt_tensor.is_contiguous, "Input tensor must be contiguous!"
         # I think I want do this
         assert not inpt_tensor.requires_grad, "Input tensor must not require grad"
@@ -246,9 +246,9 @@ class NF4Tensor(torch.Tensor):
                 size: (n_scaler_blocks)
         """
         assert inpt_tensor.dim() == 1, "Input tensor must be flattened"
-        assert (
-            (inpt_tensor.numel() % scaler_block_size) == 0
-        ), f"Input tensor must be divisible by block size, got {inpt_tensor.numel()} and {scaler_block_size}"
+        assert (inpt_tensor.numel() % scaler_block_size) == 0, (
+            f"Input tensor must be divisible by block size, got {inpt_tensor.numel()} and {scaler_block_size}"
+        )
 
         # First round of quantization
         # Produces: A tensor of size (n_blocks) of inpt_tensor.dtype
@@ -256,9 +256,9 @@ class NF4Tensor(torch.Tensor):
         scalers_1_mean = scalers_1.mean()
         scalers_1 = scalers_1 - scalers_1_mean
         # Second round of quantization
-        assert (
-            scalers_1.numel() % scaler_block_size == 0
-        ), "Number of scalers must be divisible by scaler block size"
+        assert scalers_1.numel() % scaler_block_size == 0, (
+            "Number of scalers must be divisible by scaler block size"
+        )
         n_scaler_blocks = scalers_1.numel() // scaler_block_size
         scaler_blocks = scalers_1.view(n_scaler_blocks, scaler_block_size)
 
@@ -298,9 +298,9 @@ class NF4Tensor(torch.Tensor):
 
         """
         assert inpt_tensor.dim() == 1, "Input tensor must be flattened"
-        assert (
-            (inpt_tensor.numel() % scaler_block_size) == 0
-        ), f"Input tensor must be divisible by block size, got {inpt_tensor.numel()} and {scaler_block_size}"
+        assert (inpt_tensor.numel() % scaler_block_size) == 0, (
+            f"Input tensor must be divisible by block size, got {inpt_tensor.numel()} and {scaler_block_size}"
+        )
         n_scaler_blocks = inpt_tensor.numel() // scaler_block_size
         inpt_tensor = inpt_tensor.view(n_scaler_blocks, scaler_block_size)
         dequantized = (inpt_tensor / quantization_factor.unsqueeze(-1)).flatten().to(
@@ -316,9 +316,9 @@ class NF4Tensor(torch.Tensor):
         flattened_tensor = inpt_tensor.flatten()
         #  Since we are using uint8 we will encode 2 entries per byte
         numel = inpt_tensor.numel()
-        assert (
-            numel % 2 == 0
-        ), "Number of elements must be even just to not have to think about the end"
+        assert numel % 2 == 0, (
+            "Number of elements must be even just to not have to think about the end"
+        )
         # Reshape the flattened tensor into blocks of size self.block_size
         blocks = flattened_tensor.view(n_blocks, block_size)
 

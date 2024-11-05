@@ -255,6 +255,7 @@ def attach_oom_observer(save_path: Optional[Path] = None, max_entries: int = 100
     torch._C._cuda_attach_out_of_memory_observer(oom_observer)
     torch.cuda.memory._record_memory_history(max_entries=max_entries)
 
+
 @contextmanager
 def profiler(
     path: Path,
@@ -296,7 +297,7 @@ def profiler(
         profile_memory=profile_memory,
         with_stack=with_stack,
     )
-    
+
     try:
         profiler.start()
         yield profiler

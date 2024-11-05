@@ -91,9 +91,9 @@ def dequant_nf4_tensor_kernel(
 def dequant_nf4_tensor(weight: NF4Tensor):
     """Takes a quantized tensor and dequantizes it to bfloat16"""
     assert isinstance(weight, NF4Tensor), "Input tensor must be of type NF4Tensor"
-    assert (
-        weight.shape.numel() % weight.block_size == 0
-    ), "Input tensor must be a multiple of block size"
+    assert weight.shape.numel() % weight.block_size == 0, (
+        "Input tensor must be a multiple of block size"
+    )
     out_tensor = torch.empty(weight.shape, dtype=weight.dtype, device="cuda")
     numel = weight.shape.numel()
     grid = (triton.cdiv(numel, (weight.block_size)),)

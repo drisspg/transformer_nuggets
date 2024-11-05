@@ -47,21 +47,21 @@ def validate_matmul_inputs(
     if ROW_WISE_SCALING:
         assert a_scale.dim() == 2, f"a_scale must be a 2D tensor but got {a_scale.dim()}"
         assert b_scale.dim() == 2, f"b_scale must be a 2D tensor but got {b_scale.dim()}"
-        assert (
-            a_scale.shape[0] == a.shape[0]
-        ), f"a_scale must have same number of rows as a, got {a_scale.shape[0]} vs {a.shape[0]}"
+        assert a_scale.shape[0] == a.shape[0], (
+            f"a_scale must have same number of rows as a, got {a_scale.shape[0]} vs {a.shape[0]}"
+        )
         assert a_scale.shape[1] == 1, f"a_scale must have 1 column, got {a_scale.shape[1]}"
-        assert (
-            b_scale.shape[1] == b.shape[1]
-        ), f"b_scale must have same number of columns as b, got {b_scale.shape[0]} vs {b.shape[1]}"
+        assert b_scale.shape[1] == b.shape[1], (
+            f"b_scale must have same number of columns as b, got {b_scale.shape[0]} vs {b.shape[1]}"
+        )
         assert b_scale.shape[0] == 1, f"b_scale must have 1 column, got {b_scale.shape[1]}"
     else:
-        assert (
-            a_scale.numel() == 1
-        ), f"a_scale must be a scalar for per-tensor scaling, got shape {a_scale.shape}"
-        assert (
-            b_scale.numel() == 1
-        ), f"b_scale must be a scalar for per-tensor scaling, got shape {b_scale.shape}"
+        assert a_scale.numel() == 1, (
+            f"a_scale must be a scalar for per-tensor scaling, got shape {a_scale.shape}"
+        )
+        assert b_scale.numel() == 1, (
+            f"b_scale must be a scalar for per-tensor scaling, got shape {b_scale.shape}"
+        )
 
     return ROW_WISE_SCALING
 
