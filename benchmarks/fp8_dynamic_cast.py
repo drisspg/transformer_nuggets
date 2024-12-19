@@ -12,7 +12,7 @@ from transformer_nuggets.fp8.scaled_quant import (
     dynamic_scaled_quant,
     eager_dynamic_scaled_quant,
 )
-from transformer_nuggets.utils import benchmark_torch_function_in_microseconds
+from transformer_nuggets.utils import benchmark_cuda_function_in_microseconds
 
 device = torch.device("cuda")
 
@@ -41,7 +41,9 @@ class Experiment:
 
 
 def get_configs() -> List[ExperimentConfig]:
-    sizes = [2**21, 2**22, 2**23, 2**24]
+    # We hang for anything bigger than this
+    # sizes = [2**21, 2**22, 2**23, 2**24]
+    sizes = [2**21, 2**22]
     high_precision_dtypes = [torch.float32]
     low_precision_dtypes = [torch.float8_e4m3fn, torch.float8_e5m2]
     configs = []
@@ -70,7 +72,18 @@ def correctness_check(hp_tensor, triton_tensor, config):
         config.low_precision_dtype,
     ).to(config.high_precision_dtype)
 
+    compiled_pytorch_fn = torch.compile(eager_dynamic_scaled_quant, fullgraph=True)
+    compiled_out = compiled_pytorch_fn(
+        hp_tensor,
+        config.low_precision_dtype,
+    ).to(config.high_precision_dtype)
+
     print(f"Deviation between Triton and Nuggets: {torch.abs(nuggets_out - eager_out).max()}")
+    print(
+        f"Deviation between Eager and Compiled PyTorch: {torch.abs(eager_out - compiled_out).max()}"
+    )
+
+    # Find the index of the maximum deviation
     max_dev_index = torch.abs(nuggets_out - eager_out).argmax().item()
     print(f"nuggets_out tensor value: {nuggets_out.flatten()[max_dev_index]:.4f}")
     print(f"eager_out tensor value: {eager_out.flatten()[max_dev_index]:.4f}")
@@ -83,21 +96,21 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
     triton_hp_tensor = high_precision_tensor.clone()
 
     # Triton does different rounding as far as I can tell
-    if False:
+    if True:
         correctness_check(high_precision_tensor, triton_hp_tensor, config)
 
-    triton_time = benchmark_torch_function_in_microseconds(
+    triton_time = benchmark_cuda_function_in_microseconds(
         dynamic_scaled_quant,
         triton_hp_tensor,
         config.low_precision_dtype,
     )
-    pytorch_time = benchmark_torch_function_in_microseconds(
+    pytorch_time = benchmark_cuda_function_in_microseconds(
         eager_dynamic_scaled_quant,
         high_precision_tensor,
         config.low_precision_dtype,
     )
     compiled_pytorch_fn = torch.compile(eager_dynamic_scaled_quant, fullgraph=True)
-    compiled_pytorch_time = benchmark_torch_function_in_microseconds(
+    compiled_pytorch_time = benchmark_cuda_function_in_microseconds(
         compiled_pytorch_fn,
         high_precision_tensor,
         config.low_precision_dtype,
