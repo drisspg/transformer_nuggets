@@ -401,9 +401,9 @@ def entrypoint(
     overfit: bool = False,
     profile: bool = False,
 ):
-    assert (
-        isinstance(fp8_linear_type, str) or fp8_linear_type is None
-    ), "fp8_linear_type must be str"
+    assert isinstance(fp8_linear_type, str) or fp8_linear_type is None, (
+        "fp8_linear_type must be str"
+    )
     assert isinstance(compile, bool), "compile must be bool"
     assert isinstance(overfit, bool), "overfit must be bool"
     assert isinstance(profile, bool), "profile must be bool"

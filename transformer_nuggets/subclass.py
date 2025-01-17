@@ -1,6 +1,5 @@
 from dataclasses import dataclass
-from abc import ABC, abstractmethod
-from typing import Tuple, Iterable, Type, Dict, Any
+from typing import Tuple, Iterable, Type
 import torch
 import functools
 
@@ -68,91 +67,3 @@ def _implements(cls, aten_ops_or_torch_fns: Iterable[Op] | Op) -> callable:
         return func
 
     return decorator
-
-
-class PT2Subclass(ABC, torch.Tensor):
-    """Abstract base class for PyTorch 2.0 compliant tensor subclasses.
-
-    This class enforces implementation of required methods for proper tensor subclassing
-    while maintaining inheritance from torch.Tensor.
-
-    Required Methods:
-        __new__: Constructor for creating new instances
-        __tensor_flatten__: Method for flattening the tensor into constituent parts
-        __tensor_unflatten__: Method for reconstructing the tensor from flattened parts
-        __torch_dispatch__: Handler for tensor operations
-    """
-
-    implements = classmethod(_implements)
-
-    @staticmethod
-    @abstractmethod
-    def __new__(cls, *args, **kwargs) -> "PT2Subclass":
-        """Create a new instance of the tensor subclass.
-        I like structuring this as SubclassArgs then everything else that
-        goes on the instance
-        Example:
-            subclass = torch.Tensor._make_wrapper_subclass(
-                cls,
-                tensor_meta.original_shape,
-                tensor_meta.original_strides,
-                tensor_meta.storage_offset,
-                dtype=tensor_meta.dtype,
-                device=tensor_meta.device,
-                requires_grad=tensor_meta.requires_grad,
-            )
-            return subclass
-
-        """
-        pass
-
-    @abstractmethod
-    def __init__(self, *args, **kwargs) -> None:
-        """Initialize the tensor subclass instance."""
-        pass
-
-    @abstractmethod
-    def __tensor_flatten__(self) -> Tuple[List[str], Dict[str, Any]]:
-        """Flatten the tensor into its constituent parts.
-
-        Returns:
-            Tuple containing:
-                - List of the attributes on the subclass that are tensors
-                - Dictionary of metadata needed for reconstruction
-        """
-        pass
-
-    @staticmethod
-    @abstractmethod
-    def __tensor_unflatten__(
-        inner_tensors: Dict[str, torch.Tensor], meta: Dict[str, Any], outer_size: torch.Size, outer_stride: torch.Size
-    ) -> "PT2Subclass":
-        """Reconstruct the tensor from flattened parts.
-
-        Args:
-            inner_tensors: Dictionary mapping names to constituent tensors
-            meta: Metadata dictionary from __tensor_flatten__
-            *args, **kwargs: Additional arguments for reconstruction
-
-        Returns:
-            Reconstructed tensor subclass instance
-        """
-        pass
-
-    @classmethod
-    @abstractmethod
-    def __torch_dispatch__(
-        cls, func: Op, types: Tuple[Type, ...], args: Tuple[Any, ...], kwargs: Dict[str, Any]
-    ) -> Any:
-        """Handle tensor operations.
-
-        Args:
-            func: The operation to perform
-            types: Tuple of argument types
-            args: Positional arguments
-            kwargs: Keyword arguments
-
-        Returns:
-            Result of the operation
-        """
-        pass
