@@ -102,3 +102,44 @@ def to_blocked_manual(input_matrix) -> Tensor:
             output[out_row_start:out_row_end, out_col_start:out_col_end] = rearranged_block
 
     return output
+
+
+def to_blocked_manual_v2(input_matrix) -> Tensor:
+    """Slow for testing purposes"""
+    device = input_matrix.device
+    dtype = input_matrix.dtype
+
+    rows, cols = input_matrix.shape
+
+    n_row_blocks = ceil_div(rows, 128)
+    n_col_blocks = ceil_div(cols, 4)
+
+    # Create output tensor
+    output = torch.zeros(512 * n_row_blocks * n_col_blocks, dtype=dtype, device=device)
+    # output = torch.zeros((32 * n_row_blocks, 16 * n_col_blocks), dtype=dtype, device=device)
+
+    # Process each block
+    for row_block in range(n_row_blocks):
+        for col_block in range(n_col_blocks):
+            lineared_index = row_block * n_col_blocks + col_block
+            # Calculate input block boundaries
+            row_start = row_block * 128
+            row_end = min(row_start + 128, rows)  # Avoid going out of bounds
+            col_start = col_block * 4
+            col_end = min(col_start + 4, cols)  # Avoid going out of bounds
+
+            block = input_matrix[row_start:row_end, col_start:col_end]
+
+            row_size = row_end - row_start
+            col_size = col_end - col_start
+            if row_size < 128 or col_size < 4:
+                # pad out local block with zeros
+                block = torch.nn.functional.pad(block, (0, 4 - col_size, 0, 128 - row_size))
+
+            rearranged_block = _to_blocked_single(block)
+
+            start = lineared_index * 512
+            end = start + 512
+            output[start:end] = rearranged_block.view(-1)
+
+    return output
