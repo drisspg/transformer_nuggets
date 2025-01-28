@@ -32,12 +32,39 @@ def to_blocked(input_matrix) -> Tensor:
     # rearrange all tiles
     rearranged = blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16)
 
-    # Layout rearranged tiles according to second pic
     return (
         rearranged.reshape(n_row_blocks, n_col_blocks, 32, 16)
         .permute(0, 2, 1, 3)
         .reshape(32 * n_row_blocks, 16 * n_col_blocks)
     )
+
+
+def to_blocked_v2(input_matrix) -> Tensor:
+    """
+    Rearrange a large matrix by breaking it into blocks and applying the rearrangement pattern.
+
+    See:
+        https://docs.nvidia.com/cuda/cublas/index.html#d-block-scaling-factors-layout
+
+    Args:
+        input_matrix: Input tensor of shape (H, W)
+
+    Returns:
+        Rearranged tensor of shape (32*ceil_div(H,128), 16*ceil_div(W,4))
+    """
+    rows, cols = input_matrix.shape
+    n_row_blocks = ceil_div(rows, 128)
+    n_col_blocks = ceil_div(cols, 4)
+
+    # Pad out and view as tiles of (128, 4)
+    padded = F.pad(input_matrix, (0, -cols % 4, 0, -rows % 128))
+    blocks = padded.view(n_row_blocks, 128, n_col_blocks, 4).permute(0, 2, 1, 3)
+
+    # rearrange all tiles
+    rearranged = blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16)
+
+    # Layout rearranged tiles according to second pic
+    return rearranged.flatten()
 
 
 def _to_blocked_single_manual(scales: Tensor) -> Tensor:
