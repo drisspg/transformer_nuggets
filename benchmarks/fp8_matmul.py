@@ -272,7 +272,7 @@ def get_configs_varying_k(
     M: int = 8192, N: int = 8192, bf16: bool = False
 ) -> List[ExperimentConfig]:
     shapes = [(M, K, N) for K in range(1024, 16385, 1024)]
-    scaling_strategies = [ScalingStrategy.E8M0]
+    scaling_strategies = [ScalingStrategy.PER_TENSOR]
     compile_options = [False]
     configs = []
     fp8_kernels = [
@@ -280,7 +280,7 @@ def get_configs_varying_k(
         # FP8Kernel.PERSISTENT,
         # FP8Kernel.PERSISTENT_TMA,
         # FP8Kernel.DEVICE_TMA,
-        FP8Kernel.CUTLASS_MX,
+        # FP8Kernel.CUTLASS_MX,
     ]
 
     for (M, K, N), strategy, compile, kernel in itertools.product(
