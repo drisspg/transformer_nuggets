@@ -23,7 +23,8 @@ dependencies = [
     "tqdm >= 4.66",
     "tabulate >= 0.8",
     "rich==13.7.1",
-    "matplotlib"
+    "matplotlib",
+    "pandas"
 ]
 
 [project.optional-dependencies]

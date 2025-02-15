@@ -30,6 +30,7 @@ from enum import Enum
 import csv
 import logging
 
+from torchao.ops import mx_fp8_bf16
 
 def ceil_div(a, b):
     return (a + b - 1) // b
@@ -62,10 +63,10 @@ def is_col_major(stride):
 
 def get_e8_scales(A: torch.Tensor, B: torch.Tensor):
     M, K = A.shape
-    N, _ = B.shape
-    n_a_rows = ceil_div(M, 128)
+    _, N = B.shape
+    n_a_rows = ceil_div(M, 128) * 128
     n_a_cols = ceil_div(K, 32)
-    n_b_rows = ceil_div(N, 128)
+    n_b_rows = ceil_div(N, 128) * 128
     n_b_cols = ceil_div(K, 32)
     a_scales = torch.randint(256, (n_a_rows, n_a_cols), dtype=torch.uint8, device="cuda")
     b_scales = torch.randint(256, (n_b_rows, n_b_cols), dtype=torch.uint8, device="cuda")
@@ -121,11 +122,6 @@ def get_fp8_matmul(
         assert (
             scaling_strategy == ScalingStrategy.E8M0
         ), "E8M0 scaling strategy is required for MX_FP8"
-        try:
-            from driss_torch import mx_fp8_bf16
-        except ModuleNotFoundError:
-            print("Driss Torch not installed")
-            return None
         return lambda: mx_fp8_bf16(A_fp8, B_fp8, a_scale, b_scale)
     else:
         raise ValueError(f"Invalid FP8 kernel: {fp8_kernel}")
@@ -272,15 +268,15 @@ def get_configs_varying_k(
     M: int = 8192, N: int = 8192, bf16: bool = False
 ) -> List[ExperimentConfig]:
     shapes = [(M, K, N) for K in range(1024, 16385, 1024)]
-    scaling_strategies = [ScalingStrategy.PER_TENSOR]
+    scaling_strategies = [ScalingStrategy.E8M0]
     compile_options = [False]
     configs = []
     fp8_kernels = [
-        FP8Kernel.SCALED_MM,
+        # FP8Kernel.SCALED_MM,
         # FP8Kernel.PERSISTENT,
         # FP8Kernel.PERSISTENT_TMA,
         # FP8Kernel.DEVICE_TMA,
-        # FP8Kernel.CUTLASS_MX,
+        FP8Kernel.CUTLASS_MX,
     ]
 
     for (M, K, N), strategy, compile, kernel in itertools.product(
