@@ -68,8 +68,9 @@ def get_e8_scales(A: torch.Tensor, B: torch.Tensor):
     n_a_cols = ceil_div(K, 32)
     n_b_rows = ceil_div(N, 128) * 128
     n_b_cols = ceil_div(K, 32)
-    a_scales = torch.randint(256, (n_a_rows, n_a_cols), dtype=torch.uint8, device="cuda")
-    b_scales = torch.randint(256, (n_b_rows, n_b_cols), dtype=torch.uint8, device="cuda")
+    a_scales = torch.randn(n_a_rows, n_a_cols, dtype=torch.float32, device="cuda").to(torch.float8_e8m0fnu)
+    b_scales = torch.randn(n_b_rows, n_b_cols, dtype=torch.float32, device="cuda").to(torch.float8_e8m0fnu)
+
     return a_scales, b_scales
 
 
@@ -110,10 +111,9 @@ def get_fp8_matmul(
             return lambda: torch._scaled_mm(
                 A_fp8,
                 B_fp8,
-                b_scale,  # swap since we haven't figured this out yet
                 a_scale,
+                b_scale,
                 out_dtype=torch.bfloat16,
-                scale_dtype=1,
             )
         return lambda: addmm_float8_unwrapped_inference(
             A_fp8, a_scale, B_fp8, b_scale, output_dtype=torch.bfloat16, use_fast_accum=True
@@ -272,7 +272,7 @@ def get_configs_varying_k(
     compile_options = [False]
     configs = []
     fp8_kernels = [
-        # FP8Kernel.SCALED_MM,
+        FP8Kernel.SCALED_MM,
         # FP8Kernel.PERSISTENT,
         # FP8Kernel.PERSISTENT_TMA,
         # FP8Kernel.DEVICE_TMA,
@@ -312,15 +312,42 @@ def plot_tflops_comparison(df, save_path: Path):
     m_value = df["M"].iloc[0]
     n_value = df["N"].iloc[0]
 
+    # Plot FP8 kernel performance
     for kernel in kernel_types:
         tflops_values = [grouped.get_group((k, kernel))["FP8 TFLOPS"].values[0] for k in k_values]
-        plt.plot(k_values, tflops_values, marker="o", label=kernel.split(".")[-1])
+        plt.plot(k_values, tflops_values, marker="o", label=f"FP8 - {kernel}")
+
+    # Check if BF16 data exists and plot it
+    has_bf16 = df["BF16 TFLOPS"].notna().any()
+    if has_bf16:
+        # Since there's only one BF16 implementation, we can extract it directly
+        bf16_tflops_values = []
+        for k in k_values:
+            # Get the first entry for each K value since BF16 is the same regardless of kernel
+            k_group = df[df["K"] == k]
+            if not k_group.empty and not k_group["BF16 TFLOPS"].isna().all():
+                bf16_tflops_values.append(k_group["BF16 TFLOPS"].iloc[0])
+            else:
+                # Handle case where BF16 data might be missing for some K values
+                bf16_tflops_values.append(None)
+        
+        # Filter out None values for plotting
+        valid_indices = [i for i, val in enumerate(bf16_tflops_values) if val is not None]
+        if valid_indices:
+            valid_k_values = [k_values[i] for i in valid_indices]
+            valid_bf16_values = [bf16_tflops_values[i] for i in valid_indices]
+            plt.plot(valid_k_values, valid_bf16_values, marker="s", linestyle="--", 
+                    color="red", linewidth=2, label="BF16 Baseline")
 
     plt.xlabel("K (Matrix Dimension)")
     plt.ylabel("TFLOPS")
-    plt.title(
-        f"FP8 Kernel Performance Comparison\nM={m_value}, N={n_value}\nScaling Strategy: {scaling_strategy}"
-    )
+    title = f"Matrix Multiplication Performance Comparison\nM={m_value}, N={n_value}\nScaling Strategy: {scaling_strategy}"
+    if has_bf16:
+        title = "FP8 vs BF16 " + title
+    else:
+        title = "FP8 " + title
+    plt.title(title)
+    
     plt.legend()
     plt.grid(True, which="both", ls="-", alpha=0.2)
     plt.xticks(k_values, rotation=45, ha="right")
@@ -328,7 +355,8 @@ def plot_tflops_comparison(df, save_path: Path):
 
     # Generate the file name and save in the same directory as the CSV file
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    file_name = f"fp8_kernel_comparison_{m_value}_{n_value}_{timestamp}.png"
+    prefix = "fp8_bf16_comparison" if has_bf16 else "fp8_kernel_comparison"
+    file_name = f"{prefix}_{m_value}_{n_value}_{timestamp}.png"
     graph_path = save_path.parent / file_name
     plt.savefig(graph_path, dpi=300)
     print(f"TFLOPS comparison plot saved as {graph_path}")
