@@ -61,21 +61,27 @@ def is_col_major(stride):
     return stride[1] > stride[0] and stride[0] == 1
 
 
-def get_e8_scales(A: torch.Tensor, B: torch.Tensor):
+def get_e8_scales(A: torch.Tensor, B: torch.Tensor, use_zeros: bool = False):
     M, K = A.shape
     _, N = B.shape
     n_a_rows = ceil_div(M, 128) * 128
     n_a_cols = ceil_div(K, 32)
     n_b_rows = ceil_div(N, 128) * 128
     n_b_cols = ceil_div(K, 32)
-    a_scales = torch.randn(n_a_rows, n_a_cols, dtype=torch.float32, device="cuda").to(torch.float8_e8m0fnu)
-    b_scales = torch.randn(n_b_rows, n_b_cols, dtype=torch.float32, device="cuda").to(torch.float8_e8m0fnu)
+    
+    # Use zeros or random values based on the flag
+    if use_zeros:
+        a_scales = torch.zeros(n_a_rows, n_a_cols, dtype=torch.float32, device="cuda").to(torch.float8_e8m0fnu)
+        b_scales = torch.zeros(n_b_rows, n_b_cols, dtype=torch.float32, device="cuda").to(torch.float8_e8m0fnu)
+    else:
+        a_scales = torch.randn(n_a_rows, n_a_cols, dtype=torch.float32, device="cuda").to(torch.float8_e8m0fnu)
+        b_scales = torch.randn(n_b_rows, n_b_cols, dtype=torch.float32, device="cuda").to(torch.float8_e8m0fnu)
 
     return a_scales, b_scales
 
 
 def get_fp8_matmul(
-    A: torch.Tensor, B: torch.Tensor, scaling_strategy: ScalingStrategy, fp8_kernel: FP8Kernel
+    A: torch.Tensor, B: torch.Tensor, scaling_strategy: ScalingStrategy, fp8_kernel: FP8Kernel, use_zeros: bool = False
 ):
     A_fp8 = A.to(torch.float8_e4m3fn)
     B_fp8 = B.to(torch.float8_e4m3fn)
@@ -95,7 +101,7 @@ def get_fp8_matmul(
         a_scale = torch.ones((A_fp8.size(0), 1), device="cuda", dtype=torch.float32)
         b_scale = torch.ones((B_fp8.size(1), 1), device="cuda", dtype=torch.float32).T
     elif scaling_strategy == ScalingStrategy.E8M0:
-        a_scale, b_scale = get_e8_scales(A_fp8, B_fp8)
+        a_scale, b_scale = get_e8_scales(A_fp8, B_fp8, use_zeros)
     else:
         raise ValueError(f"Invalid scaling strategy: {scaling_strategy}")
 
@@ -136,7 +142,7 @@ class ExperimentConfig:
     fp8_kernel: FP8Kernel
     compile: bool
     bf16: bool
-
+    use_zeros: bool = False
 
 @dataclass(frozen=True)
 class ExperimentResult:
@@ -161,11 +167,17 @@ def calculate_tflops(M: int, N: int, K: int, time_us: float) -> float:
 
 def run_experiment(config: ExperimentConfig) -> ExperimentResult:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    A = torch.randn(config.M, config.K, device=device, dtype=torch.bfloat16)
-    B = torch.randn(config.K, config.N, device=device, dtype=torch.bfloat16)
+    
+    # Initialize tensors with zeros or random values based on the flag
+    if config.use_zeros:
+        A = torch.zeros(config.M, config.K, device=device, dtype=torch.bfloat16)
+        B = torch.zeros(config.K, config.N, device=device, dtype=torch.bfloat16)
+    else:
+        A = torch.randn(config.M, config.K, device=device, dtype=torch.bfloat16)
+        B = torch.randn(config.K, config.N, device=device, dtype=torch.bfloat16)
 
     bf16_matmul = lambda x, y: torch.matmul(x, y)
-    fp8_matmul = get_fp8_matmul(A, B, config.scaling_strategy, config.fp8_kernel)
+    fp8_matmul = get_fp8_matmul(A, B, config.scaling_strategy, config.fp8_kernel, config.use_zeros)
 
     if config.compile and config.fp8_kernel == FP8Kernel.SCALED_MM:
         bf16_matmul = torch.compile(bf16_matmul)
@@ -192,7 +204,7 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
 
     # Baseline fp8_matmul correctness
     if CHECK:
-        scaled_mm_base = get_fp8_matmul(A, B, config.scaling_strategy, FP8Kernel.SCALED_MM)
+        scaled_mm_base = get_fp8_matmul(A, B, config.scaling_strategy, FP8Kernel.SCALED_MM, config.use_zeros)
         out_base = scaled_mm_base()
         out = fp8_matmul()
         # Failing on one sample with large N
@@ -211,6 +223,7 @@ def print_results(experiments: List[Experiment], save_path: Optional[Path] = Non
         "Scaling Strategy",
         "Fp8 Kernel",
         "Compiled",
+        "Use Zeros",  # Added new column
         "BF16 Time (ms)",
         "FP8 Time (ms)",
         "Speedup",
@@ -245,6 +258,7 @@ def print_results(experiments: List[Experiment], save_path: Optional[Path] = Non
                 config.scaling_strategy.value,
                 config.fp8_kernel.value,
                 config.compile,
+                config.use_zeros,
                 bf16_time,
                 fp8_time,
                 speedup,
@@ -264,19 +278,108 @@ def print_results(experiments: List[Experiment], save_path: Optional[Path] = Non
         print(f"💾 Results saved to: {save_path}")
 
 
+def load_and_process_data(file_path):
+    df = pd.read_csv(file_path)
+    # df["Speedup"] = df["Speedup"].str.rstrip("x").astype(float)
+    # df["TFLOPS Ratio"] = df["TFLOPS Ratio"].str.rstrip("x").astype(float)
+    return df
+
+
+def plot_tflops_comparison(df, save_path: Path):
+    plt.figure(figsize=(12, 6))
+    grouped = df.groupby(["K", "Fp8 Kernel", "Use Zeros"])  # Added Use Zeros to groupby
+    k_values = sorted(df["K"].unique())
+    kernel_types = df["Fp8 Kernel"].unique()
+    scaling_strategy = df["Scaling Strategy"].iloc[0]
+    m_value = df["M"].iloc[0]
+    n_value = df["N"].iloc[0]
+    use_zeros_values = df["Use Zeros"].unique()
+
+    # Define line styles and markers for different data types
+    line_styles = {True: "--", False: "-"}
+    markers = {True: "^", False: "o"}
+    
+    # Plot FP8 kernel performance
+    for kernel in kernel_types:
+        for use_zeros in use_zeros_values:
+            try:
+                tflops_values = [grouped.get_group((k, kernel, use_zeros))["FP8 TFLOPS"].values[0] for k in k_values]
+                zeros_label = "Zeros" if use_zeros else "Random"
+                plt.plot(k_values, tflops_values, 
+                         marker=markers[use_zeros], 
+                         linestyle=line_styles[use_zeros],
+                         label=f"FP8 - {kernel} - {zeros_label}")
+            except KeyError:
+                # Skip if this combination doesn't exist in the data
+                continue
+
+    # Check if BF16 data exists and plot it
+    has_bf16 = df["BF16 TFLOPS"].notna().any()
+    if has_bf16:
+        for use_zeros in use_zeros_values:
+            bf16_data = df[(df["BF16 TFLOPS"].notna()) & (df["Use Zeros"] == use_zeros)]
+            if not bf16_data.empty:
+                # For each K value, get BF16 TFLOPS data
+                bf16_tflops_values = []
+                valid_k_values = []
+                
+                for k in k_values:
+                    k_group = bf16_data[bf16_data["K"] == k]
+                    if not k_group.empty:
+                        valid_k_values.append(k)
+                        bf16_tflops_values.append(k_group["BF16 TFLOPS"].iloc[0])
+                
+                if valid_k_values:  # Only plot if we have data
+                    zeros_label = "Zeros" if use_zeros else "Random"
+                    plt.plot(valid_k_values, bf16_tflops_values, 
+                             marker=markers[use_zeros], 
+                             linestyle=line_styles[use_zeros],
+                             color="red", linewidth=2, 
+                             label=f"BF16 - {zeros_label}")
+
+    plt.xlabel("K (Matrix Dimension)")
+    plt.ylabel("TFLOPS")
+    
+    # Set y-axis to start at 0
+    plt.ylim(bottom=0)
+    
+    use_zeros_str = "with Zeros & Random inputs" if len(use_zeros_values) > 1 else ("with Zero inputs" if True in use_zeros_values else "with Random inputs")
+    title = f"Matrix Multiplication Performance Comparison {use_zeros_str}\nM={m_value}, N={n_value}\nScaling Strategy: {scaling_strategy}"
+    if has_bf16:
+        title = "FP8 vs BF16 " + title
+    else:
+        title = "FP8 " + title
+    plt.title(title)
+    
+    plt.legend()
+    plt.grid(True, which="both", ls="-", alpha=0.2)
+    plt.xticks(k_values, rotation=45, ha="right")
+    plt.tight_layout()
+
+    # Generate the file name and save in the same directory as the CSV file
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    zeros_suffix = "_zeros" if True in use_zeros_values else ""
+    prefix = f"fp8_bf16_comparison{zeros_suffix}" if has_bf16 else f"fp8_kernel_comparison{zeros_suffix}"
+    file_name = f"{prefix}_{m_value}_{n_value}_{timestamp}.png"
+    graph_path = save_path.parent / file_name
+    plt.savefig(graph_path, dpi=300)
+    print(f"TFLOPS comparison plot saved as {graph_path}")
+
+
+
 def get_configs_varying_k(
-    M: int = 8192, N: int = 8192, bf16: bool = False
+    M: int = 8192, N: int = 8192, bf16: bool = False, use_zeros: bool = False
 ) -> List[ExperimentConfig]:
     shapes = [(M, K, N) for K in range(1024, 16385, 1024)]
-    scaling_strategies = [ScalingStrategy.E8M0]
-    compile_options = [False]
+    scaling_strategies = [ScalingStrategy.PER_ROW]
+    compile_options = [False, True]
     configs = []
     fp8_kernels = [
         FP8Kernel.SCALED_MM,
         # FP8Kernel.PERSISTENT,
         # FP8Kernel.PERSISTENT_TMA,
         # FP8Kernel.DEVICE_TMA,
-        FP8Kernel.CUTLASS_MX,
+        # FP8Kernel.CUTLASS_MX,
     ]
 
     for (M, K, N), strategy, compile, kernel in itertools.product(
@@ -291,76 +394,10 @@ def get_configs_varying_k(
                 compile=compile,
                 fp8_kernel=kernel,
                 bf16=bf16,
+                use_zeros=use_zeros,
             )
         )
     return configs
-
-
-def load_and_process_data(file_path):
-    df = pd.read_csv(file_path)
-    # df["Speedup"] = df["Speedup"].str.rstrip("x").astype(float)
-    # df["TFLOPS Ratio"] = df["TFLOPS Ratio"].str.rstrip("x").astype(float)
-    return df
-
-
-def plot_tflops_comparison(df, save_path: Path):
-    plt.figure(figsize=(12, 6))
-    grouped = df.groupby(["K", "Fp8 Kernel"])
-    k_values = sorted(df["K"].unique())
-    kernel_types = df["Fp8 Kernel"].unique()
-    scaling_strategy = df["Scaling Strategy"].iloc[0]
-    m_value = df["M"].iloc[0]
-    n_value = df["N"].iloc[0]
-
-    # Plot FP8 kernel performance
-    for kernel in kernel_types:
-        tflops_values = [grouped.get_group((k, kernel))["FP8 TFLOPS"].values[0] for k in k_values]
-        plt.plot(k_values, tflops_values, marker="o", label=f"FP8 - {kernel}")
-
-    # Check if BF16 data exists and plot it
-    has_bf16 = df["BF16 TFLOPS"].notna().any()
-    if has_bf16:
-        # Since there's only one BF16 implementation, we can extract it directly
-        bf16_tflops_values = []
-        for k in k_values:
-            # Get the first entry for each K value since BF16 is the same regardless of kernel
-            k_group = df[df["K"] == k]
-            if not k_group.empty and not k_group["BF16 TFLOPS"].isna().all():
-                bf16_tflops_values.append(k_group["BF16 TFLOPS"].iloc[0])
-            else:
-                # Handle case where BF16 data might be missing for some K values
-                bf16_tflops_values.append(None)
-        
-        # Filter out None values for plotting
-        valid_indices = [i for i, val in enumerate(bf16_tflops_values) if val is not None]
-        if valid_indices:
-            valid_k_values = [k_values[i] for i in valid_indices]
-            valid_bf16_values = [bf16_tflops_values[i] for i in valid_indices]
-            plt.plot(valid_k_values, valid_bf16_values, marker="s", linestyle="--", 
-                    color="red", linewidth=2, label="BF16 Baseline")
-
-    plt.xlabel("K (Matrix Dimension)")
-    plt.ylabel("TFLOPS")
-    title = f"Matrix Multiplication Performance Comparison\nM={m_value}, N={n_value}\nScaling Strategy: {scaling_strategy}"
-    if has_bf16:
-        title = "FP8 vs BF16 " + title
-    else:
-        title = "FP8 " + title
-    plt.title(title)
-    
-    plt.legend()
-    plt.grid(True, which="both", ls="-", alpha=0.2)
-    plt.xticks(k_values, rotation=45, ha="right")
-    plt.tight_layout()
-
-    # Generate the file name and save in the same directory as the CSV file
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    prefix = "fp8_bf16_comparison" if has_bf16 else "fp8_kernel_comparison"
-    file_name = f"{prefix}_{m_value}_{n_value}_{timestamp}.png"
-    graph_path = save_path.parent / file_name
-    plt.savefig(graph_path, dpi=300)
-    print(f"TFLOPS comparison plot saved as {graph_path}")
-
 
 def main(
     save_path: Optional[str] = None,
@@ -368,6 +405,7 @@ def main(
     N: int = 8192,
     graph: bool = False,
     bf_16: bool = False,
+    use_zeros: bool = False,  # New flag for zero initialization
 ):
     """Benchmark FP8 MatMul with different configurations and optionally graph results.
 
@@ -377,9 +415,10 @@ def main(
         N (int, optional): Number of columns in the second matrix. Defaults to 8192.
         graph_results (bool, optional): Whether to create a graph of the results. Defaults to False.
         bf_16 (bool, optional): Whether to use BF16 for the baseline. Defaults to False.
+        use_zeros (bool, optional): Whether to initialize tensors with zeros instead of random values. Defaults to False.
     """
     torch.random.manual_seed(123)
-    configs = get_configs_varying_k(M, N, bf16=bf_16)
+    configs = get_configs_varying_k(M, N, bf16=bf_16, use_zeros=use_zeros)
     results = []
     if save_path is not None:
         save_path = Path(save_path)
