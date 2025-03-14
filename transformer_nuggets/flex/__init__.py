@@ -3,7 +3,7 @@ from dataclasses import dataclass, asdict
 
 
 @dataclass(frozen=True)
-class FlexAttentionKernelArgs:
+class FlexKernelOptions:
     """Arguments that can be passed to control the behavior of the FlexAttention kernels.
     These arguments get converted to a dictionary of string-value pairs when passed to the kernels.
     """
