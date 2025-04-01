@@ -163,6 +163,8 @@ def save_memory_snapshot(file_path: Path):
             # code to profile
     ```
     """
+    from transformer_nuggets import init_logging
+    init_logging()
     try:
         import torch.distributed as dist
 
@@ -277,6 +279,8 @@ def profiler(
             # code to profile
     ```
     """
+    from transformer_nuggets import init_logging
+    init_logging()
     path = path.with_suffix(".json")
     # make parent dir if it doesn't exist
     output_dir = path.parent
