@@ -164,6 +164,7 @@ def save_memory_snapshot(file_path: Path):
     ```
     """
     from transformer_nuggets import init_logging
+
     init_logging()
     try:
         import torch.distributed as dist
@@ -258,9 +259,19 @@ def attach_oom_observer(save_path: Optional[Path] = None, max_entries: int = 100
     torch.cuda.memory._record_memory_history(max_entries=max_entries)
 
 
+def get_process_rank():
+    """Get process rank even if distributed is not initialized"""
+    import os
+
+    # Check for LOCAL_RANK which torchrun sets
+    if "LOCAL_RANK" in os.environ:
+        return int(os.environ["LOCAL_RANK"])
+    return None
+
+
 @contextmanager
 def profiler(
-    path: Path,
+    path: Path | str,
     record_shapes: bool = True,
     profile_memory: bool = False,
     with_stack: bool = False,
@@ -280,8 +291,21 @@ def profiler(
     ```
     """
     from transformer_nuggets import init_logging
+
     init_logging()
+
+    if not isinstance(path, Path):
+        path = Path(path)
+
+    rank = get_process_rank()
+
+    # Create path with suffix
     path = path.with_suffix(".json")
+
+    # Add rank to filename if distributed
+    if rank is not None:
+        path = path.parent / f"{path.stem}_rank_{rank}{path.suffix}"
+
     # make parent dir if it doesn't exist
     output_dir = path.parent
     output_dir.mkdir(parents=True, exist_ok=True)
