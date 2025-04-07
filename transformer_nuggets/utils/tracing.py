@@ -129,11 +129,13 @@ class NanInfDetect(TorchDispatchMode):
     ```
     Args:
         do_breakpoint: If True, will call `breakpoint()` when a NaN or Inf is detected.
+        distributed: use torch.distributed.breakpoint() instead of breakpoint()
     """
 
-    def __init__(self, do_breakpoint: bool = False):
+    def __init__(self, do_breakpoint: bool = False, distributed: bool = False):
         super().__init__()
         self.do_breakpoint = do_breakpoint
+        self.distributed = distributed
 
     def __torch_dispatch__(self, func, types, args, kwargs=None):
         kwargs = kwargs or {}
@@ -151,7 +153,10 @@ class NanInfDetect(TorchDispatchMode):
             return res
         if output_has_nan or output_has_inf:
             if self.do_breakpoint:
-                breakpoint()
+                if self.distributed:
+                    torch.distributed.breakpoint()
+                else:
+                    breakpoint()
             raise RuntimeError(
                 get_error_string(func, types, args, kwargs, output_has_nan, output_has_inf)
             )
