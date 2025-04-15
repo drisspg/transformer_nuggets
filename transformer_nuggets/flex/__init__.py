@@ -10,16 +10,16 @@ class FlexAttentionKernelArgs:
 
     # Performance tuning options
     num_warps: Optional[int] = None
-    """Number of warps to use in the CUDA kernel. If None, will be autotuned."""
+    """Number of warps to use in the CUDA kernel."""
 
     num_stages: Optional[int] = None
-    """Number of pipeline stages to use in the CUDA kernel. If None, will be autotuned."""
+    """Number of pipeline stages to use in the CUDA kernel."""
 
     BLOCK_M: Optional[int] = None
-    """Thread block size across the seqlen dim of Q. If None, will be autotuned."""
+    """Thread block size across the seqlen dim of Q."""
 
     BLOCK_N: Optional[int] = None
-    """Block size to iterate over across the seqlen dim of K/V in each thread block. If None, will be autotuned."""
+    """Block size to iterate over across the seqlen dim of K/V in each thread block."""
 
     # Numerical behavior options
     PRESCALE_QK: bool = False
