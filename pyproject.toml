@@ -18,6 +18,7 @@ classifiers = [
 ]
 
 dependencies = [
+    "torch",
     "scipy >= 1.9.1",
     "tqdm >= 4.66",
     "tabulate >= 0.8",
