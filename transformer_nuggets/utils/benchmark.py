@@ -10,7 +10,7 @@ import torch.utils.benchmark as benchmark
 from torch._inductor.utils import do_bench_using_profiling
 
 from torch.cuda._memory_viz import profile_plot
-from torch.profiler import profile, ProfilerActivity, record_function
+from torch.profiler import profile, ProfilerActivity, record_function, schedule
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -285,6 +285,7 @@ def profiler(
     record_shapes: bool = True,
     profile_memory: bool = False,
     with_stack: bool = False,
+    warmup: int = 0,
 ):
     """Thin wrapper around torch.profiler
 
@@ -293,6 +294,7 @@ def profiler(
         record_shapes: Record shapes of tensors
         profile_memory: Profile memory usage
         with_stack: Record stack traces - Blows up memory
+        warmup: If greater than 0 then it will warmup record before recording
 
     Usage:
     ```
@@ -325,6 +327,7 @@ def profiler(
     def trace_handler(prof) -> None:
         prof.export_chrome_trace(path.as_posix())
 
+    prof_sched = schedule(wait=0, warmup=warmup, active=int(1_000_000)) if warmup > 0 else None
     profiler = torch.profiler.profile(
         activities=[
             torch.profiler.ProfilerActivity.CPU,
@@ -334,6 +337,7 @@ def profiler(
         record_shapes=record_shapes,
         profile_memory=profile_memory,
         with_stack=with_stack,
+        schedule=prof_sched,
     )
 
     try:
