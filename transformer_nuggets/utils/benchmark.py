@@ -126,9 +126,10 @@ def max_memory_usage(log: bool = False, precision: int = 2) -> int:
     try:
         yield
     finally:
-        max_memory = torch.cuda.max_memory_allocated() / (1024**3)
+        max_memory = torch.cuda.max_memory_allocated()
         if log:
-            print(f"Max CUDA Memory Allocated: {max_memory:.{precision}f} GiB")
+            max_memory_gib = max_memory / (1024**3)
+            print(f"Max CUDA Memory Allocated: {max_memory_gib:.{precision}f} GiB")
     return max_memory
 
 
@@ -152,9 +153,9 @@ def cuda_memory_usage(log: bool = False, precision: int = 2) -> int:
         yield
     finally:
         memory_usage = torch.cuda.memory_allocated() - initial_memory
-        memory_usage_gb = memory_usage / (1024**3)
+        memory_usage_gib = memory_usage / (1024**3)
         if log:
-            print(f"CUDA memory usage: {memory_usage_gb:.{precision}f} GB")
+            print(f"CUDA memory usage: {memory_usage_gib:.{precision}f} GiB")
     return memory_usage
 
 
