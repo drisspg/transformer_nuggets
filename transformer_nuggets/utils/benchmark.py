@@ -108,10 +108,11 @@ def profile_function(
 
 
 @contextmanager
-def print_max_memory_usage(precision: int = 2):
+def max_memory_usage(log: bool = False, precision: int = 2) -> int:
     """Prints the maximum CUDA memory usage at the end of a context manager
 
     Args:
+        log (bool): Whether to print the memory usage to the console
         precision (int): The number of decimal places to print
 
     Usage:
@@ -119,18 +120,24 @@ def print_max_memory_usage(precision: int = 2):
         with print_max_memory_usage():
             # code to profile
     ```
+    Returns:
+        max_memory (int): The maximum CUDA memory usage in GiB
     """
     try:
         yield
     finally:
-        print(f"Max Cuda Memory Used: {torch.cuda.max_memory_allocated() / (1024**3):.4f} GiB")
+        max_memory = torch.cuda.max_memory_allocated() / (1024**3)
+        if log:
+            print(f"Max CUDA Memory Allocated: {max_memory:.{precision}f} GiB")
+    return max_memory
 
 
 @contextmanager
-def print_cuda_memory_usage(precision: int = 2):
+def cuda_memory_usage(log: bool = False, precision: int = 2) -> int:
     """Prints the difference CUDA memory usage at the end of a context manager
 
     Args:
+        log (bool): Whether to print the memory usage to the console
         precision (int): The number of decimal places to print
 
     Usage:
@@ -146,7 +153,9 @@ def print_cuda_memory_usage(precision: int = 2):
     finally:
         memory_usage = torch.cuda.memory_allocated() - initial_memory
         memory_usage_gb = memory_usage / (1024**3)
-        print(f"CUDA memory usage: {memory_usage_gb:.{precision}f} GB")
+        if log:
+            print(f"CUDA memory usage: {memory_usage_gb:.{precision}f} GB")
+    return memory_usage
 
 
 @contextmanager
