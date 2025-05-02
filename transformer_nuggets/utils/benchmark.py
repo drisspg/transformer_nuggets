@@ -300,6 +300,14 @@ def profiler(
     ```
         with profiler(Path("trace.json")):
             # code to profile
+
+        # With steps (e.g. in a training loop) this will record 7 iterations
+        with profiler(Path("trace.json"), warmup=3) as p:
+            for i in range(10):
+                # Your code for this step (e.g. forward, backward, optimize)
+
+                # Call step() after each iteration
+                p.step()
     ```
     """
     from transformer_nuggets import init_logging
