@@ -10,3 +10,4 @@ from transformer_nuggets.utils.benchmark import (
     attach_oom_observer,
 )
 from transformer_nuggets.utils.tracing import LoggingMode, NanInfDetect
+from transformer_nuggets.utils.triton import print_sass
