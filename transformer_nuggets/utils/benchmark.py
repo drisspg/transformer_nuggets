@@ -72,6 +72,13 @@ def benchmark_do_bench_in_microseconds(func: Callable, *args, **kwargs) -> float
     return time * 1e3
 
 
+def benchmark_do_bench_in_microseconds(func: Callable, *args, **kwargs) -> float:
+    """Thin wrapper around do_bench_using_profiling"""
+    no_args = lambda: func(*args, **kwargs)
+    time = do_bench(no_args)
+    return time * 1e3
+
+
 def profile_function(
     config: ProfileConfig, func: Callable, *args, **kwargs
 ) -> torch.profiler.profile:
