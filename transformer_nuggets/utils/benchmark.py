@@ -7,7 +7,7 @@ from collections.abc import Callable
 
 import torch
 import torch.utils.benchmark as benchmark
-from torch._inductor.utils import do_bench_using_profiling, do_bench
+from torch._inductor.utils import do_bench_using_profiling
 
 from torch.cuda._memory_viz import profile_plot
 from torch.profiler import profile, ProfilerActivity, record_function, schedule
@@ -57,18 +57,6 @@ def benchmark_cuda_function_in_microseconds(func: Callable, *args, **kwargs) -> 
     """Thin wrapper around do_bench_using_profiling"""
     no_args = lambda: func(*args, **kwargs)
     time = do_bench_using_profiling(no_args)
-    return time * 1e3
-
-def benchmark_do_bench_in_microseconds(func: Callable, *args, **kwargs) -> float:
-    """Thin wrapper around do_bench_using_profiling"""
-    no_args = lambda: func(*args, **kwargs)
-    time = do_bench(no_args)
-    return time * 1e3
-
-def benchmark_do_bench_in_microseconds(func: Callable, *args, **kwargs) -> float:
-    """Thin wrapper around do_bench_using_profiling"""
-    no_args = lambda: func(*args, **kwargs)
-    time = do_bench(no_args)
     return time * 1e3
 
 

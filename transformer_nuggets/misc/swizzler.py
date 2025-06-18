@@ -54,7 +54,7 @@ if __name__ == "__main__":
     # Example from https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#example-matrix-transpose
     # And https://leimao.github.io/blog/CuTe-Swizzle/
 
-    #  Howe to create your swizzler, lets do an example
+    # How to create your swizzler, lets do an example
     # We are going to assume transaction size is 16 bytes int4 4*4 this means we have 8 groups
     # of 4 banks. Effectively 8 transactions before we hit a bank conflict
 
