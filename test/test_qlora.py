@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 import transformer_nuggets.quant.qlora as qlora
-from transformer_nuggets.quant import linear_nf4
+from transformer_nuggets.quant.qlora import linear_nf4
 from transformer_nuggets.quant.dequant_kernel import dequant_nf4_tensor
 from transformer_nuggets.quant.nf4_tensor import NF4Tensor
 from transformer_nuggets.quant.qlora_debug import NF4TensorDebug

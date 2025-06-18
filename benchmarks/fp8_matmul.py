@@ -1,6 +1,5 @@
 import itertools
 from dataclasses import dataclass
-from typing import List, Optional
 import torch
 from tabulate import tabulate
 import pandas as pd
@@ -160,9 +159,9 @@ class ExperimentConfig:
 
 @dataclass(frozen=True)
 class ExperimentResult:
-    bf16_time: Optional[float]
+    bf16_time: float | None
     fp8_time: float
-    bf16_tflops: Optional[float]
+    bf16_tflops: float | None
     fp8_tflops: float
 
 
@@ -231,7 +230,7 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
     )
 
 
-def print_results(experiments: List[Experiment], save_path: Optional[Path] = None):
+def print_results(experiments: list[Experiment], save_path: Path | None = None):
     headers = [
         "M",
         "K",
@@ -402,7 +401,7 @@ def plot_tflops_comparison(df, save_path: Path):
 
 def get_configs_varying_k(
     M: int = 8192, N: int = 8192, bf16: bool = False, use_zeros: bool = False
-) -> List[ExperimentConfig]:
+) -> list[ExperimentConfig]:
     shapes = [(M, K, N) for K in range(1024, 16385, 1024)]
     scaling_strategies = [ScalingStrategy.PER_ROW]
     compile_options = [False, True]
@@ -434,7 +433,7 @@ def get_configs_varying_k(
 
 
 def main(
-    save_path: Optional[str] = None,
+    save_path: str | None = None,
     M: int = 8192,
     N: int = 8192,
     graph: bool = False,

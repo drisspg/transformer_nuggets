@@ -2,7 +2,6 @@ import itertools
 
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import List
 
 import torch
 
@@ -39,7 +38,7 @@ class Experiment:
     result: ExperimentResult
 
 
-def get_configs() -> List[ExperimentConfig]:
+def get_configs() -> list[ExperimentConfig]:
     sizes = [2**21, 2**22, 2**23, 2**24]
     high_precision_dtypes = [torch.bfloat16, torch.float32]
     low_precision_dtypes = [torch.float8_e4m3fn, torch.float8_e5m2]
@@ -138,7 +137,7 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
     )
 
 
-def print_results(experiments: List[Experiment]):
+def print_results(experiments: list[Experiment]):
     headers = [
         "numel",
         "high_precision_dtype",

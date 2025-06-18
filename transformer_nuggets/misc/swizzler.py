@@ -56,7 +56,7 @@ if __name__ == "__main__":
 
     #  Howe to create your swizzler, lets do an example
     # We are going to assume transaction size is 16 bytes int4 4*4 this means we have 8 groups
-    # of 4 banks. Effecitvely 8 transactions before we hit a bank conflict
+    # of 4 banks. Effectively 8 transactions before we hit a bank conflict
 
     # So how do we set up the swizzler to avoid this?
     # Lets first get enough bits for all the effective banks

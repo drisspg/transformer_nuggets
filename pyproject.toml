@@ -10,7 +10,7 @@ version = "0.0.1"
 authors = [{ name = "Driss Guessous", email = "drisspguessous@gmail.com" }]
 description = "A place to store reusable transformer components found around the interwebs"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
@@ -52,7 +52,7 @@ llama = [
 
 # ---------- RUFF ------------
 [tool.ruff]
-target-version = "py38"
+target-version = "py310"
 line-length = 99
 # Exclude a variety of commonly ignored directories.
 exclude = [

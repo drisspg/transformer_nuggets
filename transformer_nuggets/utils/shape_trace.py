@@ -8,7 +8,6 @@ from collections import Counter, defaultdict
 
 from pathlib import Path
 
-from typing import Dict, Optional
 
 import torch
 import torch.overrides
@@ -47,7 +46,7 @@ class ShapeLog(TorchDispatchMode):
         else:
             return a
 
-    def fmt_shape(self, kwargs: Dict, with_type: bool = False) -> str:
+    def fmt_shape(self, kwargs: dict, with_type: bool = False) -> str:
         """This formats the tensor args and output into a string that is easy to parse
         Specifically:
          The input string will be broken up into two sections seperated by a ->
@@ -108,7 +107,7 @@ def construct_input(
     device: torch.device,
     default_dtype: torch.dtype = torch.float32,
     requires_grad: bool = False,
-    most_common: Optional[int] = None,
+    most_common: int | None = None,
 ):
     """Parses the log string and returns the input and output shapes
     Args:

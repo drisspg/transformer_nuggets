@@ -4,7 +4,6 @@ import itertools
 import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -153,7 +152,7 @@ experiment_types = {
 }
 
 
-def gen_configs() -> List[ExperimentConfig]:
+def gen_configs() -> list[ExperimentConfig]:
     # https://github.com/facebookresearch/llama/blob/main/MODEL_CARD.md
     # LLama 7b, 13b, 33b, 65b
     embed_dims = [4096, 5120, 6656, 8192]
@@ -170,7 +169,7 @@ def gen_configs() -> List[ExperimentConfig]:
     return configs
 
 
-def main(output_path: Optional[Path], profile_path: Optional[Path], dynamic: bool):
+def main(output_path: Path | None, profile_path: Path | None, dynamic: bool):
     """Run experiments and output results to file
 
     Args:

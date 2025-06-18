@@ -7,7 +7,6 @@ Based on the nanoGPT implementation: https://github.com/karpathy/nanoGPT.
 import math
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -20,7 +19,7 @@ from typing_extensions import Self
 
 MaskCache = torch.Tensor
 RoPECache = torch.Tensor
-KVCache = Tuple[torch.Tensor, torch.Tensor]
+KVCache = tuple[torch.Tensor, torch.Tensor]
 
 
 def find_multiple(n: int, k: int) -> int:
@@ -40,7 +39,7 @@ class MLPType(Enum):
 class LLaMAConfig:
     block_size: int = 2048
     vocab_size: int = 32000
-    padded_vocab_size: Optional[int] = None
+    padded_vocab_size: int | None = None
     n_layer: int = 32
     n_head: int = 32
     n_embd: int = 4096
@@ -78,9 +77,9 @@ class LLaMA(nn.Module):
             )
         )
 
-        self.rope_cache: Optional[RoPECache] = None
-        self.mask_cache: Optional[MaskCache] = None
-        self.kv_caches: List[KVCache] = []
+        self.rope_cache: RoPECache | None = None
+        self.mask_cache: MaskCache | None = None
+        self.kv_caches: list[KVCache] = []
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -91,9 +90,9 @@ class LLaMA(nn.Module):
     def forward(
         self,
         idx: torch.Tensor,
-        max_seq_length: Optional[int] = None,
-        input_pos: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[KVCache]]]:
+        max_seq_length: int | None = None,
+        input_pos: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[KVCache]]:
         B, T = idx.size()
 
         block_size = self.config.block_size
@@ -199,9 +198,9 @@ class Block(nn.Module):
         rope: RoPECache,
         mask: MaskCache,
         max_seq_length: int,
-        input_pos: Optional[torch.Tensor] = None,
-        kv_cache: Optional[KVCache] = None,
-    ) -> Tuple[torch.Tensor, Optional[KVCache]]:
+        input_pos: torch.Tensor | None = None,
+        kv_cache: KVCache | None = None,
+    ) -> tuple[torch.Tensor, KVCache | None]:
         h, new_kv_cache = self.attn(self.rms_1(x), rope, mask, max_seq_length, input_pos, kv_cache)
         x = x + h
         x = x + self.mlp(self.rms_2(x))
@@ -228,9 +227,9 @@ class CausalSelfAttention(nn.Module):
         rope: RoPECache,
         mask: MaskCache,
         max_seq_length: int,
-        input_pos: Optional[torch.Tensor] = None,
-        kv_cache: Optional[KVCache] = None,
-    ) -> Tuple[torch.Tensor, Optional[KVCache]]:
+        input_pos: torch.Tensor | None = None,
+        kv_cache: KVCache | None = None,
+    ) -> tuple[torch.Tensor, KVCache | None]:
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
