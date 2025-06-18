@@ -1,7 +1,6 @@
 import itertools
 
 from dataclasses import dataclass
-from typing import List
 
 import torch
 
@@ -40,7 +39,7 @@ class Experiment:
     result: ExperimentResult
 
 
-def get_configs() -> List[ExperimentConfig]:
+def get_configs() -> list[ExperimentConfig]:
     # We hang for anything bigger than this
     # sizes = [2**21, 2**22, 2**23, 2**24]
     sizes = [2**21, 2**22]
@@ -122,7 +121,7 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
     )
 
 
-def print_results(experiments: List[Experiment]):
+def print_results(experiments: list[Experiment]):
     headers = [
         "numel",
         "high_precision_dtype",

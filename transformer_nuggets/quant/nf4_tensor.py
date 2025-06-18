@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple
+from typing import Any
 
 import torch
 
@@ -9,7 +9,7 @@ bnb_available = False
 
 aten = torch.ops.aten
 c10d_functional = torch.ops.c10d_functional
-NF4_OPS_TABLE: Dict[Any, Any] = {}
+NF4_OPS_TABLE: dict[Any, Any] = {}
 
 
 def same_metadata(a: "NF4Tensor", b: "NF4Tensor"):
@@ -68,7 +68,7 @@ def copy_(func, *args, **kwargs):
 @dataclass
 class SubclassTensorArgs:
     original_shape: torch.Size
-    original_strides: Tuple
+    original_strides: tuple
     storage_offset: int
     dtype: torch.dtype
     device: torch.device
@@ -230,7 +230,7 @@ class NF4Tensor(torch.Tensor):
         inpt_tensor: torch.Tensor,
         block_size: int,
         scaler_block_size: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Used to achieve the double quantization of the scalers
         We take the input tensor first calculate the absmax quantization factors for each block.
         We then find the mean of our positive absmax scalers. We subtract this mean from the scalers
@@ -391,7 +391,7 @@ class NF4Tensor(torch.Tensor):
 
     def unpack(
         self,
-    ) -> Tuple[int, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Size]:
+    ) -> tuple[int, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Size]:
         return (
             self.block_size,
             self.n_blocks,
@@ -432,7 +432,7 @@ class NF4Tensor(torch.Tensor):
         ], ctx
 
     @staticmethod
-    def __tensor_unflatten__(inner_tensors: Dict, metadata, outer_size, outer_stride):
+    def __tensor_unflatten__(inner_tensors: dict, metadata, outer_size, outer_stride):
         assert len(inner_tensors) == 5, "Expected 5 inner tensors"
         return NF4Tensor(
             metadata["tensor_meta"],

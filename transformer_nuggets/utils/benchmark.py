@@ -3,11 +3,11 @@ import random
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from collections.abc import Callable
 
 import torch
 import torch.utils.benchmark as benchmark
-from torch._inductor.utils import do_bench_using_profiling
+from torch._inductor.utils import do_bench_using_profiling, do_bench
 
 from torch.cuda._memory_viz import profile_plot
 from torch.profiler import profile, ProfilerActivity, record_function, schedule
@@ -31,14 +31,14 @@ class bcolors:
 
 @dataclass
 class ProfileConfig:
-    file_path: Optional[str] = None
-    name: Optional[str] = None
+    file_path: str | None = None
+    name: str | None = None
     cuda: bool = True
     iters: int = 0
     warmup_iters: int = 0
     sync: bool = False
     extra_kwargs: dict = field(default_factory=dict)
-    memory_profile_path: Optional[str] = None
+    memory_profile_path: str | None = None
     row_limit: int = 10
 
 
@@ -64,6 +64,13 @@ def benchmark_do_bench_in_microseconds(func: Callable, *args, **kwargs) -> float
     no_args = lambda: func(*args, **kwargs)
     time = do_bench(no_args)
     return time * 1e3
+
+def benchmark_do_bench_in_microseconds(func: Callable, *args, **kwargs) -> float:
+    """Thin wrapper around do_bench_using_profiling"""
+    no_args = lambda: func(*args, **kwargs)
+    time = do_bench(no_args)
+    return time * 1e3
+
 
 def profile_function(
     config: ProfileConfig, func: Callable, *args, **kwargs
@@ -232,7 +239,7 @@ def _is_distributed():
     return False
 
 
-def attach_oom_observer(save_path: Optional[Path] = None, max_entries: int = 1000000):
+def attach_oom_observer(save_path: Path | None = None, max_entries: int = 1000000):
     """
     Attach an out-of-memory (OOM) observer to the CUDA device.
     The observer will save a memory snapshot when an OOM error occurs.

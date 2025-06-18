@@ -1,10 +1,10 @@
 from dataclasses import dataclass
-from typing import Tuple, Iterable, Type
+from collections.abc import Iterable
 import torch
 import functools
 
 # Type alias for PyTorch operations
-Op = Type[torch._ops.OpOverloadPacket]
+Op = type[torch._ops.OpOverloadPacket]
 
 
 @dataclass(frozen=True)
@@ -12,7 +12,7 @@ class SubclassTensorArgs:
     """Contains the essential arguments needed to reconstruct a tensor subclass."""
 
     original_shape: torch.Size
-    original_strides: Tuple[int, ...]
+    original_strides: tuple[int, ...]
     storage_offset: int
     dtype: torch.dtype
     device: torch.device

@@ -4,7 +4,6 @@ import enum
 import itertools
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
 
 import torch
 import transformer_nuggets.utils as utils
@@ -49,7 +48,7 @@ class ExperimentResult:
 
 def get_input(
     config: ExperimentConfig,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     q = torch.randn(
         (config.bsz, config.num_heads, config.seqlen, config.head_dim),
         dtype=config.dtype,
@@ -154,7 +153,7 @@ def profile_experiment(
     utils.profile_function(profile_config, fn)
 
 
-def gen_configs() -> List[ExperimentConfig]:
+def gen_configs() -> list[ExperimentConfig]:
     seqlens = [512, 1024, 2048, 4096, 8192, 16384]
     head_dim = [64, 128]
     bias_choices = [BiasMode.none, BiasMode.rel_pos, BiasMode.alibi]
@@ -178,7 +177,7 @@ def gen_configs() -> List[ExperimentConfig]:
     return configs
 
 
-def main(output_file: Optional[Path], profile_path: Optional[Path]):
+def main(output_file: Path | None, profile_path: Path | None):
     if output_file is not None:
         configs = gen_configs()
         results = []

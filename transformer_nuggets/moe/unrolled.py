@@ -2,7 +2,6 @@
 
 import torch
 import torch.nn.functional as F
-from typing import Optional
 from transformer_nuggets.utils.benchmark import profiler, save_memory_snapshot
 from pathlib import Path
 from transformer_nuggets import init_logging
@@ -54,7 +53,7 @@ class LoopMoE(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        expert_map: Optional[torch.Tensor] = None,
+        expert_map: torch.Tensor | None = None,
         renormalize: bool = False,
     ) -> torch.Tensor:
         """

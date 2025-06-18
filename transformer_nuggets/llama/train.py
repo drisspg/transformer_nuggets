@@ -11,7 +11,6 @@ import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
 
 import numpy as np
 import torch
@@ -59,8 +58,8 @@ class Hyperparameters:
 
     # Float8 Specific Config
     # We want to skip the first embedding layer since scaled_mm needs to multiple of 16
-    float8_skip_list: List[str] = field(default_factory=lambda: ["tok_embeddings"])
-    fp8_linear_type: Optional[LinearType] = None
+    float8_skip_list: list[str] = field(default_factory=lambda: ["tok_embeddings"])
+    fp8_linear_type: LinearType | None = None
 
     def __post_init__(self):
         self.gradient_accumulation_iters = self.batch_size // self.micro_batch_size
@@ -396,7 +395,7 @@ def get_lr(it, hyper_params: Hyperparameters):
 
 
 def entrypoint(
-    fp8_linear_type: Optional[LinearType] = None,
+    fp8_linear_type: LinearType | None = None,
     compile: bool = False,
     overfit: bool = False,
     profile: bool = False,

@@ -9,16 +9,16 @@ class FlexAttentionKernelArgs:
     """
 
     # Performance tuning options
-    num_warps: Optional[int] = None
+    num_warps: int | None = None
     """Number of warps to use in the CUDA kernel."""
 
-    num_stages: Optional[int] = None
+    num_stages: int | None = None
     """Number of pipeline stages to use in the CUDA kernel."""
 
-    BLOCK_M: Optional[int] = None
+    BLOCK_M: int | None = None
     """Thread block size across the seqlen dim of Q."""
 
-    BLOCK_N: Optional[int] = None
+    BLOCK_N: int | None = None
     """Block size to iterate over across the seqlen dim of K/V in each thread block."""
 
     # Numerical behavior options

@@ -1,7 +1,6 @@
 import logging
 import math
 from dataclasses import dataclass
-from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -83,7 +82,7 @@ def get_sample_inputs(
 
 def get_mlp_weights(
     embed_dim: int, device: torch.device = "cuda", dtype=torch.bfloat16
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """These three weights take up
     3 * (embed_dim * n_hidden) * 2 bytes of memory
     i.g. for embed_dim = 4096 and hidden_dim = 11008
