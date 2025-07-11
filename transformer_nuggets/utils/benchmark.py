@@ -8,12 +8,29 @@ from collections.abc import Callable
 import torch
 import torch.utils.benchmark as benchmark
 from torch._inductor.utils import do_bench_using_profiling
+import functools
 
 from torch.cuda._memory_viz import profile_plot
 from torch.profiler import profile, ProfilerActivity, record_function, schedule
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
+
+
+def lazy_import_error(error_msg: str):
+    """Decorator that allows functions with imports to be defined without the dependency"""
+
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except ImportError:
+                raise ImportError(error_msg)
+
+        return wrapper
+
+    return decorator
 
 
 class bcolors:
@@ -59,8 +76,11 @@ def benchmark_cuda_function_in_microseconds(func: Callable, *args, **kwargs) -> 
     return time * 1e3
 
 
+@lazy_import_error("This function requires Triton. Please install it with: pip install triton")
 def benchmark_cuda_function_in_microseconds_triton(func: Callable, *args, **kwargs) -> float:
     """Thin wrapper around do_bench"""
+    from triton.testing import do_bench  # Python caches this automatically
+
     no_args = lambda: func(*args, **kwargs)
     time = do_bench(no_args)
     return time * 1e3

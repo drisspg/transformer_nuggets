@@ -1,6 +1,7 @@
 from transformer_nuggets.utils.benchmark import (
     benchmark_torch_function_in_microseconds,
     benchmark_cuda_function_in_microseconds,
+    benchmark_cuda_function_in_microseconds_triton,
     max_memory_usage,
     cuda_memory_usage,
     profile_function,
