@@ -59,6 +59,13 @@ def benchmark_cuda_function_in_microseconds(func: Callable, *args, **kwargs) -> 
     return time * 1e3
 
 
+def benchmark_cuda_function_in_microseconds_triton(func: Callable, *args, **kwargs) -> float:
+    """Thin wrapper around do_bench"""
+    no_args = lambda: func(*args, **kwargs)
+    time = do_bench(no_args)
+    return time * 1e3
+
+
 def profile_function(
     config: ProfileConfig, func: Callable, *args, **kwargs
 ) -> torch.profiler.profile:
