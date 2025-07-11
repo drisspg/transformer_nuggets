@@ -1,12 +1,12 @@
 # pyproject.toml
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
 name = "transformer_nuggets"
-version = "0.0.1"
+dynamic = ["version"]
 authors = [{ name = "Driss Guessous", email = "drisspguessous@gmail.com" }]
 description = "A place to store reusable transformer components found around the interwebs"
 readme = "README.md"
@@ -49,6 +49,8 @@ llama = [
 ]
 
 # ---------- TOOL CONFIGURATIONS ------------
+[tool.hatch.version]
+source = "vcs"
 
 # ---------- RUFF ------------
 [tool.ruff]
