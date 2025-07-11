@@ -11,7 +11,6 @@ from torch._inductor.utils import do_bench_using_profiling
 
 from torch.cuda._memory_viz import profile_plot
 from torch.profiler import profile, ProfilerActivity, record_function, schedule
-from triton.testing import do_bench
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())

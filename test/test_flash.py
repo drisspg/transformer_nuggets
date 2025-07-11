@@ -1,5 +1,9 @@
+import importlib.util
 import pytest
 import torch
+
+if importlib.util.find_spec("triton") is None:
+    pytest.skip("Triton is not available", allow_module_level=True)
 
 from transformer_nuggets.flash import (
     attention,
