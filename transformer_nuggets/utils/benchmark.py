@@ -134,9 +134,8 @@ def profile_function(
     return prof
 
 
-@contextmanager
-def max_memory_usage(log: bool = False, precision: int = 2) -> int:
-    """Prints the maximum CUDA memory usage at the end of a context manager
+class max_memory_usage:
+    """Tracks maximum CUDA memory usage within a context manager region
 
     Args:
         log (bool): Whether to print the memory usage to the console
@@ -144,20 +143,28 @@ def max_memory_usage(log: bool = False, precision: int = 2) -> int:
 
     Usage:
     ```
-        with print_max_memory_usage():
+        with max_memory_usage() as mem:
             # code to profile
+        print(mem.max_memory)
     ```
-    Returns:
-        max_memory (int): The maximum CUDA memory usage in GiB
     """
-    try:
-        yield
-    finally:
-        max_memory = torch.cuda.max_memory_allocated()
-        if log:
-            max_memory_gib = max_memory / (1024**3)
-            print(f"Max CUDA Memory Allocated: {max_memory_gib:.{precision}f} GiB")
-    return max_memory
+
+    def __init__(self, log=False, precision=2):
+        self.log = log
+        self.precision = precision
+        self.max_memory = 0
+
+    def __enter__(self):
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        torch.cuda.synchronize()
+        self.max_memory = torch.cuda.max_memory_allocated()
+        if self.log:
+            max_memory_gib = self.max_memory / (1024**3)
+            print(f"Max CUDA Memory Allocated: {max_memory_gib:.{self.precision}f} GiB")
 
 
 class cuda_memory_usage:
