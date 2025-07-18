@@ -19,10 +19,10 @@ classifiers = [
 
 dependencies = [
     "torch",
-    "scipy >= 1.9.1",
-    "tqdm >= 4.66",
-    "tabulate >= 0.8",
-    "rich==13.7.1",
+    "scipy",
+    "tqdm",
+    "tabulate",
+    "rich",
     "matplotlib",
     "pandas"
 ]
