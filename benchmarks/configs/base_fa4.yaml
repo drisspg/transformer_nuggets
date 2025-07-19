@@ -1,0 +1,16 @@
+dtype: float16
+batch_sizes:
+- 2
+- 4
+seqlens:
+- 1024
+- 2048
+- 8192
+- 16384
+num_heads:
+- 16
+head_dims:
+- 128
+causal: true
+include_non_causal: True
+save_path: null
