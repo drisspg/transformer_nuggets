@@ -120,7 +120,7 @@ def elementwise_op(
     return compiled_kernel(mA, mB, mC)
 
 
-def benchmark(callable, tensor_a, *, num_warmups=5, num_iterations=200):
+def benchmark(callable, tensor_a):
     time = benchmark_cuda_function_in_microseconds(callable)
     avg_time = time / 1e3
 

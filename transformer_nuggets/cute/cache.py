@@ -68,7 +68,19 @@ def _generate_cache_key(*args, **kwargs) -> str:
 
     for arg in args:
         if isinstance(arg, cute.Tensor):
-            key_parts.append(f"tensor_shape={arg.shape}_dtype={arg._dtype}")
+            # Get string representation and extract the shape:stride pattern
+            tensor_str = str(arg)
+            # Format is: Tensor<address@mem o (shape):(stride)>
+            # We want just the (shape):(stride) part
+
+            if " o " in tensor_str and ")>" in tensor_str:
+                # Extract everything after ' o ' and before '>'
+                inner_part = tensor_str.split(" o ")[1].rstrip(">")
+                # inner_part should be like "(?,?):(?,1)"
+                key_parts.append(f"tensor_{inner_part}_dtype={arg._dtype}")
+            else:
+                # Fallback if format is different
+                key_parts.append(f"tensor_shape={arg.shape}_dtype={arg._dtype}")
         elif hasattr(arg, "__name__"):
             key_parts.append(f"op={arg.__name__}")
         else:
@@ -78,6 +90,7 @@ def _generate_cache_key(*args, **kwargs) -> str:
         key_parts.append(f"{k}={v}")
 
     key_str = "_".join(key_parts)
+    logger.debug(f"Generated cache key: {key_str}")
     return hashlib.sha256(key_str.encode()).hexdigest()[:16]
 
 
