@@ -74,15 +74,14 @@ def _generate_cache_key(*args, use_hashing: bool = False, **kwargs) -> str:
             tensor_str = str(arg)
             # Format is: Tensor<address@mem o (shape):(stride)>
             # We want just the (shape):(stride) part
-
             if " o " in tensor_str and ")>" in tensor_str:
                 # Extract everything after ' o ' and before '>'
                 inner_part = tensor_str.split(" o ")[1].rstrip(">")
                 # inner_part should be like "(?,?):(?,1)"
-                key_parts.append(f"tensor_{inner_part}_dtype={arg._dtype}")
+                key_parts.append(f"tensor_{inner_part}_dtype={arg.element_type}")
             else:
                 # Fallback if format is different
-                key_parts.append(f"tensor_shape={arg.shape}_dtype={arg._dtype}")
+                key_parts.append(f"tensor_shape={arg.shape}_dtype={arg.element_type}")
         elif hasattr(arg, "__name__"):
             key_parts.append(f"op={arg.__name__}")
         else:
@@ -100,78 +99,82 @@ def _generate_cache_key(*args, use_hashing: bool = False, **kwargs) -> str:
         return key_str
 
 
-def cute_compile_and_cache(func: Callable, *args, cache_extra=None, **kwargs):
+def compile_and_cache(func: Callable, cache_key: str, *args, **kwargs):
     """
-    Compile a @cute.jit decorated function and cache the result.
-
-    The cache key is generated from the function name, tensor shapes/strides/dtypes,
-    and any additional data provided via cache_extra. This allows caching different
-    compilations for the same kernel when memory layout properties (like alignment)
-    affect performance.
+    Compile a @cute.jit decorated function with an explicit cache key.
 
     Args:
-        func: A function decorated with @cute.jit
-        *args: Arguments to pass to cute.compile and for cache key generation.
-               Typically includes cute.Tensor objects that define the kernel's
-               input/output layout.
-        cache_extra: Optional extra data to include in cache key. Useful for
-                    caching based on properties not captured by tensor metadata
-                    alone (e.g., memory alignment, vectorization hints).
-                    Can be a single value or tuple/list of values.
-        **kwargs: Keyword arguments to pass to cute.compile (e.g., block_size,
-                 num_warps, etc.)
+        func: A function decorated with @cute.jit or a CuteOp instance with __call__ method
+        cache_key: The cache key to use for this compilation
+        *args: Arguments to pass to cute.compile
+        **kwargs: Keyword arguments to pass to cute.compile
 
     Returns:
         Compiled kernel that can be executed with the same tensor arguments
-
-    Example:
-        @cute.jit
-        def my_kernel(a, b, c):
-            # kernel implementation
-            ...
-
-        # Basic usage - cache based on tensor shapes/strides
-        compiled_kernel = cute_compile_and_cache(my_kernel, tensor_a, tensor_b, tensor_c)
-        result = compiled_kernel(tensor_a, tensor_b, tensor_c)
-
-        # Advanced usage - cache different compilations based on alignment
-        align_a = get_tensor_alignment(tensor_a, dim=-1)
-        align_b = get_tensor_alignment(tensor_b, dim=0)
-
-        compiled_kernel = cute_compile_and_cache(
-            my_kernel,
-            tensor_a, tensor_b, tensor_c,
-            cache_extra=(align_a, align_b),  # Different kernels for different alignments
-            block_size=256  # Compilation parameter
-        )
-
-        # The same tensor shapes but different alignment will result in a cache miss
-        # and a new compilation, allowing optimization for specific memory layouts
     """
+    # Handle CuteOp instances
+    if hasattr(func, "__call__") and hasattr(func, "get_key"):
+        jit_func = func
+        func_name = func.__class__.__name__
+    else:
+        jit_func = func
+        func_name = func.__name__
+
+    # Use provided cache key directly
+    full_cache_key = f"{func_name}_{cache_key}"
+
+    # Check cache
+    compiled_kernel = _kernel_cache.get(full_cache_key)
+    if compiled_kernel is not None:
+        logger.debug(f"Cache hit for {func_name} (key: {full_cache_key})")
+        return compiled_kernel
+
+    logger.debug(f"Cache miss for {func_name} (key: {full_cache_key}) - Compiling...")
+    compiled_kernel = cute.compile(jit_func, *args, **kwargs)
+    _kernel_cache.set(full_cache_key, compiled_kernel)
+    return compiled_kernel
+
+
+def auto_compile_and_cache(func: Callable, *args, cache_extra=None, **kwargs):
+    """
+    Compile a @cute.jit decorated function and automatically generate cache key.
+
+    This is the original cute_compile_and_cache function with automatic cache key generation.
+
+    Args:
+        func: A function decorated with @cute.jit or a CuteOp instance
+        *args: Arguments to pass to cute.compile and for cache key generation
+        cache_extra: Optional extra data to include in cache key
+        **kwargs: Keyword arguments to pass to cute.compile
+
+    Returns:
+        Compiled kernel that can be executed with the same tensor arguments
+    """
+    # Handle CuteOp instances
+    if hasattr(func, "__call__") and hasattr(func, "get_key"):
+        jit_func = func
+    else:
+        jit_func = func
+
     # Generate cache key from function and arguments
     cache_key = _generate_cache_key(*args, use_hashing=_kernel_cache._use_hashing, **kwargs)
 
     # Add extra cache key data if provided
     if cache_extra is not None:
-        extra_str = (
-            str(cache_extra)
-            if not isinstance(cache_extra, (list, tuple))
-            else "_".join(str(x) for x in cache_extra)
-        )
+        if isinstance(cache_extra, (list, tuple)):
+            # Handle nested tuples/lists properly
+            extra_parts = []
+            for item in cache_extra:
+                if isinstance(item, (list, tuple)):
+                    extra_parts.append("_".join(str(x) for x in item))
+                else:
+                    extra_parts.append(str(item))
+            extra_str = "_".join(extra_parts)
+        else:
+            extra_str = str(cache_extra)
         cache_key = f"{cache_key}_extra_{extra_str}"
 
-    cache_key = f"{func.__name__}_{cache_key}"
-
-    # Check cache
-    compiled_kernel = _kernel_cache.get(cache_key)
-    if compiled_kernel is not None:
-        logger.debug(f"Cache hit for {func.__name__} (key: {cache_key})")
-        return compiled_kernel
-
-    logger.debug(f"Cache miss for {func.__name__} (key: {cache_key}) - Compiling...")
-    compiled_kernel = cute.compile(func, *args, **kwargs)
-    _kernel_cache.set(cache_key, compiled_kernel)
-    return compiled_kernel
+    return compile_and_cache(jit_func, cache_key, *args, **kwargs)
 
 
 def clear_cute_cache():

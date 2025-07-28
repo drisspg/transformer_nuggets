@@ -1,4 +1,7 @@
 import torch
+import hashlib
+from typing import Any
+import cutlass.cute as cute
 
 
 def get_tensor_alignment(tensor: torch.Tensor, dim: int) -> int:
@@ -34,3 +37,59 @@ def get_tensor_alignment(tensor: torch.Tensor, dim: int) -> int:
         max_align //= 2
 
     return max_align
+
+
+def generate_tensor_cache_key(tensor: cute.Tensor) -> str:
+    """Generate a cache key component for a CUTE tensor.
+
+    Args:
+        tensor: CUTE tensor to generate key for
+
+    Returns:
+        String representation suitable for cache key
+    """
+    tensor_str = str(tensor)
+    if " o " in tensor_str and ")>" in tensor_str:
+        # Extract everything after ' o ' and before '>'
+        inner_part = tensor_str.split(" o ")[1].rstrip(">")
+        return f"tensor_{inner_part}_dtype={tensor._dtype}"
+    else:
+        # Fallback if format is different
+        return f"tensor_shape={tensor.shape}_dtype={tensor._dtype}"
+
+
+def hash_cache_key(key_parts: list | tuple, use_sha256: bool = True) -> str:
+    """Hash cache key components into a fixed-length string.
+
+    Args:
+        key_parts: List or tuple of cache key components
+        use_sha256: If True, use SHA256 hash; otherwise join with underscores
+
+    Returns:
+        Hashed or joined cache key
+    """
+    key_str = "_".join(str(part) for part in key_parts)
+
+    if use_sha256:
+        return hashlib.sha256(key_str.encode()).hexdigest()
+    else:
+        return key_str
+
+
+def extract_tensor_properties(tensor: torch.Tensor) -> dict[str, Any]:
+    """Extract relevant properties from a PyTorch tensor for caching.
+
+    Args:
+        tensor: PyTorch tensor
+
+    Returns:
+        Dictionary of tensor properties
+    """
+    return {
+        "shape": tuple(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "device": str(tensor.device),
+        "stride": tuple(tensor.stride()),
+        "is_contiguous": tensor.is_contiguous(),
+        "data_ptr": tensor.data_ptr(),
+    }
