@@ -120,7 +120,7 @@ def elementwise_op(
     return compiled_kernel(mA, mB, mC)
 
 
-def benchmark(callable, tensor_a, *, num_warmups=5, num_iterations=200):
+def benchmark(callable, tensor_a):
     time = benchmark_cuda_function_in_microseconds(callable)
     avg_time = time / 1e3
 
@@ -166,7 +166,7 @@ if __name__ == "__main__":
     benchmark(partial(torch.add, a, b, out=c), a)
 
     print("3. Optimized elementwise add kernel (with caching):")
-    benchmark(partial(elementwise_op, add, a, b, c, assumed_align=128), a)
+    benchmark(partial(elementwise_op, add, a, b, c, assumed_align=16), a)
 
     print("\nCache Statistics:")
     stats = get_cache_stats()

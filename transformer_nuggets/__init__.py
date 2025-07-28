@@ -1,7 +1,8 @@
 from transformer_nuggets import quant as quant, utils as utils
+import logging
 
 
-def init_logging():
+def init_logging(level=logging.INFO):
     """
     Configure logging for transformer_nuggets library at INFO level.
     Adds a StreamHandler if none exists.
@@ -9,7 +10,7 @@ def init_logging():
     import logging
 
     logger = logging.getLogger("transformer_nuggets")
-    logger.setLevel(logging.INFO)
+    logger.setLevel(level)
 
     if not logger.handlers:
         handler = logging.StreamHandler()
