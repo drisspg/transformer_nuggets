@@ -15,7 +15,7 @@ except ImportError:
     pytest.skip("CUTE not available", allow_module_level=True)
 
 from operator import add, mul
-from transformer_nuggets.cute import cute_compile_and_cache, get_cache_stats, clear_cute_cache
+from transformer_nuggets.cute import get_cache_stats, clear_cute_cache, auto_compile_and_cache
 from transformer_nuggets.cute.dynamic_args import elementwise_op_dynamic
 from transformer_nuggets.cute.utils import get_tensor_alignment
 
@@ -91,10 +91,10 @@ def cached_elementwise(
 
     # Use explicit caching based on operation
     if op == add:
-        compiled_kernel = cute_compile_and_cache(add_kernel, mA, mB, mC)
+        compiled_kernel = auto_compile_and_cache(add_kernel, mA, mB, mC)
         return compiled_kernel(mA, mB, mC)
     elif op == mul:
-        compiled_kernel = cute_compile_and_cache(mul_kernel, mA, mB, mC)
+        compiled_kernel = auto_compile_and_cache(mul_kernel, mA, mB, mC)
         return compiled_kernel(mA, mB, mC)
     else:
         raise ValueError(f"Unsupported operation: {op}")

@@ -7,13 +7,14 @@ from cutlass.cute.runtime import from_dlpack
 
 from transformer_nuggets.utils.benchmark import benchmark_cuda_function_in_microseconds
 from transformer_nuggets.cute.cache import (
-    cute_compile_and_cache,
+    compile_and_cache,
     get_cache_stats,
     print_cache,
     set_cache_hashing,
 )
 from transformer_nuggets.cute.element_wise import elementwise_apply_kernel
 from transformer_nuggets.cute.utils import get_tensor_alignment
+from transformer_nuggets.cute.base import CuteOp
 from rich import print
 from transformer_nuggets import init_logging
 import logging
@@ -21,30 +22,75 @@ import logging
 init_logging(logging.INFO)
 
 
-@cute.jit
-def elem_kernel_parameterized(
-    op: cutlass.Constexpr,
-    mA: cute.Tensor,
-    mB: cute.Tensor,
-    mC: cute.Tensor,
-    thr_m: cutlass.Constexpr,
-    thr_n: cutlass.Constexpr,
-    val_m: cutlass.Constexpr,
-    val_n: cutlass.Constexpr,
-):
-    """Parameterized kernel that accepts layout dimensions as constexpr"""
-    thr_layout = cute.make_layout((thr_m, thr_n), stride=(thr_n, 1))
-    val_layout = cute.make_layout((val_m, val_n), stride=(val_n, 1))
-    tiler_mn, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
+class DynamicElementwiseOp(CuteOp):
+    """Elementwise operation with dynamic parameter selection based on tensor size."""
 
-    gA = cute.zipped_divide(mA, tiler_mn)
-    gB = cute.zipped_divide(mB, tiler_mn)
-    gC = cute.zipped_divide(mC, tiler_mn)
+    def __init__(self, op: cutlass.Constexpr):
+        super().__init__()
+        self.op = op
 
-    elementwise_apply_kernel(op, gA, gB, gC, tv_layout).launch(
-        grid=[cute.size(gC, mode=[1]), 1, 1],
-        block=[cute.size(tv_layout, mode=[0]), 1, 1],
-    )
+    def get_kernel(self):
+        return elementwise_apply_kernel
+
+    def get_key(self, *args, **kwargs) -> str:
+        """Generate cache key including operation type, tensor properties, and dynamic parameters."""
+        op_name = getattr(self.op, "__name__", str(self.op))
+        key_parts = [self.__class__.__name__, f"op={op_name}"]
+
+        # Extract parameters if provided in kwargs
+        if "params" in kwargs:
+            thr_m, thr_n, val_m, val_n = kwargs["params"]
+            key_parts.extend(
+                [f"thr_m={thr_m}", f"thr_n={thr_n}", f"val_m={val_m}", f"val_n={val_n}"]
+            )
+
+        # Add tensor properties
+        for arg in args:
+            if isinstance(arg, cute.Tensor):
+                key_parts.append(self._generate_tensor_key(arg))
+
+        # Add alignment info if provided
+        if "alignments" in kwargs:
+            align_a, align_b, align_c = kwargs["alignments"]
+            key_parts.extend([f"align_a={align_a}", f"align_b={align_b}", f"align_c={align_c}"])
+
+        return "_".join(key_parts)
+
+    def _select_parameters(self, M: int, N: int) -> tuple[int, int, int, int]:
+        """Choose parameters based on tensor size."""
+        total_elements = M * N
+        if total_elements < 1024 * 1024:
+            return 8, 32, 2, 8
+        elif total_elements < 16 * 1024 * 1024:
+            return 4, 64, 4, 8
+        else:
+            return 2, 128, 8, 8
+
+    @cute.jit
+    def __call__(
+        self,
+        op: cutlass.Constexpr,
+        mA: cute.Tensor,
+        mB: cute.Tensor,
+        mC: cute.Tensor,
+        thr_m: cutlass.Constexpr,
+        thr_n: cutlass.Constexpr,
+        val_m: cutlass.Constexpr,
+        val_n: cutlass.Constexpr,
+    ):
+        """Parameterized kernel that accepts layout dimensions as constexpr"""
+        thr_layout = cute.make_layout((thr_m, thr_n), stride=(thr_n, 1))
+        val_layout = cute.make_layout((val_m, val_n), stride=(val_n, 1))
+        tiler_mn, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
+
+        gA = cute.zipped_divide(mA, tiler_mn)
+        gB = cute.zipped_divide(mB, tiler_mn)
+        gC = cute.zipped_divide(mC, tiler_mn)
+
+        elementwise_apply_kernel(op, gA, gB, gC, tv_layout).launch(
+            grid=[cute.size(gC, mode=[1]), 1, 1],
+            block=[cute.size(tv_layout, mode=[0]), 1, 1],
+        )
 
 
 def elementwise_op_dynamic(
@@ -52,17 +98,19 @@ def elementwise_op_dynamic(
     a: torch.Tensor,
     b: torch.Tensor,
 ) -> torch.Tensor:
+    """Apply elementwise operation with dynamic parameter selection.
+
+    This function automatically selects kernel parameters based on tensor size
+    for optimal performance.
+    """
     M, N = a.shape
     c = torch.empty(M, N, device="cuda", dtype=torch.float16)
 
+    # Create the operation instance
+    dynamic_op = DynamicElementwiseOp(op)
+
     # Choose parameters based on size
-    total_elements = M * N
-    if total_elements < 1024 * 1024:
-        thr_m, thr_n, val_m, val_n = 8, 32, 2, 8
-    elif total_elements < 16 * 1024 * 1024:
-        thr_m, thr_n, val_m, val_n = 4, 64, 4, 8
-    else:
-        thr_m, thr_n, val_m, val_n = 2, 128, 8, 8
+    thr_m, thr_n, val_m, val_n = dynamic_op._select_parameters(M, N)
 
     # Calculate alignment for each tensor
     align_a = get_tensor_alignment(a, dim=-1)
@@ -74,10 +122,15 @@ def elementwise_op_dynamic(
     mB = from_dlpack(b, assumed_align=align_b).mark_layout_dynamic(1)
     mC = from_dlpack(c, assumed_align=align_c).mark_layout_dynamic(1)
 
-    cache_extra = (align_a, align_b, align_c)
+    # Generate cache key with all parameters
+    cache_key = dynamic_op.get_key(
+        mA, mB, mC, params=(thr_m, thr_n, val_m, val_n), alignments=(align_a, align_b, align_c)
+    )
 
-    compiled_kernel = cute_compile_and_cache(
-        elem_kernel_parameterized,
+    # Compile with explicit cache key
+    compiled_kernel = compile_and_cache(
+        dynamic_op,
+        cache_key,
         op,
         mA,
         mB,
@@ -86,8 +139,8 @@ def elementwise_op_dynamic(
         thr_n,
         val_m,
         val_n,
-        cache_extra=cache_extra,
     )
+
     compiled_kernel(mA, mB, mC)
     return c
 

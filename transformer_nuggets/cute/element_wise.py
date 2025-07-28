@@ -7,12 +7,50 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 from transformer_nuggets.utils.benchmark import benchmark_cuda_function_in_microseconds
-from transformer_nuggets.cute.cache import cute_compile_and_cache, get_cache_stats
+from transformer_nuggets.cute.cache import compile_and_cache, get_cache_stats
+from transformer_nuggets.cute.base import CuteOp
 
 
-# init_logging()
+class ElementwiseOp(CuteOp):
+    """Elementwise operation using CUTE kernels."""
+
+    def __init__(self, op: cutlass.Constexpr):
+        super().__init__()
+        self.op = op
+
+    def get_kernel(self):
+        return elementwise_apply_kernel
+
+    def get_key(self, *args, **kwargs) -> str:
+        """Generate cache key including operation type and tensor properties."""
+        op_name = getattr(self.op, "__name__", str(self.op))
+        key_parts = [self.__class__.__name__, f"op={op_name}"]
+
+        # Add tensor properties to key
+        for arg in args:
+            if isinstance(arg, cute.Tensor):
+                key_parts.append(self._generate_tensor_key(arg))
+
+        return "_".join(key_parts)
+
+    @cute.jit
+    def __call__(self, op: cutlass.Constexpr, mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
+        """JIT function that launches the elementwise kernel."""
+        thr_layout = cute.make_layout((4, 32), stride=(32, 1))
+        val_layout = cute.make_layout((4, 8), stride=(8, 1))
+        tiler_mn, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
+
+        gA = cute.zipped_divide(mA, tiler_mn)
+        gB = cute.zipped_divide(mB, tiler_mn)
+        gC = cute.zipped_divide(mC, tiler_mn)
+
+        elementwise_apply_kernel(op, gA, gB, gC, tv_layout).launch(
+            grid=[cute.size(gC, mode=[1]), 1, 1],
+            block=[cute.size(tv_layout, mode=[0]), 1, 1],
+        )
 
 
+# Kernel definitions
 @cute.kernel
 def naive_elementwise_add_kernel(
     gA: cute.Tensor,
@@ -76,22 +114,7 @@ def elementwise_apply_kernel(
     thrC[None] = op(thrA.load(), thrB.load())
 
 
-@cute.jit
-def elem_kernel(op: cutlass.Constexpr, mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
-    thr_layout = cute.make_layout((4, 32), stride=(32, 1))
-    val_layout = cute.make_layout((4, 8), stride=(8, 1))
-    tiler_mn, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
-
-    gA = cute.zipped_divide(mA, tiler_mn)
-    gB = cute.zipped_divide(mB, tiler_mn)
-    gC = cute.zipped_divide(mC, tiler_mn)
-
-    elementwise_apply_kernel(op, gA, gB, gC, tv_layout).launch(
-        grid=[cute.size(gC, mode=[1]), 1, 1],
-        block=[cute.size(tv_layout, mode=[0]), 1, 1],
-    )
-
-
+# Public API function
 def elementwise_op(
     op: cutlass.Constexpr,
     a: torch.Tensor,
@@ -115,8 +138,16 @@ def elementwise_op(
     mB = from_dlpack(b, assumed_align=assumed_align)
     mC = from_dlpack(c, assumed_align=assumed_align)
 
-    # Compile and execute the kernel
-    compiled_kernel = cute_compile_and_cache(elem_kernel, op, mA, mB, mC)
+    # Create the operation instance
+    elem_op = ElementwiseOp(op)
+
+    # Option 1: Use manual cache key
+    cache_key = elem_op.get_key(mA, mB, mC)
+    compiled_kernel = compile_and_cache(elem_op, cache_key, op, mA, mB, mC)
+
+    # Option 2: Use auto cache key (commented out)
+    # compiled_kernel = auto_compile_and_cache(elem_op, op, mA, mB, mC)
+
     return compiled_kernel(mA, mB, mC)
 
 
