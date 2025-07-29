@@ -2,6 +2,7 @@ import torch
 import hashlib
 from typing import Any
 import cutlass.cute as cute
+from pathlib import Path
 
 
 def get_tensor_alignment(tensor: torch.Tensor, dim: int) -> int:
@@ -96,8 +97,8 @@ def extract_tensor_properties(tensor: torch.Tensor) -> dict[str, Any]:
 
 
 def visualize_tv_layout(
-    thread_layout: tuple[tuple, tuple],
-    value_layout: tuple[tuple, tuple],
+    thread_layout: tuple[tuple, tuple] | cute.Layout,
+    value_layout: tuple[tuple, tuple] | cute.Layout,
     save_path: str,
     *,
     font_size: int = 32,
@@ -120,6 +121,11 @@ def visualize_tv_layout(
     import numpy as np
     import matplotlib.pyplot as plt
     import matplotlib.colors as mcolors
+
+    if isinstance(thread_layout, cute.Layout):
+        thread_layout = (thread_layout.shape, thread_layout.stride)
+    if isinstance(value_layout, cute.Layout):
+        value_layout = (value_layout.shape, value_layout.stride)
 
     @cute.jit
     def get_tv_layout():
@@ -205,6 +211,7 @@ def visualize_tv_layout(
     ax.set_title(f"Thread: {thread_str}\nValue: {value_str}", fontsize=font_size + 2, pad=12)
 
     plt.tight_layout()
-    plt.savefig(save_path)
-    plt.show()
-    print(f"Saved to {save_path}")
+    path = Path(save_path).with_suffix(".svg")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(path)
+    print(f"Saved to {path}")

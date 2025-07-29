@@ -65,9 +65,14 @@ class DynamicElementwiseOp(CuteOp):
 
         # Extract parameters if provided in kwargs
         if "params" in kwargs:
-            thr_m, thr_n, val_m, val_n = kwargs["params"]
+            thr_m, thr_n, val_m, val_n, order = kwargs["params"]
             key_parts.extend(
-                [f"thr_m={thr_m}", f"thr_n={thr_n}", f"val_m={val_m}", f"val_n={val_n}"]
+                [
+                    f"thr_m={thr_m}",
+                    f"thr_n={thr_n}",
+                    f"val_m={val_m}",
+                    f"val_n={val_n}, order={order}",
+                ]
             )
 
         # Add tensor properties
@@ -87,10 +92,8 @@ class DynamicElementwiseOp(CuteOp):
         total_elements = M * N
         if total_elements < 1024 * 1024:
             return 8, 32, 2, 8
-        elif total_elements < 16 * 1024 * 1024:
-            return 4, 64, 4, 8
         else:
-            return 2, 128, 8, 8
+            return 4, 32, 8, 8
 
     @cute.jit
     def __call__(
@@ -103,10 +106,11 @@ class DynamicElementwiseOp(CuteOp):
         thr_n: cutlass.Constexpr,
         val_m: cutlass.Constexpr,
         val_n: cutlass.Constexpr,
+        order: cutlass.Constexpr,
     ):
         """Parameterized kernel that accepts layout dimensions as constexpr"""
-        thr_layout = cute.make_layout((thr_m, thr_n), stride=(thr_n, 1))
-        val_layout = cute.make_layout((val_m, val_n), stride=(val_n, 1))
+        thr_layout = cute.make_ordered_layout((thr_m, thr_n), order)
+        val_layout = cute.make_ordered_layout((val_m, val_n), order)
         tiler_mn, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
 
         gA = cute.zipped_divide(mA, tiler_mn)
@@ -144,31 +148,31 @@ def elementwise_op_dynamic(
     align_c = get_tensor_alignment(c, dim=-1)
 
     # Create tensors with computed alignment
-    mA = from_dlpack(a, assumed_align=align_a).mark_layout_dynamic(1)
-    mB = from_dlpack(b, assumed_align=align_b).mark_layout_dynamic(1)
-    mC = from_dlpack(c, assumed_align=align_c).mark_layout_dynamic(1)
+    mA = from_dlpack(a, assumed_align=align_a).mark_layout_dynamic()
+    mB = from_dlpack(b, assumed_align=align_b).mark_layout_dynamic()
+    mC = from_dlpack(c, assumed_align=align_c).mark_layout_dynamic()
 
+    dim_orders = tuple(reversed(a.dim_order()))
     # Generate cache key with all parameters
     cache_key = dynamic_op.get_key(
-        mA, mB, mC, params=(thr_m, thr_n, val_m, val_n), alignments=(align_a, align_b, align_c)
+        mA,
+        mB,
+        mC,
+        params=(thr_m, thr_n, val_m, val_n, dim_orders),
+        alignments=(align_a, align_b, align_c),
     )
 
     # Compile with explicit cache key
     compiled_kernel = compile_and_cache(
-        dynamic_op,
-        cache_key,
-        op,
-        mA,
-        mB,
-        mC,
-        thr_m,
-        thr_n,
-        val_m,
-        val_n,
+        dynamic_op, cache_key, op, mA, mB, mC, thr_m, thr_n, val_m, val_n, dim_orders
     )
 
     compiled_kernel(mA, mB, mC)
     return c
+
+
+def cute_add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return elementwise_op_dynamic(add, a, b)
 
 
 if __name__ == "__main__":
