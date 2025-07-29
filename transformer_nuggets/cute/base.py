@@ -8,7 +8,7 @@ class CuteOp(ABC):
 
     This class provides a consistent interface for implementing CUTE kernels with:
     - Cache key generation via get_key()
-    - Kernel definition via get_kernel()
+    - Kernel definition via kernel() method decorated with @cute.kernel
     - JIT function as __call__
     """
 
@@ -16,8 +16,12 @@ class CuteOp(ABC):
         pass
 
     @abstractmethod
-    def get_kernel(self):
-        """Return the @cute.kernel decorated function."""
+    def kernel(self, *args, **kwargs):
+        """The kernel function that must be decorated with @cute.kernel.
+
+        Subclasses must implement this method with the @cute.kernel decorator
+        to define their kernel logic.
+        """
         pass
 
     def get_key(self, *args, **kwargs) -> str:

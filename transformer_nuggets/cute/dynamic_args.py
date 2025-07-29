@@ -12,7 +12,6 @@ from transformer_nuggets.cute.cache import (
     print_cache,
     set_cache_hashing,
 )
-from transformer_nuggets.cute.element_wise import elementwise_apply_kernel
 from transformer_nuggets.cute.utils import get_tensor_alignment
 from transformer_nuggets.cute.base import CuteOp
 from rich import print
@@ -29,8 +28,35 @@ class DynamicElementwiseOp(CuteOp):
         super().__init__()
         self.op = op
 
-    def get_kernel(self):
-        return elementwise_apply_kernel
+    @cute.kernel
+    def kernel(
+        self,
+        op: cutlass.Constexpr,
+        gA: cute.Tensor,
+        gB: cute.Tensor,
+        gC: cute.Tensor,
+        tv_layout: cute.Layout,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+
+        blk_coord = ((None, None), bidx)
+
+        blkA = gA[blk_coord]
+        blkB = gB[blk_coord]
+        blkC = gC[blk_coord]
+
+        tidfrgA = cute.composition(blkA, tv_layout)
+        tidfrgB = cute.composition(blkB, tv_layout)
+        tidfrgC = cute.composition(blkC, tv_layout)
+
+        thr_coord = (tidx, None)
+
+        thrA = tidfrgA[thr_coord]
+        thrB = tidfrgB[thr_coord]
+        thrC = tidfrgC[thr_coord]
+
+        thrC[None] = op(thrA.load(), thrB.load())
 
     def get_key(self, *args, **kwargs) -> str:
         """Generate cache key including operation type, tensor properties, and dynamic parameters."""
@@ -87,7 +113,7 @@ class DynamicElementwiseOp(CuteOp):
         gB = cute.zipped_divide(mB, tiler_mn)
         gC = cute.zipped_divide(mC, tiler_mn)
 
-        elementwise_apply_kernel(op, gA, gB, gC, tv_layout).launch(
+        self.kernel(op, gA, gB, gC, tv_layout).launch(
             grid=[cute.size(gC, mode=[1]), 1, 1],
             block=[cute.size(tv_layout, mode=[0]), 1, 1],
         )
