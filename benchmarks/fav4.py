@@ -418,8 +418,8 @@ def print_results(experiments: list[Experiment], save_path: str | None = None):
 def main(
     dtype: DtypeString = "float16",
     batch_sizes: list[int] = [2, 4],
-    seqlens: list[int] = [512, 1024, 2048, 8192],
-    num_heads: list[int] = [16],
+    seqlens: list[int] = [2048, 4096, 8192, 16384, 32768],
+    num_heads: list[int] = [16, 32],
     head_dims: list[int] = [64, 128],
     causal: bool = True,
     include_non_causal: bool = False,
