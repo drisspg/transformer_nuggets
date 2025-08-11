@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from jsonargparse import CLI
 from pathlib import Path
-from transformer_nuggets.utils.benchmark import benchmark_cuda_function_in_microseconds
+from transformer_nuggets.utils.benchmark import benchmark_cuda_function_in_microseconds_triton
 from torchao.float8.inference import (
     addmm_float8_unwrapped_inference,
     preprocess_data,
@@ -29,7 +29,7 @@ from enum import Enum
 import csv
 import logging
 
-from torchao.ops import mx_fp8_bf16
+# from torchao.ops import mx_fp8_bf16
 
 
 def ceil_div(a, b):
@@ -47,7 +47,6 @@ class FP8Kernel(Enum):
     PERSISTENT_TMA = "Persistent-TMA"
     DEVICE_TMA = "Device-TMA"
     SCALED_MM = "Scaled-MM"
-    CUTLASS_MX = "Cutlass-MX-FP8"
 
 
 class ScalingStrategy(Enum):
@@ -101,7 +100,7 @@ def get_fp8_matmul(
 
     # Handle E8M0 format for supported kernels
     if scaling_strategy == ScalingStrategy.E8M0:
-        if fp8_kernel not in [FP8Kernel.CUTLASS_MX, FP8Kernel.SCALED_MM]:
+        if fp8_kernel not in [FP8Kernel.SCALED_MM]:
             raise ValueError(
                 "E8M0 scaling strategy is only supported by MX_FP8 and SCALED_MM kernels"
             )
@@ -136,11 +135,6 @@ def get_fp8_matmul(
         return lambda: addmm_float8_unwrapped_inference(
             A_fp8, a_scale, B_fp8, b_scale, output_dtype=torch.bfloat16, use_fast_accum=True
         )
-    elif fp8_kernel == FP8Kernel.CUTLASS_MX:
-        assert scaling_strategy == ScalingStrategy.E8M0, (
-            "E8M0 scaling strategy is required for MX_FP8"
-        )
-        return lambda: mx_fp8_bf16(A_fp8, B_fp8, a_scale, b_scale)
     else:
         raise ValueError(f"Invalid FP8 kernel: {fp8_kernel}")
 
@@ -207,9 +201,9 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
     # Actual benchmarking
 
     bf16_time = (
-        benchmark_cuda_function_in_microseconds(lambda: bf16_matmul(A, B)) if config.bf16 else None
+        benchmark_cuda_function_in_microseconds_triton(lambda: bf16_matmul(A, B)) if config.bf16 else None
     )
-    fp8_time = benchmark_cuda_function_in_microseconds(fp8_matmul)
+    fp8_time = benchmark_cuda_function_in_microseconds_triton(fp8_matmul)
 
     # Calculate TFLOPS
     bf16_tflops = calculate_tflops(config.M, config.N, config.K, bf16_time) if bf16_time else None
@@ -411,7 +405,6 @@ def get_configs_varying_k(
         # FP8Kernel.PERSISTENT,
         # FP8Kernel.PERSISTENT_TMA,
         # FP8Kernel.DEVICE_TMA,
-        # FP8Kernel.CUTLASS_MX,
     ]
 
     for (M, K, N), strategy, compile, kernel in itertools.product(
