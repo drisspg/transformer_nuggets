@@ -1,4 +1,4 @@
-from transformer_nuggets import quant as quant, utils as utils
+from transformer_nuggets import quant as quant, utils as utils, numerics as numerics
 import logging
 
 

@@ -44,6 +44,7 @@ class LoggingMode(TorchDispatchMode):
     """
 
     next_id: int
+    supports_higher_order_operators = True
 
     def __init__(self, with_type: bool = True, collect_logs=False):
         self.memo = {}
