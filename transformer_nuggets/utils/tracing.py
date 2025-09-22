@@ -44,6 +44,7 @@ class LoggingMode(TorchDispatchMode):
     """
 
     next_id: int
+    # Lets FlexAttention in graph work
     supports_higher_order_operators = True
 
     def __init__(self, with_type: bool = True, collect_logs=False):
@@ -77,6 +78,11 @@ class LoggingMode(TorchDispatchMode):
             return Lit(f"${self._shortid(a)}{maybe_type}")
         else:
             return a
+
+    @classmethod
+    def ignore_compile_internals(cls):
+        """Without this compile will fall back to eager !!"""
+        return True
 
     def str_logs(self):
         return "\n".join(self.logs)
