@@ -85,6 +85,10 @@ class LoggingMode(TorchDispatchMode):
         if kwargs is None:
             kwargs = {}
         rs = func(*args, **kwargs)
+        func_name = torch.overrides.resolve_name(func)
+        if not func_name:
+            func_name = getattr(func, "__name__", repr(func))
+
         fmt_args = ", ".join(
             itertools.chain(
                 (repr(tree_map(self._fmt, a)) for a in args),
@@ -92,7 +96,7 @@ class LoggingMode(TorchDispatchMode):
             )
         )
         fmt_rets = repr(tree_map(partial(self._fmt, with_type=True), rs))
-        log_msg = f"{fmt_rets} = {torch.overrides.resolve_name(func)}({fmt_args})"
+        log_msg = f"{fmt_rets} = {func_name}({fmt_args})"
         if self.collect_logs:
             self.logs.append(log_msg)
         else:
