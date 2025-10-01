@@ -64,8 +64,6 @@ def assert_close_with_ulp(
     actual: torch.Tensor,
     expected: torch.Tensor,
     *,
-    rtol: float = 1e-5,
-    atol: float = 1e-8,
     equal_nan: bool = False,
     msg: str = "",
     verbose: bool = True,
@@ -90,7 +88,16 @@ def assert_close_with_ulp(
     Raises:
         AssertionError: If tensors are not close within the specified tolerances
     """
-    # Step 1: Use torch.isclose to find matches (exact PyTorch algorithm)
+    assert actual.dtype == expected.dtype, "Dtypes of actual and expected must match"
+    tol_dict = {
+        torch.float16: (1e-3, 1e-5),
+        torch.bfloat16: (1.6e-2, 1e-5),
+        torch.float32: (1.3e-6, 1e-5),
+        torch.float64: (1e-7, 1e-7),
+    }
+
+    rtol, atol = tol_dict[actual.dtype]
+
     matches = torch.isclose(actual, expected, rtol=rtol, atol=atol, equal_nan=equal_nan)
 
     if torch.all(matches):
