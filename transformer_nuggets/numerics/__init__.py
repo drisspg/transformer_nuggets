@@ -294,13 +294,9 @@ def plot_abs_diff_distribution(
     import matplotlib.pyplot as plt
     import seaborn as sns
 
-    if isinstance(a, torch.Tensor):
-        a = a.detach().cpu().numpy()
-    if isinstance(b, torch.Tensor):
-        b = b.detach().cpu().numpy()
-
-    abs_diffs = np.abs(a - b).flatten()
-
+    abs_diffs = (
+        torch.abs(a.to(torch.float32) - b.to(torch.float32)).flatten().detach().cpu().numpy()
+    )
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
 
     sns.histplot(abs_diffs, bins=bins, kde=True, ax=ax1, color="steelblue")
