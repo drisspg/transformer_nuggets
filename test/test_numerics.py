@@ -1,10 +1,18 @@
 import torch
 import pytest
+import tempfile
+from pathlib import Path
 from transformer_nuggets.numerics import (
     ulp_distance,
-    analyze_precision_differences,
-    categorize_differences,
+    compute_rmse,
+    compute_error_stats,
+    plot_abs_diff_distribution,
 )
+
+
+@pytest.fixture(params=["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"])
+def device(request):
+    return request.param
 
 
 class TestULPDistance:
@@ -110,93 +118,6 @@ class TestULPDistance:
             assert torch.all(result == 0)
 
 
-class TestAnalyzePrecisionDifferences:
-    def test_identical_tensors(self):
-        a = torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16)
-        b = a.clone()
-
-        results = analyze_precision_differences(a, b, print_results=False)
-
-        assert results["total_elements"] == 3
-        assert results["mismatch_count"] == 0
-        assert results["exact_match_count"] == 3
-        assert results["mismatch_percentage"] == 0.0
-        assert results["dtype"] == torch.bfloat16
-
-    def test_different_tensors(self):
-        a = torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16)
-        a_int = a.view(torch.int16)
-        b_int = a_int + torch.tensor([1, 2, 3], dtype=torch.int16)
-        b = b_int.view(torch.bfloat16)
-
-        results = analyze_precision_differences(a, b, print_results=False)
-
-        assert results["total_elements"] == 3
-        assert results["mismatch_count"] == 3
-        assert results["exact_match_count"] == 0
-        assert results["mismatch_percentage"] == 100.0
-        assert "ulp_min" in results
-        assert "ulp_max" in results
-        assert "ulp_mean" in results
-        assert "ulp_categories" in results
-        assert "ulp_histogram" in results
-
-    def test_mixed_differences(self):
-        a = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float32)
-        b = a.clone()
-        b[1] = torch.nextafter(b[1], b[1] + 1)
-
-        results = analyze_precision_differences(a, b, print_results=False)
-
-        assert results["total_elements"] == 4
-        assert results["mismatch_count"] == 1
-        assert results["exact_match_count"] == 3
-        assert results["mismatch_percentage"] == 25.0
-
-    def test_print_output(self, capsys):
-        a = torch.tensor([1.0, 2.0], dtype=torch.bfloat16)
-        b = a.clone()
-
-        analyze_precision_differences(a, b, name="test analysis", print_results=True)
-
-        captured = capsys.readouterr()
-        assert "test analysis" in captured.out
-        assert "Total elements: 2" in captured.out
-        assert "Exact matches: 2" in captured.out
-
-
-class TestCategorizeDifferences:
-    def test_all_exact(self):
-        ulp_distances = torch.zeros(5, dtype=torch.int32)
-        result = categorize_differences(ulp_distances)
-
-        assert result["exact"] == 5
-        assert result["1_ulp"] == 0
-        assert result["2_ulp"] == 0
-        assert result["small_3_10"] == 0
-        assert result["medium_11_100"] == 0
-        assert result["large_over_100"] == 0
-
-    def test_mixed_categories(self):
-        ulp_distances = torch.tensor([0, 1, 2, 5, 50, 200], dtype=torch.int32)
-        result = categorize_differences(ulp_distances)
-
-        assert result["exact"] == 1
-        assert result["1_ulp"] == 1
-        assert result["2_ulp"] == 1
-        assert result["small_3_10"] == 1
-        assert result["medium_11_100"] == 1
-        assert result["large_over_100"] == 1
-
-    def test_boundary_values(self):
-        ulp_distances = torch.tensor([3, 10, 11, 100, 101], dtype=torch.int32)
-        result = categorize_differences(ulp_distances)
-
-        assert result["small_3_10"] == 2
-        assert result["medium_11_100"] == 2
-        assert result["large_over_100"] == 1
-
-
 class TestEdgeCases:
     def test_nan_handling(self):
         dtypes = [torch.bfloat16, torch.float16, torch.float32]
@@ -231,3 +152,140 @@ class TestEdgeCases:
         result = ulp_distance(a, b)
         assert result.shape == a.shape
         assert result.numel() == 0
+
+
+class TestComputeRMSE:
+    def test_identical_tensors(self, device):
+        a = torch.tensor([1.0, 2.0, 3.0], device=device)
+        b = torch.tensor([1.0, 2.0, 3.0], device=device)
+        rmse = compute_rmse(a, b)
+        assert rmse == 0.0
+
+    def test_different_tensors(self, device):
+        a = torch.tensor([1.0, 2.0, 3.0], device=device)
+        b = torch.tensor([2.0, 3.0, 4.0], device=device)
+        rmse = compute_rmse(a, b)
+        assert rmse == pytest.approx(1.0, rel=1e-5)
+
+    def test_multidimensional(self, device):
+        a = torch.randn(3, 4, 5, device=device)
+        b = a.clone()
+        rmse = compute_rmse(a, b)
+        assert rmse == 0.0
+
+    def test_numpy_input(self, device):
+        import numpy as np
+
+        a = np.array([1.0, 2.0, 3.0])
+        b = np.array([2.0, 3.0, 4.0])
+        rmse = compute_rmse(a, b)
+        assert rmse == pytest.approx(1.0, rel=1e-5)
+
+    def test_mixed_dtypes(self, device):
+        a = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32, device=device)
+        b = torch.tensor([2.0, 3.0, 4.0], dtype=torch.float16, device=device)
+        rmse = compute_rmse(a, b)
+        assert isinstance(rmse, float)
+        assert rmse > 0.0
+
+
+class TestComputeErrorStats:
+    def test_identical_tensors(self, device):
+        a = torch.tensor([1.0, 2.0, 3.0], device=device)
+        b = torch.tensor([1.0, 2.0, 3.0], device=device)
+        stats = compute_error_stats(a, b)
+
+        assert stats["mean"] == 0.0
+        assert stats["max"] == 0.0
+        assert stats["median"] == 0.0
+        assert stats["std"] == 0.0
+
+    def test_different_tensors(self, device):
+        a = torch.tensor([1.0, 2.0, 3.0, 4.0], device=device)
+        b = torch.tensor([2.0, 3.0, 4.0, 5.0], device=device)
+        stats = compute_error_stats(a, b)
+
+        assert stats["mean"] == pytest.approx(1.0, rel=1e-5)
+        assert stats["max"] == pytest.approx(1.0, rel=1e-5)
+        assert stats["median"] == pytest.approx(1.0, rel=1e-5)
+        assert stats["std"] == pytest.approx(0.0, rel=1e-5)
+
+    def test_varied_errors(self, device):
+        a = torch.tensor([0.0, 0.0, 0.0, 0.0], device=device)
+        b = torch.tensor([1.0, 2.0, 3.0, 4.0], device=device)
+        stats = compute_error_stats(a, b)
+
+        assert stats["mean"] == pytest.approx(2.5, rel=1e-5)
+        assert stats["max"] == pytest.approx(4.0, rel=1e-5)
+        assert stats["median"] == pytest.approx(2.5, rel=1e-5)
+        assert stats["std"] > 0.0
+
+    def test_multidimensional(self, device):
+        a = torch.randn(3, 4, 5, device=device)
+        b = a + 0.1
+        stats = compute_error_stats(a, b)
+
+        assert "mean" in stats
+        assert "max" in stats
+        assert "median" in stats
+        assert "std" in stats
+        assert all(isinstance(v, float) for v in stats.values())
+
+    def test_numpy_input(self, device):
+        import numpy as np
+
+        a = np.array([1.0, 2.0, 3.0])
+        b = np.array([2.0, 3.0, 4.0])
+        stats = compute_error_stats(a, b)
+
+        assert stats["mean"] == pytest.approx(1.0, rel=1e-5)
+        assert stats["max"] == pytest.approx(1.0, rel=1e-5)
+
+
+class TestPlotAbsDiffDistribution:
+    def test_creates_plot_file(self, device):
+        a = torch.randn(100, device=device)
+        b = a + torch.randn(100, device=device) * 0.1
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_path = Path(tmpdir) / "test_plot.png"
+            plot_abs_diff_distribution(a, b, save_path, name="Test")
+            assert save_path.exists()
+
+    def test_with_different_bins(self, device):
+        a = torch.randn(100, device=device)
+        b = a + 0.1
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_path = Path(tmpdir) / "test_plot.png"
+            plot_abs_diff_distribution(a, b, save_path, bins=20)
+            assert save_path.exists()
+
+    def test_with_auto_bins(self, device):
+        a = torch.randn(100, device=device)
+        b = a + 0.1
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_path = Path(tmpdir) / "test_plot.png"
+            plot_abs_diff_distribution(a, b, save_path, bins="auto")
+            assert save_path.exists()
+
+    def test_multidimensional_tensors(self, device):
+        a = torch.randn(10, 10, device=device)
+        b = a + 0.1
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_path = Path(tmpdir) / "test_plot.png"
+            plot_abs_diff_distribution(a, b, save_path)
+            assert save_path.exists()
+
+    def test_numpy_input(self, device):
+        import numpy as np
+
+        a = np.random.randn(100)
+        b = a + 0.1
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_path = Path(tmpdir) / "test_plot.png"
+            plot_abs_diff_distribution(a, b, save_path)
+            assert save_path.exists()

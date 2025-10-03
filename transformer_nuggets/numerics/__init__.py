@@ -1,4 +1,6 @@
 import torch
+import numpy as np
+from pathlib import Path
 
 
 def _ulp_distance_unified(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -229,9 +231,105 @@ def assert_close_with_ulp(
     raise AssertionError("\n".join(error_parts))
 
 
+def compute_rmse(a: torch.Tensor, b: torch.Tensor) -> float:
+    """
+    Calculate root mean squared error between two tensors.
+
+    Args:
+        a: First tensor
+        b: Second tensor
+
+    Returns:
+        RMSE as a float
+    """
+    if isinstance(a, torch.Tensor):
+        a = a.cpu().numpy()
+    if isinstance(b, torch.Tensor):
+        b = b.cpu().numpy()
+    return float(np.sqrt(np.mean((a - b) ** 2)))
+
+
+def compute_error_stats(a: torch.Tensor, b: torch.Tensor) -> dict[str, float]:
+    """
+    Compute statistics of absolute errors between two tensors.
+
+    Args:
+        a: First tensor
+        b: Second tensor
+
+    Returns:
+        Dictionary with 'mean', 'max', 'median', 'std' of absolute errors
+    """
+    if isinstance(a, torch.Tensor):
+        a = a.cpu().numpy()
+    if isinstance(b, torch.Tensor):
+        b = b.cpu().numpy()
+
+    abs_errors = np.abs(a - b)
+    return {
+        "mean": float(np.mean(abs_errors)),
+        "max": float(np.max(abs_errors)),
+        "median": float(np.median(abs_errors)),
+        "std": float(np.std(abs_errors)),
+    }
+
+
+def plot_abs_diff_distribution(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    save_path: str | Path,
+    name: str = "",
+    bins: int | str = "auto",
+) -> None:
+    """
+    Plot histogram and CDF of absolute differences between two tensors.
+
+    Args:
+        a: First tensor
+        b: Second tensor
+        save_path: Path to save the plot
+        name: Optional name for the plot title
+        bins: Number of bins or binning strategy ('auto', 'fd', 'sturges', etc.)
+    """
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    if isinstance(a, torch.Tensor):
+        a = a.detach().cpu().numpy()
+    if isinstance(b, torch.Tensor):
+        b = b.detach().cpu().numpy()
+
+    abs_diffs = np.abs(a - b).flatten()
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+
+    sns.histplot(abs_diffs, bins=bins, kde=True, ax=ax1, color="steelblue")
+    title = (
+        f"Absolute Difference Distribution: {name}" if name else "Absolute Difference Distribution"
+    )
+    ax1.set_title(title, fontsize=14)
+    ax1.set_xlabel("Absolute Difference", fontsize=12)
+    ax1.set_ylabel("Count", fontsize=12)
+    ax1.grid(True, alpha=0.3)
+
+    sorted_diffs = np.sort(abs_diffs)
+    cdf = np.linspace(0, 1, len(sorted_diffs))
+    ax2.plot(sorted_diffs, cdf, linewidth=2, color="steelblue")
+    ax2.set_xscale("log")
+    ax2.set_xlabel("Absolute Difference", fontsize=12)
+    ax2.set_ylabel("Cumulative Probability", fontsize=12)
+    ax2.set_title(f"CDF: {name}" if name else "Error CDF", fontsize=14)
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(str(save_path), dpi=150, bbox_inches="tight")
+    plt.close()
+
+
 __all__ = [
     "ulp_distance",
-    "analyze_precision_differences",
-    "categorize_differences",
     "assert_close_with_ulp",
+    "compute_rmse",
+    "compute_error_stats",
+    "plot_abs_diff_distribution",
 ]
