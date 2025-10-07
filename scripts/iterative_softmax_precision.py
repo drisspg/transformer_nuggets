@@ -71,7 +71,8 @@ def iterative_attention(q, k, v, chunk_size, use_exp2=False):
         l = l * alpha  # noqa: E741  # (B, H, Nq, 1)
         l = l + p.sum(dim=-1, keepdim=True)  # noqa: E741  # (B, H, Nq, 1)
 
-        acc = acc + p @ v_[:, :, s:e, :]  # (B, H, Nq, D)
+        # Mimic Tensor core usage + accum in hp
+        acc = acc + p.to(q.dtype).to(accum_dtype) @ v_[:, :, s:e, :]  # (B, H, Nq, D)
 
         m = m_new
 
