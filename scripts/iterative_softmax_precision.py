@@ -1,8 +1,9 @@
 import torch
 import numpy as np
 import pandas as pd
-import argparse
 import math
+
+from transformer_nuggets.utils import AttentionExtractor
 
 
 M_LOG2E = math.log2(math.e)
@@ -147,6 +148,10 @@ def qkv_factory(
     head_dim: int,
     factory: str = "rand",
     device: str = "cuda",
+    qwen_model: str | None = None,
+    qwen_layer: int | None = None,
+    qwen_prompt: str | None = None,
+    qwen_sample_idx: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     shape = (batch_size, num_heads, seq_len, head_dim)
 
@@ -158,8 +163,42 @@ def qkv_factory(
         q = torch.testing.make_tensor(shape, device=device, dtype=torch.float64)
         k = torch.testing.make_tensor(shape, device=device, dtype=torch.float64)
         v = torch.testing.make_tensor(shape, device=device, dtype=torch.float64)
+    elif factory == "sorted_scores":
+        q = torch.testing.make_tensor(shape, device=device, dtype=torch.float64)
+        v = torch.testing.make_tensor(shape, device=device, dtype=torch.float64)
+
+        k = torch.arange(seq_len, device=device, dtype=torch.float64)
+        k = k.view(1, 1, seq_len, 1).expand(batch_size, num_heads, seq_len, head_dim)
+
+        return q, k, v
+    elif factory == "qwen":
+        if qwen_model is None or qwen_layer is None:
+            raise ValueError("For 'qwen' factory, must provide --qwen-model and --qwen-layer")
+
+        extractor = AttentionExtractor(qwen_model, device=device)
+        extractor.load_model()
+        extractor.register_hooks([qwen_layer])
+        extractor.run_inference(prompts=[qwen_prompt] if qwen_prompt else None, seq_len=seq_len)
+
+        layer_name = f"layer_{qwen_layer}"
+        q = extractor.attention_data[layer_name]["q"][qwen_sample_idx].to(torch.float64)
+        k = extractor.attention_data[layer_name]["k"][qwen_sample_idx].to(torch.float64)
+        v = extractor.attention_data[layer_name]["v"][qwen_sample_idx].to(torch.float64)
+
+        num_q_heads = q.shape[1]
+        num_kv_heads = k.shape[1]
+        if num_q_heads != num_kv_heads:
+            n_rep = num_q_heads // num_kv_heads
+            k = k.repeat_interleave(n_rep, dim=1)
+            v = v.repeat_interleave(n_rep, dim=1)
+
+        extractor.cleanup()
+
+        return q, k, v
     else:
-        raise ValueError(f"Unknown factory: {factory}. Must be 'rand' or 'make_tensor'")
+        raise ValueError(
+            f"Unknown factory: {factory}. Must be 'rand', 'make_tensor', 'sorted_scores', or 'qwen'"
+        )
 
     scale = head_dim**-0.5
     q = q * scale
@@ -173,50 +212,63 @@ def wrapped_print(title: str, width: int = 80):
     print("=" * width)
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Test iterative softmax precision with different chunk sizes"
-    )
-    parser.add_argument("--batch-size", type=int, default=2, help="Batch size")
-    parser.add_argument("--num-heads", type=int, default=8, help="Number of attention heads")
-    parser.add_argument("--seq-len", type=int, default=8192, help="Sequence length")
-    parser.add_argument("--head-dim", type=int, default=64, help="Head dimension")
-    parser.add_argument("--device", type=str, default="cuda", help="Device to run on")
-    parser.add_argument(
-        "--chunk-sizes",
-        type=int,
-        nargs="+",
-        default=[16, 32, 64, 128, 256, 512, 1024],
-        help="Chunk sizes to test",
-    )
-    parser.add_argument(
-        "--factory",
-        type=str,
-        default="make_tensor",
-        choices=["rand", "make_tensor"],
-        help="Factory method for creating Q, K, V tensors",
-    )
-    parser.add_argument(
-        "--use-exp2",
-        action="store_true",
-        help="Use exp2 (base-2) instead of exp (natural base) for exponentials",
-    )
+def main(
+    batch_size: int = 2,
+    num_heads: int = 8,
+    seq_len: int = 8192,
+    head_dim: int = 64,
+    device: str = "cuda",
+    chunk_sizes: list[int] = [16, 32, 64, 128, 256, 512, 1024],
+    factory: str = "sorted_scores",
+    qwen_model: str = "Qwen/Qwen2.5-1.5B-Instruct",
+    qwen_layer: int = 0,
+    qwen_prompt: str | None = None,
+    use_exp2: bool = False,
+):
+    """Test iterative softmax precision with different chunk sizes.
 
-    args = parser.parse_args()
-
+    Args:
+        batch_size: Batch size
+        num_heads: Number of attention heads
+        seq_len: Sequence length
+        head_dim: Head dimension
+        device: Device to run on
+        chunk_sizes: Chunk sizes to test
+        factory: Factory method for creating Q, K, V tensors (rand, make_tensor, or qwen)
+        qwen_model: Qwen model name (only used with factory=qwen)
+        qwen_layer: Qwen layer to extract (only used with factory=qwen)
+        qwen_prompt: Prompt for Qwen inference (only used with factory=qwen)
+        use_exp2: Use exp2 (base-2) instead of exp (natural base) for exponentials
+    """
     WIDTH = 80
 
     wrapped_print("SETUP", WIDTH)
-    print(f"Factory: {args.factory}")
-    print(f"Shape: [{args.batch_size}, {args.num_heads}, {args.seq_len}, {args.head_dim}]")
-    print(f"Exponential: {'exp2 (base-2)' if args.use_exp2 else 'exp (natural)'}")
+    print(f"Factory: {factory}")
+    if factory == "qwen":
+        print(f"Qwen Model: {qwen_model}")
+        print(f"Qwen Layer: {qwen_layer}")
+        if qwen_prompt is None:
+            prompt_display = "<long prompt>"
+        else:
+            prompt_display = qwen_prompt if len(qwen_prompt) <= 60 else qwen_prompt[:57] + "..."
+        print(f"Qwen Prompt: {prompt_display}")
+    print(f"Shape: [{batch_size}, {num_heads}, {seq_len}, {head_dim}]")
+    print(f"Exponential: {'exp2 (base-2)' if use_exp2 else 'exp (natural)'}")
 
     q, k, v = qkv_factory(
-        args.batch_size, args.num_heads, args.seq_len, args.head_dim, args.factory, args.device
+        batch_size,
+        num_heads,
+        seq_len,
+        head_dim,
+        factory,
+        device,
+        qwen_model=qwen_model,
+        qwen_layer=qwen_layer,
+        qwen_prompt=qwen_prompt,
     )
 
-    chunk_sizes = [cs for cs in args.chunk_sizes if cs <= args.seq_len]
-    chunk_sizes.append(args.seq_len)
+    chunk_sizes = [cs for cs in chunk_sizes if cs <= seq_len]
+    chunk_sizes.append(seq_len)
     chunk_sizes = sorted(set(chunk_sizes))
 
     precisions = [torch.float64, torch.float32, torch.float16, torch.bfloat16]
@@ -226,7 +278,7 @@ def main():
 
     wrapped_print("RUNNING EXPERIMENTS", WIDTH)
 
-    results_df = run_experiment(q, k, v, chunk_sizes, precisions, use_exp2=args.use_exp2)
+    results_df = run_experiment(q, k, v, chunk_sizes, precisions, use_exp2=use_exp2)
 
     wrapped_print("RESULTS", WIDTH)
 
@@ -268,4 +320,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    from jsonargparse import CLI
+
+    CLI(main)
