@@ -54,6 +54,9 @@ def iterative_attention(q, k, v, chunk_size, use_exp2=False):
     exp_fn = torch.exp2 if use_exp2 else torch.exp
     log2e = M_LOG2E if use_exp2 else 1.0
 
+    #  reuse L inited to 0 for first delta
+    deltas = [l.to(torch.float64)]
+
     num_chunks = ceil_div(Nk, chunk_size)
     for ci in range(num_chunks):
         s = ci * chunk_size
@@ -64,6 +67,11 @@ def iterative_attention(q, k, v, chunk_size, use_exp2=False):
 
         m_chunk = scores_chunk.max(dim=-1, keepdim=True).values  # (B, H, Nq, 1)
         m_new = torch.maximum(m, m_chunk)
+
+        if ci != 0:
+            # skip first chunk w/ is -inf
+            delta = m.to(torch.float64) - m_new.to(torch.float64)
+            deltas.append(delta)
 
         alpha = exp_fn(m - m_new)  # (B, H, Nq, 1)
         acc = acc * alpha
@@ -78,7 +86,8 @@ def iterative_attention(q, k, v, chunk_size, use_exp2=False):
         m = m_new
 
     out = acc / l  # (B, H, Nq, D)
-    return out.to(q.dtype)
+    deltas_tensor = torch.cat(deltas, dim=0)
+    return out.to(q.dtype), deltas_tensor
 
 
 def compute_errors(baseline: torch.Tensor, test: torch.Tensor) -> dict[str, float]:
@@ -123,17 +132,25 @@ def run_experiment(
             k_test = k_fp64.to(precision)
             v_test = v_fp64.to(precision)
 
-            output = iterative_attention(q_test, k_test, v_test, chunk_size, use_exp2=use_exp2)
+            output, deltas = iterative_attention(
+                q_test, k_test, v_test, chunk_size, use_exp2=use_exp2
+            )
 
             output_fp64 = output.to(torch.float64)
 
             errors = compute_errors(baseline, output_fp64)
+
+            deltas_np = deltas.cpu().numpy()
+            delta_mean = np.mean(deltas_np)
+            delta_std = np.std(deltas_np)
 
             results.append(
                 {
                     "precision": precision_name,
                     "chunk_size": chunk_size,
                     "exp_fn": "exp2" if use_exp2 else "exp",
+                    "delta_mean": delta_mean,
+                    "delta_std": delta_std,
                     **errors,
                 }
             )
@@ -190,6 +207,7 @@ def qkv_factory(
             max_length=seq_len,
             min_prompt_length=100,
             num_random_samples=1,
+            layers=[0],
         )
 
         q = q[qwen_sample_idx].unsqueeze(0).to(device).to(torch.float64)
@@ -308,6 +326,13 @@ def main(
                 ["chunk_size", "mse", "mae", "max_abs_error", "relative_error"]
             ].to_string(index=False)
         )
+
+    wrapped_print("DELTA STATISTICS BY PRECISION", WIDTH)
+
+    for precision in results_df["precision"].unique():
+        precision_data = results_df[results_df["precision"] == precision]
+        print(f"\n{precision}:")
+        print(precision_data[["chunk_size", "delta_mean", "delta_std"]].to_string(index=False))
 
     wrapped_print("KEY INSIGHTS", WIDTH)
 
