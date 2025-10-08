@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import math
 
-from transformer_nuggets.utils import AttentionExtractor
+from transformer_nuggets.utils.model_extraction import extract_attention_data
 
 
 M_LOG2E = math.log2(math.e)
@@ -180,18 +180,21 @@ def qkv_factory(
 
         return q, k, v
     elif factory == "qwen":
-        if qwen_model is None or qwen_layer is None:
-            raise ValueError("For 'qwen' factory, must provide --qwen-model and --qwen-layer")
+        if qwen_model is None:
+            raise ValueError("For 'qwen' factory, must provide --qwen-model")
 
-        extractor = AttentionExtractor(qwen_model, device=device)
-        extractor.load_model()
-        extractor.register_hooks([qwen_layer])
-        extractor.run_inference(prompts=[qwen_prompt] if qwen_prompt else None, seq_len=seq_len)
+        q, k, v = extract_attention_data(
+            model_id=qwen_model,
+            dataset_name="fka/awesome-chatgpt-prompts",
+            num_samples=1,
+            max_length=seq_len,
+            min_prompt_length=100,
+            num_random_samples=1,
+        )
 
-        layer_name = f"layer_{qwen_layer}"
-        q = extractor.attention_data[layer_name]["q"][qwen_sample_idx].to(torch.float64)
-        k = extractor.attention_data[layer_name]["k"][qwen_sample_idx].to(torch.float64)
-        v = extractor.attention_data[layer_name]["v"][qwen_sample_idx].to(torch.float64)
+        q = q[qwen_sample_idx].unsqueeze(0).to(device).to(torch.float64)
+        k = k[qwen_sample_idx].unsqueeze(0).to(device).to(torch.float64)
+        v = v[qwen_sample_idx].unsqueeze(0).to(device).to(torch.float64)
 
         num_q_heads = q.shape[1]
         num_kv_heads = k.shape[1]
@@ -199,8 +202,6 @@ def qkv_factory(
             n_rep = num_q_heads // num_kv_heads
             k = k.repeat_interleave(n_rep, dim=1)
             v = v.repeat_interleave(n_rep, dim=1)
-
-        extractor.cleanup()
 
         return q, k, v
     else:
