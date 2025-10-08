@@ -10,6 +10,23 @@ qkv = []
 target_layers = set()
 
 
+def _extract_text(item: dict) -> str | None:
+    if "prompt" in item and item["prompt"]:
+        return item["prompt"]
+
+    if "text" in item and item["text"]:
+        return item["text"]
+
+    conversations = item.get("conversations")
+    if isinstance(conversations, list):
+        parts = [turn.get("value") for turn in conversations if isinstance(turn, dict)]
+        parts = [p.strip() for p in parts if isinstance(p, str) and p.strip()]
+        if parts:
+            return "\n\n".join(parts)
+
+    return None
+
+
 def my_new_sdpa(module, *args, **kwargs):
     layer_idx = module.layer_idx if hasattr(module, "layer_idx") else None
 
@@ -27,7 +44,6 @@ def extract_attention_data(
     num_samples: int = 2,
     max_length: int = 2048,
     min_prompt_length: int = 500,
-    num_random_samples: int = 8,
     layers: list[int] | None = None,
 ):
     global qkv, target_layers
@@ -47,24 +63,69 @@ def extract_attention_data(
     print(f"Loading dataset: {dataset_name}")
     dataset = load_dataset(dataset_name, split="train")
 
-    prompts = []
-    for _, item in tqdm(enumerate(dataset), desc="Loading prompts"):
-        if len(prompts) >= num_samples:
-            break
-        if "prompt" in item and len(item["prompt"]) > min_prompt_length:
-            prompts.append(item["prompt"])
+    tolerance = max(64, int(max_length * 0.1))
+    candidates: list[tuple[str, int]] = []
 
-    if len(prompts) < num_samples:
-        print(f"Warning: Only found {len(prompts)} prompts longer than {min_prompt_length} chars")
+    for _, item in tqdm(enumerate(dataset), desc="Scanning prompts", total=len(dataset)):
+        prompt = _extract_text(item)
+        if prompt is None or len(prompt) <= min_prompt_length:
+            continue
 
-    print(f"Processing {len(prompts)} prompts")
+        encoded = tokenizer(
+            prompt,
+            padding=False,
+            truncation=False,
+        )
+        token_len = len(encoded["input_ids"])
+
+        candidates.append((prompt, token_len))
+
+    if not candidates:
+        raise ValueError(
+            f"No prompts longer than {min_prompt_length} characters found in {dataset_name}"
+        )
+
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    long_prompts = [(p, length) for p, length in candidates if length >= max_length]
+    near_prompts = [
+        (p, length) for p, length in candidates if max_length - tolerance <= length < max_length
+    ]
+    fallback_prompts = [(p, length) for p, length in candidates if length < max_length - tolerance]
+
+    selected_prompts: list[str] = []
+    selected_lengths: list[int] = []
+
+    def take_from(bucket: list[tuple[str, int]]):
+        for prompt, length in bucket:
+            if len(selected_prompts) >= num_samples:
+                break
+            selected_prompts.append(prompt)
+            selected_lengths.append(length)
+
+    take_from(long_prompts)
+    take_from(near_prompts)
+    take_from(fallback_prompts)
+
+    if len(selected_prompts) < num_samples:
+        print(
+            f"Warning: Requested {num_samples} prompts but only found {len(selected_prompts)} with sufficient length"
+        )
+
+    print(
+        "Prompt buckets -> "
+        f"long: {len(long_prompts)}, near: {len(near_prompts)}, fallback: {len(fallback_prompts)} "
+        f"(tolerance={tolerance} tokens)"
+    )
+    print(f"Selected prompt lengths: {selected_lengths}")
+
+    print(f"Processing {len(selected_prompts)} prompts")
 
     print(f"Loading model: {model_id}")
     model = AutoModelForCausalLM.from_pretrained(
         model_id, attn_implementation="my_new_sdpa"
     ).cuda()
 
-    for _, prompt in tqdm(enumerate(prompts), desc="Processing prompts"):
+    for _, prompt in tqdm(enumerate(selected_prompts), desc="Processing prompts"):
         tokenized = tokenizer(
             prompt,
             padding="max_length",
@@ -91,14 +152,7 @@ def extract_attention_data(
     kk = torch.cat([e[1] for e in qkv], dim=0)
     vv = torch.cat([e[2] for e in qkv], dim=0)
 
-    print(f"Total shape before sampling: {qq.shape}")
-
-    idx = torch.randperm(qq.shape[0])[:num_random_samples]
-    qq = qq[idx, ...]
-    kk = kk[idx, ...]
-    vv = vv[idx, ...]
-
-    print(f"Final sampled shape: {qq.shape}")
+    print(f"Final shape: {qq.shape}")
 
     return qq, kk, vv
 
