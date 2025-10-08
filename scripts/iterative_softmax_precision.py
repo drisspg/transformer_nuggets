@@ -171,6 +171,14 @@ def qkv_factory(
         k = k.view(1, 1, seq_len, 1).expand(batch_size, num_heads, seq_len, head_dim)
 
         return q, k, v
+    elif factory == "descending_scores":
+        q = torch.testing.make_tensor(shape, device=device, dtype=torch.float64)
+        v = torch.testing.make_tensor(shape, device=device, dtype=torch.float64)
+
+        k = torch.arange(seq_len, 0, -1, device=device, dtype=torch.float64)
+        k = k.view(1, 1, seq_len, 1).expand(batch_size, num_heads, seq_len, head_dim)
+
+        return q, k, v
     elif factory == "qwen":
         if qwen_model is None or qwen_layer is None:
             raise ValueError("For 'qwen' factory, must provide --qwen-model and --qwen-layer")
@@ -197,7 +205,7 @@ def qkv_factory(
         return q, k, v
     else:
         raise ValueError(
-            f"Unknown factory: {factory}. Must be 'rand', 'make_tensor', 'sorted_scores', or 'qwen'"
+            f"Unknown factory: {factory}. Must be 'rand', 'make_tensor', 'sorted_scores', 'descending_scores', or 'qwen'"
         )
 
     scale = head_dim**-0.5
@@ -234,7 +242,7 @@ def main(
         head_dim: Head dimension
         device: Device to run on
         chunk_sizes: Chunk sizes to test
-        factory: Factory method for creating Q, K, V tensors (rand, make_tensor, or qwen)
+        factory: Factory method for creating Q, K, V tensors (rand, make_tensor, sorted_scores, descending_scores, or qwen)
         qwen_model: Qwen model name (only used with factory=qwen)
         qwen_layer: Qwen layer to extract (only used with factory=qwen)
         qwen_prompt: Prompt for Qwen inference (only used with factory=qwen)
