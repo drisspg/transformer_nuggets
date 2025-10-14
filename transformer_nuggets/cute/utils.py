@@ -96,45 +96,24 @@ def extract_tensor_properties(tensor: torch.Tensor) -> dict[str, Any]:
     }
 
 
-def visualize_tv_layout(
-    thread_layout: tuple[tuple, tuple] | cute.Layout,
-    value_layout: tuple[tuple, tuple] | cute.Layout,
+def _visualize_tv_layout_impl(
+    tiler_mn: tuple[int, int],
+    shape: tuple,
+    stride: tuple,
     save_path: str,
     *,
+    thread_layout: tuple[tuple, tuple] | None = None,
+    value_layout: tuple[tuple, tuple] | None = None,
     font_size: int = 32,
     cell_px: int = 200,
     grid_lw: float = 2.5,
     color_fn=None,
+    DEBUG: bool = False,
 ):
-    """Visualize a T/V layout from thread and value layouts.
-
-    Args:
-        thread_layout: (shape, stride) tuple for thread layout
-        value_layout: (shape, stride) tuple for value layout
-        save_path: Path to save the SVG file
-        font_size: Font size for text labels
-        cell_px: Cell size in pixels
-        grid_lw: Grid line width
-        color_fn: Optional function (tid, vid) -> color
-    """
     import math
     import numpy as np
     import matplotlib.pyplot as plt
     import matplotlib.colors as mcolors
-
-    if isinstance(thread_layout, cute.Layout):
-        thread_layout = (thread_layout.shape, thread_layout.stride)
-    if isinstance(value_layout, cute.Layout):
-        value_layout = (value_layout.shape, value_layout.stride)
-
-    @cute.jit
-    def get_tv_layout():
-        thread_cute_layout = cute.make_layout(thread_layout[0], stride=thread_layout[1])
-        value_cute_layout = cute.make_layout(value_layout[0], stride=value_layout[1])
-        tiler_mn, tv_layout = cute.make_layout_tv(thread_cute_layout, value_cute_layout)
-        return tiler_mn, tv_layout.shape, tv_layout.stride
-
-    tiler_mn, shape, stride = get_tv_layout()
 
     if isinstance(shape[0], int):
         n_thr = shape[0]
@@ -146,10 +125,18 @@ def visualize_tv_layout(
         n_val = math.prod(shape[1])
 
     M, N = tiler_mn
-
     thr_ids = np.full((M, N), -1, dtype=int)
     val_ids = np.full((M, N), -1, dtype=int)
     filled = np.zeros((M, N), dtype=bool)
+
+    if DEBUG:
+        if thread_layout is not None:
+            print(f"Thread layout: {thread_layout}")
+        if value_layout is not None:
+            print(f"Value layout: {value_layout}")
+        print(f"Tiler (M, N): {tiler_mn}")
+        print(f"TV Layout shape: {shape}, stride: {stride}")
+        print(f"Total threads: {n_thr}, total values: {n_val}")
 
     for tid in range(n_thr):
         for vid in range(n_val):
@@ -162,6 +149,8 @@ def visualize_tv_layout(
             pos = g()
             n = pos // M
             m = pos % M
+            if DEBUG:
+                print(f"tid={tid}, vid={vid} -> pos={pos} -> (m,n)=({m},{n})")
             if filled[m, n]:
                 continue
             thr_ids[m, n] = tid
@@ -206,12 +195,109 @@ def visualize_tv_layout(
     ax.set_xlim(-0.5, N - 0.5)
     ax.set_ylim(M - 0.5, -0.5)
 
-    thread_str = f"{thread_layout[0]} : {thread_layout[1]}"
-    value_str = f"{value_layout[0]} : {value_layout[1]}"
-    ax.set_title(f"Thread: {thread_str}\nValue: {value_str}", fontsize=font_size + 2, pad=12)
+    @cute.jit()
+    def get_tv_layout_str():
+        return str(cute.make_layout(shape, stride=stride))
+
+    tv_layout_str = get_tv_layout_str()
+    if thread_layout is not None and value_layout is not None:
+        thread_str = f"{thread_layout[0]} : {thread_layout[1]}"
+        value_str = f"{value_layout[0]} : {value_layout[1]}"
+        title = f"Thread: {thread_str}\nValue: {value_str} \ntv_layout {tv_layout_str}"
+    else:
+        title = f"TV Layout: {shape} : {stride}\n{tv_layout_str}"
+    ax.set_title(title, fontsize=font_size + 2, pad=12)
 
     plt.tight_layout()
     path = Path(save_path).with_suffix(".svg")
     path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(path)
     print(f"Saved to {path}")
+
+
+def visualize_tv_layout(
+    thread_layout: tuple[tuple, tuple],
+    value_layout: tuple[tuple, tuple],
+    save_path: str,
+    *,
+    font_size: int = 32,
+    cell_px: int = 200,
+    grid_lw: float = 2.5,
+    color_fn=None,
+    DEBUG: bool = False,
+):
+    """Visualize a T/V layout from thread and value layouts.
+
+    Args:
+        thread_layout: (shape, stride) tuple for thread layout
+        value_layout: (shape, stride) tuple for value layout
+        save_path: Path to save the SVG file
+        font_size: Font size for text labels
+        cell_px: Cell size in pixels
+        grid_lw: Grid line width
+        color_fn: Optional function (tid, vid) -> color
+    """
+    if isinstance(thread_layout, cute.Layout):
+        thread_layout = (thread_layout.shape, thread_layout.stride)
+    if isinstance(value_layout, cute.Layout):
+        value_layout = (value_layout.shape, value_layout.stride)
+
+    @cute.jit
+    def get_tv_layout():
+        thread_cute_layout = cute.make_layout(thread_layout[0], stride=thread_layout[1])
+        value_cute_layout = cute.make_layout(value_layout[0], stride=value_layout[1])
+        tiler_mn, tv_layout = cute.make_layout_tv(thread_cute_layout, value_cute_layout)
+        return tiler_mn, tv_layout.shape, tv_layout.stride
+
+    tiler_mn, shape, stride = get_tv_layout()
+
+    return _visualize_tv_layout_impl(
+        tiler_mn,
+        shape,
+        stride,
+        save_path,
+        thread_layout=thread_layout,
+        value_layout=value_layout,
+        font_size=font_size,
+        cell_px=cell_px,
+        grid_lw=grid_lw,
+        color_fn=color_fn,
+        DEBUG=DEBUG,
+    )
+
+
+def visualize_tv_layout_direct(
+    tv_layout: tuple[tuple, tuple],
+    tiler_mn: tuple[int, int],
+    save_path: str,
+    *,
+    font_size: int = 32,
+    cell_px: int = 200,
+    grid_lw: float = 2.5,
+    color_fn=None,
+    DEBUG: bool = False,
+):
+    """Visualize a T/V layout directly from tv_layout and tiler_mn.
+
+    Args:
+        tv_layout: (shape, stride) tuple for the combined TV layout
+        tiler_mn: (M, N) tuple for the tiler dimensions
+        save_path: Path to save the SVG file
+        font_size: Font size for text labels
+        cell_px: Cell size in pixels
+        grid_lw: Grid line width
+        color_fn: Optional function (tid, vid) -> color
+    """
+    shape, stride = tv_layout
+
+    return _visualize_tv_layout_impl(
+        tiler_mn,
+        shape,
+        stride,
+        save_path,
+        font_size=font_size,
+        cell_px=cell_px,
+        grid_lw=grid_lw,
+        color_fn=color_fn,
+        DEBUG=DEBUG,
+    )
