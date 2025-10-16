@@ -201,7 +201,9 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
     # Actual benchmarking
 
     bf16_time = (
-        benchmark_cuda_function_in_microseconds_triton(lambda: bf16_matmul(A, B)) if config.bf16 else None
+        benchmark_cuda_function_in_microseconds_triton(lambda: bf16_matmul(A, B))
+        if config.bf16
+        else None
     )
     fp8_time = benchmark_cuda_function_in_microseconds_triton(fp8_matmul)
 

@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import itertools
 import weakref
 from functools import partial
@@ -7,6 +8,7 @@ import torch.overrides
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_map, tree_map_only
 from torch.utils.weak import WeakIdRef
+from torch.profiler import profile, ProfilerActivity, record_function
 
 dtype_abbrs = {
     torch.bfloat16: "bf16",
@@ -172,3 +174,40 @@ class NanInfDetect(TorchDispatchMode):
                 get_error_string(func, types, args, kwargs, output_has_nan, output_has_inf)
             )
         return res
+
+
+@contextmanager
+def cuda_kernel_profiler(kernel_pattern: str | None = None, record_name: str | None = None):
+    """
+    Context manager for profiling CUDA kernels.
+
+    Usage:
+        with cuda_kernel_profiler("flash_attn") as result:
+            output = model(input)
+
+        if result["found"]:
+            print("Flash attention kernel was used")
+        print(f"All kernels: {result['kernel_names']}")
+
+    Yields a dictionary that will be populated with:
+    - 'found': Boolean indicating if kernel_pattern was found
+    - 'kernel_names': List of all CUDA kernel names
+    """
+    result = {"found": False, "kernel_names": []}
+
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        if record_name:
+            with record_function(record_name):
+                yield result
+        else:
+            yield result
+
+    kernel_names = [
+        evt.name
+        for evt in prof.events()
+        if evt.device_type == torch.autograd.DeviceType.CUDA and evt.name
+    ]
+    result["kernel_names"] = kernel_names
+    result["found"] = (
+        any(kernel_pattern in name for name in kernel_names) if kernel_pattern else False
+    )
