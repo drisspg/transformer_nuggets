@@ -29,6 +29,7 @@ class DynamicElementwiseOp(CuteOp):
         self.op = op
 
     @cute.kernel
+    # pyrefly: ignore  # bad-override
     def kernel(
         self,
         op: cutlass.Constexpr,
@@ -46,8 +47,11 @@ class DynamicElementwiseOp(CuteOp):
         blkB = gB[blk_coord]
         blkC = gC[blk_coord]
 
+        # pyrefly: ignore  # no-matching-overload
         tidfrgA = cute.composition(blkA, tv_layout)
+        # pyrefly: ignore  # no-matching-overload
         tidfrgB = cute.composition(blkB, tv_layout)
+        # pyrefly: ignore  # no-matching-overload
         tidfrgC = cute.composition(blkC, tv_layout)
 
         thr_coord = (tidx, None)
@@ -56,6 +60,7 @@ class DynamicElementwiseOp(CuteOp):
         thrB = tidfrgB[thr_coord]
         thrC = tidfrgC[thr_coord]
 
+        # pyrefly: ignore  # not-callable
         thrC[None] = op(thrA.load(), thrB.load())
 
     def get_key(self, *args, **kwargs) -> str:
@@ -117,6 +122,7 @@ class DynamicElementwiseOp(CuteOp):
         gB = cute.zipped_divide(mB, tiler_mn)
         gC = cute.zipped_divide(mC, tiler_mn)
 
+        # pyrefly: ignore  # missing-attribute, bad-argument-count
         self.kernel(op, gA, gB, gC, tv_layout).launch(
             grid=[cute.size(gC, mode=[1]), 1, 1],
             block=[cute.size(tv_layout, mode=[0]), 1, 1],
@@ -172,6 +178,7 @@ def elementwise_op_dynamic(
 
 
 def cute_add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    # pyrefly: ignore  # bad-argument-type
     return elementwise_op_dynamic(add, a, b)
 
 
@@ -184,11 +191,13 @@ if __name__ == "__main__":
         b = torch.randn(M, N, device="cuda", dtype=torch.float16)
 
         # Test the new API that takes regular PyTorch tensors
+        # pyrefly: ignore  # bad-argument-type
         out = elementwise_op_dynamic(add, a, b)
         torch.testing.assert_close(out, a + b)
 
         time_torch = benchmark_cuda_function_in_microseconds(lambda: a + b)
         time_cute = benchmark_cuda_function_in_microseconds(
+            # pyrefly: ignore  # bad-argument-type
             lambda: elementwise_op_dynamic(add, a, b)
         )
         print(f"M = {M}, N = {N}")

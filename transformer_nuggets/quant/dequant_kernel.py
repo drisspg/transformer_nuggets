@@ -105,7 +105,9 @@ def dequant_nf4_tensor(weight: NF4Tensor):
         weight.quantization_factor,
         weight.scaler_mean,
         weight.nf4,
+        # pyrefly: ignore  # bad-argument-type
         weight.scaler_block_size,
+        # pyrefly: ignore  # bad-argument-type
         weight.block_size // 2,  # Each block is responsible for 2 output elements
     )
 

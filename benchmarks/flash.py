@@ -10,6 +10,7 @@ import transformer_nuggets.utils as utils
 from torch.nn.functional import scaled_dot_product_attention
 from tqdm import tqdm
 
+# pyrefly: ignore  # missing-module-attribute
 from transformer_nuggets.flash import attention, BiasMode, build_alibi_mask
 from transformer_nuggets.utils import benchmark_torch_function_in_microseconds
 
@@ -25,6 +26,7 @@ def build_mask(bias_choice, batch, num_heads, seq_len, causal, dtype):
         attn_bias = attn_bias.expand(batch, num_heads, seq_len, seq_len).to(device).to(dtype)
     elif bias_choice == BiasMode.none:
         attn_bias = None
+    # pyrefly: ignore  # unbound-name
     return attn_bias
 
 
@@ -181,12 +183,14 @@ def main(output_file: Path | None, profile_path: Path | None):
     if output_file is not None:
         configs = gen_configs()
         results = []
+        # pyrefly: ignore  # not-iterable
         for experiment_config in tqdm(configs, unit="Experiment"):
             experiment_result = run_experiment(experiment_config)
             merged = asdict(experiment_config) | asdict(experiment_result)
             results.append(merged)
 
         print(f"Writing results to {output_path}")
+        # pyrefly: ignore  # no-matching-overload
         with open(output_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=results[0].keys())
             writer.writeheader()

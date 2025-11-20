@@ -85,6 +85,7 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
         eager_abs_max,
         scale,
         config.low_precision_dtype,
+        # pyrefly: ignore  # bad-argument-type
         config.saturated,
     ).to(config.high_precision_dtype)
     eager_out_hp = eager_out.to(config.high_precision_dtype)
@@ -167,6 +168,7 @@ def main():
     torch.random.manual_seed(123)
     configs = get_configs()
     results = []
+    # pyrefly: ignore  # not-iterable
     for config in tqdm(configs):
         result = run_experiment(config)
         results.append(Experiment(config=config, result=result))

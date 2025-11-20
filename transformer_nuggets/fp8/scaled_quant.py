@@ -67,9 +67,13 @@ def scaled_quant(
         scale,
         abs_max,
         numel,
+        # pyrefly: ignore  # bad-argument-type
         4096,
+        # pyrefly: ignore  # bad-argument-type
         tl_dtype,
+        # pyrefly: ignore  # bad-argument-type
         max_val,
+        # pyrefly: ignore  # unexpected-keyword
         num_warps=8,
     )
     return out_tensor
@@ -80,6 +84,7 @@ def eager_scaled_quant(
     scale: torch.Tensor,
     abs_max: torch.Tensor,
     fp8_dtype: torch.dtype,
+    # pyrefly: ignore  # bad-function-definition
     saturated: torch.dtype = False,
 ):
     """Quantize tensor to fp8 using a delayed scaled and calculate abs_max
@@ -162,8 +167,11 @@ def dynamic_scaled_quant(
         abs_max_scratch,
         spin_lock,
         numel,
+        # pyrefly: ignore  # bad-argument-type
         16384,
+        # pyrefly: ignore  # bad-argument-type
         tl_dtype,
+        # pyrefly: ignore  # bad-argument-type
         max_val,
     )
     return out_tensor
@@ -178,6 +186,7 @@ def eager_dynamic_scaled_quant(
         a: Input tensor to quantize
         fp8_dtype: FP8 datatype to quantize to
     """
+    # pyrefly: ignore  # import-error
     from torchao.float8.float8_utils import tensor_to_scale, to_fp8_saturated
 
     scale = tensor_to_scale(a, fp8_dtype)

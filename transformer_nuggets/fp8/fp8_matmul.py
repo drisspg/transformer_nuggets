@@ -1,7 +1,11 @@
 import torch
 import triton
 import triton.language as tl
+
+# pyrefly: ignore  # import-error
 import triton.tools.experimental_descriptor
+
+# pyrefly: ignore  # import-error
 from triton.language.extra.cuda._experimental_tma import experimental_device_tensormap_create2d
 
 # Autotuner does not work with TMA. Use manual config.
@@ -190,6 +194,7 @@ def matmul_kernel_persistent(
             tile_id += NUM_SMS
             group_id = tile_id // num_pid_in_group
             first_pid_m = group_id * GROUP_SIZE_M
+            # pyrefly: ignore  # no-matching-overload
             group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
             pid_m = first_pid_m + (tile_id % group_size_m)
             pid_n = (tile_id % num_pid_in_group) // group_size_m
@@ -269,13 +274,20 @@ def matmul_persistent(
         c.stride(1),
         a_scale.stride(0) if ROW_WISE_SCALING else 0,
         b_scale.stride(1) if ROW_WISE_SCALING else 0,
+        # pyrefly: ignore  # bad-argument-type
         BLOCK_SIZE_M=configs[dtype]["BLOCK_SIZE_M"],
+        # pyrefly: ignore  # bad-argument-type
         BLOCK_SIZE_N=configs[dtype]["BLOCK_SIZE_N"],
+        # pyrefly: ignore  # bad-argument-type
         BLOCK_SIZE_K=configs[dtype]["BLOCK_SIZE_K"],
+        # pyrefly: ignore  # bad-argument-type
         GROUP_SIZE_M=configs[dtype]["GROUP_SIZE_M"],
         NUM_SMS=NUM_SMS,
+        # pyrefly: ignore  # unexpected-keyword
         num_stages=configs[dtype]["num_stages"],
+        # pyrefly: ignore  # unexpected-keyword
         num_warps=configs[dtype]["num_warps"],
+        # pyrefly: ignore  # bad-argument-type
         ROW_WISE_SCALING=ROW_WISE_SCALING,
     )
     return c
@@ -355,6 +367,7 @@ def matmul_kernel_tma_persistent(
             tile_id += NUM_SMS
             group_id = tile_id // num_pid_in_group
             first_pid_m = group_id * GROUP_SIZE_M
+            # pyrefly: ignore  # no-matching-overload
             group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
             pid_m = first_pid_m + (tile_id % group_size_m)
             pid_n = (tile_id % num_pid_in_group) // group_size_m
@@ -364,9 +377,11 @@ def matmul_kernel_tma_persistent(
 
         offs_k = ki * BLOCK_SIZE_K
 
+        # pyrefly: ignore  # missing-attribute
         a = tl._experimental_descriptor_load(
             a_desc_ptr, [offs_am, offs_k], [BLOCK_SIZE_M, BLOCK_SIZE_K], dtype
         )
+        # pyrefly: ignore  # missing-attribute
         b = tl._experimental_descriptor_load(
             b_desc_ptr, [offs_bn, offs_k], [BLOCK_SIZE_N, BLOCK_SIZE_K], dtype
         )
@@ -390,6 +405,7 @@ def matmul_kernel_tma_persistent(
             )
             c = accumulator.to(output_dtype)
 
+            # pyrefly: ignore  # missing-attribute
             tl._experimental_descriptor_store(c_desc_ptr, c, [offs_am, offs_bn])
             accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
@@ -452,14 +468,22 @@ def matmul_tma_persistent(
         K,
         a_scale.stride(0) if ROW_WISE_SCALING else 0,
         b_scale.stride(1) if ROW_WISE_SCALING else 0,
+        # pyrefly: ignore  # bad-argument-type
         BLOCK_SIZE_M=configs[dtype]["BLOCK_SIZE_M"],
+        # pyrefly: ignore  # bad-argument-type
         BLOCK_SIZE_N=configs[dtype]["BLOCK_SIZE_N"],
+        # pyrefly: ignore  # bad-argument-type
         BLOCK_SIZE_K=configs[dtype]["BLOCK_SIZE_K"],
+        # pyrefly: ignore  # bad-argument-type
         GROUP_SIZE_M=configs[dtype]["GROUP_SIZE_M"],
         NUM_SMS=NUM_SMS,
+        # pyrefly: ignore  # unexpected-keyword
         num_stages=configs[dtype]["num_stages"],
+        # pyrefly: ignore  # unexpected-keyword
         num_warps=configs[dtype]["num_warps"],
+        # pyrefly: ignore  # bad-argument-type
         output_dtype=triton_out_dtype,
+        # pyrefly: ignore  # bad-argument-type
         ROW_WISE_SCALING=ROW_WISE_SCALING,
     )
     return c
@@ -494,6 +518,7 @@ def matmul_kernel_device_tma_persistent(
     k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
     num_tiles = num_pid_m * num_pid_n
 
+    # pyrefly: ignore  # bad-assignment
     TMA_SIZE: tl.constexpr = 128
     workspace_base = workspace_ptr + start_pid * 3 * TMA_SIZE
     a_desc_ptr = workspace_base
@@ -521,8 +546,11 @@ def matmul_kernel_device_tma_persistent(
         global_size=[M, N],
         element_ty=c_ptr.dtype.element_ty,
     )
+    # pyrefly: ignore  # implicit-import, missing-attribute
     tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(a_desc_ptr)
+    # pyrefly: ignore  # implicit-import, missing-attribute
     tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(b_desc_ptr)
+    # pyrefly: ignore  # implicit-import, missing-attribute
     tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(c_desc_ptr)
 
     tiles_per_SM = num_tiles // NUM_SMS
@@ -548,6 +576,7 @@ def matmul_kernel_device_tma_persistent(
             tile_id += NUM_SMS
             group_id = tile_id // num_pid_in_group
             first_pid_m = group_id * GROUP_SIZE_M
+            # pyrefly: ignore  # no-matching-overload
             group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
             pid_m = first_pid_m + (tile_id % group_size_m)
             pid_n = (tile_id % num_pid_in_group) // group_size_m
@@ -557,9 +586,11 @@ def matmul_kernel_device_tma_persistent(
 
         offs_k = ki * BLOCK_SIZE_K
 
+        # pyrefly: ignore  # missing-attribute
         a = tl._experimental_descriptor_load(
             a_desc_ptr, [offs_am, offs_k], [BLOCK_SIZE_M, BLOCK_SIZE_K], dtype
         )
+        # pyrefly: ignore  # missing-attribute
         b = tl._experimental_descriptor_load(
             b_desc_ptr, [offs_bn, offs_k], [BLOCK_SIZE_N, BLOCK_SIZE_K], dtype
         )
@@ -584,6 +615,7 @@ def matmul_kernel_device_tma_persistent(
             )
             c = accumulator.to(OUTPUT_DTYPE)
 
+            # pyrefly: ignore  # missing-attribute
             tl._experimental_descriptor_store(c_desc_ptr, c, [offs_am, offs_bn])
 
             accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
@@ -626,14 +658,22 @@ def matmul_device_tma_persistent(
         K,
         a_scale.stride(0) if ROW_WISE_SCALING else 0,
         b_scale.stride(1) if ROW_WISE_SCALING else 0,
+        # pyrefly: ignore  # bad-argument-type
         BLOCK_SIZE_M=configs[dtype]["BLOCK_SIZE_M"],
+        # pyrefly: ignore  # bad-argument-type
         BLOCK_SIZE_N=configs[dtype]["BLOCK_SIZE_N"],
+        # pyrefly: ignore  # bad-argument-type
         BLOCK_SIZE_K=configs[dtype]["BLOCK_SIZE_K"],
+        # pyrefly: ignore  # bad-argument-type
         GROUP_SIZE_M=configs[dtype]["GROUP_SIZE_M"],
         NUM_SMS=NUM_SMS,
+        # pyrefly: ignore  # unexpected-keyword
         num_stages=configs[dtype]["num_stages"],
+        # pyrefly: ignore  # unexpected-keyword
         num_warps=configs[dtype]["num_warps"],
+        # pyrefly: ignore  # bad-argument-type
         OUTPUT_DTYPE=triton_out_dtype,
+        # pyrefly: ignore  # bad-argument-type
         ROW_WISE_SCALING=ROW_WISE_SCALING,
     )
     return c

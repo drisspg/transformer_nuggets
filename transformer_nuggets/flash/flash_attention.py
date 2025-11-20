@@ -15,6 +15,7 @@ from transformer_nuggets.flash.masks import BiasMode, score_modification
 
 @triton.jit
 def max_fn(x, y):
+    # pyrefly: ignore  # missing-attribute
     return tl.math.max(x, y)
 
 
@@ -134,6 +135,7 @@ def _fwd_kernel(
             H,
             q,
             k,
+            # pyrefly: ignore  # unbound-name
             mask_block_ptr,
             BIAS_CHOICE,
             DEBUG_MASK,
@@ -167,6 +169,7 @@ def _fwd_kernel(
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
         # ~~~~~~~~~~~~~ Output Debug Mask ~~~~~~~~~~~~~~~
         if DEBUG_MASK and BIAS_CHOICE != BiasMode.none:
+            # pyrefly: ignore  # unbound-name
             mask_block_ptr = tl.advance(mask_block_ptr, (0, BLOCK_N))
     # write back l and m
     acc = acc / l_i[:, None]
@@ -339,6 +342,7 @@ def _bwd_kernel(
 
 class _attention(torch.autograd.Function):
     @staticmethod
+    # pyrefly: ignore  # bad-override
     def forward(
         ctx,
         q: torch.Tensor,
@@ -399,13 +403,21 @@ class _attention(torch.autograd.Function):
             q.shape[0],
             q.shape[1],
             q.shape[2],
+            # pyrefly: ignore  # bad-argument-type
             BLOCK_M=BLOCK_M,
+            # pyrefly: ignore  # bad-argument-type
             BLOCK_N=BLOCK_N,
+            # pyrefly: ignore  # bad-argument-type
             BLOCK_DMODEL=Lk,
+            # pyrefly: ignore  # bad-argument-type
             IS_CAUSAL=causal,
+            # pyrefly: ignore  # bad-argument-type
             BIAS_CHOICE=bias_choice.value,
+            # pyrefly: ignore  # bad-argument-type
             DEBUG_MASK=debug_mask,
+            # pyrefly: ignore  # unexpected-keyword
             num_warps=num_warps,
+            # pyrefly: ignore  # unexpected-keyword
             num_stages=4,
         )
 
@@ -419,6 +431,7 @@ class _attention(torch.autograd.Function):
         return o, scratch_space
 
     @staticmethod
+    # pyrefly: ignore  # bad-override
     def backward(ctx, do, dmask=None):
         BLOCK = 128
         q, k, v, o, L = ctx.saved_tensors
@@ -432,6 +445,7 @@ class _attention(torch.autograd.Function):
             o,
             do,
             delta,
+            # pyrefly: ignore  # bad-argument-type
             BLOCK_M=BLOCK,
             D_HEAD=ctx.BLOCK_DMODEL,
         )
@@ -463,12 +477,16 @@ class _attention(torch.autograd.Function):
             q.shape[1],
             q.shape[2],
             ctx.grid[0],
+            # pyrefly: ignore  # bad-argument-type
             BLOCK_M=BLOCK,
+            # pyrefly: ignore  # bad-argument-type
             BLOCK_N=BLOCK,
             BLOCK_DMODEL=ctx.BLOCK_DMODEL,
+            # pyrefly: ignore  # unexpected-keyword
             num_warps=8,
             CAUSAL=ctx.causal,
             BIAS_CHOICE=ctx.bias_choice.value,
+            # pyrefly: ignore  # unexpected-keyword
             num_stages=1,
         )
         return dq, dk, dv, None, None, None, None

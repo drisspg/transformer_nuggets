@@ -24,7 +24,9 @@ class DataConfig:
     dataset_name: str = "openwebtext"
     test_size: float = 0.0005
     seed: int = 42
+    # pyrefly: ignore  # unsupported-operation
     num_proc: int = os.cpu_count() // 2
+    # pyrefly: ignore  # unsupported-operation
     num_proc_load_dataset: int = os.cpu_count() // 2
 
 
@@ -39,6 +41,7 @@ def main(tokenizer_path: str, output_dir: str):
 
     logging.info("Loading dataset %s", data_config.dataset_name)
     dataset = load_dataset(data_config.dataset_name, num_proc=data_config.num_proc_load_dataset)
+    # pyrefly: ignore  # missing-attribute
     split_dataset = dataset["train"].train_test_split(
         test_size=data_config.test_size, seed=data_config.seed, shuffle=True
     )
@@ -63,6 +66,7 @@ def main(tokenizer_path: str, output_dir: str):
         total_batches = 1024
 
         idx = 0
+        # pyrefly: ignore  # not-iterable
         for batch_idx in tqdm(range(total_batches), desc=f"writing {filename}"):
             # Batch together samples for faster write
             batch = dset.shard(

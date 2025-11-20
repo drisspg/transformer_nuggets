@@ -24,6 +24,7 @@ class ModelArgs:
     n_layer: int = 32
     n_head: int = 32
     dim: int = 4096
+    # pyrefly: ignore  # bad-assignment
     intermediate_size: int = None
     n_local_heads: int = -1
     head_dim: int = 64
@@ -36,6 +37,7 @@ class ModelArgs:
         if self.intermediate_size is None:
             hidden_dim = 4 * self.dim
             n_hidden = int(2 * hidden_dim / 3)
+            # pyrefly: ignore  # bad-assignment
             self.intermediate_size = find_multiple(n_hidden, 256)
         self.head_dim = self.dim // self.n_head
 
@@ -86,7 +88,9 @@ class KVCache(nn.Module):
 
         k_out = self.k_cache
         v_out = self.v_cache
+        # pyrefly: ignore  # unsupported-operation
         k_out[:, :, input_pos] = k_val
+        # pyrefly: ignore  # unsupported-operation
         v_out[:, :, input_pos] = v_val
 
         return k_out, v_out
@@ -119,6 +123,7 @@ class Transformer(nn.Module):
             max_seq_length,
             head_dim,
             device,
+            # pyrefly: ignore  # bad-argument-type
             self.config.rope_base,
         )
 

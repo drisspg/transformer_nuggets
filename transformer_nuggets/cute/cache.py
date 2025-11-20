@@ -166,8 +166,10 @@ def auto_compile_and_cache(func: Callable, *args, cache_extra=None, **kwargs):
             extra_parts = []
             for item in cache_extra:
                 if isinstance(item, (list, tuple)):
+                    # pyrefly: ignore  # bad-argument-type
                     extra_parts.append("_".join(str(x) for x in item))
                 else:
+                    # pyrefly: ignore  # bad-argument-type
                     extra_parts.append(str(item))
             extra_str = "_".join(extra_parts)
         else:

@@ -8,6 +8,8 @@ from tqdm import tqdm
 from jsonargparse import CLI
 from pathlib import Path
 from transformer_nuggets.utils.benchmark import benchmark_cuda_function_in_microseconds_triton
+
+# pyrefly: ignore  # import-error
 from torchao.float8.inference import (
     addmm_float8_unwrapped_inference,
     preprocess_data,
@@ -38,6 +40,7 @@ def ceil_div(a, b):
 
 torch._dynamo.config.cache_size_limit = 10000
 logging.getLogger("transformer_nuggets").setLevel(logging.INFO)
+# pyrefly: ignore  # implicit-import
 torch._inductor.config.max_autotune_gemm_backends = "TRITON"
 CHECK = False
 
@@ -256,6 +259,7 @@ def print_results(experiments: list[Experiment], save_path: Path | None = None):
         # Calculate ratios only if bf16 results exist
         if result.bf16_time is not None:
             speedup = f"{(result.bf16_time / result.fp8_time):.2f}x"
+            # pyrefly: ignore  # unsupported-operation
             tflops_ratio = f"{(result.fp8_tflops / result.bf16_tflops):.2f}x"
         else:
             speedup = "N/A"
@@ -449,9 +453,12 @@ def main(
     configs = get_configs_varying_k(M, N, bf16=bf_16, use_zeros=use_zeros)
     results = []
     if save_path is not None:
+        # pyrefly: ignore  # bad-assignment
         save_path = Path(save_path)
+        # pyrefly: ignore  # missing-attribute
         save_path = save_path.with_suffix(".csv")
         save_path.parent.mkdir(parents=True, exist_ok=True)
+    # pyrefly: ignore  # not-iterable
     for config in tqdm(configs):
         result = run_experiment(config)
         results.append(Experiment(config=config, result=result))

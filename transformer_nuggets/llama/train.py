@@ -15,10 +15,15 @@ from pathlib import Path
 import numpy as np
 import torch
 from fire import Fire
+
+# pyrefly: ignore  # import-error
 from float8_experimental.float8_dynamic_linear import Float8DynamicLinear
+
+# pyrefly: ignore  # import-error
 from float8_experimental.float8_linear import Float8Linear
 
 # Float8 imports
+# pyrefly: ignore  # import-error
 from float8_experimental.float8_linear_utils import (
     linear_requires_sync,
     LinearType,
@@ -196,6 +201,7 @@ def main(
         model = torch.compile(model)
 
     train(
+        # pyrefly: ignore  # bad-argument-type
         model,
         optimizer,
         train_dataloader,
@@ -289,16 +295,20 @@ def train(
 
             if not is_accumulating and step_count % training_config.save_interval == 0:
                 checkpoint_path = training_config.out_dir / f"iter-{iter_num:06d}-ckpt.pth"
+                # pyrefly: ignore  # bad-argument-type
                 torch.save(checkpoint_path, {"model": model})
 
             if iter_num % training_config.log_interval == 0:
                 # loss.item causes a sync so we update the progress bar sporadically
                 write_loss_to_file(train_loss_file, step_count, loss.item())
+                # pyrefly: ignore  # missing-attribute
                 progress_bar.set_postfix_str(f"Loss {loss.item():.4f}")
+            # pyrefly: ignore  # missing-attribute
             progress_bar.update(1)
 
             if training_config.profile and iter_num < 103:
                 # We want to profile iters 100-102 of the model training
+                # pyrefly: ignore  # missing-attribute
                 p.step()
 
 
@@ -322,6 +332,7 @@ def validate(
     model.eval()
     val_iter = iter(val_data)
     losses = torch.zeros(training_config.eval_iters)
+    # pyrefly: ignore  # not-iterable
     for k in tqdm(range(training_config.eval_iters)):
         input_ids, targets = next(val_iter)
         input_ids = input_ids.pin_memory().to(training_config.device)
@@ -332,17 +343,21 @@ def validate(
 
     val_loss = losses.mean()
     model.train()
+    # pyrefly: ignore  # unbound-name
     write_loss_to_file(loss_file, training_iter, loss.item())
+    # pyrefly: ignore  # bad-return
     return val_loss.item()
 
 
 def load_datasets(hyper_params: Hyperparameters, training_config: TrainingConfig):
     train_data = Dataset(
+        # pyrefly: ignore  # bad-argument-type
         str(training_config.data_dir / "train.bin"),
         max_seq_length=hyper_params.max_seq_length,
         training_config=training_config,
     )
     val_data = Dataset(
+        # pyrefly: ignore  # bad-argument-type
         str(training_config.data_dir / "val.bin"),
         max_seq_length=hyper_params.max_seq_length,
         training_config=training_config,

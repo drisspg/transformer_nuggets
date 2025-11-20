@@ -40,6 +40,7 @@ class DirectCopy(CuteOp):
         self.DEBUG = debug
 
     @cute.kernel
+    # pyrefly: ignore  # bad-override
     def kernel(
         self,
         gA: cute.Tensor,
@@ -52,6 +53,7 @@ class DirectCopy(CuteOp):
         tiler_mn: cutlass.Constexpr,
     ):
         smem = cutlass.utils.SmemAllocator()
+        # pyrefly: ignore  # no-matching-overload
         storage = smem.allocate(shared_storage)
         smem_layout = cute.make_layout(tiler_mn)
         sA = storage.data.get_tensor(smem_layout)
@@ -104,25 +106,33 @@ class DirectCopy(CuteOp):
     ):
         @cute.struct
         class Shared:
+            # pyrefly: ignore  # bad-specialization, not-a-type
             bar: cute.struct.Align[cute.struct.MemRange[cutlass.Int64, 1], 16]
+            # pyrefly: ignore  # bad-specialization
             data: cute.struct.Align[
+                # pyrefly: ignore  # bad-specialization, not-a-type
                 cute.struct.MemRange[dtype, num_elms],
+                # pyrefly: ignore  # not-a-type
                 16,
             ]
 
         return Shared
 
+    # pyrefly: ignore  # bad-return
     def get_key(self, *args, **kwargs) -> str:
         pass
 
     @cute.jit
+    # pyrefly: ignore  # bad-function-definition
     def __call__(self, mA: cute.Tensor, mB: cute.Tensor, USE_TMA: cutlass.Constexpr = False):
         # Simple 32 threads handle 4 contiguous elements
         thr_layout = cute.make_layout(256)
         val_layout = cute.make_layout(4)
         tiler_mn, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
         smem_layout = cute.make_layout(cute.size(tiler_mn))
+        # pyrefly: ignore  # index-error
         assert mA.shape[0] % val_layout.shape == 0, (
+            # pyrefly: ignore  # index-error
             f"Input size {mA.shape[0]} is not divisible by vector size {val_layout.shape}"
         )
 
@@ -135,6 +145,7 @@ class DirectCopy(CuteOp):
             )
             copy_atoms = (tma_atom_load, tma_atom_store)
         else:
+            # pyrefly: ignore  # missing-attribute
             bits_per_copy = mA.element_type.width
             copy_atom_load = cute.make_copy_atom(
                 cute.nvgpu.CopyUniversalOp(),
@@ -157,12 +168,14 @@ class DirectCopy(CuteOp):
 
         dtype = mA.element_type
         num_elms = cute.size(smem_layout, mode=[0])
+        # pyrefly: ignore  # bad-argument-type
         Shared = self._get_shared_struct(dtype, num_elms, USE_TMA)
 
         if cutlass.const_expr(self.DEBUG):
             print(
                 f"Launching a grid of {cute.size(gA, mode=[1])} and a block of {cute.size(tv_layout, mode=[0])}"
             )
+            # pyrefly: ignore  # unbound-name
             print(f"Using copy atoms with {bits_per_copy}-bit copies")
             print("Load Atom:", copy_atoms[0])
             print("Store Atom:", copy_atoms[1])
@@ -170,6 +183,7 @@ class DirectCopy(CuteOp):
             print("Tiler MN:", tiler_mn)
             print("TV layout:", tv_layout)
 
+        # pyrefly: ignore  # missing-attribute, bad-argument-count
         self.kernel(gA, gB, copy_atoms, tv_layout, crdB, Shared, mB.shape, tiler_mn).launch(
             grid=[cute.size(gA, mode=[1]), 1, 1],
             block=[cute.size(tv_layout, mode=[0]), 1, 1],
@@ -184,6 +198,7 @@ class DirectCopy(CuteOp):
         return tma_atom, tma_tensor
 
     def get_copy_atoms(self, copy_op, tensor: cute.Tensor, tiler_mn: cute.Layout):
+        # pyrefly: ignore  # missing-attribute
         copy_atom, copy_tensor = cute.make_tiled_copy_atom(
             copy_op,
             tensor,
@@ -204,6 +219,7 @@ def direct_copy(gA: torch.Tensor):
             f"Output tensor must be 16-byte aligned, got alignment {destination_ptr % 16}"
         )
 
+    # pyrefly: ignore  # bad-assignment
     gA = from_dlpack(gA, assumed_align=16)
     gB = from_dlpack(destination, assumed_align=16)
 

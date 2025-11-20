@@ -33,6 +33,7 @@ def test_saturated(fp8_dtype):
     abs_max = torch.tensor([-1.0], dtype=torch.float32, device="cuda")
     output = scaled_quant(a, scale, abs_max, fp8_dtype, saturated=True)
     eager_abs_max = torch.clone(abs_max)
+    # pyrefly: ignore  # bad-argument-type
     eager_output = eager_scaled_quant(a, scale, eager_abs_max, fp8_dtype, saturated=True)
     torch.testing.assert_close(output, eager_output)
     torch.testing.assert_close(

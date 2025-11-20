@@ -5,6 +5,8 @@ import logging
 from pathlib import Path
 
 from transformer_nuggets.utils.benchmark import ProfileConfig, profile_function
+
+# pyrefly: ignore  # import-error
 from torchao.float8.inference import (
     addmm_float8_unwrapped_inference,
     preprocess_data,

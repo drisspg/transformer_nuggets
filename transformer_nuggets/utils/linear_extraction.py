@@ -86,6 +86,7 @@ def _create_hook(fqn: str):
             linear_captures[fqn] = LinearCapture(
                 module_fqn=fqn,
                 layer_idx=layer_idx,
+                # pyrefly: ignore  # bad-argument-type
                 weight=None,  # Will be populated later
                 bias=None,  # Will be populated later
                 inputs=[],
@@ -189,6 +190,7 @@ def extract_linear_data(
     tolerance = max(64, int(max_length * 0.1))
     candidates: list[tuple[str, int]] = []
 
+    # pyrefly: ignore  # not-iterable, bad-argument-type
     for _, item in tqdm(enumerate(dataset), desc="Scanning prompts", total=len(dataset)):
         prompt = _extract_text(item)
         if prompt is None or len(prompt) <= min_prompt_length:
@@ -251,6 +253,7 @@ def extract_linear_data(
     hooks = _register_hooks(model)
 
     # Process prompts
+    # pyrefly: ignore  # not-iterable
     for _, prompt in tqdm(enumerate(selected_prompts), desc="Processing prompts"):
         tokenized = tokenizer(
             prompt,
@@ -292,6 +295,7 @@ if __name__ == "__main__":
     import sys
 
     sys.path.insert(0, "/home/dev/meta/my_scripts")
+    # pyrefly: ignore  # import-error
     from quant_compare import compare_fp8_quantization
 
     model_id = "Qwen/Qwen2.5-7B-Instruct"

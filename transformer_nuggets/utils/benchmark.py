@@ -10,7 +10,7 @@ import torch.utils.benchmark as benchmark
 from torch._inductor.utils import do_bench_using_profiling
 import functools
 
-from torch.cuda._memory_viz import profile_plot
+from torch.cuda._memory_viz import profile_plot  # type: ignore
 from torch.profiler import profile, ProfilerActivity, record_function, schedule
 
 logger = logging.getLogger(__name__)
@@ -83,6 +83,7 @@ def benchmark_cuda_function_in_microseconds_triton(func: Callable, *args, **kwar
 
     no_args = lambda: func(*args, **kwargs)
     time = do_bench(no_args)
+    # pyrefly: ignore  # unsupported-operation, bad-return
     return time * 1e3
 
 
@@ -123,7 +124,7 @@ def profile_function(
         prof.export_chrome_trace(str(trace_path))
         logger.info(f"💾 Trace file 📄 saved to: {bcolors.OKGREEN}{trace_path}{bcolors.ENDC}")
 
-    if profile_memory:
+    if profile_memory and config.memory_profile_path is not None:
         with open(config.memory_profile_path, "w") as f:
             f.write(profile_plot(prof))
 
@@ -216,6 +217,7 @@ def save_memory_snapshot(file_path: Path):
     from transformer_nuggets import init_logging
 
     init_logging()
+    dist_avail = False
     try:
         import torch.distributed as dist
 
@@ -223,6 +225,7 @@ def save_memory_snapshot(file_path: Path):
     except ImportError:
         pass
 
+    # pyrefly: ignore  # unbound-name
     dist_avail = dist_avail and dist.is_initialized()
     if dist_avail:
         if not file_path.is_dir():
@@ -241,12 +244,13 @@ def save_memory_snapshot(file_path: Path):
     finally:
         s = torch.cuda.memory._snapshot()
         if dist_avail:
+            # pyrefly: ignore  # unbound-name
             local_rank = dist.get_rank()
             output_path = file_path / f"_rank_{local_rank}.html"
         else:
             output_path = file_path.with_suffix(".html")
         with open(output_path, "w") as f:
-            f.write(torch.cuda._memory_viz.trace_plot(s))
+            f.write(torch.cuda._memory_viz.trace_plot(s))  # type: ignore
             logger.info(f"💾 Trace file 📄 saved to: {bcolors.OKGREEN}{output_path}{bcolors.ENDC}")
 
 
@@ -300,12 +304,12 @@ def attach_oom_observer(save_path: Path | None = None, max_entries: int = 100000
             logging.info("Saving allocated state during OOM")
             snapshot = torch.cuda.memory._snapshot()
             with open(current_trace_name, "w") as f:
-                f.write(torch.cuda._memory_viz.trace_plot(snapshot))
+                f.write(torch.cuda._memory_viz.trace_plot(snapshot))  # type: ignore
             logging.info(f"Wrote memory snapshot to {current_trace_name}")
         except Exception as e:
             logging.error(f"Failed to save memory snapshot: {e}")
 
-    torch._C._cuda_attach_out_of_memory_observer(oom_observer)
+    torch._C._cuda_attach_out_of_memory_observer(oom_observer)  # type: ignore
     torch.cuda.memory._record_memory_history(max_entries=max_entries)
 
 

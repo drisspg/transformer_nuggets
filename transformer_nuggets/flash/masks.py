@@ -98,6 +98,7 @@ def score_modification(
     BIAS_CHOICE: tl.constexpr,
     DEBUG_MASK: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
+    # pyrefly: ignore  # bad-function-definition
     MATMUL_PRECISION: tl.constexpr = tl.float16,
 ):
     batch = off_hz // num_heads

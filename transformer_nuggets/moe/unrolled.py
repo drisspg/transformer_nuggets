@@ -112,6 +112,7 @@ class LoopMoE(nn.Module):
                 final_hidden_states = final_hidden_states + current_hidden_states
 
         # Reshape back to original shape
+        # pyrefly: ignore  # missing-attribute
         return final_hidden_states.view(orig_shape)
 
 

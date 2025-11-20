@@ -77,8 +77,10 @@ class LoggingMode(TorchDispatchMode):
             maybe_type = ""
             if with_type and self.with_type:
                 maybe_type = f": {dtype_abbrs[a.dtype]}[{', '.join(map(str, a.shape))}]"
+            # pyrefly: ignore  # bad-return
             return Lit(f"${self._shortid(a)}{maybe_type}")
         else:
+            # pyrefly: ignore  # bad-return
             return a
 
     @classmethod
@@ -150,6 +152,7 @@ class NanInfDetect(TorchDispatchMode):
         self.do_breakpoint = do_breakpoint
         self.distributed = distributed
 
+    # pyrefly: ignore  # bad-override
     def __torch_dispatch__(self, func, types, args, kwargs=None):
         kwargs = kwargs or {}
         res = func(*args, **kwargs)
@@ -204,6 +207,7 @@ def cuda_kernel_profiler(kernel_pattern: str | None = None, record_name: str | N
 
     kernel_names = [
         evt.name
+        # pyrefly: ignore  # not-iterable
         for evt in prof.events()
         if evt.device_type == torch.autograd.DeviceType.CUDA and evt.name
     ]

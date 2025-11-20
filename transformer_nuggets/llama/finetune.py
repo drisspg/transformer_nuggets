@@ -121,6 +121,7 @@ def main(
         logging.info(model)
 
     optimizer = torch.optim.AdamW(
+        # pyrefly: ignore  # missing-attribute
         [p for p in model.parameters() if p.requires_grad],
         lr=hyper_params.learning_rate,
         weight_decay=hyper_params.weight_decay,
@@ -129,6 +130,7 @@ def main(
     )
 
     train(
+        # pyrefly: ignore  # bad-argument-type
         model,
         optimizer,
         train_dataloader,
@@ -165,6 +167,7 @@ def fsdp_main(rank, world_size, args):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12355"
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    # pyrefly: ignore  # bad-keyword-argument
     entrypoint(*args, rank=rank, world_size=world_size)
     dist.destroy_process_group()
 
@@ -254,6 +257,7 @@ def train(
 
             if not is_accumulating and step_count % training_config.save_interval == 0:
                 checkpoint_path = training_config.out_dir / f"iter-{iter_num:06d}-ckpt.pth"
+                # pyrefly: ignore  # bad-argument-type
                 torch.save(checkpoint_path, {"model": model})
 
             if (iter_num + 1) % training_config.log_interval == 0:
@@ -268,6 +272,7 @@ def train(
                     dist.all_reduce(fsdp_loss, op=dist.ReduceOp.SUM)
                     loss_val = fsdp_loss[0] / fsdp_loss[1]
 
+                # pyrefly: ignore  # bad-argument-type
                 write_loss_to_file(train_loss_file, step_count, loss_val)
 
                 if rank == 0:
@@ -281,6 +286,7 @@ def train(
             if training_config.profile:
                 if iter_num < 103:
                     # dump profile traces in iters 100-102
+                    # pyrefly: ignore  # missing-attribute
                     p.step()
                 if iter_num == 1:
                     # check memory during both init and train
@@ -342,6 +348,7 @@ def load_datasets(
     world_size: int,
 ):
     train_data = Dataset(
+        # pyrefly: ignore  # bad-argument-type
         str(training_config.data_dir / "train.bin"),
         hyper_params=hyper_params,
         training_config=training_config,
@@ -349,6 +356,7 @@ def load_datasets(
         world_size=world_size,
     )
     val_data = Dataset(
+        # pyrefly: ignore  # bad-argument-type
         str(training_config.data_dir / "val.bin"),
         hyper_params=hyper_params,
         training_config=training_config,
@@ -400,6 +408,7 @@ def validate(
     iterator = range(training_config.eval_iters)
     if rank == 0:
         iterator = tqdm(iterator)
+    # pyrefly: ignore  # not-iterable
     for k in iterator:
         input_ids, targets = next(val_iter)
         input_ids = input_ids.pin_memory().to(training_config.device)
@@ -414,7 +423,9 @@ def validate(
 
     val_loss = losses.mean()
     model.train()
+    # pyrefly: ignore  # unbound-name
     write_loss_to_file(loss_file, training_iter, loss.item())
+    # pyrefly: ignore  # bad-return
     return val_loss.item()
 
 

@@ -21,6 +21,7 @@ bnb_available = False
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 
 try:
+    # pyrefly: ignore  # import-error
     import bitsandbytes as bnb  # noqa: F401
 
     bnb_available = True
@@ -69,6 +70,7 @@ def linear_experiment(config: ExperimentConfig) -> ExperimentResult:
         compiled_qlora_linear(sample_input, qlora_weight)
         qlora.linear_nf4_trtion(sample_input, qlora_weight)
         if bnb_available:
+            # pyrefly: ignore  # unbound-name
             bnb_linear(sample_input)
 
     linear_time = nugs.utils.benchmark_torch_function_in_microseconds(
@@ -86,7 +88,9 @@ def linear_experiment(config: ExperimentConfig) -> ExperimentResult:
 
     if bnb_available:
         bnb_linear_time = nugs.utils.benchmark_torch_function_in_microseconds(
-            bnb_linear, sample_input
+            # pyrefly: ignore  # unbound-name
+            bnb_linear,
+            sample_input,
         )
     else:
         bnb_linear_time = -1.0
@@ -122,6 +126,7 @@ def mlp_experiment(config: ExperimentConfig) -> ExperimentResult:
         compiled_qlora_mlp(sample_input)
         nf4_mlp_triton(sample_input)
         if bnb_available:
+            # pyrefly: ignore  # unbound-name
             bnb_mlp(sample_input)
 
     mlp_time = nugs.utils.benchmark_torch_function_in_microseconds(mlp, sample_input)
@@ -133,6 +138,7 @@ def mlp_experiment(config: ExperimentConfig) -> ExperimentResult:
         nf4_mlp_triton, sample_input
     )
     if bnb_available:
+        # pyrefly: ignore  # unbound-name
         bnb_mlp_time = nugs.utils.benchmark_torch_function_in_microseconds(bnb_mlp, sample_input)
     else:
         bnb_mlp_time = -1.0
@@ -179,6 +185,7 @@ def main(output_path: Path | None, profile_path: Path | None, dynamic: bool):
     """
 
     results = []
+    # pyrefly: ignore  # not-iterable
     for experiment_config in tqdm(gen_configs()):
         # Since we are changing between dynamic and not
         import torch._dynamo  # noqa: F402
@@ -200,7 +207,9 @@ def main(output_path: Path | None, profile_path: Path | None, dynamic: bool):
         print(tabulate(rows, headers=headers))
 
     if profile_path is not None:
+        # pyrefly: ignore  # unbound-name
         profile_experiment = ExperimentConfig(4096, 8, 128, torch.device("cuda:0"), "mlp", dynamic)
+        # pyrefly: ignore  # missing-attribute
         with nugs.utils.print_cuda_memory_usage():
             weights = qlora.get_mlp_weights(
                 profile_experiment.embed_dim, profile_experiment.device
@@ -213,6 +222,7 @@ def main(output_path: Path | None, profile_path: Path | None, dynamic: bool):
         )
 
         qlora_mlp = qlora.NF4MLP(*weights)
+        # pyrefly: ignore  # unbound-name
         compiled_qlora_mlp = torch.compile(qlora_mlp, fullgraph=True, dynamic=dynamic)
         logging.info("Running torch.compile with dynamic = %s", dynamic)
         profile_config = nugs.utils.ProfileConfig(

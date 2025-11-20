@@ -29,3 +29,8 @@ repos:
   hooks:
     - id: pyupgrade
       args: [--py310-plus]
+
+- repo: https://github.com/facebook/pyrefly
+  rev: 0.41.3
+  hooks:
+    - id: pyrefly-typecheck
