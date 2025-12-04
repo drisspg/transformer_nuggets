@@ -30,12 +30,10 @@ repos:
     - id: pyupgrade
       args: [--py310-plus]
 
-- repo: local
+- repo: https://github.com/facebook/pyrefly-pre-commit
+  rev: 0.44.1
   hooks:
-    - id: pyrefly-typecheck
-      name: pyrefly check
-      entry: pyrefly check
+    - id: pyrefly-check
+      name: Pyrefly (type checking)
       language: system
-      types: [python]
       pass_filenames: false
-      # NOTE: version pinned in .github/workflows/pre-commit.yml
