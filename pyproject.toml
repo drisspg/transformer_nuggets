@@ -24,7 +24,8 @@ dependencies = [
     "tabulate",
     "rich",
     "matplotlib",
-    "pandas"
+    "pandas",
+    "seaborn"
 ]
 
 [project.optional-dependencies]

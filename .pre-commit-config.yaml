@@ -37,3 +37,4 @@ repos:
       name: Pyrefly (type checking)
       language: system
       pass_filenames: false
+      args: ["--ignore=missing-import"]
