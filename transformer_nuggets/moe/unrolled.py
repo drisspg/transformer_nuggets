@@ -69,7 +69,8 @@ class LoopMoE(nn.Module):
         """
         orig_shape = hidden_states.shape
         hidden_size = hidden_states.shape[-1]
-        num_tokens = hidden_states.shape[:-1].numel()
+        # pyrefly: ignore [missing-attribute]
+        num_tokens = (hidden_states.shape[:-1]).numel()
         dtype = hidden_states.dtype
 
         # Splat batch of tokens

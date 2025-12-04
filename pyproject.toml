@@ -36,7 +36,8 @@ dev = [
     "pytest",
     "ruff",
     "jsonargparse",
-    "docstring-parser"
+    "docstring-parser",
+    "pyrefly==0.44.1"
 ]
 
 qlora = ['bitsandbytes']
