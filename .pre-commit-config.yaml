@@ -38,3 +38,4 @@ repos:
       language: system
       types: [python]
       pass_filenames: false
+      # NOTE: version pinned in .github/workflows/pre-commit.yml

@@ -18,5 +18,7 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python-version }}
+    - name: Install pyrefly
+      run: pip install pyrefly==0.41.3
     - name: Run pre-commit
       uses: pre-commit/action@v3.0.1
