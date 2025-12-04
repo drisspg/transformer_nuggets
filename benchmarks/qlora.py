@@ -115,6 +115,7 @@ def mlp_experiment(config: ExperimentConfig) -> ExperimentResult:
     mlp = qlora.MLP(*weights)
     nf4_mlp = qlora.NF4MLP(*weights)
     nf4_mlp_triton = qlora.NF4MLPTriton(*weights)
+    # pyrefly: ignore [no-matching-overload]
     compiled_qlora_mlp = torch.compile(nf4_mlp, fullgraph=True, dynamic=config.dynamic)
     if bnb_available:
         bnb_mlp = qlora.BnbQloraMLP(*weights, config.device)
@@ -129,13 +130,17 @@ def mlp_experiment(config: ExperimentConfig) -> ExperimentResult:
             # pyrefly: ignore  # unbound-name
             bnb_mlp(sample_input)
 
+    # pyrefly: ignore [bad-argument-type]
     mlp_time = nugs.utils.benchmark_torch_function_in_microseconds(mlp, sample_input)
+    # pyrefly: ignore [bad-argument-type]
     qlora_mlp_time = nugs.utils.benchmark_torch_function_in_microseconds(nf4_mlp, sample_input)
     compiled_qlora_mlp_time = nugs.utils.benchmark_torch_function_in_microseconds(
         compiled_qlora_mlp, sample_input
     )
     qlora_mlp_triton_time = nugs.utils.benchmark_torch_function_in_microseconds(
-        nf4_mlp_triton, sample_input
+        # pyrefly: ignore [bad-argument-type]
+        nf4_mlp_triton,
+        sample_input,
     )
     if bnb_available:
         # pyrefly: ignore  # unbound-name

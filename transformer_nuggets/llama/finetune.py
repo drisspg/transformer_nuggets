@@ -115,6 +115,7 @@ def main(
             )
 
     if training_config.compile:
+        # pyrefly: ignore [no-matching-overload]
         model = torch.compile(model)
 
     if rank == 0:

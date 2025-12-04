@@ -68,6 +68,7 @@ def extract_attention_data(
 
     # pyrefly: ignore  # not-iterable, bad-argument-type
     for _, item in tqdm(enumerate(dataset), desc="Scanning prompts", total=len(dataset)):
+        # pyrefly: ignore [bad-argument-type]
         prompt = _extract_text(item)
         if prompt is None or len(prompt) <= min_prompt_length:
             continue

@@ -42,6 +42,7 @@ def main(output_folder: Path, use_qlora: bool = False, compile: bool = False):
     x = get_sample_inputs(1, 8, 8192, "cuda", requires_grad=False)
 
     if compile:
+        # pyrefly: ignore [no-matching-overload]
         model = torch.compile(model)
         with torch.no_grad():
             model(x)  # warmup

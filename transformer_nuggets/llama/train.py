@@ -198,6 +198,7 @@ def main(
         foreach=hyper_params.foreach_optimizer,
     )
     if training_config.compile:
+        # pyrefly: ignore [no-matching-overload]
         model = torch.compile(model)
 
     train(
@@ -264,6 +265,7 @@ def train(
 
             # Sync the amax and scale history for the fp8 linear layers at the start of every iteration
             if linear_requires_sync(fp8_linear_type):
+                # pyrefly: ignore [bad-argument-type]
                 sync_func(model)
 
             input_ids, targets = next(train_iter)

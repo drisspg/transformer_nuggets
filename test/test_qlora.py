@@ -202,6 +202,7 @@ def test_bitsandbytes_mlp_parity(embed_dim, compile, dtype):
 
     nugs_mlp = qlora_mlp
     if compile:
+        # pyrefly: ignore [no-matching-overload]
         nugs_mlp = torch.compile(qlora_mlp, fullgraph=True)
 
     original_result = mlp(sample_input)
@@ -240,6 +241,7 @@ def test_qlora_linear(
     nugs_qlora_linear = qlora.QloraLinear(embed_dim, n_hidden, weight, r, lora_dropout=dropout)
     func = nugs_qlora_linear
     if compile:
+        # pyrefly: ignore [no-matching-overload]
         func = torch.compile(nugs_qlora_linear, fullgraph=True)
     # pyrefly: ignore  # bad-argument-type
     sample_input = qlora.get_sample_inputs(8, 128, embed_dim, device, dtype=dtype)

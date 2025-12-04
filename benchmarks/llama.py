@@ -439,6 +439,7 @@ def main():
     input_batch = torch.randint(config.vocab_size, (bsz, max_seq_len), device=device)
 
     if compile:
+        # pyrefly: ignore [no-matching-overload]
         model = torch.compile(model)
 
     # Warmup
@@ -451,8 +452,10 @@ def main():
         warmup_iters=3,
         sync=True,
     )
+    # pyrefly: ignore [bad-argument-type]
     benchmark_utils.profile_function(profile_config, model, input_batch)
 
+    # pyrefly: ignore [bad-argument-type]
     benchmark_time = benchmark_utils.benchmark_torch_function_in_microseconds(model, input_batch)
     print(
         f"Benchmark time for llama_forward_{config.mlp_type.value}_compile_{compile}: {benchmark_time} us"
