@@ -62,6 +62,7 @@ def main(tokenizer_path: str, output_dir: str):
         arr_len = np.sum(dset["len"], dtype=np.uint64)
         filename = data_config.output_dir / f"{split}.bin"
         dtype = np.uint16
+        # pyrefly: ignore  # no-matching-overload
         arr = np.memmap(filename, dtype=dtype, mode="w+", shape=(arr_len,))
         total_batches = 1024
 

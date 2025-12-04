@@ -32,7 +32,7 @@ def _pointer_to_int(pointer) -> int:
     raise TypeError(f"Unsupported pointer type {type(pointer)!r}")
 
 
-class DirectCopy(CuteOp):
+class DirectCopy(CuteOp[[torch.Tensor], torch.Tensor]):
     """Playing Around w/ TMA in cuteDsl"""
 
     def __init__(self, debug: bool = False):
@@ -120,7 +120,33 @@ class DirectCopy(CuteOp):
 
     # pyrefly: ignore  # bad-return
     def get_key(self, *args, **kwargs) -> str:
-        pass
+        key_parts = [self.__class__.__name__, f"debug={self.DEBUG}"]
+        for arg in args:
+            if isinstance(arg, cute.Tensor):
+                key_parts.append(self._generate_tensor_key(arg))
+        if "use_tma" in kwargs:
+            key_parts.append(f"use_tma={kwargs['use_tma']}")
+        return "_".join(key_parts)
+
+    def interface(self, gA: torch.Tensor, *, use_tma: bool = False) -> torch.Tensor:
+        destination = torch.empty_like(gA)
+
+        gA_ptr = gA.data_ptr()
+        if gA_ptr % 16 != 0:
+            raise ValueError(f"Input tensor must be 16-byte aligned, got alignment {gA_ptr % 16}")
+        destination_ptr = destination.data_ptr()
+        if destination_ptr % 16 != 0:
+            raise ValueError(
+                f"Output tensor must be 16-byte aligned, got alignment {destination_ptr % 16}"
+            )
+
+        gA_cute = from_dlpack(gA, assumed_align=16)
+        gB_cute = from_dlpack(destination, assumed_align=16)
+
+        compile_and_cache(
+            self, self.get_key(gA_cute, gB_cute, use_tma=use_tma), gA_cute, gB_cute, use_tma
+        )(gA_cute, gB_cute)
+        return destination
 
     @cute.jit
     # pyrefly: ignore  # bad-function-definition
@@ -207,28 +233,8 @@ class DirectCopy(CuteOp):
         return copy_atom, copy_tensor
 
 
-def direct_copy(gA: torch.Tensor):
-    destination = torch.empty_like(gA)
-
-    gA_ptr = gA.data_ptr()
-    if gA_ptr % 16 != 0:
-        raise ValueError(f"Input tensor must be 16-byte aligned, got alignment {gA_ptr % 16}")
-    destination_ptr = destination.data_ptr()
-    if destination_ptr % 16 != 0:
-        raise ValueError(
-            f"Output tensor must be 16-byte aligned, got alignment {destination_ptr % 16}"
-        )
-
-    # pyrefly: ignore  # bad-assignment
-    gA = from_dlpack(gA, assumed_align=16)
-    gB = from_dlpack(destination, assumed_align=16)
-
-    op = DirectCopy(False)
-
-    cache_key = op.get_key(gA, gB)
-    compiled_kernel = compile_and_cache(op, cache_key, gA, gB)
-    compiled_kernel(gA, gB)
-    return destination
+def direct_copy(gA: torch.Tensor, *, use_tma: bool = False):
+    return DirectCopy(False).interface(gA, use_tma=use_tma)
 
 
 if __name__ == "__main__":

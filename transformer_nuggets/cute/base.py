@@ -1,15 +1,21 @@
 from abc import ABC, abstractmethod
+from typing import Generic, ParamSpec, TypeVar
 
 import cutlass.cute as cute
 
 
-class CuteOp(ABC):
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+class CuteOp(Generic[_P, _R], ABC):
     """Abstract base class for CUTE operations.
 
     This class provides a consistent interface for implementing CUTE kernels with:
     - Cache key generation via get_key()
     - Kernel definition via kernel() method decorated with @cute.kernel
     - JIT function as __call__
+    - Public Python-facing API via interface()
     """
 
     def __init__(self):
@@ -47,6 +53,11 @@ class CuteOp(ABC):
             return f"tensor_{inner_part}_dtype={tensor.element_type}"
         else:
             return f"tensor_shape={tensor.shape}_dtype={tensor.element_type}"
+
+    @abstractmethod
+    def interface(self, *args: _P.args, **kwargs: _P.kwargs) -> _R:
+        """Public entrypoint for running the operation from Python code."""
+        pass
 
     @abstractmethod
     def __call__(self, *args, **kwargs):

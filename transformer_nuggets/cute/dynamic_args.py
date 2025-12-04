@@ -21,7 +21,7 @@ import logging
 init_logging(logging.INFO)
 
 
-class DynamicElementwiseOp(CuteOp):
+class DynamicElementwiseOp(CuteOp[[torch.Tensor, torch.Tensor], torch.Tensor]):
     """Elementwise operation with dynamic parameter selection based on tensor size."""
 
     def __init__(self, op: cutlass.Constexpr):
@@ -100,6 +100,42 @@ class DynamicElementwiseOp(CuteOp):
         else:
             return 4, 32, 8, 8
 
+    def interface(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        M, N = a.shape
+        c = torch.empty(M, N, device="cuda", dtype=torch.float16)
+
+        thr_m, thr_n, val_m, val_n = self._select_parameters(M, N)
+
+        align_a = get_tensor_alignment(a, dim=-1)
+        align_b = get_tensor_alignment(b, dim=-1)
+        align_c = get_tensor_alignment(c, dim=-1)
+
+        mA = from_dlpack(a, assumed_align=align_a).mark_layout_dynamic()
+        mB = from_dlpack(b, assumed_align=align_b).mark_layout_dynamic()
+        mC = from_dlpack(c, assumed_align=align_c).mark_layout_dynamic()
+
+        dim_orders = tuple(reversed(a.dim_order()))
+        compile_and_cache(
+            self,
+            self.get_key(
+                mA,
+                mB,
+                mC,
+                params=(thr_m, thr_n, val_m, val_n, dim_orders),
+                alignments=(align_a, align_b, align_c),
+            ),
+            self.op,
+            mA,
+            mB,
+            mC,
+            thr_m,
+            thr_n,
+            val_m,
+            val_n,
+            dim_orders,
+        )(mA, mB, mC)
+        return c
+
     @cute.jit
     def __call__(
         self,
@@ -139,42 +175,7 @@ def elementwise_op_dynamic(
     This function automatically selects kernel parameters based on tensor size
     for optimal performance.
     """
-    M, N = a.shape
-    c = torch.empty(M, N, device="cuda", dtype=torch.float16)
-
-    # Create the operation instance
-    dynamic_op = DynamicElementwiseOp(op)
-
-    # Choose parameters based on size
-    thr_m, thr_n, val_m, val_n = dynamic_op._select_parameters(M, N)
-
-    # Calculate alignment for each tensor
-    align_a = get_tensor_alignment(a, dim=-1)
-    align_b = get_tensor_alignment(b, dim=-1)
-    align_c = get_tensor_alignment(c, dim=-1)
-
-    # Create tensors with computed alignment
-    mA = from_dlpack(a, assumed_align=align_a).mark_layout_dynamic()
-    mB = from_dlpack(b, assumed_align=align_b).mark_layout_dynamic()
-    mC = from_dlpack(c, assumed_align=align_c).mark_layout_dynamic()
-
-    dim_orders = tuple(reversed(a.dim_order()))
-    # Generate cache key with all parameters
-    cache_key = dynamic_op.get_key(
-        mA,
-        mB,
-        mC,
-        params=(thr_m, thr_n, val_m, val_n, dim_orders),
-        alignments=(align_a, align_b, align_c),
-    )
-
-    # Compile with explicit cache key
-    compiled_kernel = compile_and_cache(
-        dynamic_op, cache_key, op, mA, mB, mC, thr_m, thr_n, val_m, val_n, dim_orders
-    )
-
-    compiled_kernel(mA, mB, mC)
-    return c
+    return DynamicElementwiseOp(op).interface(a, b)
 
 
 def cute_add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:

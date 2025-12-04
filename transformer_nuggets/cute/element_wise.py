@@ -11,7 +11,7 @@ from transformer_nuggets.cute.cache import compile_and_cache, get_cache_stats
 from transformer_nuggets.cute.base import CuteOp
 
 
-class ElementwiseOp(CuteOp):
+class ElementwiseOp(CuteOp[[torch.Tensor, torch.Tensor, torch.Tensor], None]):
     """Elementwise operation using CUTE kernels."""
 
     def __init__(self, op: cutlass.Constexpr):
@@ -64,6 +64,14 @@ class ElementwiseOp(CuteOp):
                 key_parts.append(self._generate_tensor_key(arg))
 
         return "_".join(key_parts)
+
+    def interface(
+        self, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, *, assumed_align: int = 16
+    ) -> None:
+        mA = from_dlpack(a, assumed_align=assumed_align)
+        mB = from_dlpack(b, assumed_align=assumed_align)
+        mC = from_dlpack(c, assumed_align=assumed_align)
+        return compile_and_cache(self, self.get_key(mA, mB, mC), self.op, mA, mB, mC)(mA, mB, mC)
 
     @cute.jit
     def __call__(self, op: cutlass.Constexpr, mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
@@ -142,21 +150,7 @@ def elementwise_op(
         assumed_align: Memory alignment assumption for dlpack conversion
     """
     # Convert PyTorch tensors to CUTE tensors
-    mA = from_dlpack(a, assumed_align=assumed_align)
-    mB = from_dlpack(b, assumed_align=assumed_align)
-    mC = from_dlpack(c, assumed_align=assumed_align)
-
-    # Create the operation instance
-    elem_op = ElementwiseOp(op)
-
-    # Option 1: Use manual cache key
-    cache_key = elem_op.get_key(mA, mB, mC)
-    compiled_kernel = compile_and_cache(elem_op, cache_key, op, mA, mB, mC)
-
-    # Option 2: Use auto cache key (commented out)
-    # compiled_kernel = auto_compile_and_cache(elem_op, op, mA, mB, mC)
-
-    return compiled_kernel(mA, mB, mC)
+    return ElementwiseOp(op).interface(a, b, c, assumed_align=assumed_align)
 
 
 def benchmark(callable, tensor_a):
