@@ -1,3 +1,4 @@
+# pyrefly: ignore-errors
 import torch
 
 
@@ -21,26 +22,50 @@ class ToBlocked(CuteOp):
     def kernel(
         self,
         gI: cute.Tensor,
-        gO: cute.Tensor,
-        tv_layout: cute.Layout,
+        gO_blocked: cute.Tensor,
+        tv_layout_swizzle: cute.Layout,
+        tv_layout_linear: cute.Layout,
+        linear_layout: cute.Layout,
+        smem_swizzle: cute.Swizzle,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
 
-        blk_coord = ((None, None), bidx)
-        gI_blk = gI[blk_coord]
-        gO_blk = gO[blk_coord]
+        smem = cutlass.utils.SmemAllocator()
 
-        # pyrefly: ignore  # no-matching-overload
-        tXgI_tv = cute.composition(gI_blk, tv_layout)  # (Threads, Values) → gmem addr
-        # pyrefly: ignore  # no-matching-overload
-        tXgO_tv = cute.composition(gO_blk, tv_layout)  # (Threads, Values) → gmem addr
+        blk_coord = ((None, None), bidx)
+        gI_blk: cute.Tensor = gI[blk_coord]
+        gO_blk: cute.Tensor = gO_blocked[blk_coord]
+
+        tXgI_tv = cute.composition(gI_blk, tv_layout_swizzle)
+        smem_layout_swizzled = cute.make_composed_layout(smem_swizzle, 0, gO_blk.layout)
+        sBlk = smem.allocate_tensor(
+            element_type=gO_blk.element_type,
+            layout=smem_layout_swizzled,
+            byte_alignment=128,
+        )
+        tXs_tv = cute.composition(sBlk, tv_layout_swizzle)
 
         tXgI = tXgI_tv[(tidx, None)]
-        tXgO = tXgO_tv[(tidx, None)]
+        tXsO = tXs_tv[(tidx, None)]
 
         tXrI = tXgI.load()
-        tXgO.store(tXrI)
+        tXsO.store(tXrI)
+
+        cute.arch.barrier()
+
+        linear_layout_swizzled = cute.make_composed_layout(smem_swizzle, 0, linear_layout)
+        s_linear = cute.make_tensor(sBlk.iterator, linear_layout_swizzled)
+        g_linear = cute.make_tensor(gO_blk.iterator, linear_layout)
+
+        s_tv = cute.composition(s_linear, tv_layout_linear)
+        g_tv = cute.composition(g_linear, tv_layout_linear)
+
+        s_thr = s_tv[(tidx, None)]
+        g_thr = g_tv[(tidx, None)]
+
+        tXO_ssa = s_thr.load()
+        g_thr.store(tXO_ssa)
 
     @cutlass.dsl_user_op
     def get_block_swizzled_atom(self, *, loc=None, ip=None):
@@ -56,17 +81,30 @@ class ToBlocked(CuteOp):
         # Tile the atom layout to the full output shape
         block_scale_layout = cute.tile_to_shape(block_scale_atom, cute.shape(output), (2, 1))
 
-        # Each thread block handles K_BLOCKS_PER_TB worth of K (128 x 16 elements)
-        # 128 threads, each handles 16 elements (4 elements per K-block × 4 K-blocks)
+        # === Blocked layout ===
         thread_layout = cute.make_ordered_layout((128, 1), order=(1, 0))
         val_layout = cute.make_ordered_layout((1, 4 * self.K_BLOCKS_PER_TB), order=(1, 0))
-        tiler_mn, tv_layout = cute.make_layout_tv(thread_layout, val_layout)
+        tiler_mn, tv_layout_swizzle = cute.make_layout_tv(thread_layout, val_layout)
+
+        # === TV layout for linear store (smem → output) ===
+        num_threads = cute.size(thread_layout)
+        num_values = cute.size(val_layout)
+        tile_size = cute.size(tiler_mn)
+
+        thr_layout_linear = cute.make_layout(num_threads)
+        val_layout_linear = cute.make_layout(num_values)
+        _, tv_layout_linear = cute.make_layout_tv(thr_layout_linear, val_layout_linear)
+        linear_layout = cute.make_layout(tile_size)
+
+        smem_swizzle = cute.make_swizzle(5, 2, 5)
 
         gI = cute.zipped_divide(input, tiler_mn)
         output_blocked = cute.make_tensor(output.iterator, block_scale_layout)
-        gO = cute.zipped_divide(output_blocked, tiler_mn)
+        gO_blocked = cute.zipped_divide(output_blocked, tiler_mn)
 
-        self.kernel(gI, gO, tv_layout).launch(
+        self.kernel(
+            gI, gO_blocked, tv_layout_swizzle, tv_layout_linear, linear_layout, smem_swizzle
+        ).launch(
             grid=[cute.size(gI, mode=[1]), 1, 1],
             block=[cute.size(thread_layout), 1, 1],
         )
@@ -103,6 +141,8 @@ def to_blocked_mx(scales: torch.Tensor):
 if __name__ == "__main__":
     from jsonargparse import CLI
 
+    from torchao.prototype.mx_formats.utils import to_blocked as to_blocked_ao
+
     def main(trace: bool = False):
         M_chunks = 8192
         K_chunks = 128
@@ -110,23 +150,26 @@ if __name__ == "__main__":
         def bytes_tb_per_second(scales: torch.Tensor, time_us: float):
             return 2 * (scales.numel() * scales.element_size()) / time_us * 1e-6
 
-        scales = torch.arange(
-            (M_chunks * 128 * K_chunks * 4), device="cuda", dtype=torch.uint8
-        ).view(M_chunks * 128, K_chunks * 4)
+        scales = (
+            torch.randint(0, 256, size=(M_chunks * 128 * K_chunks * 4,), device="cuda")
+            .to(torch.uint8)
+            .view(M_chunks * 128, K_chunks * 4)
+        )
         out_cute = to_blocked_mx(scales)
+        out_ao = to_blocked_ao(scales, use_triton_kernel=True).view(-1, 32, 16)
+        torch.testing.assert_close(out_cute, out_ao, atol=0, rtol=0)
         if not trace:
             from transformer_nuggets.utils.benchmark import benchmark_cuda_function_in_microseconds
 
             time = benchmark_cuda_function_in_microseconds(to_blocked_mx, scales)
-            print(f"Time taken: {time} microseconds, IO: {bytes_tb_per_second(scales, time)} TB/s")
-            # pyrefly: ignore  # import-error
-            from torchao.prototype.mx_formats.utils import to_blocked as to_blocked_ao
-
+            print(
+                f"Cute time taken: {time} microseconds, IO: {bytes_tb_per_second(scales, time)} TB/s"
+            )
             time_ao = benchmark_cuda_function_in_microseconds(
                 to_blocked_ao, scales, use_triton_kernel=True
             )
             print(
-                f"Time taken: {time_ao} microseconds, IO: {bytes_tb_per_second(scales, time_ao)} TB/s"
+                f"AO triton time taken: {time_ao} microseconds, IO: {bytes_tb_per_second(scales, time_ao)} TB/s"
             )
         print(out_cute.shape)
 
