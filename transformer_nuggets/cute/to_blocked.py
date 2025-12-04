@@ -11,6 +11,9 @@ from transformer_nuggets.cute.base import CuteOp
 class ToBlocked(CuteOp):
     """Convert a mx/nv tensor to blocked format"""
 
+    # Number of K-blocks (each 128x4) to process per thread block
+    K_BLOCKS_PER_TB = 32
+
     def __init__(self):
         super().__init__()
 
@@ -52,13 +55,17 @@ class ToBlocked(CuteOp):
 
         # Tile the atom layout to the full output shape
         block_scale_layout = cute.tile_to_shape(block_scale_atom, cute.shape(output), (2, 1))
+
+        # Each thread block handles K_BLOCKS_PER_TB worth of K (128 x 16 elements)
+        # 128 threads, each handles 16 elements (4 elements per K-block × 4 K-blocks)
         thread_layout = cute.make_ordered_layout((128, 1), order=(1, 0))
-        val_layout = cute.make_ordered_layout((1, 4), order=(1, 0))
+        val_layout = cute.make_ordered_layout((1, 4 * self.K_BLOCKS_PER_TB), order=(1, 0))
         tiler_mn, tv_layout = cute.make_layout_tv(thread_layout, val_layout)
+
         gI = cute.zipped_divide(input, tiler_mn)
-        # Create output tensor with the blocked layout
         output_blocked = cute.make_tensor(output.iterator, block_scale_layout)
         gO = cute.zipped_divide(output_blocked, tiler_mn)
+
         self.kernel(gI, gO, tv_layout).launch(
             grid=[cute.size(gI, mode=[1]), 1, 1],
             block=[cute.size(thread_layout), 1, 1],
@@ -67,14 +74,20 @@ class ToBlocked(CuteOp):
     def interface(self, scales: torch.Tensor):
         output = torch.empty_like(scales)
 
-        assumed_align = 512  # Scales are 128*4 byte algined
+        assumed_align = 512  # Scales are 128*4 byte aligned
+        # K dimension must be divisible by 4 * K_BLOCKS_PER_TB
+        k_divisibility = 4 * self.K_BLOCKS_PER_TB
         input_cute = (
-            from_dlpack(scales, assumed_align=assumed_align).mark_layout_dynamic(leading_dim=1)
-            # .mark_compact_shape_dynamic(mode=0, divisibility=128)
+            from_dlpack(scales, assumed_align=assumed_align)
+            .mark_layout_dynamic(leading_dim=1)
+            .mark_compact_shape_dynamic(mode=0, divisibility=128)
+            .mark_compact_shape_dynamic(mode=1, divisibility=k_divisibility)
         )
         output_cute = (
-            from_dlpack(output, assumed_align=assumed_align).mark_layout_dynamic(leading_dim=1)
-            # .mark_compact_shape_dynamic(mode=0, divisibility=k)
+            from_dlpack(output, assumed_align=assumed_align)
+            .mark_layout_dynamic(leading_dim=1)
+            .mark_compact_shape_dynamic(mode=0, divisibility=128)
+            .mark_compact_shape_dynamic(mode=1, divisibility=k_divisibility)
         )
         self(input_cute, output_cute)
         return output.view(-1, 32, 16)
@@ -88,11 +101,33 @@ def to_blocked_mx(scales: torch.Tensor):
 
 
 if __name__ == "__main__":
-    M_chunks = 8192
-    K_chunks = 128
+    from jsonargparse import CLI
 
-    scales = torch.arange((M_chunks * 128 * K_chunks * 4), device="cuda", dtype=torch.uint8).view(
-        M_chunks * 128, K_chunks * 4
-    )
-    out_cute = to_blocked_mx(scales)
-    print(out_cute.shape)
+    def main(trace: bool = False):
+        M_chunks = 8192
+        K_chunks = 128
+
+        def bytes_tb_per_second(scales: torch.Tensor, time_us: float):
+            return 2 * (scales.numel() * scales.element_size()) / time_us * 1e-6
+
+        scales = torch.arange(
+            (M_chunks * 128 * K_chunks * 4), device="cuda", dtype=torch.uint8
+        ).view(M_chunks * 128, K_chunks * 4)
+        out_cute = to_blocked_mx(scales)
+        if not trace:
+            from transformer_nuggets.utils.benchmark import benchmark_cuda_function_in_microseconds
+
+            time = benchmark_cuda_function_in_microseconds(to_blocked_mx, scales)
+            print(f"Time taken: {time} microseconds, IO: {bytes_tb_per_second(scales, time)} TB/s")
+            # pyrefly: ignore  # import-error
+            from torchao.prototype.mx_formats.utils import to_blocked as to_blocked_ao
+
+            time_ao = benchmark_cuda_function_in_microseconds(
+                to_blocked_ao, scales, use_triton_kernel=True
+            )
+            print(
+                f"Time taken: {time_ao} microseconds, IO: {bytes_tb_per_second(scales, time_ao)} TB/s"
+            )
+        print(out_cute.shape)
+
+    CLI(main)
