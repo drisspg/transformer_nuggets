@@ -236,8 +236,8 @@ def compute_rmse(a: torch.Tensor, b: torch.Tensor) -> float:
     Calculate root mean squared error between two tensors.
 
     Args:
-        a: First tensor
-        b: Second tensor
+        a: First tensor or array
+        b: Second tensor or array
 
     Returns:
         RMSE as a float
@@ -280,14 +280,14 @@ def compute_error_stats(a: torch.Tensor, b: torch.Tensor) -> dict[str, float]:
 
 
 def plot_abs_diff_distribution(
-    a: torch.Tensor,
-    b: torch.Tensor,
+    a: torch.Tensor | np.ndarray,
+    b: torch.Tensor | np.ndarray,
     save_path: str | Path,
     name: str = "",
     bins: int | str = "auto",
 ) -> None:
     """
-    Plot histogram and CDF of absolute differences between two tensors.
+    Plot histogram and CDF of absolute differences between two tensors or arrays.
 
     Args:
         a: First tensor
@@ -299,8 +299,21 @@ def plot_abs_diff_distribution(
     import matplotlib.pyplot as plt
     import seaborn as sns
 
+    target_device = a.device if isinstance(a, torch.Tensor) else None
+    if target_device is None and isinstance(b, torch.Tensor):
+        target_device = b.device
+
+    a_tensor = a if isinstance(a, torch.Tensor) else torch.as_tensor(a, device=target_device)
+    b_tensor = b if isinstance(b, torch.Tensor) else torch.as_tensor(b, device=target_device)
+    if a_tensor.device != b_tensor.device:
+        b_tensor = b_tensor.to(a_tensor.device)
+
     abs_diffs = (
-        torch.abs(a.to(torch.float32) - b.to(torch.float32)).flatten().detach().cpu().numpy()
+        torch.abs(a_tensor.to(torch.float32) - b_tensor.to(torch.float32))
+        .flatten()
+        .detach()
+        .cpu()
+        .numpy()
     )
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
 
