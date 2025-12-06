@@ -1,5 +1,10 @@
+from pathlib import Path
+
 from transformer_nuggets import quant as quant, utils as utils, numerics as numerics
 import logging
+
+# Data directory at repo root (for traces, artifacts, etc.)
+DATA_DIR = Path(__file__).parent.parent / "data"
 
 
 def init_logging(level=logging.INFO):
