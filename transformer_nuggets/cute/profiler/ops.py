@@ -18,14 +18,14 @@ Usage in kernels (using guarded helpers - recommended):
     unit_id = bidx
     event_idx = Int32(0)
 
-    warp_start(prof_buf, unit_id, event_idx, max_events_per_unit, Int32(0))
-    warp_stop(prof_buf, unit_id, event_idx, TAG_X, tid, max_events_per_unit, Int32(0))
+    start_ns = warp_start(prof_buf, unit_id, event_idx, max_events_per_unit, Int32(0))
+    warp_stop(prof_buf, unit_id, event_idx, start_ns, TAG_X, tid, max_events_per_unit, Int32(0))
     warp_flush(prof_buf, unit_id, event_idx, max_events_per_unit, Int32(0))
 
 Low-level usage (manual guards):
     if warp_idx == 0 and lane_idx == 0:
-        static_start(prof_buf, unit_id, event_idx, max_events_per_unit)
-        static_stop(prof_buf, unit_id, event_idx, TAG_X, tid, max_events_per_unit)
+        start_ns = static_start(prof_buf, unit_id, event_idx, max_events_per_unit)
+        static_stop(prof_buf, unit_id, event_idx, start_ns, TAG_X, tid, max_events_per_unit)
         static_flush(prof_buf, unit_id, event_idx, max_events_per_unit)
 """
 
@@ -91,26 +91,6 @@ def _store_i64(ptr: Int64, val: Int64, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
-def _load_i64(ptr: Int64, *, loc=None, ip=None) -> Int64:
-    """Load an int64 value from a global memory address.
-
-    Uses inline PTX ld.global.u64 instruction.
-    """
-    result = llvm.inline_asm(
-        T.i64(),
-        [ptr.ir_value(loc=loc, ip=ip)],
-        "ld.global.u64 $0, [$1];",
-        "=l,l",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return Int64(result)
-
-
-@dsl_user_op
 def _atomic_add_i64_ptr(ptr: Int64, val: Int64, *, loc=None, ip=None) -> Int64:
     """Atomically add val to the int64 at ptr and return the old value.
 
@@ -136,28 +116,25 @@ def static_start(
     unit_id: Int32,
     event_idx: Int32,
     max_events_per_unit: Int32,
-) -> None:
-    """Start profiling an event within a unit's static buffer slice.
+) -> Int64:
+    """Read start timestamp for an event within a unit's static buffer slice.
 
-    Stores the start timestamp at the appropriate offset within the unit's slice.
-    No atomics are used - each unit has its own pre-allocated buffer region.
+    No atomics or memory traffic are performed here. The caller must pass the
+    returned timestamp to static_stop.
 
     Args:
         buf: Profile buffer tensor (int64).
         unit_id: Which profiling unit this is (e.g., block index, warp index).
         event_idx: Event index within this unit (0, 1, 2, ... tracked in registers).
         max_events_per_unit: Maximum events per unit (determines slice size).
+
+    Returns:
+        Int64: Start timestamp (0 when event_idx >= max_events_per_unit).
     """
+    start_ns = Int64(0)
     if event_idx < max_events_per_unit:
         start_ns = read_globaltimer()
-
-        base_ptr = buf.iterator.toint()
-
-        slice_size = Int64(1 + 4 * max_events_per_unit)
-        offset = Int64(unit_id) * slice_size + Int64(1 + 4 * event_idx)
-        byte_offset = offset * Int64(8)
-
-        _store_i64(base_ptr + byte_offset, start_ns)
+    return start_ns
 
 
 @cute.jit
@@ -165,19 +142,21 @@ def static_stop(
     buf: cute.Tensor,
     unit_id: Int32,
     event_idx: Int32,
+    start_ns: Int64,
     tag: Int32,
     tid: Int32,
     max_events_per_unit: Int32,
 ) -> None:
     """Stop profiling an event, recording duration, tag, and tid.
 
-    Computes duration from the stored start timestamp and writes event data.
+    Computes duration from the provided start timestamp and writes event data.
     No atomics are used.
 
     Args:
         buf: Profile buffer tensor (int64).
         unit_id: Which profiling unit this is (must match static_start).
         event_idx: Event index within this unit (must match static_start).
+        start_ns: Start timestamp returned by static_start.
         tag: Tag ID for this event (from TagTable on host).
         tid: Thread/block identifier for Perfetto visualization.
         max_events_per_unit: Maximum events per unit (determines slice size).
@@ -191,9 +170,9 @@ def static_stop(
         base_offset = Int64(unit_id) * slice_size + Int64(1 + 4 * event_idx)
         byte_offset = base_offset * Int64(8)
 
-        start_ns = _load_i64(base_ptr + byte_offset)
         dur_ns = end_ns - start_ns
 
+        _store_i64(base_ptr + byte_offset, start_ns)
         _store_i64(base_ptr + byte_offset + Int64(8), dur_ns)
         _store_i64(base_ptr + byte_offset + Int64(16), Int64(tag))
         _store_i64(base_ptr + byte_offset + Int64(24), Int64(tid))
@@ -266,7 +245,7 @@ def warp_start(
     event_idx: Int32,
     max_events_per_unit: Int32,
     target_warp: Int32,
-) -> None:
+) -> Int64:
     """Start profiling, but only for lane 0 of the specified warp.
 
     This is a convenience wrapper around static_start that automatically
@@ -281,12 +260,17 @@ def warp_start(
         event_idx: Event index within this unit (0, 1, 2, ... tracked in registers).
         max_events_per_unit: Maximum events per unit (determines slice size).
         target_warp: Which warp should profile (0, 1, 2, ...).
+
+    Returns:
+        Int64: Start timestamp for this event (0 for non-participating lanes).
     """
     warp_idx = cute.arch.warp_idx()
     lane_idx = cute.arch.lane_idx()
 
+    start_ns = Int64(0)
     if warp_idx == target_warp and lane_idx == 0:
-        static_start(buf, unit_id, event_idx, max_events_per_unit)
+        start_ns = static_start(buf, unit_id, event_idx, max_events_per_unit)
+    return start_ns
 
 
 @cute.jit
@@ -294,6 +278,7 @@ def warp_stop(
     buf: cute.Tensor,
     unit_id: Int32,
     event_idx: Int32,
+    start_ns: Int64,
     tag: Int32,
     tid: Int32,
     max_events_per_unit: Int32,
@@ -308,6 +293,7 @@ def warp_stop(
         buf: Profile buffer tensor (int64).
         unit_id: Which profiling unit this is (must match warp_start).
         event_idx: Event index within this unit (must match warp_start).
+        start_ns: Start timestamp returned by warp_start.
         tag: Tag ID for this event (from TagTable on host).
         tid: Thread/block identifier for Perfetto visualization.
         max_events_per_unit: Maximum events per unit (determines slice size).
@@ -317,7 +303,7 @@ def warp_stop(
     lane_idx = cute.arch.lane_idx()
 
     if warp_idx == target_warp and lane_idx == 0:
-        static_stop(buf, unit_id, event_idx, tag, tid, max_events_per_unit)
+        static_stop(buf, unit_id, event_idx, start_ns, tag, tid, max_events_per_unit)
 
 
 @cute.jit
@@ -382,7 +368,7 @@ class _ProfileRegionContext:
                 self._buf, self._unit_id, self._max_events_per_unit, self._target_warp
             )
 
-        warp_start(
+        self._start_ns = warp_start(
             self._buf,
             self._unit_id,
             self._event_idx,
@@ -396,6 +382,7 @@ class _ProfileRegionContext:
             self._buf,
             self._unit_id,
             self._event_idx,
+            self._start_ns,
             self._tag,
             self._tid,
             self._max_events_per_unit,
