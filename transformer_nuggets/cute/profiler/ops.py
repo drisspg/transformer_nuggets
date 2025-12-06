@@ -76,14 +76,11 @@ def read_globaltimer(*, loc=None, ip=None) -> Int64:
 
 @dsl_user_op
 def _store_i64(ptr: Int64, val: Int64, *, loc=None, ip=None) -> None:
-    """Store an int64 value to a global memory address.
-
-    Uses inline PTX st.global.u64 instruction.
-    """
+    """Store an int64 value to a global memory address using cache-streaming store."""
     llvm.inline_asm(
         None,
         [ptr.ir_value(loc=loc, ip=ip), val.ir_value(loc=loc, ip=ip)],
-        "st.global.u64 [$0], $1;",
+        "st.global.cs.u64 [$0], $1;",
         "l,l",
         has_side_effects=True,
         is_align_stack=False,
