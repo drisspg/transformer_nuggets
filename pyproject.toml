@@ -96,4 +96,4 @@ ignore = ['E231', 'E731']
 
 # ---------- PYREFLY ------------
 [tool.pyrefly]
-project-excludes = ["**/cute/**"]
+project-excludes = ["**/cute/**", "examples/**"]

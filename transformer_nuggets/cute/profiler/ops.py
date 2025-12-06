@@ -29,6 +29,9 @@ Low-level usage (manual guards):
         static_flush(prof_buf, unit_id, event_idx, max_events_per_unit)
 """
 
+import os
+
+import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64
 from cutlass.cutlass_dsl import T, dsl_user_op
@@ -43,7 +46,26 @@ __all__ = [
     "warp_start",
     "warp_stop",
     "profile_region",
+    "ENABLE_PROFILING",
+    "ENABLE_PROFILING_CONST",
 ]
+
+
+def _env_flag(name: str, default: bool = True) -> bool:
+    """Parse a boolean-like environment variable."""
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() not in ("0", "false", "off", "no", "")
+
+
+# Global kill-switch for profiling generation. Evaluated at kernel staging time,
+# so toggling the env var and re-staging the kernel removes all profiling code.
+ENABLE_PROFILING: bool = _env_flag("TNUGGETS_ENABLE_PROFILING", default=True)
+# Use cutlass.const_expr so the branch is compile-time in staged kernels.
+# If const_expr is missing in the installed cutlass, fall back to plain bool.
+ENABLE_PROFILING_CONST = getattr(cutlass, "const_expr", lambda x: x)(ENABLE_PROFILING)
+_PROFILE_DISABLED_PRINTED = False
 
 
 @dsl_user_op
@@ -363,7 +385,7 @@ class _ProfileRegionContext:
         bidx, _, _ = cute.arch.block_idx()
         self._unit_id = bidx
 
-        if self._use_atomic:
+        if cutlass.const_expr(self._use_atomic):
             self._event_idx = warp_atomic_alloc(
                 self._buf, self._unit_id, self._max_events_per_unit, self._target_warp
             )
@@ -388,6 +410,16 @@ class _ProfileRegionContext:
             self._max_events_per_unit,
             self._target_warp,
         )
+        return False
+
+
+class _NoOpProfileRegion:
+    """No-op context used when profiling is disabled."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
         return False
 
 
@@ -431,6 +463,13 @@ def profile_region(buf, max_events_per_unit, tag, tid, target_warp=None, event_i
     Returns:
         Context manager for use with `with` statement.
     """
+    if not cutlass.const_expr(bool(ENABLE_PROFILING_CONST)):
+        global _PROFILE_DISABLED_PRINTED
+        if not _PROFILE_DISABLED_PRINTED:
+            print("profiling disabled: TNUGGETS_ENABLE_PROFILING=0, profile_region is no-op")
+            _PROFILE_DISABLED_PRINTED = True
+        return _NoOpProfileRegion()
+
     if target_warp is None:
         target_warp = Int32(0)
 

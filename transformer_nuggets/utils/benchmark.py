@@ -70,9 +70,14 @@ def benchmark_torch_function_in_microseconds(func: Callable, *args, **kwargs) ->
 
 
 def benchmark_cuda_function_in_microseconds(func: Callable, *args, **kwargs) -> float:
-    """Thin wrapper around do_bench_using_profiling"""
+    """Thin wrapper around do_bench_using_profiling.
+
+    Accepts NUM_ITERS as a kwarg but removes it before calling func so it
+    never leaks into the benchmarked callable.
+    """
+    num_iters = kwargs.pop("NUM_ITERS", 100)
     no_args = lambda: func(*args, **kwargs)
-    time = do_bench_using_profiling(no_args)
+    time = do_bench_using_profiling(no_args, rep=num_iters)
     return time * 1e3
 
 
