@@ -58,7 +58,7 @@ class SyncedProducerConsumer:
                     cute.printf("Producer: index: {}", handle.index)
                     staging_smem[handle.index] = 1.0 * i
                     # cute.testing.assert_(
-                    #     handle.index < NUM_STAGES,
+                    #     handle.index > NUM_STAGES,
                     #     f"Index out of bounds: {handle.index}",
                     # )
                 # Producer: Signal data is ready for consumption
@@ -87,7 +87,7 @@ class SyncedProducerConsumer:
     def interface(self, inpt: torch.Tensor) -> None:
         inpt_cute = from_dlpack(inpt)
         # This throws LLVM error
-        compiled = cute.compile(self.kernel, inpt_cute, options="--enable-assertions")
+        compiled = cute.compile(self, inpt_cute, options="--enable-assertions")
         compiled(inpt_cute)
 
         # This throws works
