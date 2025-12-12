@@ -13,7 +13,7 @@ from cutlass.cute.runtime import from_dlpack
 
 import transformer_nuggets
 from transformer_nuggets.cute.base import CuteOp
-from transformer_nuggets.cute.profiler.host import profile_session
+from transformer_nuggets.cute.profiler import profile_session, group_by_unit, rename_processes
 from transformer_nuggets.cute.profiler.ops import profile_region
 
 
@@ -42,7 +42,6 @@ class WarpSpecializedStaticProfile(CuteOp):
         warp_idx = cute.arch.warp_idx()
         lane_idx = cute.arch.lane_idx()
 
-        prof_tid = bidx * Int32(2) + warp_idx
         block_base = bidx * bdim
 
         if warp_idx == 0:
@@ -50,7 +49,7 @@ class WarpSpecializedStaticProfile(CuteOp):
                 prof_buf,
                 max_events_per_unit,
                 TAG_PRODUCER,
-                prof_tid,
+                bidx,
                 target_warp=Int32(0),
                 event_idx=Int32(0),
             ):
@@ -58,6 +57,9 @@ class WarpSpecializedStaticProfile(CuteOp):
                 if idx < cute.size(output):
                     # Do extra writes so producer spans a measurable interval.
                     # pyrefly: ignore [not-iterable]
+                    for i in cutlass.range(bidx * 2, unroll=-1):
+                        # per bidx timing changes
+                        output[idx + i] = Float32(i)
                     for i in cutlass.range(Int32(PRODUCER_WORK_ITERS)):
                         output[idx + i] = Float32(i)
 
@@ -66,7 +68,7 @@ class WarpSpecializedStaticProfile(CuteOp):
                 prof_buf,
                 max_events_per_unit,
                 TAG_CONSUMER,
-                prof_tid,
+                bidx,
                 target_warp=Int32(1),
                 event_idx=Int32(1),
             ):
@@ -74,6 +76,9 @@ class WarpSpecializedStaticProfile(CuteOp):
                 if idx < cute.size(output):
                     # Make consumer slightly shorter to show overlap.
                     # pyrefly: ignore [not-iterable]
+                    for i in cutlass.range(bidx * 2, unroll=-1):
+                        # per bidx timing changes
+                        output[idx + i] = Float32(i)
                     for i in cutlass.range(Int32(CONSUMER_WORK_ITERS)):
                         output[CONSUMER_WORK_ITERS + idx + i] = Float32(i)
 
@@ -109,12 +114,16 @@ def run():
 
     trace_path = transformer_nuggets.DATA_DIR / "profiler_warp_static_trace.json"
 
+    process_names = {i: f"CTA {i}" for i in range(NUM_BLOCKS)}
+
     with profile_session(
         max_events_per_unit=MAX_EVENTS_PER_UNIT,
-        num_units=(NUM_BLOCKS, "Block*Warp"),
-        tag_names=["producer_warp0", "consumer_warp1"],
+        num_units=(NUM_BLOCKS, "Warp"),
+        tag_names=["producer", "consumer"],
         trace_path=str(trace_path),
         device=device,
+        post_process_events=group_by_unit,
+        post_process_trace=rename_processes(process_names),
     ) as (prof, tag_table):
         print(f"Tags: {tag_table.names}")
         kernel = WarpSpecializedStaticProfile()

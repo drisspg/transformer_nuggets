@@ -32,6 +32,7 @@ from transformer_nuggets.cute.profiler.host import (
     ProfileBuf,
     TagTable,
     Event,
+    PostProcessContext,
     allocate_profile_buffer,
     decode_events,
     events_to_perfetto,
@@ -48,11 +49,23 @@ from transformer_nuggets.cute.profiler.ops import (
     profile_region,
 )
 
+from transformer_nuggets.cute.profiler.postprocessors import (
+    group_by_unit,
+    group_by_tag,
+    strip_tid_suffix,
+    prefix_tag_with_unit,
+    filter_by_tag,
+    compose,
+    rename_processes,
+    rename_threads,
+)
+
 __all__ = [
     # Host-side
     "ProfileBuf",
     "TagTable",
     "Event",
+    "PostProcessContext",
     "allocate_profile_buffer",
     "decode_events",
     "events_to_perfetto",
@@ -65,4 +78,13 @@ __all__ = [
     "warp_start",
     "warp_stop",
     "profile_region",
+    # Post-processors
+    "group_by_unit",
+    "group_by_tag",
+    "strip_tid_suffix",
+    "prefix_tag_with_unit",
+    "filter_by_tag",
+    "compose",
+    "rename_processes",
+    "rename_threads",
 ]

@@ -361,30 +361,26 @@ class _ProfileRegionContext:
     """DSL-level context manager for profiling regions in CUTE kernels.
 
     This works at IR generation time, not runtime. When you use:
-        with profile_region(prof_buf, max_events, tag, tid):
+        with profile_region(prof_buf, max_events, tag, unit_id):
             compute_something()
 
     The __enter__ generates warp_start IR, __exit__ generates warp_stop IR.
-    unit_id is derived from bidx.
 
     Two modes:
     - Atomic mode (event_idx=None): Allocates event index at runtime via atomic.
     - Static mode (event_idx provided): Uses the given index, no atomics.
     """
 
-    def __init__(self, buf, max_events_per_unit, tag, tid, target_warp, event_idx):
+    def __init__(self, buf, max_events_per_unit, tag, unit_id, target_warp, event_idx):
         self._buf = buf
         self._max_events_per_unit = max_events_per_unit
         self._tag = tag
-        self._tid = tid
+        self._unit_id = unit_id
         self._target_warp = target_warp
         self._event_idx = event_idx
         self._use_atomic = event_idx is None
 
     def __enter__(self):
-        bidx, _, _ = cute.arch.block_idx()
-        self._unit_id = bidx
-
         if cutlass.const_expr(self._use_atomic):
             self._event_idx = warp_atomic_alloc(
                 self._buf, self._unit_id, self._max_events_per_unit, self._target_warp
@@ -406,7 +402,7 @@ class _ProfileRegionContext:
             self._event_idx,
             self._start_ns,
             self._tag,
-            self._tid,
+            self._unit_id,
             self._max_events_per_unit,
             self._target_warp,
         )
@@ -423,7 +419,7 @@ class _NoOpProfileRegion:
         return False
 
 
-def profile_region(buf, max_events_per_unit, tag, tid, target_warp=None, event_idx=None):
+def profile_region(buf, max_events_per_unit, tag, unit_id, target_warp=None, event_idx=None):
     """Create a context manager for profiling a code region in CUTE DSL kernels.
 
     This enables clean `with` statement syntax inside @cute.kernel functions.
@@ -434,9 +430,9 @@ def profile_region(buf, max_events_per_unit, tag, tid, target_warp=None, event_i
     No manual index tracking or flushing needed:
 
         for i in cutlass.range(4):
-            with profile_region(prof_buf, max_events, TAG_COMPUTE, tid):
+            with profile_region(prof_buf, max_events, TAG_COMPUTE):
                 compute_something()
-            with profile_region(prof_buf, max_events, TAG_STORE, tid):
+            with profile_region(prof_buf, max_events, TAG_STORE):
                 store_something()
         # Done! No flush needed.
 
@@ -456,7 +452,7 @@ def profile_region(buf, max_events_per_unit, tag, tid, target_warp=None, event_i
         buf: Profile buffer tensor (cute.Tensor).
         max_events_per_unit: Maximum events per unit (Int32).
         tag: Tag ID for this region (Int32).
-        tid: Thread/block identifier for Perfetto visualization (Int32).
+        unit_id: Which profiling unit (buffer slice) to use (Int32). Defaults to bidx.
         target_warp: Which warp should profile (Int32). Defaults to Int32(0).
         event_idx: Event index (Int32). If None, uses atomic allocation.
 
@@ -473,4 +469,4 @@ def profile_region(buf, max_events_per_unit, tag, tid, target_warp=None, event_i
     if target_warp is None:
         target_warp = Int32(0)
 
-    return _ProfileRegionContext(buf, max_events_per_unit, tag, tid, target_warp, event_idx)
+    return _ProfileRegionContext(buf, max_events_per_unit, tag, unit_id, target_warp, event_idx)

@@ -20,6 +20,7 @@ from cutlass.cute.runtime import from_dlpack
 from transformer_nuggets.cute.base import CuteOp
 from transformer_nuggets.cute.profiler.host import profile_session
 from transformer_nuggets.cute.profiler.ops import profile_region
+from transformer_nuggets.cute.profiler.postprocessors import group_by_unit
 
 
 TAG_ITERATION = 0
@@ -27,6 +28,7 @@ TAG_COMPUTE = 1
 TAG_STORE = 2
 NUM_BLOCKS = 4
 THREADS_PER_BLOCK = 64
+NUM_ITERATIONS = 1024
 
 
 class ProfiledKernelAtomic(CuteOp):
@@ -159,19 +161,19 @@ def run_atomic_mode():
     trace_path = transformer_nuggets.DATA_DIR / "profiler_atomic_trace.json"
 
     with profile_session(
-        max_events_per_unit=64,
+        max_events_per_unit=3 * NUM_ITERATIONS + 2,
         num_units=(NUM_BLOCKS, "Block"),
         tag_names=["iteration", "compute", "store"],
         trace_path=str(trace_path),
         device=device,
     ) as (prof, tag_table):
         print(f"Tags: {tag_table.names}")
-        kernel = ProfiledKernelAtomic(num_iterations=4)
+        kernel = ProfiledKernelAtomic(num_iterations=NUM_ITERATIONS)
         kernel.interface(output, prof.tensor, prof.max_events_per_unit)
 
     print(f"Trace: {trace_path}")
 
-    expected = torch.full_like(output, 4.0)
+    expected = torch.full_like(output, float(NUM_ITERATIONS))
     if torch.allclose(output, expected):
         print("✓ Output verification passed!")
     else:
@@ -192,19 +194,20 @@ def run_static_mode():
     trace_path = transformer_nuggets.DATA_DIR / "profiler_static_trace.json"
 
     with profile_session(
-        max_events_per_unit=64,
+        max_events_per_unit=3 * NUM_ITERATIONS + 2,
         num_units=(NUM_BLOCKS, "Block"),
         tag_names=["iteration", "compute", "store"],
         trace_path=str(trace_path),
         device=device,
+        post_process_events=group_by_unit,
     ) as (prof, tag_table):
         print(f"Tags: {tag_table.names}")
-        kernel = ProfiledKernelStatic(num_iterations=4)
+        kernel = ProfiledKernelStatic(num_iterations=NUM_ITERATIONS)
         kernel.interface(output, prof.tensor, prof.max_events_per_unit)
 
     print(f"Trace: {trace_path}")
 
-    expected = torch.full_like(output, 4.0)
+    expected = torch.full_like(output, float(NUM_ITERATIONS))
     if torch.allclose(output, expected):
         print("✓ Output verification passed!")
     else:
