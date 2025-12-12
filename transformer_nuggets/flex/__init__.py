@@ -37,5 +37,8 @@ class FlexAttentionKernelArgs:
     FORCE_USE_FLEX_ATTENTION: bool = False
     """If this flag is set this disallows the use of flex-decoding kernel"""
 
+    BACKEND: str | None = None
+    """Backend to use for flex attention. Options: 'FLASH', 'TRITON'."""
+
     def asdict(self):
         return {k: v for k, v in asdict(self).items() if v is not None}

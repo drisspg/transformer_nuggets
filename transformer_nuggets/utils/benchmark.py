@@ -206,7 +206,7 @@ class cuda_memory_usage:
 
 
 @contextmanager
-def save_memory_snapshot(file_path: Path):
+def save_memory_snapshot(file_path: Path | str):
     """Save a memory snapshot information to a folder
 
     Args:
@@ -220,6 +220,9 @@ def save_memory_snapshot(file_path: Path):
     ```
     """
     from transformer_nuggets import init_logging
+
+    if not isinstance(file_path, Path):
+        file_path = Path(file_path)
 
     init_logging()
     dist_avail = False

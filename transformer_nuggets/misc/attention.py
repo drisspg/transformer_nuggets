@@ -164,7 +164,6 @@ class RopeAttention(nn.Module):
                     raise ValueError("attn_mask is only supported when backend='sdpa'.")
 
                 kernel_options = kernel_args.asdict() if kernel_args is not None else None
-                print(q.stride())
                 attn_out = cast(
                     Tensor,
                     flex_attention(
@@ -256,34 +255,126 @@ class RopeAttention(nn.Module):
         return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
 
 
-def main(compile: bool = False) -> None:
+class AttentionStack(nn.Module):
+    """
+    Stack of attention layers.
+    """
+
+    def __init__(self, num_layers: int, **kwargs):
+        super().__init__()
+        self.layers = nn.ModuleList([RopeAttention(**kwargs) for _ in range(num_layers)])
+
+    def forward(self, x: Tensor, **kwargs) -> Tensor:
+        for layer in self.layers:
+            x = layer(x, **kwargs)
+        return x
+
+    def get_input(
+        self,
+        batch_size: int,
+        seq_len: int,
+        device: str = "cuda",
+        dtype: torch.dtype = torch.bfloat16,
+        requires_grad: bool = True,
+    ) -> Tensor:
+        return cast(
+            Tensor,
+            self.layers[0].get_input(  # type: ignore
+                batch_size, seq_len, device, dtype, requires_grad
+            ),
+        )
+
+    def get_attn_params(self) -> tuple[int, int, int, int]:
+        # pyrefly: ignore [not-callable]
+        return self.layers[0].get_attn_params()
+
+
+def main(
+    compile: bool = False,
+    max_autotune: bool = False,
+    backend: AttentionBackend = "sdpa",
+    flash: bool = False,
+    do_profile: bool = False,
+    batch_size: int = 4,
+    seq_len: int = 512,
+    dim: int = 2048,
+    num_heads: int = 16,
+) -> None:
+    """
+    Run RopeAttention with configurable options.
+
+    Args:
+        compile: Whether to torch.compile the model
+        max_autotune: Use torch.compile with mode='max-autotune' (enables CUDA graphs)
+        backend: Attention backend - 'sdpa' or 'flex'
+        flash: Use FLASH backend for flex attention (sets kernel_options={"BACKEND": "FLASH"})
+        do_profile: Whether to generate profiler trace
+        batch_size: Batch size for input tensor
+        seq_len: Sequence length for input tensor
+        dim: Model dimension
+        num_heads: Number of attention heads
+    """
     from rich import print
 
     activate_flash_attention_impl("FA4")
-    model = RopeAttention(dim=2048, num_heads=16).to("cuda", torch.bfloat16)
-    if compile:
-        # pyrefly: ignore [no-matching-overload]
-        model = torch.compile(model)
-    x = model.get_input(batch_size=4, seq_len=512)
+
+    # Build kernel args for flex attention if flash backend requested
+    flex_kernel_args = None
+    if flash:
+        if backend != "flex":
+            print("[Warning] --flash only applies when backend='flex', switching to flex")
+            backend = "flex"
+        flex_kernel_args = FlexAttentionKernelArgs(BACKEND="FLASH")
+
+    print(
+        f"[Config] compile={compile}, max_autotune={max_autotune}, backend={backend}, flash={flash}"
+    )
+    print(f"[Config] batch_size={batch_size}, seq_len={seq_len}, dim={dim}, num_heads={num_heads}")
+
+    model = AttentionStack(
+        num_layers=8,
+        dim=dim,
+        num_heads=num_heads,
+        backend=backend,
+        flex_kernel_args=flex_kernel_args,
+    ).to("cuda", torch.bfloat16)
+
+    # Get input and params before compiling (avoids type checker issues with compiled model)
+    x = model.get_input(batch_size=batch_size, seq_len=seq_len)
+    # Build rope cache
     hq, hkv, dq, dkv = model.get_attn_params()
     print(f"Hq: {hq}, Hkv: {hkv}, Dq: {dq}, Dkv: {dkv}")
     print(f"Input shape: {x.shape}")
-
-    from transformer_nuggets.utils.benchmark import profiler
 
     def forw_back():
         out = model(x)
         grads = torch.autograd.grad(out, (x,), torch.randn_like(out))
         return out, grads
 
+    # Run once to build rope cache
+    out, grads = forw_back()
+
+    if compile or max_autotune:
+        compile_mode = "max-autotune" if max_autotune else None
+        print(f"[Compile] mode={compile_mode}")
+        # pyrefly: ignore [no-matching-overload]
+        model = torch.compile(model, mode=compile_mode, fullgraph=True)
+
     with cuda_kernel_profiler("flash_attncute") as result:
         out, grads = forw_back()
     for kernel in result["kernel_names"]:  # type: ignore
         if "flash" in kernel:
             print(f"Found flash kernel: {kernel}")
+    torch.cuda.synchronize()
+    if do_profile:
+        from transformer_nuggets.utils.benchmark import profiler
 
-    with profiler("data/flash_attncute.json") as result:
-        out, grads = forw_back()
+        trace_file = f"data/attention_b{batch_size}_s{seq_len}_{backend}.json"
+        print(f"[Profile] Saving trace to {trace_file}")
+        with profiler(trace_file):
+            for _ in range(10):
+                out, grads = forw_back()
+        torch.cuda.synchronize()
 
     print("jobs done!")
 
