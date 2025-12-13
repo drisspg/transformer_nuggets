@@ -1,0 +1,10 @@
+compile: true
+max_autotune: false
+backend: flex
+flash: false
+do_profile: true
+batch_size: 4
+seq_len: 8192
+dim: 2048
+num_heads: 16
+causal: True

@@ -3,46 +3,45 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Literal, cast
 from collections.abc import Callable
-from contextlib import contextmanager
-from torch.profiler import profile, ProfilerActivity
+from jsonargparse import CLI
+import warnings
 
-from torch.nn.attention.flex_attention import BlockMask, flex_attention, _DEFAULT_SPARSE_BLOCK_SIZE
+from torch.nn.attention.flex_attention import (
+    BlockMask,
+    flex_attention,
+    _DEFAULT_SPARSE_BLOCK_SIZE,
+    create_block_mask,
+)
 from torch.nn.attention import sdpa_kernel, SDPBackend, activate_flash_attention_impl
 
 from transformer_nuggets.flex import FlexAttentionKernelArgs
 from transformer_nuggets import init_logging
+from transformer_nuggets.utils.tracing import cuda_kernel_profiler
+
+
+def causal_mod(b, h, q_idx, kv_idx):
+    return q_idx >= kv_idx
+
+
+cbm = torch.compile(create_block_mask)
+flex_compiled = torch.compile(flex_attention)
 
 init_logging()
+warnings.filterwarnings(
+    "ignore",
+    message="Warning only once for all operators,  other operators may also be overridden.",
+    module="torch.library",
+)
+warnings.filterwarnings(
+    "ignore",
+    message="Warning: Profiler clears events at the end of each cycle.*",
+    module="torch.profiler.profiler",
+)
 Tensor = torch.Tensor
 AttentionBackend = Literal["sdpa", "flex"]
 RopeCache = tuple[Tensor, Tensor]
 
 __all__ = ["RopeAttention"]
-
-
-@contextmanager
-def cuda_kernel_profiler(kernel_pattern: str = "flash_attncute"):
-    """
-    Context manager that profiles CUDA kernels and checks for a pattern.
-
-    Usage:
-        with cuda_kernel_profiler("flash_attncute") as result:
-            flex_attention(...)
-        print(result["found"])  # True if flash kernel was called
-        print(result["kernel_names"])  # List of all CUDA kernel names
-    """
-    result = {"found": False, "kernel_names": []}
-
-    with profile(activities=[ProfilerActivity.CUDA]) as prof:
-        yield result
-
-    kernel_names = [
-        evt.name
-        for evt in prof.events()  # type: ignore
-        if evt.device_type == torch.autograd.DeviceType.CUDA and evt.name
-    ]
-    result["kernel_names"] = kernel_names
-    result["found"] = any(kernel_pattern in name for name in kernel_names)
 
 
 def get_flash_block_size(device: str = "cuda") -> tuple[int, int]:
@@ -166,7 +165,7 @@ class RopeAttention(nn.Module):
                 kernel_options = kernel_args.asdict() if kernel_args is not None else None
                 attn_out = cast(
                     Tensor,
-                    flex_attention(
+                    flex_compiled(
                         q,
                         k,
                         v,
@@ -262,11 +261,13 @@ class AttentionStack(nn.Module):
 
     def __init__(self, num_layers: int, **kwargs):
         super().__init__()
+        self.backend = kwargs.get("backend", "sdpa")
+        self.causal = kwargs.get("causal", True)
         self.layers = nn.ModuleList([RopeAttention(**kwargs) for _ in range(num_layers)])
 
     def forward(self, x: Tensor, **kwargs) -> Tensor:
         for layer in self.layers:
-            x = layer(x, **kwargs)
+            x = x + layer(x, **kwargs)
         return x
 
     def get_input(
@@ -276,13 +277,25 @@ class AttentionStack(nn.Module):
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         requires_grad: bool = True,
-    ) -> Tensor:
-        return cast(
-            Tensor,
-            self.layers[0].get_input(  # type: ignore
-                batch_size, seq_len, device, dtype, requires_grad
-            ),
-        )
+        block_size: tuple[int, int] | None = None,
+    ) -> tuple[Tensor, BlockMask | None]:
+        # pyrefly: ignore [not-callable]
+        inpt = self.layers[0].get_input(batch_size, seq_len, device, dtype, requires_grad)
+        match (self.backend, self.causal):
+            case ("flex", True):
+                block_mask = cbm(
+                    causal_mod,
+                    B=None,
+                    H=None,
+                    Q_LEN=seq_len,
+                    KV_LEN=seq_len,
+                    device=device,
+                    BLOCK_SIZE=block_size
+                    or (_DEFAULT_SPARSE_BLOCK_SIZE, _DEFAULT_SPARSE_BLOCK_SIZE),
+                )
+            case _:
+                block_mask = None
+        return inpt, block_mask
 
     def get_attn_params(self) -> tuple[int, int, int, int]:
         # pyrefly: ignore [not-callable]
@@ -294,6 +307,7 @@ def main(
     max_autotune: bool = False,
     backend: AttentionBackend = "sdpa",
     flash: bool = False,
+    causal: bool = True,
     do_profile: bool = False,
     batch_size: int = 4,
     seq_len: int = 512,
@@ -308,6 +322,7 @@ def main(
         max_autotune: Use torch.compile with mode='max-autotune' (enables CUDA graphs)
         backend: Attention backend - 'sdpa' or 'flex'
         flash: Use FLASH backend for flex attention (sets kernel_options={"BACKEND": "FLASH"})
+        causal: Whether to apply causal masking
         do_profile: Whether to generate profiler trace
         batch_size: Batch size for input tensor
         seq_len: Sequence length for input tensor
@@ -320,34 +335,39 @@ def main(
 
     # Build kernel args for flex attention if flash backend requested
     flex_kernel_args = None
+    block_size = None
     if flash:
         if backend != "flex":
             print("[Warning] --flash only applies when backend='flex', switching to flex")
             backend = "flex"
+        block_size = get_flash_block_size("cuda")
         flex_kernel_args = FlexAttentionKernelArgs(BACKEND="FLASH")
 
     print(
         f"[Config] compile={compile}, max_autotune={max_autotune}, backend={backend}, flash={flash}"
     )
-    print(f"[Config] batch_size={batch_size}, seq_len={seq_len}, dim={dim}, num_heads={num_heads}")
+    print(
+        f"[Config] batch_size={batch_size}, seq_len={seq_len}, dim={dim}, num_heads={num_heads}, causal={causal}"
+    )
 
     model = AttentionStack(
         num_layers=8,
         dim=dim,
         num_heads=num_heads,
         backend=backend,
+        causal=causal,
         flex_kernel_args=flex_kernel_args,
     ).to("cuda", torch.bfloat16)
 
     # Get input and params before compiling (avoids type checker issues with compiled model)
-    x = model.get_input(batch_size=batch_size, seq_len=seq_len)
+    x, opt_bm = model.get_input(batch_size=batch_size, seq_len=seq_len, block_size=block_size)
     # Build rope cache
     hq, hkv, dq, dkv = model.get_attn_params()
     print(f"Hq: {hq}, Hkv: {hkv}, Dq: {dq}, Dkv: {dkv}")
     print(f"Input shape: {x.shape}")
 
     def forw_back():
-        out = model(x)
+        out = model(x, block_mask=opt_bm)
         grads = torch.autograd.grad(out, (x,), torch.randn_like(out))
         return out, grads
 
@@ -365,6 +385,7 @@ def main(
     for kernel in result["kernel_names"]:  # type: ignore
         if "flash" in kernel:
             print(f"Found flash kernel: {kernel}")
+            break
     torch.cuda.synchronize()
     if do_profile:
         from transformer_nuggets.utils.benchmark import profiler
@@ -380,6 +401,4 @@ def main(
 
 
 if __name__ == "__main__":
-    from jsonargparse import CLI
-
-    CLI(main)
+    CLI(main, as_positional=False)
