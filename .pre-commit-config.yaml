@@ -2,7 +2,7 @@
 # See https://pre-commit.com/hooks.html for more hooks
 repos:
 -   repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+    rev: v6.0.0
     hooks:
     -   id: trailing-whitespace
     -   id: end-of-file-fixer
@@ -16,7 +16,7 @@ repos:
 
 - repo: https://github.com/astral-sh/ruff-pre-commit
   # Ruff version.
-  rev: v0.12.0
+  rev: v0.14.9
   hooks:
     # Run the linter.
     - id: ruff
@@ -25,13 +25,13 @@ repos:
     - id: ruff-format
 
 - repo: https://github.com/asottile/pyupgrade
-  rev: v3.19.1
+  rev: v3.21.2
   hooks:
     - id: pyupgrade
       args: [--py310-plus]
 
 - repo: https://github.com/facebook/pyrefly-pre-commit
-  rev: 0.44.1
+  rev: 0.45.2
   hooks:
     - id: pyrefly-check
       name: Pyrefly (type checking)
