@@ -60,19 +60,23 @@ class DirectCopy(CuteOp[[torch.Tensor], torch.Tensor]):
         bidx, _, _ = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
+        tiler = cute.make_layout(tile_size)
+        gA_tiled = cute.zipped_divide(tma_tensor_load, tiler)
+        gB_tiled = cute.zipped_divide(tma_tensor_store, tiler)
+
         tAsA_load, tAgA = cpasync.tma_partition(
             load_atom,
             0,
             cute.make_layout(1),
-            cute.group_modes(sA, 0, 1),
-            cute.group_modes(tma_tensor_load, 0, 1),
+            sA,
+            gA_tiled[(None, bidx)],
         )
         tAsA_store, tBgB = cpasync.tma_partition(
             store_atom,
             0,
             cute.make_layout(1),
-            cute.group_modes(sA, 0, 1),
-            cute.group_modes(tma_tensor_store, 0, 1),
+            sA,
+            gB_tiled[(None, bidx)],
         )
 
         load_mbar_ptr = storage.load_mbar_ptr.data_ptr()
@@ -90,11 +94,11 @@ class DirectCopy(CuteOp[[torch.Tensor], torch.Tensor]):
                 cute.arch.mbarrier_arrive_and_expect_tx(load_mbar_ptr, tma_load_bytes)
 
         if warp_idx == 0:
-            cute.copy(load_atom, tAgA[(None, bidx)], tAsA_load, tma_bar_ptr=load_mbar_ptr)
+            cute.copy(load_atom, tAgA, tAsA_load, tma_bar_ptr=load_mbar_ptr)
 
         cute.arch.mbarrier_wait(load_mbar_ptr, 0)
         if warp_idx == 1:
-            cute.copy(store_atom, tAsA_store, tBgB[(None, bidx)])
+            cute.copy(store_atom, tAsA_store, tBgB)
         cute.arch.cp_async_bulk_commit_group()
         cute.arch.cp_async_bulk_wait_group(0)
 
@@ -211,19 +215,19 @@ class DirectCopy(CuteOp[[torch.Tensor], torch.Tensor]):
     @cute.jit
     def call_tma(self, mA: cute.Tensor, mB: cute.Tensor):
         num_warps = 2
-        load_store_size = 1024
+        load_store_size = 8192 * 3
         num_threads = num_warps * 32
-        num_blocks = mA.shape[0] // load_store_size
-        gmem_layout_2d = cute.make_layout((load_store_size, num_blocks))
-        mA_2d = cute.make_tensor(mA.iterator, gmem_layout_2d)
-        mB_2d = cute.make_tensor(mB.iterator, gmem_layout_2d)
+        total_size = mA.shape[0]
+        # 1 block gets a load store size chunk
+        num_blocks = cute.ceil_div(total_size, load_store_size)
 
-        smem_layout_tma = cute.make_layout((load_store_size, 1))
+        smem_layout_tma = cute.make_layout(load_store_size)
+        # define the op, pass in global tensor, and flat smemlayout, tiler is 1d
         tma_atom_load, tma_tensor_load = self.get_tma_atoms(
-            cpasync.CopyBulkTensorTileG2SOp(), mA_2d, smem_layout_tma, (load_store_size, 1)
+            cpasync.CopyBulkTensorTileG2SOp(), mA, smem_layout_tma, load_store_size
         )
         tma_atom_store, tma_tensor_store = self.get_tma_atoms(
-            cpasync.CopyBulkTensorTileS2GOp(), mB_2d, smem_layout_tma, (load_store_size, 1)
+            cpasync.CopyBulkTensorTileS2GOp(), mB, smem_layout_tma, load_store_size
         )
         Shared = self._get_shared_struct(mA.element_type, load_store_size)
         dtype = mA.element_type
