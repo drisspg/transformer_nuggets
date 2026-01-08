@@ -17,13 +17,11 @@ bnb_available = False
 
 class LinearNF4(torch.autograd.Function):
     @staticmethod
-    # pyrefly: ignore  # bad-override
     def forward(ctx, input: torch.Tensor, weight: NF4Tensor):
         ctx.nf4_weight = weight
         return F.linear(input, weight.get_original_weight())
 
     @staticmethod
-    # pyrefly: ignore  # bad-override
     def backward(ctx, grad_output):
         weight: NF4Tensor = ctx.nf4_weight
         return grad_output @ weight.get_original_weight(), None
@@ -35,13 +33,11 @@ def linear_nf4(input: torch.Tensor, weight: NF4Tensor) -> torch.Tensor:
 
 class LinearNF4Triton(torch.autograd.Function):
     @staticmethod
-    # pyrefly: ignore  # bad-override
     def forward(ctx, input: torch.Tensor, weight: NF4Tensor):
         ctx.nf4_weight = weight
         return F.linear(input, dequant_nf4_tensor(weight))
 
     @staticmethod
-    # pyrefly: ignore  # bad-override
     def backward(ctx, grad_output):
         weight: NF4Tensor = ctx.nf4_weight
         return grad_output @ dequant_nf4_tensor(weight), None
@@ -59,10 +55,8 @@ def build_input_weight(embed_dim: int, device: torch.device, dtype=torch.bfloat1
 
 
 def build_bitsandbytes_linear(input_weight: torch.Tensor, device: torch.device):
-    # pyrefly: ignore  # unknown-name
     global bnb
     if "bnb" not in globals():
-        # pyrefly: ignore  # import-error
         import bitsandbytes as bnb
     param = bnb.nn.Params4bit(input_weight, requires_grad=False, quant_type="nf4").cuda(device)
     bnb_linear = bnb.nn.LinearNF4(input_weight.size(0), input_weight.size(1), bias=False)
@@ -87,7 +81,6 @@ def get_sample_inputs(
 
 
 def get_mlp_weights(
-    # pyrefly: ignore  # bad-function-definition
     embed_dim: int,
     device: torch.device = torch.device("cuda"),
     dtype=torch.bfloat16,
@@ -190,7 +183,6 @@ class QloraLinear(nn.Module):
         if lora_dropout > 0.0:
             self.lora_dropout = nn.Dropout(p=lora_dropout)
         else:
-            # pyrefly: ignore  # bad-assignment
             self.lora_dropout = lambda x: x
 
         self.reset_parameters()
@@ -223,7 +215,6 @@ class QloraMLP(nn.Module):
         weight1: torch.Tensor,
         weight2: torch.Tensor,
         weight3: torch.Tensor,
-        # pyrefly: ignore  # bad-function-definition
         qlora_config: QloraConfig = None,
     ) -> None:
         super().__init__()
@@ -267,7 +258,7 @@ class QloraMLP(nn.Module):
 
 def swap_for_qlora(model: torch.nn.Module, qlora_config: QloraConfig, dtype) -> None:
     logger.info("Swapping for Qlora...")
-    # pyrefly: ignore  # not-iterable
+
     for module in tqdm(model.layers):
         feed_forward = module.feed_forward
         w1 = feed_forward.w1.weight.to(dtype=dtype)

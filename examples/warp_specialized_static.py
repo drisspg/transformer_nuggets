@@ -30,7 +30,6 @@ class WarpSpecializedStaticProfile(CuteOp):
     """Profiles producer/consumer warps with static event indices."""
 
     @cute.kernel
-    # pyrefly: ignore [bad-override]
     def kernel(
         self,
         output: cute.Tensor,
@@ -56,7 +55,7 @@ class WarpSpecializedStaticProfile(CuteOp):
                 idx = block_base + lane_idx
                 if idx < cute.size(output):
                     # Do extra writes so producer spans a measurable interval.
-                    # pyrefly: ignore [not-iterable]
+
                     for i in cutlass.range(bidx * 2, unroll=-1):
                         # per bidx timing changes
                         output[idx + i] = Float32(i)
@@ -75,7 +74,7 @@ class WarpSpecializedStaticProfile(CuteOp):
                 idx = block_base + Int32(32) + lane_idx
                 if idx < cute.size(output):
                     # Make consumer slightly shorter to show overlap.
-                    # pyrefly: ignore [not-iterable]
+
                     for i in cutlass.range(bidx * 2, unroll=-1):
                         # per bidx timing changes
                         output[idx + i] = Float32(i)
@@ -89,7 +88,6 @@ class WarpSpecializedStaticProfile(CuteOp):
         prof_buf: cute.Tensor,
         max_events_per_unit: cutlass.Int32,
     ):
-        # pyrefly: ignore [bad-argument-count, missing-attribute]
         self.kernel(output, prof_buf, max_events_per_unit).launch(
             grid=(NUM_BLOCKS, 1, 1),
             block=(THREADS_PER_BLOCK, 1, 1),

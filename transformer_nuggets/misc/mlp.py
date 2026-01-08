@@ -78,5 +78,5 @@ class FeedForward(nn.Module):
                 ffn_dim_multiplier=1.2,
             ),
         }
-        # pyrefly: ignore  # bad-argument-type
+
         return cls(**arg_map[flavor])

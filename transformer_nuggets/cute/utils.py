@@ -53,11 +53,11 @@ def generate_tensor_cache_key(tensor: cute.Tensor) -> str:
     if " o " in tensor_str and ")>" in tensor_str:
         # Extract everything after ' o ' and before '>'
         inner_part = tensor_str.split(" o ")[1].rstrip(">")
-        # pyrefly: ignore  # missing-attribute
+
         return f"tensor_{inner_part}_dtype={tensor._dtype}"
     else:
         # Fallback if format is different
-        # pyrefly: ignore  # missing-attribute
+
         return f"tensor_shape={tensor.shape}_dtype={tensor._dtype}"
 
 
@@ -148,11 +148,10 @@ def _visualize_tv_layout_impl(
                 tv_layout = cute.make_layout(shape, stride=stride)
                 return tv_layout((tid, vid))
 
-            # pyrefly: ignore  # missing-argument
             pos = g()
-            # pyrefly: ignore  # unsupported-operation
+
             n = pos // M
-            # pyrefly: ignore  # unsupported-operation
+
             m = pos % M
             if DEBUG:
                 print(f"tid={tid}, vid={vid} -> pos={pos} -> (m,n)=({m},{n})")
@@ -163,7 +162,6 @@ def _visualize_tv_layout_impl(
             filled[m, n] = True
 
     if color_fn is None:
-        # pyrefly: ignore  # missing-attribute
         pastel = plt.cm.Set3.colors
         cmap = (pastel * ((n_thr // 12) + 1))[:n_thr]
         color_fn = lambda t, v: cmap[t % len(cmap)]
@@ -244,10 +242,8 @@ def visualize_tv_layout(
         color_fn: Optional function (tid, vid) -> color
     """
     if isinstance(thread_layout, cute.Layout):
-        # pyrefly: ignore  # bad-assignment
         thread_layout = (thread_layout.shape, thread_layout.stride)
     if isinstance(value_layout, cute.Layout):
-        # pyrefly: ignore  # bad-assignment
         value_layout = (value_layout.shape, value_layout.stride)
 
     @cute.jit
@@ -257,7 +253,6 @@ def visualize_tv_layout(
         tiler_mn, tv_layout = cute.make_layout_tv(thread_cute_layout, value_cute_layout)
         return tiler_mn, tv_layout.shape, tv_layout.stride
 
-    # pyrefly: ignore  # not-iterable, missing-argument
     tiler_mn, shape, stride = get_tv_layout()
 
     return _visualize_tv_layout_impl(

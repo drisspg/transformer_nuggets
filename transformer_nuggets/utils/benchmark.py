@@ -88,7 +88,7 @@ def benchmark_cuda_function_in_microseconds_triton(func: Callable, *args, **kwar
 
     no_args = lambda: func(*args, **kwargs)
     time = do_bench(no_args)
-    # pyrefly: ignore  # unsupported-operation, bad-return
+
     return time * 1e3
 
 
@@ -233,7 +233,6 @@ def save_memory_snapshot(file_path: Path | str):
     except ImportError:
         pass
 
-    # pyrefly: ignore  # unbound-name
     dist_avail = dist_avail and dist.is_initialized()
     if dist_avail:
         if not file_path.is_dir():
@@ -252,7 +251,6 @@ def save_memory_snapshot(file_path: Path | str):
     finally:
         s = torch.cuda.memory._snapshot()
         if dist_avail:
-            # pyrefly: ignore  # unbound-name
             local_rank = dist.get_rank()
             output_path = file_path / f"_rank_{local_rank}.html"
         else:

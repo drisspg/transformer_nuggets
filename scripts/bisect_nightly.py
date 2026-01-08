@@ -127,27 +127,26 @@ def print_bisect_results(last_good, first_bad, last_good_sha, first_bad_sha, tes
                       git bisect bad   # If test FAILS (broken)
                 """).strip()
 
-        # pyrefly: ignore  # unbound-name
         if older_sha and newer_sha:
             print(
                 dedent(f"""
 
                 Commit SHA range:
-                  # pyrefly: ignore  # unbound-name
+
                   Older commit: {older_sha} ({older_date})
-                  # pyrefly: ignore  # unbound-name
+
                   Newer commit: {newer_sha} ({newer_date})
 
                 Note: These SHAs may be from the nightly release branch.
                 Extract the actual main branch SHAs from the nightly release commits:
                   cd <pytorch>
-                  # pyrefly: ignore  # unbound-name
+
                   git log --format='%H %s %b' {older_sha} -1
-                  # pyrefly: ignore  # unbound-name
+
                   git log --format='%H %s %b' {newer_sha} -1
                   # Look for the main branch SHA in parentheses in the commit message
 
-                # pyrefly: ignore  # unbound-name
+
                 {bisect_instructions}
             """).strip()
             )
@@ -206,7 +205,7 @@ def binary_search_fix(
         Using conda environment: {conda_env}
         Python version: {py_ver}
         Running test script: {test_script}
-        # pyrefly: ignore  # unbound-name
+
         Mode: Finding when {mode_desc} occurred
     """).strip()
         + "\n"
@@ -219,7 +218,6 @@ def binary_search_fix(
         date = dates[mid]
         version = version_map[date]
 
-        # pyrefly: ignore  # missing-attribute
         pbar.set_description(f"Testing {date} (torch-{version})")
 
         if not install_nightly(date, version, py_ver, conda_env):
@@ -230,13 +228,12 @@ def binary_search_fix(
 
         sha = get_commit_sha(conda_env)
         passed, _, _ = test_pytorch(test_script, conda_env)
-        # pyrefly: ignore  # missing-attribute
+
         pbar.update(1)
 
         sha_display = sha[:8] if sha else "unknown"
 
         if passed:
-            # pyrefly: ignore  # unbound-name
             tqdm.write(f"  ✅ {date}: PASSED - {pass_msg} (commit: {sha_display})")
             last_good = date
             last_good_sha = sha
@@ -246,7 +243,6 @@ def binary_search_fix(
                 case "regression":
                     left = mid + 1
         else:
-            # pyrefly: ignore  # unbound-name
             tqdm.write(f"  ❌ {date}: FAILED - {fail_msg} (commit: {sha_display})")
             first_bad = date
             first_bad_sha = sha
@@ -256,7 +252,6 @@ def binary_search_fix(
                 case "regression":
                     right = mid - 1
 
-    # pyrefly: ignore  # missing-attribute
     pbar.close()
     print_bisect_results(last_good, first_bad, last_good_sha, first_bad_sha, test_script, mode)
     return last_good_sha, first_bad_sha

@@ -37,7 +37,6 @@ dev = [
     "ruff",
     "jsonargparse",
     "docstring-parser",
-    "pyrefly==0.44.1"
 ]
 
 qlora = ['bitsandbytes']
@@ -93,7 +92,3 @@ ignore = ['E231', 'E731']
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401", "F403"]
-
-# ---------- PYREFLY ------------
-[tool.pyrefly]
-project-excludes = ["**/cute/**", "examples/**"]

@@ -44,7 +44,6 @@ class ShapeLog(TorchDispatchMode):
                 maybe_type = dtype_abbrs[a.dtype]
             return f"{maybe_type}{shape_str}"
         else:
-            # pyrefly: ignore  # bad-return
             return a
 
     def fmt_shape(self, kwargs: dict, with_type: bool = False) -> str:
@@ -79,7 +78,7 @@ class ShapeLog(TorchDispatchMode):
         rs = func(*args, **kwargs)
 
         # Convert all to kwargs
-        # pyrefly: ignore  # not-iterable
+
         _, new_kwargs = normalize_function(
             func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
         )

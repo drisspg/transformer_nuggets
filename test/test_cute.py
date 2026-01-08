@@ -32,7 +32,6 @@ def simple_add_kernel(
 
     thread_idx = bidx * bdim + tidx
 
-    # pyrefly: ignore  # not-iterable
     m, n = gA.shape
     ni = thread_idx % n
     mi = thread_idx // n
@@ -40,7 +39,6 @@ def simple_add_kernel(
     a_val = gA[mi, ni]
     b_val = gB[mi, ni]
 
-    # pyrefly: ignore  # unsupported-operation
     gC[mi, ni] = a_val + b_val
 
 
@@ -56,7 +54,6 @@ def simple_mul_kernel(
 
     thread_idx = bidx * bdim + tidx
 
-    # pyrefly: ignore  # not-iterable
     m, n = gA.shape
     ni = thread_idx % n
     mi = thread_idx // n
@@ -64,7 +61,6 @@ def simple_mul_kernel(
     a_val = gA[mi, ni]
     b_val = gB[mi, ni]
 
-    # pyrefly: ignore  # unsupported-operation
     gC[mi, ni] = a_val * b_val
 
 
@@ -78,10 +74,9 @@ def cached_elementwise(
     @cute.jit
     def add_kernel(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
         num_threads_per_block = 256
-        # pyrefly: ignore  # not-iterable
+
         m, n = mA.shape
 
-        # pyrefly: ignore  # missing-attribute, bad-argument-count
         simple_add_kernel(mA, mB, mC).launch(
             grid=((m * n) // num_threads_per_block, 1, 1), block=(num_threads_per_block, 1, 1)
         )
@@ -89,10 +84,9 @@ def cached_elementwise(
     @cute.jit
     def mul_kernel(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
         num_threads_per_block = 256
-        # pyrefly: ignore  # not-iterable
+
         m, n = mA.shape
 
-        # pyrefly: ignore  # missing-attribute, bad-argument-count
         simple_mul_kernel(mA, mB, mC).launch(
             grid=((m * n) // num_threads_per_block, 1, 1), block=(num_threads_per_block, 1, 1)
         )
@@ -190,7 +184,7 @@ def test_elementwise_op_dynamic_correctness(shape):
     b = torch.randn(M, N, device="cuda", dtype=torch.float16)
 
     # Test the dynamic API
-    # pyrefly: ignore  # bad-argument-type
+
     out = elementwise_op_dynamic(add, a, b)
     expected = a + b
 
@@ -218,7 +212,6 @@ def test_cache_behavior():
     a = torch.randn(512, 512, device="cuda", dtype=torch.float16)
     b = torch.randn(512, 512, device="cuda", dtype=torch.float16)
 
-    # pyrefly: ignore  # bad-argument-type
     elementwise_op_dynamic(add, a, b)
     stats1 = get_cache_stats()
     assert stats1["misses"] >= 1
@@ -227,7 +220,6 @@ def test_cache_behavior():
     c = torch.randn(512, 512, device="cuda", dtype=torch.float16)
     d = torch.randn(512, 512, device="cuda", dtype=torch.float16)
 
-    # pyrefly: ignore  # bad-argument-type
     elementwise_op_dynamic(add, c, d)
     stats2 = get_cache_stats()
     assert stats2["hits"] >= 1
@@ -243,7 +235,6 @@ def test_different_sizes_use_different_configs():
         a = torch.randn(M, N, device="cuda", dtype=torch.float16)
         b = torch.randn(M, N, device="cuda", dtype=torch.float16)
 
-        # pyrefly: ignore  # bad-argument-type
         out = elementwise_op_dynamic(add, a, b)
         expected = a + b
         torch.testing.assert_close(out, expected, rtol=1e-3, atol=1e-3)

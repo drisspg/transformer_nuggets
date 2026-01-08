@@ -84,9 +84,9 @@ def correctness_check(hp_tensor, triton_tensor, config):
 
     # Find the index of the maximum deviation
     max_dev_index = torch.abs(nuggets_out - eager_out).argmax().item()
-    # pyrefly: ignore  # index-error
+
     print(f"nuggets_out tensor value: {nuggets_out.flatten()[max_dev_index]:.4f}")
-    # pyrefly: ignore  # index-error
+
     print(f"eager_out tensor value: {eager_out.flatten()[max_dev_index]:.4f}")
 
 
@@ -151,7 +151,7 @@ def main():
     torch.random.manual_seed(123)
     configs = get_configs()
     results = []
-    # pyrefly: ignore  # not-iterable
+
     for config in tqdm(configs):
         result = run_experiment(config)
         results.append(Experiment(config=config, result=result))

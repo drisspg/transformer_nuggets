@@ -279,7 +279,6 @@ class AttentionStack(nn.Module):
         requires_grad: bool = True,
         block_size: tuple[int, int] | None = None,
     ) -> tuple[Tensor, BlockMask | None]:
-        # pyrefly: ignore [not-callable]
         inpt = self.layers[0].get_input(batch_size, seq_len, device, dtype, requires_grad)
         match (self.backend, self.causal):
             case ("flex", True):
@@ -298,7 +297,6 @@ class AttentionStack(nn.Module):
         return inpt, block_mask
 
     def get_attn_params(self) -> tuple[int, int, int, int]:
-        # pyrefly: ignore [not-callable]
         return self.layers[0].get_attn_params()
 
 
@@ -377,7 +375,7 @@ def main(
     if compile or max_autotune:
         compile_mode = "max-autotune" if max_autotune else None
         print(f"[Compile] mode={compile_mode}")
-        # pyrefly: ignore [no-matching-overload]
+
         model = torch.compile(model, mode=compile_mode, fullgraph=True)
 
     with cuda_kernel_profiler("flash_attncute") as result:

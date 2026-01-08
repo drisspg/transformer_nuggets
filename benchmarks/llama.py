@@ -15,7 +15,7 @@ import transformer_nuggets.quant.qlora as qlora
 import transformer_nuggets.utils.benchmark as benchmark_utils
 from torch.nn import functional as F
 
-# pyrefly: ignore  # missing-module-attribute
+
 from transformer_nuggets.quant import linear_nf4
 from typing_extensions import Self
 
@@ -53,7 +53,6 @@ class LLaMAConfig:
 
     @classmethod
     def from_name(cls, name: str) -> Self:
-        # pyrefly: ignore  # bad-argument-type
         return cls(**llama_configs[name])
 
 
@@ -125,13 +124,11 @@ class LLaMA(nn.Module):
             mask = self.mask_cache[:, :, :T, :T]
 
         # forward the model itself
-        # pyrefly: ignore  # not-callable
+
         x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
 
         if input_pos is None:  # proxy for use_cache=False
-            # pyrefly: ignore  # not-iterable
             for block in self.transformer.h:
-                # pyrefly: ignore  # not-callable
                 x, _ = block(x, rope, mask, max_seq_length)
         else:
             if not self.kv_caches:
@@ -144,13 +141,12 @@ class LLaMA(nn.Module):
                     )
                     for _ in range(self.config.n_layer)
                 ]
-            # pyrefly: ignore  # bad-argument-type
+
             for i, block in enumerate(self.transformer.h):
                 x, self.kv_caches[i] = block(
                     x, rope, mask, max_seq_length, input_pos, self.kv_caches[i]
                 )
 
-        # pyrefly: ignore  # not-callable
         x = self.transformer.ln_f(x)
 
         logits = self.lm_head(x)  # (b, t, vocab_size)
@@ -179,7 +175,7 @@ class LLaMA(nn.Module):
 
     def reset_cache(self) -> None:
         self.kv_caches.clear()
-        # pyrefly: ignore  # missing-attribute
+
         if self.mask_cache.device.type == "xla":
             # https://github.com/Lightning-AI/lit-parrot/pull/83#issuecomment-1558150179
             self.rope_cache = None
@@ -195,13 +191,10 @@ class Block(nn.Module):
         if config.mlp_type == MLPType.Original:
             self.mlp = MLP(config)
         elif config.mlp_type == MLPType.BnB:
-            # pyrefly: ignore  # bad-assignment
             self.mlp = BnbNF4MLP(config)
         elif config.mlp_type == MLPType.NF4:
-            # pyrefly: ignore  # bad-assignment
             self.mlp = NF4MLP(config)
         elif config.mlp_type == MLPType.QloraNugs:
-            # pyrefly: ignore  # bad-assignment
             self.mlp = QloraMLP(config)
 
     def forward(
@@ -262,16 +255,15 @@ class CausalSelfAttention(nn.Module):
         if kv_cache is not None:
             cache_k, cache_v = kv_cache
             # check if reached token limit
-            # pyrefly: ignore  # unsupported-operation
+
             if input_pos[-1] >= max_seq_length:
-                # pyrefly: ignore  # missing-attribute
                 input_pos = torch.tensor(max_seq_length - 1, device=input_pos.device)
                 # shift 1 position to the left
                 cache_k = torch.roll(cache_k, -1, dims=2)
                 cache_v = torch.roll(cache_v, -1, dims=2)
-            # pyrefly: ignore  # no-matching-overload
+
             k = cache_k.index_copy(2, input_pos, k)
-            # pyrefly: ignore  # no-matching-overload
+
             v = cache_v.index_copy(2, input_pos, v)
             kv_cache = k, v
 
@@ -439,7 +431,6 @@ def main():
     input_batch = torch.randint(config.vocab_size, (bsz, max_seq_len), device=device)
 
     if compile:
-        # pyrefly: ignore [no-matching-overload]
         model = torch.compile(model)
 
     # Warmup
@@ -452,10 +443,9 @@ def main():
         warmup_iters=3,
         sync=True,
     )
-    # pyrefly: ignore [bad-argument-type]
+
     benchmark_utils.profile_function(profile_config, model, input_batch)
 
-    # pyrefly: ignore [bad-argument-type]
     benchmark_time = benchmark_utils.benchmark_torch_function_in_microseconds(model, input_batch)
     print(
         f"Benchmark time for llama_forward_{config.mlp_type.value}_compile_{compile}: {benchmark_time} us"
@@ -463,7 +453,6 @@ def main():
     # Get the full model snapshot
     model(input_batch)
     with benchmark_utils.save_memory_snapshot(
-        # pyrefly: ignore  # bad-argument-type
         f"llama_{config.mlp_type.value}_compile_{compile}.pickle"
     ):
         model(input_batch).sum().backward()

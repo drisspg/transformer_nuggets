@@ -13,7 +13,6 @@ from transformer_nuggets.quant.qlora_debug import NF4TensorDebug
 
 bnb_available = False
 try:
-    # pyrefly: ignore  # import-error
     import bitsandbytes as bnb
 
     bnb_available = True
@@ -75,10 +74,10 @@ def test_reconstruction_triton_kernel(
 def test_reconstruction_qlora_vs_bnb(embed_dim: int, dtype: torch.dtype):
     torch.manual_seed(0)
     device = "cuda"
-    # pyrefly: ignore  # bad-argument-type
+
     input_weight = qlora.build_input_weight(embed_dim, device, dtype)
     nugs_qlora = NF4Tensor.from_tensor(input_weight)
-    # pyrefly: ignore  # bad-argument-type
+
     bnb_linear = qlora.build_bitsandbytes_linear(input_weight, device)
     # This is sneaky but don't know if there is a better way to get the reconstruction
     bnb_reconstruction = bnb_linear(torch.eye(embed_dim, embed_dim, dtype=dtype, device=device))
@@ -98,7 +97,7 @@ def test_reconstruction_qlora_vs_bnb(embed_dim: int, dtype: torch.dtype):
 )
 def test_binning_distribution(embed_dim: int):
     device = "cuda"
-    # pyrefly: ignore  # bad-argument-type
+
     input_weight = qlora.build_input_weight(embed_dim, device)
     nugs_qlora = NF4Tensor.from_tensor(input_weight)
     first_elements = (nugs_qlora.quantized_data >> 4).to(torch.long)
@@ -130,10 +129,9 @@ def test_autograd_func_to_eager(
     torch._dynamo.reset()
     torch.manual_seed(0)
     device = torch.device("cuda")
-    # pyrefly: ignore  # bad-argument-type
+
     input_weight = qlora.build_input_weight(embed_dim, device, dtype)
     sample_input = qlora.get_sample_inputs(
-        # pyrefly: ignore  # bad-argument-type
         8,
         128,
         embed_dim,
@@ -202,7 +200,6 @@ def test_bitsandbytes_mlp_parity(embed_dim, compile, dtype):
 
     nugs_mlp = qlora_mlp
     if compile:
-        # pyrefly: ignore [no-matching-overload]
         nugs_mlp = torch.compile(qlora_mlp, fullgraph=True)
 
     original_result = mlp(sample_input)
@@ -235,15 +232,14 @@ def test_qlora_linear(
     torch.manual_seed(0)
     device = "cuda:0"
     # Analog for replacing first linear in MLP
-    # pyrefly: ignore  # bad-argument-type
+
     weight = qlora.get_mlp_weights(embed_dim, device, dtype)[0]
     n_hidden = weight.size(0)  # hardcode llama 7b
     nugs_qlora_linear = qlora.QloraLinear(embed_dim, n_hidden, weight, r, lora_dropout=dropout)
     func = nugs_qlora_linear
     if compile:
-        # pyrefly: ignore [no-matching-overload]
         func = torch.compile(nugs_qlora_linear, fullgraph=True)
-    # pyrefly: ignore  # bad-argument-type
+
     sample_input = qlora.get_sample_inputs(8, 128, embed_dim, device, dtype=dtype)
     out = func(sample_input)
     if run_backward:

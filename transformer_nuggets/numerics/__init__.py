@@ -243,12 +243,10 @@ def compute_rmse(a: torch.Tensor, b: torch.Tensor) -> float:
         RMSE as a float
     """
     if isinstance(a, torch.Tensor):
-        # pyrefly: ignore  # bad-assignment
         a = a.cpu().numpy()
     if isinstance(b, torch.Tensor):
-        # pyrefly: ignore  # bad-assignment
         b = b.cpu().numpy()
-    # pyrefly: ignore  # unsupported-operation
+
     return float(np.sqrt(np.mean((a - b) ** 2)))
 
 
@@ -264,10 +262,8 @@ def compute_error_stats(a: torch.Tensor, b: torch.Tensor) -> dict[str, float]:
         Dictionary with 'mean', 'max', 'median', 'std' of absolute errors
     """
     if isinstance(a, torch.Tensor):
-        # pyrefly: ignore  # bad-assignment
         a = a.cpu().numpy()
     if isinstance(b, torch.Tensor):
-        # pyrefly: ignore  # bad-assignment
         b = b.cpu().numpy()
 
     abs_errors = np.abs(a - b)

@@ -38,23 +38,20 @@ def main(output_folder: Path, use_qlora: bool = False, compile: bool = False):
     """
     model = get_mlp_stack(use_qlora)
 
-    # pyrefly: ignore  # bad-argument-type
     x = get_sample_inputs(1, 8, 8192, "cuda", requires_grad=False)
 
     if compile:
-        # pyrefly: ignore [no-matching-overload]
         model = torch.compile(model)
         with torch.no_grad():
             model(x)  # warmup
 
     assert output_folder.is_dir(), f"output_folder {output_folder} should be a directory"
-    # pyrefly: ignore  # missing-attribute
+
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     with save_memory_snapshot(output_folder / ("qlora_mlp" if use_qlora else "main_mlp")):
         for epoch in range(2):
-            # pyrefly: ignore  # bad-argument-type
             x = get_sample_inputs(1, 8, 8192, "cuda", requires_grad=False)
-            # pyrefly: ignore  # not-iterable
+
             for layer in model:
                 x = layer(x)
 

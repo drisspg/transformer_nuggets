@@ -21,7 +21,6 @@ from torch.nn.attention import sdpa_kernel, SDPBackend
 from transformer_nuggets.utils.benchmark import benchmark_cuda_function_in_microseconds
 
 try:
-    # pyrefly: ignore  # import-error
     from flash_attn.cute import flash_attn_func
 
     CUTE_AVAILABLE = True
@@ -333,7 +332,7 @@ def run_single_experiment(config: ExperimentConfig) -> Experiment:
         )
 
     # Run CUTE
-    # pyrefly: ignore  # bad-argument-type
+
     cute_results = run_cute_attention(config, q, k, v, pytorch_output)
 
     return Experiment(
@@ -404,7 +403,7 @@ def print_results(experiments: list[Experiment], save_path: str | None = None):
         print(f"\nAverage CUTE performance:    {avg_cute_tflops:.2f} TFLOPs/s")
         print(f"Average PyTorch performance: {avg_pytorch_tflops:.2f} TFLOPs/s")
         print(f"Max numerical difference:    {max(max_errors):.2e}")
-        # pyrefly: ignore  # no-matching-overload
+
         print(f"Mean numerical difference:   {np.mean(mean_errors):.2e}")
 
     # Save to CSV if requested
@@ -497,7 +496,7 @@ def main(
     )
 
     experiments = []
-    # pyrefly: ignore  # not-iterable
+
     for config in tqdm(configs, desc="Running experiments"):
         experiment = run_single_experiment(config)
         experiments.append(experiment)

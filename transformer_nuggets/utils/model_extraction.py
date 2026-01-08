@@ -66,9 +66,7 @@ def extract_attention_data(
     tolerance = max(64, int(max_length * 0.1))
     candidates: list[tuple[str, int]] = []
 
-    # pyrefly: ignore  # not-iterable, bad-argument-type
     for _, item in tqdm(enumerate(dataset), desc="Scanning prompts", total=len(dataset)):
-        # pyrefly: ignore [bad-argument-type]
         prompt = _extract_text(item)
         if prompt is None or len(prompt) <= min_prompt_length:
             continue
@@ -127,7 +125,6 @@ def extract_attention_data(
         model_id, attn_implementation="my_new_sdpa"
     ).cuda()
 
-    # pyrefly: ignore  # not-iterable
     for _, prompt in tqdm(enumerate(selected_prompts), desc="Processing prompts"):
         tokenized = tokenizer(
             prompt,
@@ -169,7 +166,6 @@ if __name__ == "__main__":
         num_samples=2,
         max_length=2048,
         min_prompt_length=500,
-        # pyrefly: ignore  # unexpected-keyword
         num_random_samples=8,
     )
 

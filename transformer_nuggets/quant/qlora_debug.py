@@ -1,7 +1,7 @@
 # A loop based (slow) implementation of the QLoRA weight
 import torch
 
-# pyrefly: ignore  # missing-module-attribute
+
 from scipy.stats import norm
 from tqdm import tqdm
 
@@ -44,19 +44,17 @@ class NF4TensorDebug:
         return nkf
 
     @staticmethod
-    # pyrefly: ignore  # not-a-type
     def quantize(value: torch.float16, nkf: torch.Tensor) -> torch.Tensor:
         """Quantize a float16 value to nkf format"""
         for i in range(len(nkf)):
             if value <= nkf[i]:
                 # print("value", value, "nkf", nkf[i])
-                # pyrefly: ignore  # bad-return
+
                 return 0 | i
-        # pyrefly: ignore  # bad-return
+
         return 0 | (len(nkf) - 1)
 
     @staticmethod
-    # pyrefly: ignore  # not-a-type
     def quantize_nearest(value: torch.float16, nkf: torch.Tensor) -> torch.Tensor:
         closest_index = 0
         closest_diff = abs(nkf[0] - value)
@@ -65,7 +63,7 @@ class NF4TensorDebug:
             if diff < closest_diff:
                 closest_diff = diff
                 closest_index = i
-        # pyrefly: ignore  # bad-return
+
         return 0 | closest_index
 
     @staticmethod
@@ -106,7 +104,7 @@ class NF4TensorDebug:
         )
         quantized_length = numel // 2
         quantized_tensor = torch.zeros(quantized_length, dtype=torch.uint8)
-        # pyrefly: ignore  # not-iterable
+
         for i in tqdm(range(len(self.scalers))):
             block_start = i * self.block_size
             block_end = min(block_start + self.block_size, flattened_tensor.numel())
@@ -138,8 +136,8 @@ class NF4TensorDebug:
                 element_1 = combined >> 4
                 # Select out the bottom 4 bits
                 element_2 = combined & 0b1111
-                # pyrefly: ignore  # bad-argument-type
+
                 block[j] = self.dequantize(element_1.item(), nkf) * self.scalers[i]
-                # pyrefly: ignore  # bad-argument-type
+
                 block[j + 1] = self.dequantize(element_2.item(), nkf) * self.scalers[i]
         return original_weight.reshape(self.original_shape)

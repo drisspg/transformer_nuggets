@@ -69,7 +69,7 @@ class LoopMoE(nn.Module):
         """
         orig_shape = hidden_states.shape
         hidden_size = hidden_states.shape[-1]
-        # pyrefly: ignore [missing-attribute]
+
         num_tokens = (hidden_states.shape[:-1]).numel()
         dtype = hidden_states.dtype
 
@@ -113,7 +113,7 @@ class LoopMoE(nn.Module):
                 final_hidden_states = final_hidden_states + current_hidden_states
 
         # Reshape back to original shape
-        # pyrefly: ignore  # missing-attribute
+
         return final_hidden_states.view(orig_shape)
 
 

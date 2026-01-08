@@ -46,7 +46,7 @@ def copy_(func, *args, **kwargs):
     copy_in: torch.Tensor = args[0][1]
 
     # Base Case
-    # pyrefly: ignore  # bad-argument-type
+
     if same_metadata(original, copy_in):
         original_tensors = original.__tensor_flatten__()[0]
         for tensor_name in original_tensors:
@@ -209,7 +209,6 @@ class NF4Tensor(torch.Tensor):
         tensor_meta = SubclassTensorArgs(
             inpt_tensor.size(),
             inpt_tensor.stride(),
-            # pyrefly: ignore  # bad-argument-type
             inpt_tensor.storage_offset(),
             inpt_tensor.dtype,
             inpt_tensor.device,
@@ -312,7 +311,6 @@ class NF4Tensor(torch.Tensor):
 
     @staticmethod
     def convert_to_norm_float_weight(
-        # pyrefly: ignore  # not-a-type
         inpt_tensor: torch.Tensor,
         n_blocks: int,
         block_size: int,
@@ -380,7 +378,6 @@ class NF4Tensor(torch.Tensor):
         return torch.stack([scaled_first, scaled_second], dim=-1).reshape(self.shape)
 
     @staticmethod
-    # pyrefly: ignore  # not-a-type
     def quantize_tensor_nearest(value: torch.float16, nf4: torch.Tensor) -> torch.Tensor:
         """Quantize a float16 tensor to nf4 format to nearest and not rounded up"""
         value = value.unsqueeze(-1)  # (numel, 1)
@@ -391,7 +388,6 @@ class NF4Tensor(torch.Tensor):
         return closest_nf4
 
     @staticmethod
-    # pyrefly: ignore  # bad-override
     def dequantize(value: torch.Tensor, nf4: torch.Tensor) -> torch.Tensor:
         """Dequantize a nf4 value to float16 format"""
         # return nf4.index_select(0, value)
@@ -400,7 +396,6 @@ class NF4Tensor(torch.Tensor):
     def unpack(
         self,
     ) -> tuple[int, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Size]:
-        # pyrefly: ignore  # bad-return
         return (
             self.block_size,
             self.n_blocks,
@@ -421,7 +416,6 @@ class NF4Tensor(torch.Tensor):
         tensor_meta = SubclassTensorArgs(
             self.shape,
             self.stride(),
-            # pyrefly: ignore  # bad-argument-type
             self.storage_offset(),
             self.dtype,
             self.device,
@@ -457,7 +451,6 @@ class NF4Tensor(torch.Tensor):
         )
 
     @classmethod
-    # pyrefly: ignore  # bad-param-name-override
     def __torch_dispatch__(cls, func, types, args, kwargs=None):
         # All ops in the  NF4_OPS_TABLE expect NF4 Tensors as inputs
         # And don't support mixed tensor subclasses. This will trigger the handler for
@@ -466,12 +459,10 @@ class NF4Tensor(torch.Tensor):
             return (
                 issubclass(cls, type)
                 or issubclass(torch._subclasses.fake_tensor.FakeTensor, type)
-                # pyrefly: ignore  # implicit-import
                 or issubclass(torch._subclasses.functional_tensor.FunctionalTensor, type)
             )
 
         if not all(allowed_subclasses(t) for t in types):
-            # pyrefly: ignore  # not-callable
             return NotImplemented("Up to the next one to handle")
 
         if func in NF4_OPS_TABLE:
@@ -481,5 +472,5 @@ class NF4Tensor(torch.Tensor):
         )
 
     # Do not force the Float8Tensor type on the returned tensor
-    # pyrefly: ignore  # bad-param-name-override
+
     __torch_function__ = torch._C._disabled_torch_function_impl

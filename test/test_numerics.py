@@ -178,7 +178,7 @@ class TestComputeRMSE:
 
         a = np.array([1.0, 2.0, 3.0])
         b = np.array([2.0, 3.0, 4.0])
-        # pyrefly: ignore  # bad-argument-type
+
         rmse = compute_rmse(a, b)
         assert rmse == pytest.approx(1.0, rel=1e-5)
 
@@ -237,7 +237,7 @@ class TestComputeErrorStats:
 
         a = np.array([1.0, 2.0, 3.0])
         b = np.array([2.0, 3.0, 4.0])
-        # pyrefly: ignore  # bad-argument-type
+
         stats = compute_error_stats(a, b)
 
         assert stats["mean"] == pytest.approx(1.0, rel=1e-5)
@@ -289,6 +289,6 @@ class TestPlotAbsDiffDistribution:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             save_path = Path(tmpdir) / "test_plot.png"
-            # pyrefly: ignore  # bad-argument-type
+
             plot_abs_diff_distribution(a, b, save_path)
             assert save_path.exists()

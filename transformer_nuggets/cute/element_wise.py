@@ -19,7 +19,6 @@ class ElementwiseOp(CuteOp[[torch.Tensor, torch.Tensor, torch.Tensor], None]):
         self.op = op
 
     @cute.kernel
-    # pyrefly: ignore  # bad-override
     def kernel(
         self,
         op: cutlass.Constexpr,
@@ -37,11 +36,10 @@ class ElementwiseOp(CuteOp[[torch.Tensor, torch.Tensor, torch.Tensor], None]):
         blkB = gB[blk_coord]
         blkC = gC[blk_coord]
 
-        # pyrefly: ignore  # no-matching-overload
         tidfrgA = cute.composition(blkA, tv_layout)
-        # pyrefly: ignore  # no-matching-overload
+
         tidfrgB = cute.composition(blkB, tv_layout)
-        # pyrefly: ignore  # no-matching-overload
+
         tidfrgC = cute.composition(blkC, tv_layout)
 
         thr_coord = (tidx, None)
@@ -50,7 +48,6 @@ class ElementwiseOp(CuteOp[[torch.Tensor, torch.Tensor, torch.Tensor], None]):
         thrB = tidfrgB[thr_coord]
         thrC = tidfrgC[thr_coord]
 
-        # pyrefly: ignore  # not-callable
         thrC[None] = op(thrA.load(), thrB.load())
 
     def get_key(self, *args, **kwargs) -> str:
@@ -84,7 +81,6 @@ class ElementwiseOp(CuteOp[[torch.Tensor, torch.Tensor, torch.Tensor], None]):
         gB = cute.zipped_divide(mB, tiler_mn)
         gC = cute.zipped_divide(mC, tiler_mn)
 
-        # pyrefly: ignore  # missing-attribute, bad-argument-count
         self.kernel(op, gA, gB, gC, tv_layout).launch(
             grid=[cute.size(gC, mode=[1]), 1, 1],
             block=[cute.size(tv_layout, mode=[0]), 1, 1],
@@ -104,7 +100,6 @@ def naive_elementwise_add_kernel(
 
     thread_idx = bidx * bdim + tidx
 
-    # pyrefly: ignore  # not-iterable
     m, n = gA.shape
     ni = thread_idx % n
     mi = thread_idx // n
@@ -112,19 +107,17 @@ def naive_elementwise_add_kernel(
     a_val = gA[mi, ni]
     b_val = gB[mi, ni]
 
-    # pyrefly: ignore  # unsupported-operation
     gC[mi, ni] = a_val + b_val
 
 
 @cute.jit
 def naive_elementwise_add(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
     num_threads_per_block = 256
-    # pyrefly: ignore  # not-iterable
+
     m, n = mA.shape
 
-    # pyrefly: ignore  # bad-argument-count
     kernel = naive_elementwise_add_kernel(mA, mB, mC)
-    # pyrefly: ignore  # missing-attribute
+
     kernel.launch(
         grid=((m * n) // num_threads_per_block, 1, 1), block=(num_threads_per_block, 1, 1)
     )
@@ -173,7 +166,7 @@ if __name__ == "__main__":
     c = torch.zeros(M, N, device="cuda", dtype=torch.float16)
 
     # Test the new API that takes regular PyTorch tensors
-    # pyrefly: ignore  # bad-argument-type
+
     elementwise_op(mul, a, b, c)
     torch.testing.assert_close(c, mul(a, b))
     print("✓ Multiplication test passed")

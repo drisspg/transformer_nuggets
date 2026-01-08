@@ -35,12 +35,70 @@ def _pointer_to_int(pointer) -> int:
 class DirectCopy(CuteOp[[torch.Tensor], torch.Tensor]):
     """Playing Around w/ TMA in cuteDsl"""
 
-    def __init__(self, debug: bool = False):
+    def __init__(self, use_tma: bool = False, num_stages: int = 1):
         super().__init__()
-        self.DEBUG = debug
+        self.num_stages = 1
 
     @cute.kernel
-    # pyrefly: ignore  # bad-override
+    def kernel_tma(
+        self,
+        tma_tensor_load: cute.Tensor,
+        tma_tensor_store: cute.Tensor,
+        load_atom: cute.CopyAtom,
+        store_atom: cute.CopyAtom,
+        shared_storage: cutlass.Constexpr,
+        tile_size: cutlass.Constexpr,
+        dtype: cutlass.Constexpr,
+    ):
+        smem = cutlass.utils.SmemAllocator()
+
+        storage = smem.allocate(shared_storage)
+        smem_layout = cute.make_layout(tile_size)
+        sA = storage.data.get_tensor(smem_layout)
+
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+
+        tAsA_load, tAgA = cpasync.tma_partition(
+            load_atom,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sA, 0, 1),
+            cute.group_modes(tma_tensor_load, 0, 1),
+        )
+        tAsA_store, tBgB = cpasync.tma_partition(
+            store_atom,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sA, 0, 1),
+            cute.group_modes(tma_tensor_store, 0, 1),
+        )
+
+        load_mbar_ptr = storage.load_mbar_ptr.data_ptr()
+
+        if warp_idx == 0:
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_init(load_mbar_ptr, 1)
+        cute.arch.mbarrier_init_fence()
+        cute.arch.barrier()
+
+        tma_load_bytes = cute.size_in_bytes(dtype, smem_layout)
+
+        if warp_idx == 0:
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(load_mbar_ptr, tma_load_bytes)
+
+        if warp_idx == 0:
+            cute.copy(load_atom, tAgA[(None, bidx)], tAsA_load, tma_bar_ptr=load_mbar_ptr)
+
+        cute.arch.mbarrier_wait(load_mbar_ptr, 0)
+        if warp_idx == 1:
+            cute.copy(store_atom, tAsA_store, tBgB[(None, bidx)])
+        cute.arch.cp_async_bulk_commit_group()
+        cute.arch.cp_async_bulk_wait_group(0)
+
+    @cute.kernel
     def kernel(
         self,
         gA: cute.Tensor,
@@ -53,7 +111,7 @@ class DirectCopy(CuteOp[[torch.Tensor], torch.Tensor]):
         tiler_mn: cutlass.Constexpr,
     ):
         smem = cutlass.utils.SmemAllocator()
-        # pyrefly: ignore  # no-matching-overload
+
         storage = smem.allocate(shared_storage)
         smem_layout = cute.make_layout(tiler_mn)
         sA = storage.data.get_tensor(smem_layout)
@@ -66,7 +124,6 @@ class DirectCopy(CuteOp[[torch.Tensor], torch.Tensor]):
 
         ctaA = gA[cta_coord]
         ctaB = gB[cta_coord]
-        # ctacrdB = crdB[cta_coord]
 
         gmem_tiled_copy_load = cute.make_tiled_copy(load_atom, tv_layout, tiler_mn)
         gmem_thr_copy_load = gmem_tiled_copy_load.get_slice(tidx)
@@ -80,47 +137,24 @@ class DirectCopy(CuteOp[[torch.Tensor], torch.Tensor]):
         tBsA = gmem_thr_copy_store.partition_S(sA)
         tBgB = gmem_thr_copy_store.partition_D(ctaB)
 
-        # tAcA = gmem_thr_copy_load.partition_S(ctacrdB)
-        # tApA = cute.make_fragment(tAcA.shape, cutlass.Boolean)
-        # for i in cutlass.range(cute.size(tApA), unroll=1):
-        #     tApA[i] = cute.elem_less(tAcA[i], shape)
-
-        cute.copy(
-            load_atom,
-            tAgA,
-            tAsA,
-        )
-        # cute.arch.cp_async_commit_group()
-        # cute.arch.cp_async_wait_group(0)
-        # cute.arch.barrier()
-
-        if cutlass.const_expr(self.DEBUG):
-            if bidx == 0 and tidx == 0:
-                cute.printf("Block {} loading tile into smem\n", bidx)
-                cute.print_tensor(sA)
-
+        cute.copy(load_atom, tAgA, tAsA)
         cute.copy(store_atom, tBsA, tBgB)
 
-    def _get_shared_struct(
-        self, dtype: cutlass.Constexpr, num_elms: cutlass.Constexpr, USE_TMA: cutlass.Constexpr
-    ):
+    def _get_shared_struct(self, dtype: cutlass.Constexpr, num_elms: cutlass.Constexpr):
         @cute.struct
-        class Shared:
-            # pyrefly: ignore  # bad-specialization, not-a-type
-            bar: cute.struct.Align[cute.struct.MemRange[cutlass.Int64, 1], 16]
-            # pyrefly: ignore  # bad-specialization
-            data: cute.struct.Align[
-                # pyrefly: ignore  # bad-specialization, not-a-type
-                cute.struct.MemRange[dtype, num_elms],
-                # pyrefly: ignore  # not-a-type
-                16,
+        class SharedStorage:
+            load_mbar_ptr: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int64, self.num_stages], 8
             ]
+            store_mbar_ptr: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int64, self.num_stages], 8
+            ]
+            data: cute.struct.Align[cute.struct.MemRange[dtype, num_elms], 128]
 
-        return Shared
+        return SharedStorage
 
-    # pyrefly: ignore  # bad-return
     def get_key(self, *args, **kwargs) -> str:
-        key_parts = [self.__class__.__name__, f"debug={self.DEBUG}"]
+        key_parts = [self.__class__.__name__]
         for arg in args:
             if isinstance(arg, cute.Tensor):
                 key_parts.append(self._generate_tensor_key(arg))
@@ -149,82 +183,24 @@ class DirectCopy(CuteOp[[torch.Tensor], torch.Tensor]):
         return destination
 
     @cute.jit
-    # pyrefly: ignore  # bad-function-definition
     def __call__(self, mA: cute.Tensor, mB: cute.Tensor, USE_TMA: cutlass.Constexpr = False):
-        # Simple 32 threads handle 4 contiguous elements
-        thr_layout = cute.make_layout(256)
-        val_layout = cute.make_layout(4)
-        tiler_mn, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
-        smem_layout = cute.make_layout(cute.size(tiler_mn))
-        # pyrefly: ignore  # index-error
-        assert mA.shape[0] % val_layout.shape == 0, (
-            # pyrefly: ignore  # index-error
-            f"Input size {mA.shape[0]} is not divisible by vector size {val_layout.shape}"
-        )
-
         if cutlass.const_expr(USE_TMA):
-            tma_atom_load, tma_tensor_load = self.get_tma_atoms(
-                cpasync.CopyBulkTensorTileG2SOp(), mA, tiler_mn
-            )
-            tma_atom_store, tma_tensor_store = self.get_tma_atoms(
-                cpasync.CopyBulkTensorTileS2GOp(), mB, tiler_mn
-            )
-            copy_atoms = (tma_atom_load, tma_atom_store)
+            self.call_tma(mA, mB)
         else:
-            # pyrefly: ignore  # missing-attribute
-            bits_per_copy = mA.element_type.width
-            copy_atom_load = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(),
-                # cpasync.CopyG2SOp(),
-                mA.element_type,
-                num_bits_per_copy=bits_per_copy,
-            )
-            copy_atom_store = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(),
-                mB.element_type,
-                num_bits_per_copy=bits_per_copy,
-            )
-            copy_atoms = (copy_atom_load, copy_atom_store)
+            self.call_tv(mA, mB)
 
-        gA = cute.zipped_divide(mA, tiler_mn)
-        gB = cute.zipped_divide(mB, tiler_mn)
-
-        idB = cute.make_identity_tensor(mB.shape)
-        crdB = cute.zipped_divide(idB, tiler_mn)
-
-        dtype = mA.element_type
-        num_elms = cute.size(smem_layout, mode=[0])
-        # pyrefly: ignore  # bad-argument-type
-        Shared = self._get_shared_struct(dtype, num_elms, USE_TMA)
-
-        if cutlass.const_expr(self.DEBUG):
-            print(
-                f"Launching a grid of {cute.size(gA, mode=[1])} and a block of {cute.size(tv_layout, mode=[0])}"
-            )
-            # pyrefly: ignore  # unbound-name
-            print(f"Using copy atoms with {bits_per_copy}-bit copies")
-            print("Load Atom:", copy_atoms[0])
-            print("Store Atom:", copy_atoms[1])
-            print("Smem layout:", smem_layout)
-            print("Tiler MN:", tiler_mn)
-            print("TV layout:", tv_layout)
-
-        # pyrefly: ignore  # missing-attribute, bad-argument-count
-        self.kernel(gA, gB, copy_atoms, tv_layout, crdB, Shared, mB.shape, tiler_mn).launch(
-            grid=[cute.size(gA, mode=[1]), 1, 1],
-            block=[cute.size(tv_layout, mode=[0]), 1, 1],
-        )
-
-    def get_tma_atoms(self, copy_op, tensor: cute.Tensor, tiler_mn: cute.Layout):
+    def get_tma_atoms(
+        self, copy_op, gmem_tensor: cute.Tensor, smem_layout: cute.Layout, tiler_mn: cute.Layout
+    ):
         tma_atom, tma_tensor = cute.nvgpu.cpasync.make_tiled_tma_atom(
             copy_op,
-            tensor,
+            gmem_tensor,
+            smem_layout,
             tiler_mn,
         )
         return tma_atom, tma_tensor
 
     def get_copy_atoms(self, copy_op, tensor: cute.Tensor, tiler_mn: cute.Layout):
-        # pyrefly: ignore  # missing-attribute
         copy_atom, copy_tensor = cute.make_tiled_copy_atom(
             copy_op,
             tensor,
@@ -232,21 +208,97 @@ class DirectCopy(CuteOp[[torch.Tensor], torch.Tensor]):
         )
         return copy_atom, copy_tensor
 
+    @cute.jit
+    def call_tma(self, mA: cute.Tensor, mB: cute.Tensor):
+        num_warps = 2
+        load_store_size = 1024
+        num_threads = num_warps * 32
+        num_blocks = mA.shape[0] // load_store_size
+        gmem_layout_2d = cute.make_layout((load_store_size, num_blocks))
+        mA_2d = cute.make_tensor(mA.iterator, gmem_layout_2d)
+        mB_2d = cute.make_tensor(mB.iterator, gmem_layout_2d)
+
+        smem_layout_tma = cute.make_layout((load_store_size, 1))
+        tma_atom_load, tma_tensor_load = self.get_tma_atoms(
+            cpasync.CopyBulkTensorTileG2SOp(), mA_2d, smem_layout_tma, (load_store_size, 1)
+        )
+        tma_atom_store, tma_tensor_store = self.get_tma_atoms(
+            cpasync.CopyBulkTensorTileS2GOp(), mB_2d, smem_layout_tma, (load_store_size, 1)
+        )
+        Shared = self._get_shared_struct(mA.element_type, load_store_size)
+        dtype = mA.element_type
+        self.kernel_tma(
+            tma_tensor_load,
+            tma_tensor_store,
+            tma_atom_load,
+            tma_atom_store,
+            Shared,
+            load_store_size,
+            dtype,
+        ).launch(
+            grid=[num_blocks, 1, 1],
+            block=[num_threads, 1, 1],
+            cluster=[1, 1, 1],
+        )
+
+    @cute.jit
+    def call_tv(self, mA: cute.Tensor, mB: cute.Tensor):
+        # Simple 32 threads handle 4 contiguous elements
+        thr_layout = cute.make_layout(256)
+        val_layout = cute.make_layout(4)
+        tiler_mn, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
+        smem_layout = cute.make_layout(cute.size(tiler_mn))
+
+        assert mA.shape[0] % val_layout.shape == 0, (
+            f"Input size {mA.shape[0]} is not divisible by vector size {val_layout.shape}"
+        )
+        dtype = mA.element_type
+        num_elms = cute.size(smem_layout, mode=[0])
+        Shared = self._get_shared_struct(dtype, num_elms)
+
+        num_threads = cute.size(tv_layout, mode=[0])
+        bits_per_copy = mA.element_type.width
+        copy_atom_load = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            mA.element_type,
+            num_bits_per_copy=bits_per_copy,
+        )
+        copy_atom_store = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            mB.element_type,
+            num_bits_per_copy=bits_per_copy,
+        )
+        copy_atoms = (copy_atom_load, copy_atom_store)
+
+        gA = cute.zipped_divide(mA, tiler_mn)
+        gB = cute.zipped_divide(mB, tiler_mn)
+
+        idB = cute.make_identity_tensor(mB.shape)
+        crdB = cute.zipped_divide(idB, tiler_mn)
+
+        self.kernel(gA, gB, copy_atoms, tv_layout, crdB, Shared, mB.shape, tiler_mn).launch(
+            grid=[cute.size(gA, mode=[1]), 1, 1], block=[num_threads, 1, 1]
+        )
+
 
 def direct_copy(gA: torch.Tensor, *, use_tma: bool = False):
-    return DirectCopy(False).interface(gA, use_tma=use_tma)
+    return DirectCopy().interface(gA, use_tma=use_tma)
 
 
-if __name__ == "__main__":
+def main(use_tma: bool = False):
     set_cache_hashing(True)
     a = torch.randn(268435456, device="cuda", dtype=torch.float32)
     for _ in range(10):
-        out = direct_copy(a)
+        out = direct_copy(a, use_tma=use_tma)
         torch.testing.assert_close(out, a, atol=0.0, rtol=0.0)
+    print("All tests passed")
 
-    from transformer_nuggets.utils.benchmark import benchmark_cuda_function_in_microseconds
-
-    time_us = benchmark_cuda_function_in_microseconds(lambda: direct_copy(a))
+    time_us = benchmark_cuda_function_in_microseconds(
+        lambda: direct_copy(
+            a,
+            use_tma=use_tma,
+        )
+    )
     avg_time = time_us / 1e3
     print(f"Time: {avg_time:.3f} ms")
     bytes_moved = a.numel() * a.element_size() * 2
@@ -256,3 +308,9 @@ if __name__ == "__main__":
     stats = get_cache_stats()
     print(f"Cache stats: {stats}")
     print_cache()
+
+
+if __name__ == "__main__":
+    from jsonargparse import CLI
+
+    CLI(main)

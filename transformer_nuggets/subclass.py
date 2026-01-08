@@ -24,7 +24,6 @@ class SubclassTensorArgs:
         return SubclassTensorArgs(
             tensor.shape,
             tensor.stride(),
-            # pyrefly: ignore  # bad-argument-type
             tensor.storage_offset(),
             tensor.dtype,
             tensor.device,
@@ -32,7 +31,6 @@ class SubclassTensorArgs:
         )
 
 
-# pyrefly: ignore  # not-a-type
 def _implements(cls, aten_ops_or_torch_fns: Iterable[Op] | Op) -> callable:
     """Decorator to implement functions for aten ops in __torch_dispatch__ or torch functions in __torch_function__.
 
@@ -56,11 +54,9 @@ def _implements(cls, aten_ops_or_torch_fns: Iterable[Op] | Op) -> callable:
         cls._ATEN_OP_OR_TORCH_FN_TABLE = {}
 
     if not isinstance(aten_ops_or_torch_fns, (list, tuple)):
-        # pyrefly: ignore  # bad-assignment
         aten_ops_or_torch_fns = [aten_ops_or_torch_fns]
 
     def decorator(func):
-        # pyrefly: ignore  # not-iterable
         for op in aten_ops_or_torch_fns:
 
             @functools.wraps(op)
