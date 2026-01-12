@@ -1,4 +1,5 @@
 # benchmarks / data will be used for experiment results
+*.claude
 benchmarks/data/*
 transformer_nuggets/llama/data/*
 .vscode
