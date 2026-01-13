@@ -1,4 +1,4 @@
-name: pre-commit
+name: prek
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
   pull_request:
 
 jobs:
-  pre-commit:
+  prek:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -22,5 +22,5 @@ jobs:
       run: pip install ".[dev]"
     - name: Install pyrefly
       run: pip install pyrefly==0.44.1
-    - name: Run pre-commit
-      uses: pre-commit/action@v3.0.1
+    - name: Run prek
+      run: prek run --all-files
