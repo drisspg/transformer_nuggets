@@ -8,7 +8,7 @@ A grab-bag of experimental transformer kernels and utilities (mostly PyTorch + T
 
 - **`transformer_nuggets/flash`**: Triton FlashAttention experiments + masking/bias utilities.
 - **`transformer_nuggets/quant`**: NF4 tensor subclass + QLoRA building blocks (pure PyTorch).
-- **`transformer_nuggets/fp8`**: FP8 casting / scaled-quantization kernels (Triton).
+- **`transformer_nuggets/fp8`**: FP8 casting / scaled-quantization kernels (Triton). Try helion :)
 - **`transformer_nuggets/cute`**: CUTE DSL experiments and tooling (includes an intra-kernel profiler).
 - **`transformer_nuggets/misc`**: Odds and ends (e.g. attention wrappers, utilities).
 - **`transformer_nuggets/llama`**: LLaMA-ish model + training/finetune scripts (research-grade).
