@@ -44,34 +44,12 @@ pip install "transformer_nuggets[llama]"  # llama training utilities
 
 ### Quick examples
 
-NF4 tensor round-trip:
-
-```python
-import torch
-
-from transformer_nuggets.quant.nf4_tensor import NF4Tensor
-
-w = torch.randn(4096, 4096, dtype=torch.float16).contiguous()
-w.requires_grad_(False)
-
-nf4_w = NF4Tensor.from_tensor(w)
-w_dequant = nf4_w.get_original_weight()
-```
+Use torchao :)
 
 FlashAttention (requires CUDA + Triton; API is experimental):
 
-```python
-import math
-import torch
+Use flex-attention :)
 
-from transformer_nuggets.flash import BiasMode, attention
-
-q = torch.randn(2, 8, 1024, 64, device="cuda", dtype=torch.float16)
-k = torch.randn(2, 8, 1024, 64, device="cuda", dtype=torch.float16)
-v = torch.randn(2, 8, 1024, 64, device="cuda", dtype=torch.float16)
-
-o, _ = attention(q, k, v, causal=True, sm_scale=1 / math.sqrt(q.size(-1)), bias_choice=BiasMode.none)
-```
 
 CUTE intra-kernel profiling (writes a Perfetto trace):
 
