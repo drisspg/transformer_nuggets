@@ -40,6 +40,14 @@ def get_tensor_alignment(tensor: torch.Tensor, dim: int) -> int:
     return max_align
 
 
+def get_max_power_of_two_divisibility(value: int, cap: int = 128) -> int:
+    """Return the largest power-of-two divisor of value, capped by cap."""
+    divisibility = 1
+    while divisibility < cap and value % (divisibility * 2) == 0:
+        divisibility *= 2
+    return divisibility
+
+
 def generate_tensor_cache_key(tensor: cute.Tensor) -> str:
     """Generate a cache key component for a CUTE tensor.
 

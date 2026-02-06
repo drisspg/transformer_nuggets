@@ -20,17 +20,19 @@ from helion.autotuner.generic import autotune
 from helion.runtime.config import Config
 
 from transformer_nuggets.cute.cache import compile_and_cache
-from transformer_nuggets.cute.utils import get_tensor_alignment
+from transformer_nuggets.cute.utils import (
+    get_tensor_alignment,
+)
 from transformer_nuggets.cute.base import CuteOp
 from transformer_nuggets.utils.benchmark import benchmark_cuda_function_in_microseconds
 
 
 class ElementwiseAddOp(CuteOp[[torch.Tensor, torch.Tensor], torch.Tensor]):
     tunables = {
-        "thr_m": PowerOfTwoFragment(4, 16, 8),
-        "thr_n": PowerOfTwoFragment(16, 64, 32),
-        "val_m": PowerOfTwoFragment(2, 8, 2),
-        "val_n": PowerOfTwoFragment(4, 16, 8),
+        "thr_m": PowerOfTwoFragment(4, 32, 8),
+        "thr_n": PowerOfTwoFragment(8, 128, 32),
+        "val_m": PowerOfTwoFragment(1, 16, 4),
+        "val_n": PowerOfTwoFragment(1, 32, 8),
     }
 
     def __init__(self):
@@ -43,17 +45,24 @@ class ElementwiseAddOp(CuteOp[[torch.Tensor, torch.Tensor], torch.Tensor]):
 
         def run(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             M, N = a.shape
+            tile_m = thr_m * val_m
+            tile_n = thr_n * val_n
+            if M % tile_m != 0 or N % tile_n != 0:
+                raise ValueError(
+                    f"Invalid tile for shape {M}x{N}: tile_m={tile_m}, tile_n={tile_n}"
+                )
+            if thr_m * thr_n > 1024:
+                raise ValueError(f"Invalid thread block size: thr_m*thr_n={thr_m * thr_n}")
             c = torch.empty(M, N, device="cuda", dtype=a.dtype)
-
-            mA = from_dlpack(
-                a, assumed_align=get_tensor_alignment(a, dim=-1)
-            ).mark_layout_dynamic()
-            mB = from_dlpack(
-                b, assumed_align=get_tensor_alignment(b, dim=-1)
-            ).mark_layout_dynamic()
-            mC = from_dlpack(
-                c, assumed_align=get_tensor_alignment(c, dim=-1)
-            ).mark_layout_dynamic()
+            mA = from_dlpack(a, assumed_align=get_tensor_alignment(a, dim=-1)).mark_layout_dynamic(
+                leading_dim=1
+            )
+            mB = from_dlpack(b, assumed_align=get_tensor_alignment(b, dim=-1)).mark_layout_dynamic(
+                leading_dim=1
+            )
+            mC = from_dlpack(c, assumed_align=get_tensor_alignment(c, dim=-1)).mark_layout_dynamic(
+                leading_dim=1
+            )
 
             dim_orders = tuple(reversed(a.dim_order()))
             cache_key = f"add_{thr_m}_{thr_n}_{val_m}_{val_n}_{dim_orders}"
@@ -107,7 +116,7 @@ class ElementwiseAddOp(CuteOp[[torch.Tensor, torch.Tensor], torch.Tensor]):
         thrB = tidfrgB[thr_coord]
         thrC = tidfrgC[thr_coord]
 
-        thrC[None] = op(thrA.load(), thrB.load())
+        thrC.store(op(thrA.load(), thrB.load()))
 
     @cute.jit
     def __call__(
@@ -150,11 +159,9 @@ def autotuned_add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             compile_fn=_op.compile,
             baseline_fn=_op.baseline,
             args=(a, b),
-            algorithm="PatternSearch",
+            algorithm="LFBOPatternSearch",
             autotune_accuracy_check=True,
             autotune_ignore_errors=True,
-            max_generations=3,
-            initial_population=20,
         )
         print(f"Best config for {M}x{N}: {dict(_config_cache[cache_key])}")
 
