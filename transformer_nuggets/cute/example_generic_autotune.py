@@ -16,7 +16,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 from helion.autotuner import PowerOfTwoFragment
-from helion.autotuner.generic import autotune
+from helion.autotuner.external import autotune
 from helion.runtime.config import Config
 
 from transformer_nuggets.cute.cache import compile_and_cache
