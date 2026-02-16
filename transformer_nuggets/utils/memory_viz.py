@@ -170,6 +170,7 @@ def generate_memory_html(
 ) -> str:
     timeline, alloc_polys, stacks, categories, max_ts = process_snapshot(snapshot, device)
     hwm = max((p["h"] for p in timeline), default=0)
+    hwm_timestep = next((i for i, p in enumerate(timeline) if p["a"] == hwm), 0)
 
     cat_to_idx: dict[str, int] = {}
     for cat in categories:
@@ -183,6 +184,7 @@ def generate_memory_html(
         "num_events": len(timeline),
         "num_allocs": len(alloc_polys),
         "high_water_mark_bytes": hwm,
+        "hwm_timestep": hwm_timestep,
         "num_categories": len(cat_to_idx),
         "max_timestep": max_ts,
     }
@@ -426,8 +428,153 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
   .hwm-line { stroke: var(--hwm-color); stroke-width: 0.75; stroke-dasharray: 8 4; }
   .hwm-label { fill: var(--hwm-color); font-size: 11px; font-family: var(--mono); font-weight: 500; letter-spacing: 0.02em; }
 
-  .alloc-poly { stroke: rgba(0,0,0,0.5); stroke-width: 0.5; cursor: pointer; transition: opacity 0.1s; }
+  .alloc-poly { stroke: rgba(0,0,0,0.5); stroke-width: 0.5; cursor: pointer; transition: opacity 0.15s; }
   .alloc-poly:hover { stroke: rgba(255,255,255,0.8); stroke-width: 1; }
+  .alloc-poly.dimmed { opacity: 0.08 !important; }
+  .alloc-poly.highlighted { stroke: rgba(255,255,255,0.9); stroke-width: 1.5; }
+
+  #search-input {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 4px 10px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 11px;
+    width: 180px;
+    outline: none;
+  }
+
+  #search-input:focus { border-color: var(--accent); }
+  #search-input::placeholder { color: rgba(255,255,255,0.25); }
+
+  #regex-toggle {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid var(--border);
+    border-left: none;
+    border-radius: 0 3px 3px 0;
+    padding: 4px 8px;
+    color: var(--text-muted);
+    font-family: var(--mono);
+    font-size: 11px;
+    cursor: pointer;
+    height: 100%;
+  }
+
+  #regex-toggle:hover { color: var(--text); }
+  #regex-toggle.active { background: var(--accent); color: white; border-color: var(--accent); }
+
+  #search-input { border-radius: 3px 0 0 3px; }
+
+  #minimap {
+    height: 40px;
+    padding: 0 16px;
+    border-top: 1px solid var(--border);
+    background: var(--surface);
+    flex-shrink: 0;
+  }
+
+  #minimap svg { width: 100%; height: 100%; }
+
+  .minimap-area { fill: rgba(62, 147, 204, 0.3); }
+  .minimap-viewport {
+    fill: rgba(255,255,255,0.06);
+    stroke: rgba(255,255,255,0.3);
+    stroke-width: 1;
+    cursor: grab;
+  }
+  .minimap-viewport:active { cursor: grabbing; }
+
+  .detail-tabs {
+    display: flex;
+    gap: 0;
+  }
+
+  .detail-tab {
+    padding: 4px 12px;
+    font-size: 10px;
+    font-family: var(--mono);
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    background: transparent;
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+    cursor: pointer;
+  }
+
+  .detail-tab:first-child { border-radius: 3px 0 0 3px; }
+  .detail-tab:last-child { border-radius: 0 3px 3px 0; }
+  .detail-tab + .detail-tab { border-left: none; }
+  .detail-tab.active { background: var(--accent); color: white; border-color: var(--accent); }
+
+  .breakdown-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 16px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-muted);
+    border-bottom: 1px solid rgba(255,255,255,0.03);
+    cursor: pointer;
+  }
+
+  .breakdown-row:hover { background: rgba(255,255,255,0.03); color: var(--text); }
+
+  .breakdown-row .bd-size {
+    min-width: 70px;
+    text-align: right;
+    color: var(--text);
+    font-weight: 500;
+  }
+
+  .breakdown-row .bd-count {
+    min-width: 30px;
+    text-align: right;
+    color: rgba(255,255,255,0.3);
+    font-size: 10px;
+  }
+
+  .breakdown-row .bd-pct {
+    min-width: 40px;
+    text-align: right;
+    color: var(--accent);
+    font-size: 10px;
+  }
+
+  .breakdown-row .bd-bar {
+    width: 60px;
+    height: 4px;
+    background: rgba(255,255,255,0.06);
+    border-radius: 2px;
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+
+  .breakdown-row .bd-bar-fill {
+    height: 100%;
+    background: var(--accent);
+    border-radius: 2px;
+  }
+
+  .breakdown-row .bd-frame {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .peak-label {
+    padding: 8px 16px;
+    font-family: var(--mono);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+    background: rgba(255,255,255,0.02);
+  }
 
   #tooltip {
     position: fixed; display: none;
@@ -490,6 +637,10 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
 <div id="header">
   <h1>__TITLE__</h1>
   <div id="controls">
+    <div style="display:flex;align-items:center;gap:0;">
+      <input type="text" id="search-input" placeholder="/ search allocations...">
+      <button id="regex-toggle" title="Toggle regex mode">.*</button>
+    </div>
     <label class="toggle">
       <input type="checkbox" id="hwm-toggle" checked>
       High Water Mark
@@ -503,7 +654,11 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
   <div id="chart-container"></div>
   <div id="detail-panel">
     <div id="detail-header">
-      <span>Stack Trace</span>
+      <div class="detail-tabs">
+        <button class="detail-tab active" data-tab="stack">Stack Trace</button>
+        <button class="detail-tab" data-tab="breakdown">Breakdown</button>
+        <button class="detail-tab" data-tab="peak">At Peak</button>
+      </div>
       <span class="detail-stats" id="detail-stats"></span>
     </div>
     <div id="detail-body">
@@ -511,11 +666,14 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
     </div>
   </div>
 </div>
+<div id="minimap"></div>
 <div id="shortcut-bar" style="display:none">
   <span><kbd>A</kbd><kbd>D</kbd> pan</span>
   <span><kbd>W</kbd><kbd>S</kbd> zoom</span>
   <div class="sep"></div>
   <span><kbd>[</kbd><kbd>]</kbd> speed: <span id="speed-indicator">3</span>/5</span>
+  <div class="sep"></div>
+  <span><kbd>/</kbd> search</span>
   <div class="sep"></div>
   <span><kbd>?</kbd> toggle shortcuts</span>
 </div>
@@ -573,6 +731,9 @@ function showTooltip(event, html) {
 
 function hideTooltip() { tooltipEl.style.display = 'none'; }
 
+let lastStackIdx = -1;
+let lastStackLabel = '';
+
 function classifyFrame(frame) {
   if (frame.includes('::')) return 'internal';
   if (frame.includes('/site-packages/') || frame.includes('/torch/')) return 'internal';
@@ -619,6 +780,8 @@ function renderFrame(frame) {
 const GROUP_LABELS = { user: 'Your Code', internal: 'Internals' };
 
 function renderStack(stackIdx, label) {
+  lastStackIdx = stackIdx;
+  lastStackLabel = label;
   const stack = STACKS[stackIdx] || [];
   detailStats.textContent = label;
   if (!stack.length) {
@@ -703,8 +866,8 @@ g.append('g').attr('class', 'axis y-axis').call(yAxisFn);
 
 const chartArea = g.append('g').attr('clip-path', 'url(#clip)');
 
-// HWM
-const hwmG = chartArea.append('g').attr('class', 'hwm-group').style('pointer-events', 'none');
+// HWM (clickable for peak breakdown)
+const hwmG = chartArea.append('g').attr('class', 'hwm-group').style('cursor', 'pointer');
 hwmG.append('line').attr('class', 'hwm-line')
   .attr('x1', 0).attr('x2', width)
   .attr('y1', yScale(META.high_water_mark_bytes)).attr('y2', yScale(META.high_water_mark_bytes));
@@ -832,6 +995,238 @@ document.addEventListener('keyup', function(event) {
 document.getElementById('hwm-toggle').onchange = function() {
   hwmG.style('display', this.checked ? null : 'none');
 };
+
+// --- Feature 1: Search & Filter ---
+const searchInput = document.getElementById('search-input');
+const regexToggle = document.getElementById('regex-toggle');
+let useRegex = false;
+
+regexToggle.addEventListener('click', () => {
+  useRegex = !useRegex;
+  regexToggle.classList.toggle('active', useRegex);
+  applySearch(searchInput.value);
+});
+
+function applySearch(query) {
+  searchInput.value = query;
+  let matcher;
+  if (!query) {
+    matcher = null;
+  } else if (useRegex) {
+    try { matcher = new RegExp(query, 'i'); } catch(e) { matcher = null; }
+  } else {
+    const q = query.toLowerCase();
+    matcher = { test: (s) => s.toLowerCase().includes(q) };
+  }
+
+  polysG.selectAll('.alloc-poly').each(function(d) {
+    const el = d3.select(this);
+    if (!matcher) {
+      el.classed('dimmed', false).classed('highlighted', false);
+      return;
+    }
+    const stack = STACKS[d.si] || [];
+    const match = stack.some(f => matcher.test(f));
+    el.classed('dimmed', !match).classed('highlighted', match);
+  });
+}
+
+searchInput.addEventListener('input', (e) => applySearch(e.target.value));
+
+document.addEventListener('keydown', function(event) {
+  if (event.key === '/' && event.target.tagName !== 'INPUT') {
+    event.preventDefault();
+    searchInput.focus();
+  }
+  if (event.key === 'Escape' && event.target === searchInput) {
+    searchInput.value = '';
+    applySearch('');
+    searchInput.blur();
+  }
+});
+
+// --- Feature 2: What's at Peak ---
+function showPeakBreakdown() {
+  const peakTs = META.hwm_timestep;
+  const alive = ALLOCS.filter(d => d.ts[0] <= peakTs && d.ts[d.ts.length - 1] >= peakTs);
+  alive.sort((a, b) => b.s - a.s);
+  const total = alive.reduce((s, d) => s + d.s, 0);
+
+  detailStats.textContent = `${alive.length} allocs, ${formatBytes(total)}`;
+
+  let html = `<div class="peak-label">Allocations alive at peak (${formatBytes(META.high_water_mark_bytes)})</div>`;
+  html += alive.map(d => {
+    const pct = (d.s / META.high_water_mark_bytes * 100).toFixed(1);
+    const bf = bestFrame(d.si);
+    const barW = (d.s / alive[0].s * 100).toFixed(0);
+    return `<div class="breakdown-row" onclick="renderStack(${d.si}, '${formatBytes(d.s)}'); setActiveTab('stack');">
+      <span class="bd-size">${formatBytes(d.s)}</span>
+      <span class="bd-pct">${pct}%</span>
+      <span class="bd-bar"><span class="bd-bar-fill" style="width:${barW}%"></span></span>
+      <span class="bd-frame">${bf}</span>
+    </div>`;
+  }).join('');
+  detailBody.innerHTML = html;
+}
+
+hwmG.on('click', function() {
+  setActiveTab('peak');
+  showPeakBreakdown();
+});
+
+// --- Feature 3: Memory Breakdown ---
+function showBreakdown() {
+  const byFrame = {};
+  for (const d of ALLOCS) {
+    const f = bestFrame(d.si);
+    if (!byFrame[f]) byFrame[f] = { frame: f, totalBytes: 0, count: 0, si: d.si };
+    byFrame[f].totalBytes += d.s;
+    byFrame[f].count += 1;
+  }
+  const rows = Object.values(byFrame).sort((a, b) => b.totalBytes - a.totalBytes);
+  const maxBytes = rows[0]?.totalBytes || 1;
+  const totalBytes = rows.reduce((s, r) => s + r.totalBytes, 0);
+
+  detailStats.textContent = `${rows.length} call sites`;
+
+  detailBody.innerHTML = rows.slice(0, 30).map(r => {
+    const pct = (r.totalBytes / totalBytes * 100).toFixed(1);
+    const barW = (r.totalBytes / maxBytes * 100).toFixed(0);
+    return `<div class="breakdown-row" onclick="applySearch('${r.frame.replace(/'/g, "\\'")}')">
+      <span class="bd-size">${formatBytes(r.totalBytes)}</span>
+      <span class="bd-count">×${r.count}</span>
+      <span class="bd-pct">${pct}%</span>
+      <span class="bd-bar"><span class="bd-bar-fill" style="width:${barW}%"></span></span>
+      <span class="bd-frame">${r.frame}</span>
+    </div>`;
+  }).join('');
+}
+
+// --- Detail panel tabs ---
+function setActiveTab(tab) {
+  document.querySelectorAll('.detail-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
+}
+
+document.querySelectorAll('.detail-tab').forEach(tab => {
+  tab.addEventListener('click', function() {
+    setActiveTab(this.dataset.tab);
+    if (this.dataset.tab === 'breakdown') showBreakdown();
+    else if (this.dataset.tab === 'peak') showPeakBreakdown();
+    else {
+      searchInput.value = '';
+      applySearch('');
+      if (lastStackIdx >= 0) renderStack(lastStackIdx, lastStackLabel);
+      else detailBody.innerHTML = '<div class="empty-detail">Click an allocation to inspect its stack trace</div>';
+    }
+  });
+});
+
+// --- Feature 4: Minimap ---
+const minimapContainer = document.getElementById('minimap');
+const minimapRect = minimapContainer.getBoundingClientRect();
+const minimapW = minimapRect.width - 32;
+const minimapH = 32;
+const miniMargin = { left: 16, top: 4 };
+
+const miniSvg = d3.select('#minimap').append('svg')
+  .attr('viewBox', `0 0 ${minimapW + 32} ${minimapH + 8}`);
+
+const miniG = miniSvg.append('g')
+  .attr('transform', `translate(${miniMargin.left},${miniMargin.top})`);
+
+const miniX = d3.scaleLinear().domain([0, META.max_timestep]).range([0, minimapW]);
+const miniY = d3.scaleLinear().domain([0, META.high_water_mark_bytes * 1.05]).range([minimapH, 0]);
+
+const miniArea = d3.area()
+  .x((d, i) => miniX(i))
+  .y0(minimapH)
+  .y1(d => miniY(d));
+
+const allocatedAtTimestep = new Float64Array(META.max_timestep + 1);
+for (const t of TIMELINE) {
+  if (t.act === 'alloc' || t.act === 'free_completed') {
+    const ts = ALLOCS.length > 0 ? Math.round(miniX.invert(miniX(0))) : 0;
+  }
+}
+
+let runningAlloc = 0;
+let tsIdx = 0;
+for (const t of TIMELINE) {
+  if (t.act === 'alloc' || t.act === 'free_completed' || t.act === 'segment_alloc' || t.act === 'segment_free') {
+    allocatedAtTimestep[tsIdx] = t.a;
+  } else {
+    allocatedAtTimestep[tsIdx] = tsIdx > 0 ? allocatedAtTimestep[tsIdx - 1] : 0;
+  }
+  tsIdx++;
+}
+
+const miniData = [];
+const step = Math.max(1, Math.floor(tsIdx / minimapW));
+for (let i = 0; i < tsIdx; i += step) {
+  miniData.push(allocatedAtTimestep[i]);
+}
+
+miniG.append('path')
+  .datum(miniData)
+  .attr('class', 'minimap-area')
+  .attr('d', d3.area()
+    .x((d, i) => i * minimapW / miniData.length)
+    .y0(minimapH)
+    .y1(d => miniY(d))
+  );
+
+const viewportRect = miniG.append('rect')
+  .attr('class', 'minimap-viewport')
+  .attr('y', 0)
+  .attr('height', minimapH);
+
+function updateMinimap() {
+  const newX = currentTransform.rescaleX(xScale);
+  const [d0, d1] = newX.domain();
+  const x0 = miniX(Math.max(0, d0));
+  const x1 = miniX(Math.min(META.max_timestep, d1));
+  viewportRect.attr('x', x0).attr('width', Math.max(2, x1 - x0));
+}
+
+updateMinimap();
+
+const origUpdateChart = updateChart;
+updateChart = function(transform) {
+  origUpdateChart(transform);
+  updateMinimap();
+};
+
+zoom.on('zoom', (event) => updateChart(event.transform));
+
+const miniDrag = d3.drag()
+  .on('drag', function(event) {
+    const dx = event.dx;
+    const domainPerPx = META.max_timestep / minimapW;
+    const shift = dx * domainPerPx;
+    const newX = currentTransform.rescaleX(xScale);
+    const [d0, d1] = newX.domain();
+    const range = d1 - d0;
+    const newD0 = Math.max(0, Math.min(META.max_timestep - range, d0 + shift));
+    const newK = META.max_timestep / range;
+    const newTx = -newD0 * width / range;
+    const t = d3.zoomIdentity.translate(newTx, 0).scale(newK);
+    zoomRect.call(zoom.transform, t);
+  });
+
+viewportRect.call(miniDrag);
+
+miniSvg.on('click', function(event) {
+  const [mx] = d3.pointer(event, miniG.node());
+  const clickTs = miniX.invert(mx);
+  const newX = currentTransform.rescaleX(xScale);
+  const [d0, d1] = newX.domain();
+  const range = d1 - d0;
+  const newD0 = Math.max(0, Math.min(META.max_timestep - range, clickTs - range / 2));
+  const newK = META.max_timestep / range;
+  const newTx = -newD0 * width / range;
+  const t = d3.zoomIdentity.translate(newTx, 0).scale(newK);
+  zoomRect.transition().duration(300).call(zoom.transform, t);
+});
 </script>
 </body>
 </html>

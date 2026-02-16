@@ -266,7 +266,7 @@ def save_memory_snapshot(file_path: Path | str, viz: str = "torch"):
             case "d3":
                 from transformer_nuggets.utils.memory_viz import generate_memory_html
 
-                html = generate_memory_html(s)
+                html = generate_memory_html(s, title=file_path.stem)
             case _:
                 raise ValueError(f"Unknown viz backend: {viz!r}, expected 'torch' or 'd3'")
 
@@ -336,7 +336,7 @@ def attach_oom_observer(
                 case "d3":
                     from transformer_nuggets.utils.memory_viz import generate_memory_html
 
-                    html = generate_memory_html(snapshot)
+                    html = generate_memory_html(snapshot, title=f"OOM rank {rank}")
                 case _:
                     html = torch.cuda._memory_viz.trace_plot(snapshot)  # type: ignore
 
