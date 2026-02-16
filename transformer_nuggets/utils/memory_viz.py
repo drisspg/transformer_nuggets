@@ -59,20 +59,29 @@ def _categorize_stack(frames: list[str]) -> str:
 
 def process_snapshot(
     snapshot: dict, device: int = 0
-) -> tuple[list[dict], list[dict], list[list[str]], list[str], int]:
+) -> tuple[list[dict], list[dict], list[str], list[list[int]], list[str], int]:
     traces = snapshot.get("device_traces", [])
     if device >= len(traces):
-        return [], [], [], [], 0
+        return [], [], [], [], [], 0
 
-    stack_to_idx: dict[tuple[str, ...], int] = {}
-    stacks: list[list[str]] = []
+    frame_to_idx: dict[str, int] = {}
+    frames: list[str] = []
+    stack_to_idx: dict[tuple[int, ...], int] = {}
+    stacks: list[list[int]] = []
 
-    def get_stack_idx(frames: list[dict]) -> int:
-        extracted = _extract_frames(frames)
-        key = tuple(extracted)
+    def intern_frame(f: str) -> int:
+        if f not in frame_to_idx:
+            frame_to_idx[f] = len(frames)
+            frames.append(f)
+        return frame_to_idx[f]
+
+    def get_stack_idx(raw_frames: list[dict]) -> int:
+        extracted = _extract_frames(raw_frames)
+        frame_indices = [intern_frame(f) for f in extracted]
+        key = tuple(frame_indices)
         if key not in stack_to_idx:
             stack_to_idx[key] = len(stacks)
-            stacks.append(extracted)
+            stacks.append(frame_indices)
         return stack_to_idx[key]
 
     allocated = 0
@@ -159,8 +168,8 @@ def process_snapshot(
         poly["ts"].append(timestep)
         poly["offsets"].append(poly["offsets"][-1])
 
-    categories = [_categorize_stack(stack) for stack in stacks]
-    return timeline, alloc_polys, stacks, categories, timestep
+    categories = [_categorize_stack([frames[fi] for fi in stack]) for stack in stacks]
+    return timeline, alloc_polys, frames, stacks, categories, timestep
 
 
 def generate_memory_html(
@@ -168,7 +177,9 @@ def generate_memory_html(
     device: int = 0,
     title: str = "Memory Timeline",
 ) -> str:
-    timeline, alloc_polys, stacks, categories, max_ts = process_snapshot(snapshot, device)
+    timeline, alloc_polys, frames, stacks, categories, max_ts = process_snapshot(
+        snapshot, device
+    )
     hwm = max((p["h"] for p in timeline), default=0)
     hwm_timestep = next((i for i, p in enumerate(timeline) if p["a"] == hwm), 0)
 
@@ -193,6 +204,7 @@ def generate_memory_html(
         _MEMORY_VIZ_TEMPLATE.replace("__TITLE__", title)
         .replace("__TIMELINE__", json.dumps(timeline))
         .replace("__ALLOCS__", json.dumps(alloc_polys))
+        .replace("__FRAMES__", json.dumps(frames))
         .replace("__STACKS__", json.dumps(stacks))
         .replace("__CATEGORIES__", json.dumps(cat_indices))
         .replace("__META__", json.dumps(meta))
@@ -683,9 +695,15 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
 <script>
 const TIMELINE = __TIMELINE__;
 const ALLOCS = __ALLOCS__;
+const FRAMES = __FRAMES__;
 const STACKS = __STACKS__;
 const CATEGORIES = __CATEGORIES__;
 const META = __META__;
+
+function resolveStack(stackIdx) {
+  const indices = STACKS[stackIdx] || [];
+  return indices.map(i => FRAMES[i]);
+}
 
 function formatBytes(b) {
   if (Math.abs(b) >= 1024**3) return (b / 1024**3).toFixed(2) + ' GiB';
@@ -743,7 +761,7 @@ function classifyFrame(frame) {
 }
 
 function bestFrame(stackIdx) {
-  const stack = STACKS[stackIdx] || [];
+  const stack = resolveStack(stackIdx);
   for (const f of stack) {
     if (classifyFrame(f) === 'user') return f;
   }
@@ -782,7 +800,7 @@ const GROUP_LABELS = { user: 'Your Code', internal: 'Internals' };
 function renderStack(stackIdx, label) {
   lastStackIdx = stackIdx;
   lastStackLabel = label;
-  const stack = STACKS[stackIdx] || [];
+  const stack = resolveStack(stackIdx);
   detailStats.textContent = label;
   if (!stack.length) {
     detailBody.innerHTML = '<div class="empty-detail">No frames recorded</div>';
@@ -1025,7 +1043,7 @@ function applySearch(query) {
       el.classed('dimmed', false).classed('highlighted', false);
       return;
     }
-    const stack = STACKS[d.si] || [];
+    const stack = resolveStack(d.si) || [];
     const match = stack.some(f => matcher.test(f));
     el.classed('dimmed', !match).classed('highlighted', match);
   });

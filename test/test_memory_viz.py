@@ -11,6 +11,11 @@ from transformer_nuggets.utils.memory_viz import (
     process_snapshot,
 )
 
+def _unpack(snapshot, device=0):
+    timeline, allocs, frames, stacks, categories, max_ts = process_snapshot(snapshot, device)
+    resolved_stacks = [[frames[fi] for fi in s] for s in stacks]
+    return timeline, allocs, resolved_stacks, categories, max_ts
+
 DATA_DIR = Path(__file__).parent / "data"
 SNAPSHOT_PATH = DATA_DIR / "mini_snapshot.pickle"
 
@@ -78,12 +83,19 @@ class TestHelpers:
 
 class TestProcessSnapshot:
     def test_returns_correct_tuple_shape(self, snapshot):
-        timeline, allocs, stacks, categories, max_ts = process_snapshot(snapshot)
+        timeline, allocs, frames, stacks, categories, max_ts = process_snapshot(snapshot)
         assert len(timeline) > 0
         assert len(allocs) > 0
+        assert len(frames) > 0
         assert len(stacks) > 0
         assert len(categories) == len(stacks)
         assert max_ts > 0
+
+    def test_stacks_reference_valid_frame_indices(self, snapshot):
+        _, _, frames, stacks, *_ = process_snapshot(snapshot)
+        for stack in stacks:
+            for fi in stack:
+                assert 0 <= fi < len(frames)
 
     def test_timeline_fields(self, snapshot):
         timeline, *_ = process_snapshot(snapshot)
@@ -111,15 +123,13 @@ class TestProcessSnapshot:
         assert all(e["a"] >= 0 for e in timeline)
 
     def test_stack_indices_valid(self, snapshot):
-        timeline, allocs, stacks, *_ = process_snapshot(snapshot)
-        for e in timeline:
-            assert 0 <= e["si"] < len(stacks)
+        _, allocs, _, stacks, *_ = process_snapshot(snapshot)
         for a in allocs:
             assert 0 <= a["si"] < len(stacks)
 
     def test_empty_device_returns_empty(self, snapshot):
         result = process_snapshot(snapshot, device=99)
-        assert result == ([], [], [], [], 0)
+        assert result == ([], [], [], [], [], 0)
 
     def test_polygon_offsets_non_negative(self, snapshot):
         _, allocs, *_ = process_snapshot(snapshot)
