@@ -206,17 +206,22 @@ class cuda_memory_usage:
 
 
 @contextmanager
-def save_memory_snapshot(file_path: Path | str):
+def save_memory_snapshot(file_path: Path | str, viz: str = "torch"):
     """Save a memory snapshot information to a folder
 
     Args:
         file_path: The path to the folder to save the snapshot to
                     will create the folder if it doesn't exist
+        viz: Visualization backend - "torch" for PyTorch's built-in viz,
+             "d3" for custom D3.js interactive viz
 
     Usage:
     ```
         with save_memory_snapshot(file_path):
             # code to profile
+
+        with save_memory_snapshot(file_path, viz="d3"):
+            # code to profile with custom D3 visualization
     ```
     """
     from transformer_nuggets import init_logging
@@ -243,7 +248,6 @@ def save_memory_snapshot(file_path: Path | str):
         if file_path.is_dir():
             raise ValueError(f"{file_path} is a directory")
 
-    # make parent dir
     file_path.parent.mkdir(parents=True, exist_ok=True)
     torch.cuda.memory._record_memory_history()
     try:
@@ -255,8 +259,18 @@ def save_memory_snapshot(file_path: Path | str):
             output_path = file_path / f"_rank_{local_rank}.html"
         else:
             output_path = file_path.with_suffix(".html")
+
+        match viz:
+            case "torch":
+                html = torch.cuda._memory_viz.trace_plot(s)  # type: ignore
+            case "d3":
+                from transformer_nuggets.utils.memory_viz import generate_memory_html
+                html = generate_memory_html(s)
+            case _:
+                raise ValueError(f"Unknown viz backend: {viz!r}, expected 'torch' or 'd3'")
+
         with open(output_path, "w") as f:
-            f.write(torch.cuda._memory_viz.trace_plot(s))  # type: ignore
+            f.write(html)
             logger.info(f"💾 Trace file 📄 saved to: {bcolors.OKGREEN}{output_path}{bcolors.ENDC}")
 
 
@@ -270,7 +284,11 @@ def _is_distributed():
     return False
 
 
-def attach_oom_observer(save_path: Path | None = None, max_entries: int = 1000000):
+def attach_oom_observer(
+    save_path: Path | None = None,
+    max_entries: int = 1000000,
+    viz: str = "torch",
+):
     """
     Attach an out-of-memory (OOM) observer to the CUDA device.
     The observer will save a memory snapshot when an OOM error occurs.
@@ -280,6 +298,7 @@ def attach_oom_observer(save_path: Path | None = None, max_entries: int = 100000
                          The cwd will be used.
         max_entries (int): Maximum number of memory history entries to record.
                            Default is 1000000.
+        viz: Visualization backend - "torch" or "d3"
 
     Usage:
     ```
@@ -309,8 +328,18 @@ def attach_oom_observer(save_path: Path | None = None, max_entries: int = 100000
 
             logging.info("Saving allocated state during OOM")
             snapshot = torch.cuda.memory._snapshot()
+
+            match viz:
+                case "torch":
+                    html = torch.cuda._memory_viz.trace_plot(snapshot)  # type: ignore
+                case "d3":
+                    from transformer_nuggets.utils.memory_viz import generate_memory_html
+                    html = generate_memory_html(snapshot)
+                case _:
+                    html = torch.cuda._memory_viz.trace_plot(snapshot)  # type: ignore
+
             with open(current_trace_name, "w") as f:
-                f.write(torch.cuda._memory_viz.trace_plot(snapshot))  # type: ignore
+                f.write(html)
             logging.info(f"Wrote memory snapshot to {current_trace_name}")
         except Exception as e:
             logging.error(f"Failed to save memory snapshot: {e}")
