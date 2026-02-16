@@ -1,19 +1,47 @@
 import json
 
 
+_SKIP_NAMES = {
+    "torch::unwind::unwind()",
+    "torch::CapturedTraceback::gather(bool, bool, bool)",
+}
+
+_CPYTHON_MARKERS = (
+    "/usr/local/src/conda/python",
+    "/conda-bld/python",
+    "/cpython/",
+)
+
+
+def _is_cpython_c_frame(fn: str, name: str) -> bool:
+    if any(m in fn for m in _CPYTHON_MARKERS):
+        return True
+    if fn.endswith(".c") and name.startswith(("_Py", "Py", "pyrun", "pymain", "run_")):
+        return True
+    return False
+
+
+def _shorten_path(path: str) -> str:
+    markers = ["/site-packages/", "/lib/python"]
+    for marker in markers:
+        idx = path.find(marker)
+        if idx >= 0:
+            return path[idx + len(marker) :]
+    return path
+
+
 def _extract_frames(frames: list[dict]) -> list[str]:
     result = []
     for f in frames:
         fn = f.get("filename", "")
         name = f.get("name", "")
         line = f.get("line", 0)
-        if not name or name in (
-            "torch::unwind::unwind()",
-            "torch::CapturedTraceback::gather(bool, bool, bool)",
-        ):
+        if not name or name in _SKIP_NAMES:
+            continue
+        if _is_cpython_c_frame(fn, name):
             continue
         if fn and fn != "??" and fn != "":
-            result.append(f"{fn}:{line} {name}")
+            result.append(f"{_shorten_path(fn)}:{line} {name}")
         elif name:
             result.append(name)
     return result
@@ -175,20 +203,21 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <title>__TITLE__</title>
 <style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap');
   :root {
-    --bg: #0f1117;
-    --surface: #1a1d2e;
-    --border: #2a2d3e;
-    --text: #e2e4e9;
-    --text-muted: #8b8fa3;
-    --accent: #6366f1;
-    --accent-light: rgba(99, 102, 241, 0.15);
-    --accent-stroke: rgba(99, 102, 241, 0.8);
-    --hwm-color: #f59e0b;
-    --grid: rgba(255, 255, 255, 0.04);
-    --tooltip-bg: #1e2235;
-    --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', sans-serif;
-    --mono: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    --bg: #0E0E0E;
+    --surface: #1a1a1a;
+    --border: rgba(255, 255, 255, 0.10);
+    --text: rgba(255, 255, 255, 0.92);
+    --text-muted: rgba(255, 255, 255, 0.50);
+    --accent: #3E93CC;
+    --accent-light: rgba(62, 147, 204, 0.12);
+    --accent-stroke: rgba(62, 147, 204, 0.7);
+    --hwm-color: rgba(255, 255, 255, 0.60);
+    --grid: rgba(255, 255, 255, 0.03);
+    --tooltip-bg: #1f1f1f;
+    --font: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    --mono: 'IBM Plex Mono', 'Fira Mono', monospace;
   }
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -212,7 +241,7 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
     flex-shrink: 0;
   }
 
-  #header h1 { font-size: 16px; font-weight: 600; }
+  #header h1 { font-size: 14px; font-weight: 500; font-family: var(--mono); letter-spacing: 0.03em; text-transform: uppercase; }
 
   #controls {
     display: flex;
@@ -240,15 +269,16 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
   .toggle:hover { color: var(--text); }
 
   .stat {
-    font-size: 12px;
+    font-size: 11px;
+    font-family: var(--mono);
     color: var(--text-muted);
     padding: 4px 10px;
-    background: var(--surface);
-    border-radius: 4px;
+    background: rgba(255,255,255,0.04);
+    border-radius: 3px;
     border: 1px solid var(--border);
   }
 
-  .stat strong { color: var(--text); font-weight: 600; }
+  .stat strong { color: var(--text); font-weight: 500; }
 
   #main {
     display: flex;
@@ -277,8 +307,11 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
   #detail-header {
     padding: 12px 16px;
     border-bottom: 1px solid var(--border);
-    font-size: 13px;
-    font-weight: 600;
+    font-size: 11px;
+    font-weight: 500;
+    font-family: var(--mono);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
     display: flex;
     justify-content: space-between;
     align-items: center;
@@ -301,13 +334,62 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
   #detail-body::-webkit-scrollbar-track { background: transparent; }
   #detail-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 
+  .stack-group {
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+  }
+
+  .stack-group-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 16px;
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+    cursor: pointer;
+    user-select: none;
+    background: rgba(255,255,255,0.02);
+  }
+
+  .stack-group-header:hover { background: rgba(255,255,255,0.04); }
+
+  .stack-group-header .chevron {
+    display: inline-block;
+    width: 12px;
+    font-size: 8px;
+    transition: transform 0.15s;
+    color: rgba(255,255,255,0.3);
+  }
+
+  .stack-group.collapsed .chevron { transform: rotate(-90deg); }
+  .stack-group.collapsed .stack-group-frames { display: none; }
+
+  .stack-group-header .group-count {
+    margin-left: auto;
+    font-size: 9px;
+    color: rgba(255,255,255,0.25);
+  }
+
+  .stack-group-header .group-tag {
+    padding: 1px 6px;
+    border-radius: 2px;
+    font-size: 9px;
+  }
+
+  .group-tag.user { background: rgba(73, 201, 99, 0.15); color: #49C963; }
+  .group-tag.torch { background: rgba(62, 147, 204, 0.15); color: #3E93CC; }
+  .group-tag.cpp { background: rgba(189, 147, 249, 0.15); color: #bd93f9; }
+  .group-tag.python { background: rgba(255, 255, 255, 0.06); color: var(--text-muted); }
+
   .stack-frame {
-    padding: 4px 16px;
+    padding: 3px 16px 3px 34px;
     font-family: var(--mono);
     font-size: 11px;
-    line-height: 1.6;
+    line-height: 1.5;
     color: var(--text-muted);
-    border-bottom: 1px solid rgba(255,255,255,0.02);
     cursor: pointer;
     overflow: hidden;
   }
@@ -326,16 +408,10 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
 
   .stack-frame:hover { background: rgba(255,255,255,0.03); color: var(--text); }
 
-  .stack-frame .frame-idx {
-    display: inline-block; width: 24px;
-    color: rgba(255,255,255,0.15); text-align: right;
-    margin-right: 8px; font-size: 10px;
-    vertical-align: top;
-  }
-
-  .stack-frame .frame-cpp { color: #f97316; }
-  .stack-frame .frame-file { color: var(--accent); }
-  .stack-frame .frame-func { color: var(--text); }
+  .stack-frame .frame-cpp { color: #bd93f9; }
+  .stack-frame .frame-file { color: #3E93CC; }
+  .stack-frame .frame-func { color: #49C963; }
+  .stack-frame .frame-basename { color: var(--text); }
 
   .empty-detail {
     padding: 24px 16px;
@@ -349,19 +425,20 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
   .grid line { stroke: var(--grid); }
   .grid path { stroke: none; }
 
-  .hwm-line { stroke: var(--hwm-color); stroke-width: 1; stroke-dasharray: 6 4; }
-  .hwm-label { fill: var(--hwm-color); font-size: 11px; font-family: var(--font); font-weight: 600; }
+  .hwm-line { stroke: var(--hwm-color); stroke-width: 0.75; stroke-dasharray: 8 4; }
+  .hwm-label { fill: var(--hwm-color); font-size: 11px; font-family: var(--mono); font-weight: 500; letter-spacing: 0.02em; }
 
-  .alloc-poly { stroke: rgba(0,0,0,0.3); stroke-width: 0.5; cursor: pointer; }
-  .alloc-poly:hover { stroke: white; stroke-width: 1.5; }
+  .alloc-poly { stroke: rgba(0,0,0,0.5); stroke-width: 0.5; cursor: pointer; transition: opacity 0.1s; }
+  .alloc-poly:hover { stroke: rgba(255,255,255,0.8); stroke-width: 1; }
 
   #tooltip {
     position: fixed; display: none;
-    background: var(--tooltip-bg); border: 1px solid var(--border);
-    border-radius: 6px; padding: 10px 12px;
-    font-size: 12px; line-height: 1.5;
+    background: #1f1f1f; border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 4px; padding: 10px 14px;
+    font-size: 12px; line-height: 1.6;
     pointer-events: none; z-index: 100; max-width: 500px;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
+    font-family: var(--mono);
   }
 
   #tooltip .tt-label { color: var(--text-muted); margin-right: 4px; }
@@ -465,13 +542,12 @@ document.getElementById('peak-stat').textContent = formatBytes(META.high_water_m
 document.getElementById('allocs-stat').textContent = META.num_allocs.toLocaleString();
 
 const PALETTE = [
-  '#6366f1', '#8b5cf6', '#a78bfa', '#c084fc',
-  '#ec4899', '#f43f5e', '#fb7185', '#f97316',
-  '#f59e0b', '#eab308', '#84cc16', '#22c55e',
-  '#14b8a6', '#06b6d4', '#0ea5e9', '#3b82f6',
-  '#818cf8', '#a5b4fc', '#c4b5fd', '#e879f9',
-  '#f472b6', '#fb923c', '#fbbf24', '#a3e635',
-  '#34d399', '#2dd4bf', '#22d3ee', '#38bdf8',
+  '#3E93CC', '#2E7DB5', '#5BA8D9', '#78BBE3',
+  '#49C963', '#3AA852', '#6DD883', '#8DE49D',
+  '#bd93f9', '#a06eed', '#d4b5ff', '#9054e0',
+  '#CC6B3E', '#E08A5B', '#B55A30', '#F0A478',
+  '#3ECCC1', '#5BD9D0', '#2EB5AC', '#78E3DC',
+  '#C9CC3E', '#D9DB5B', '#B5B72E', '#E3E478',
 ];
 
 function getColor(stackIdx) {
@@ -492,6 +568,39 @@ function showTooltip(event, html) {
 
 function hideTooltip() { tooltipEl.style.display = 'none'; }
 
+function classifyFrame(frame) {
+  if (!frame.includes(':') && frame.includes('::')) return 'cpp';
+  if (frame.includes('/site-packages/torch/') || frame.includes('/torch/')) return 'torch';
+  if (frame.includes('/lib/python') || frame.includes('/conda/') || frame.includes('lib/python')) return 'torch';
+  return 'user';
+}
+
+function renderFrame(frame) {
+  const hasColon = frame.includes(':');
+  const isCpp = !hasColon && frame.includes('::');
+  if (isCpp) {
+    const parts = frame.split('::');
+    const funcName = parts[parts.length - 1];
+    const ns = parts.slice(0, -1).join('::');
+    return `<span class="frame-cpp">${ns}::</span><span class="frame-basename">${funcName}</span>`;
+  }
+  if (hasColon) {
+    const sp = frame.indexOf(' ', frame.lastIndexOf(':'));
+    if (sp > 0) {
+      const filePart = frame.substring(0, sp);
+      const funcPart = frame.substring(sp + 1);
+      const lastSlash = filePart.lastIndexOf('/');
+      const basename = lastSlash >= 0 ? filePart.substring(lastSlash + 1) : filePart;
+      const dir = lastSlash >= 0 ? filePart.substring(0, lastSlash + 1) : '';
+      return `<span class="frame-file">${dir}</span><span class="frame-basename">${basename}</span> <span class="frame-func">${funcPart}</span>`;
+    }
+    return `<span class="frame-file">${frame}</span>`;
+  }
+  return frame;
+}
+
+const GROUP_LABELS = { user: 'Your Code', torch: 'PyTorch / Python', cpp: 'C++ Runtime' };
+
 function renderStack(stackIdx, label) {
   const stack = STACKS[stackIdx] || [];
   detailStats.textContent = label;
@@ -499,23 +608,31 @@ function renderStack(stackIdx, label) {
     detailBody.innerHTML = '<div class="empty-detail">No frames recorded</div>';
     return;
   }
-  detailBody.innerHTML = stack.map((frame, i) => {
-    const hasColon = frame.includes(':');
-    const isCpp = !hasColon && frame.includes('::');
-    let inner;
-    if (isCpp) {
-      inner = `<span class="frame-cpp">${frame}</span>`;
-    } else if (hasColon) {
-      const sp = frame.indexOf(' ', frame.lastIndexOf(':'));
-      if (sp > 0) {
-        inner = `<span class="frame-file">${frame.substring(0, sp)}</span> <span class="frame-func">${frame.substring(sp + 1)}</span>`;
-      } else {
-        inner = `<span class="frame-file">${frame}</span>`;
-      }
-    } else {
-      inner = frame;
+
+  const groups = [];
+  let cur = null;
+  for (const frame of stack) {
+    const cls = classifyFrame(frame);
+    if (!cur || cur.cls !== cls) {
+      cur = { cls, frames: [] };
+      groups.push(cur);
     }
-    return `<div class="stack-frame" onclick="this.classList.toggle('expanded')"><span class="frame-idx">${i}</span><span class="frame-text">${inner}</span></div>`;
+    cur.frames.push(frame);
+  }
+
+  detailBody.innerHTML = groups.map(g => {
+    const collapsed = g.cls !== 'user' ? ' collapsed' : '';
+    const framesHtml = g.frames.map(f =>
+      `<div class="stack-frame" onclick="event.stopPropagation();this.classList.toggle('expanded')"><span class="frame-text">${renderFrame(f)}</span></div>`
+    ).join('');
+    return `<div class="stack-group${collapsed}">
+      <div class="stack-group-header" onclick="this.parentElement.classList.toggle('collapsed')">
+        <span class="chevron">▼</span>
+        <span class="group-tag ${g.cls}">${GROUP_LABELS[g.cls]}</span>
+        <span class="group-count">${g.frames.length}</span>
+      </div>
+      <div class="stack-group-frames">${framesHtml}</div>
+    </div>`;
   }).join('');
 }
 
