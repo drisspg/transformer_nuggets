@@ -380,9 +380,7 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
   }
 
   .group-tag.user { background: rgba(73, 201, 99, 0.15); color: #49C963; }
-  .group-tag.torch { background: rgba(62, 147, 204, 0.15); color: #3E93CC; }
-  .group-tag.cpp { background: rgba(189, 147, 249, 0.15); color: #bd93f9; }
-  .group-tag.python { background: rgba(255, 255, 255, 0.06); color: var(--text-muted); }
+  .group-tag.internal { background: rgba(255, 255, 255, 0.06); color: var(--text-muted); }
 
   .stack-frame {
     padding: 3px 16px 3px 34px;
@@ -550,8 +548,15 @@ const PALETTE = [
   '#C9CC3E', '#D9DB5B', '#B5B72E', '#E3E478',
 ];
 
+function hashStr(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+  return Math.abs(h);
+}
+
 function getColor(stackIdx) {
-  return PALETTE[(CATEGORIES[stackIdx] || 0) % PALETTE.length];
+  const frame = bestFrame(stackIdx);
+  return PALETTE[hashStr(frame) % PALETTE.length];
 }
 
 const tooltipEl = document.getElementById('tooltip');
@@ -569,10 +574,22 @@ function showTooltip(event, html) {
 function hideTooltip() { tooltipEl.style.display = 'none'; }
 
 function classifyFrame(frame) {
-  if (!frame.includes(':') && frame.includes('::')) return 'cpp';
-  if (frame.includes('/site-packages/torch/') || frame.includes('/torch/')) return 'torch';
-  if (frame.includes('/lib/python') || frame.includes('/conda/') || frame.includes('lib/python')) return 'torch';
+  if (frame.includes('::')) return 'internal';
+  if (frame.includes('/site-packages/') || frame.includes('/torch/')) return 'internal';
+  if (frame.includes('/lib/python') || frame.includes('/conda/') || frame.includes('lib/python')) return 'internal';
+  if (frame.includes('.cpp:') || frame.includes('.c:')) return 'internal';
   return 'user';
+}
+
+function bestFrame(stackIdx) {
+  const stack = STACKS[stackIdx] || [];
+  for (const f of stack) {
+    if (classifyFrame(f) === 'user') return f;
+  }
+  for (const f of stack) {
+    if (f.includes('.py')) return f;
+  }
+  return stack[stack.length - 1] || '';
 }
 
 function renderFrame(frame) {
@@ -599,7 +616,7 @@ function renderFrame(frame) {
   return frame;
 }
 
-const GROUP_LABELS = { user: 'Your Code', torch: 'PyTorch / Python', cpp: 'C++ Runtime' };
+const GROUP_LABELS = { user: 'Your Code', internal: 'Internals' };
 
 function renderStack(stackIdx, label) {
   const stack = STACKS[stackIdx] || [];
@@ -707,9 +724,10 @@ polysG.selectAll('.alloc-poly')
   .attr('fill', d => getColor(d.si))
   .attr('opacity', 0.85)
   .on('mousemove', function(event, d) {
+    const bf = bestFrame(d.si);
     showTooltip(event, [
       `<div class="tt-row"><span class="tt-label">Size:</span><span class="tt-value">${formatBytes(d.s)}</span></div>`,
-      (STACKS[d.si]||[])[0] ? `<div class="tt-hint">${STACKS[d.si][0]}</div>` : '',
+      bf ? `<div class="tt-hint">${bf}</div>` : '',
     ].join(''));
   })
   .on('mouseleave', hideTooltip)
@@ -763,15 +781,15 @@ function navTarget() {
   const zoomFactor = SPEEDS[speedIdx].zoom;
 
   if (activeKeys.has('a') || activeKeys.has('arrowleft'))
-    t = t.translate(panPx, 0);
+    t = t.translate(panPx / t.k, 0);
   if (activeKeys.has('d') || activeKeys.has('arrowright'))
-    t = t.translate(-panPx, 0);
+    t = t.translate(-panPx / t.k, 0);
   if (activeKeys.has('w') || activeKeys.has('arrowup')) {
-    const cx = width / 2;
+    const cx = (width / 2 - t.x) / t.k;
     t = t.translate(cx, 0).scale(zoomFactor).translate(-cx, 0);
   }
   if (activeKeys.has('s') || activeKeys.has('arrowdown')) {
-    const cx = width / 2;
+    const cx = (width / 2 - t.x) / t.k;
     t = t.translate(cx, 0).scale(1 / zoomFactor).translate(-cx, 0);
   }
   return t;
