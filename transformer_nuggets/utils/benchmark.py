@@ -3,6 +3,7 @@ import random
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 from collections.abc import Callable
 
 import torch
@@ -206,7 +207,7 @@ class cuda_memory_usage:
 
 
 @contextmanager
-def save_memory_snapshot(file_path: Path | str, viz: str = "torch"):
+def save_memory_snapshot(file_path: Path | str, viz: Literal["torch", "d3"] = "torch"):
     """Save a memory snapshot information to a folder
 
     Args:
@@ -288,7 +289,7 @@ def _is_distributed():
 def attach_oom_observer(
     save_path: Path | None = None,
     max_entries: int = 1000000,
-    viz: str = "torch",
+    viz: Literal["torch", "d3"] = "torch",
 ):
     """
     Attach an out-of-memory (OOM) observer to the CUDA device.
