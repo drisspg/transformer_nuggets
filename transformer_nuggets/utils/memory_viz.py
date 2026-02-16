@@ -189,6 +189,8 @@ def generate_memory_html(
             cat_to_idx[cat] = len(cat_to_idx)
     cat_indices = [cat_to_idx.get(c, 0) for c in categories]
 
+    max_at_time = [e["a"] for e in timeline]
+
     meta = {
         "title": title,
         "device": device,
@@ -202,7 +204,7 @@ def generate_memory_html(
 
     return (
         _MEMORY_VIZ_TEMPLATE.replace("__TITLE__", title)
-        .replace("__TIMELINE__", json.dumps(timeline))
+        .replace("__TIMELINE__", json.dumps(max_at_time))
         .replace("__ALLOCS__", json.dumps(alloc_polys))
         .replace("__FRAMES__", json.dumps(frames))
         .replace("__STACKS__", json.dumps(stacks))
@@ -1160,29 +1162,7 @@ const miniArea = d3.area()
   .y0(minimapH)
   .y1(d => miniY(d));
 
-const allocatedAtTimestep = new Float64Array(META.max_timestep + 1);
-for (const t of TIMELINE) {
-  if (t.act === 'alloc' || t.act === 'free_completed') {
-    const ts = ALLOCS.length > 0 ? Math.round(miniX.invert(miniX(0))) : 0;
-  }
-}
-
-let runningAlloc = 0;
-let tsIdx = 0;
-for (const t of TIMELINE) {
-  if (t.act === 'alloc' || t.act === 'free_completed' || t.act === 'segment_alloc' || t.act === 'segment_free') {
-    allocatedAtTimestep[tsIdx] = t.a;
-  } else {
-    allocatedAtTimestep[tsIdx] = tsIdx > 0 ? allocatedAtTimestep[tsIdx - 1] : 0;
-  }
-  tsIdx++;
-}
-
-const miniData = [];
-const step = Math.max(1, Math.floor(tsIdx / minimapW));
-for (let i = 0; i < tsIdx; i += step) {
-  miniData.push(allocatedAtTimestep[i]);
-}
+const miniData = TIMELINE;
 
 miniG.append('path')
   .datum(miniData)
