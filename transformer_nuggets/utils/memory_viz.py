@@ -7,7 +7,10 @@ def _extract_frames(frames: list[dict]) -> list[str]:
         fn = f.get("filename", "")
         name = f.get("name", "")
         line = f.get("line", 0)
-        if not name or name in ("torch::unwind::unwind()", "torch::CapturedTraceback::gather(bool, bool, bool)"):
+        if not name or name in (
+            "torch::unwind::unwind()",
+            "torch::CapturedTraceback::gather(bool, bool, bool)",
+        ):
             continue
         if fn and fn != "??" and fn != "":
             result.append(f"{fn}:{line} {name}")
@@ -48,7 +51,6 @@ def process_snapshot(
     reserved = 0
     hwm = 0
     timeline: list[dict] = []
-    active_by_addr: dict[int, dict] = {}
     last_time = 0
 
     current_stack: list[int] = []
@@ -70,12 +72,14 @@ def process_snapshot(
                 allocated += size
                 offset = allocated - size
                 alloc_id = len(alloc_polys)
-                alloc_polys.append({
-                    "si": si,
-                    "s": size,
-                    "ts": [timestep],
-                    "offsets": [offset],
-                })
+                alloc_polys.append(
+                    {
+                        "si": si,
+                        "s": size,
+                        "ts": [timestep],
+                        "offsets": [offset],
+                    }
+                )
                 current_stack.append(alloc_id)
                 alloc_id_by_addr[addr] = alloc_id
                 timestep += 1
@@ -110,10 +114,17 @@ def process_snapshot(
                 pass
 
         hwm = max(hwm, allocated)
-        timeline.append({
-            "t": time_us, "a": allocated, "r": reserved,
-            "h": hwm, "act": action, "s": size, "si": si,
-        })
+        timeline.append(
+            {
+                "t": time_us,
+                "a": allocated,
+                "r": reserved,
+                "h": hwm,
+                "act": action,
+                "s": size,
+                "si": si,
+            }
+        )
 
     for alloc_id in current_stack:
         poly = alloc_polys[alloc_id]
@@ -149,8 +160,7 @@ def generate_memory_html(
     }
 
     return (
-        _MEMORY_VIZ_TEMPLATE
-        .replace("__TITLE__", title)
+        _MEMORY_VIZ_TEMPLATE.replace("__TITLE__", title)
         .replace("__TIMELINE__", json.dumps(timeline))
         .replace("__ALLOCS__", json.dumps(alloc_polys))
         .replace("__STACKS__", json.dumps(stacks))
@@ -363,6 +373,42 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
   }
 
   .zoom-hint { font-size: 11px; color: var(--text-muted); opacity: 0.5; }
+
+  #shortcut-bar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 6px 24px;
+    border-top: 1px solid var(--border);
+    background: var(--surface);
+    font-size: 11px;
+    color: var(--text-muted);
+    flex-shrink: 0;
+  }
+
+  #shortcut-bar kbd {
+    display: inline-block;
+    padding: 1px 5px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text);
+    min-width: 18px;
+    text-align: center;
+  }
+
+  #shortcut-bar .sep {
+    width: 1px;
+    height: 14px;
+    background: var(--border);
+  }
+
+  #speed-indicator {
+    color: var(--accent);
+    font-weight: 600;
+  }
 </style>
 </head>
 <body>
@@ -375,7 +421,7 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
     </label>
     <span class="stat">Peak: <strong id="peak-stat"></strong></span>
     <span class="stat">Allocs: <strong id="allocs-stat"></strong></span>
-    <span class="zoom-hint">scroll to zoom, drag to pan, dbl-click to reset</span>
+    <span class="zoom-hint">scroll to zoom, drag to pan, dbl-click to reset, <kbd>?</kbd> shortcuts</span>
   </div>
 </div>
 <div id="main">
@@ -389,6 +435,14 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
       <div class="empty-detail">Click an allocation to inspect its stack trace</div>
     </div>
   </div>
+</div>
+<div id="shortcut-bar" style="display:none">
+  <span><kbd>A</kbd><kbd>D</kbd> pan</span>
+  <span><kbd>W</kbd><kbd>S</kbd> zoom</span>
+  <div class="sep"></div>
+  <span><kbd>[</kbd><kbd>]</kbd> speed: <span id="speed-indicator">3</span>/5</span>
+  <div class="sep"></div>
+  <span><kbd>?</kbd> toggle shortcuts</span>
 </div>
 <div id="tooltip"></div>
 
@@ -566,7 +620,7 @@ const zoom = d3.zoom()
   .extent([[0, 0], [width, height]])
   .on('zoom', (event) => updateChart(event.transform));
 
-chartArea.append('rect')
+const zoomRect = chartArea.append('rect')
   .attr('width', width).attr('height', height)
   .attr('fill', 'none').attr('pointer-events', 'all')
   .call(zoom);
@@ -574,10 +628,76 @@ chartArea.append('rect')
 // Raise polys above the zoom rect
 polysG.raise();
 
+// WASD / arrow key navigation (Perfetto-style, smooth)
+const activeKeys = new Set();
+let animating = false;
+const SPEEDS = [
+  { pan: 0.005, zoom: 1.01 },
+  { pan: 0.01,  zoom: 1.025 },
+  { pan: 0.02,  zoom: 1.05 },
+  { pan: 0.04,  zoom: 1.08 },
+  { pan: 0.08,  zoom: 1.12 },
+];
+let speedIdx = 2;
+
+function navTarget() {
+  let t = currentTransform;
+  const panPx = width * SPEEDS[speedIdx].pan;
+  const zoomFactor = SPEEDS[speedIdx].zoom;
+
+  if (activeKeys.has('a') || activeKeys.has('arrowleft'))
+    t = t.translate(panPx, 0);
+  if (activeKeys.has('d') || activeKeys.has('arrowright'))
+    t = t.translate(-panPx, 0);
+  if (activeKeys.has('w') || activeKeys.has('arrowup')) {
+    const cx = width / 2;
+    t = t.translate(cx, 0).scale(zoomFactor).translate(-cx, 0);
+  }
+  if (activeKeys.has('s') || activeKeys.has('arrowdown')) {
+    const cx = width / 2;
+    t = t.translate(cx, 0).scale(1 / zoomFactor).translate(-cx, 0);
+  }
+  return t;
+}
+
+function navLoop() {
+  if (activeKeys.size === 0) { animating = false; return; }
+  zoomRect.call(zoom.transform, navTarget());
+  requestAnimationFrame(navLoop);
+}
+
+const shortcutBar = document.getElementById('shortcut-bar');
+const speedIndicator = document.getElementById('speed-indicator');
+
+document.addEventListener('keydown', function(event) {
+  if (event.target.tagName === 'INPUT') return;
+  const k = event.key.toLowerCase();
+
+  if (k === '?') {
+    shortcutBar.style.display = shortcutBar.style.display === 'none' ? 'flex' : 'none';
+    return;
+  }
+  if (k === '[' || k === ']') {
+    speedIdx = Math.max(0, Math.min(SPEEDS.length - 1, speedIdx + (k === ']' ? 1 : -1)));
+    speedIndicator.textContent = speedIdx + 1;
+    shortcutBar.style.display = 'flex';
+    return;
+  }
+
+  if (!['a','d','w','s','arrowleft','arrowright','arrowup','arrowdown'].includes(k)) return;
+  event.preventDefault();
+  activeKeys.add(k);
+  if (!animating) { animating = true; navLoop(); }
+});
+
+document.addEventListener('keyup', function(event) {
+  activeKeys.delete(event.key.toLowerCase());
+});
+
 document.getElementById('hwm-toggle').onchange = function() {
   hwmG.style('display', this.checked ? null : 'none');
 };
 </script>
 </body>
 </html>
-""";
+"""
