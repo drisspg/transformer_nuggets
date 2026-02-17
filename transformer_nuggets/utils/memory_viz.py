@@ -47,22 +47,12 @@ def _extract_frames(frames: list[dict]) -> list[str]:
     return result
 
 
-def _categorize_stack(frames: list[str]) -> str:
-    for frame in frames:
-        if "/site-packages/" not in frame and "lib/python" not in frame and "::" not in frame:
-            return frame
-    for frame in frames:
-        if "/site-packages/" not in frame and "lib/python" not in frame:
-            return frame
-    return frames[0] if frames else "unknown"
-
-
 def process_snapshot(
     snapshot: dict, device: int = 0
-) -> tuple[list[dict], list[dict], list[str], list[list[int]], list[str], int]:
+) -> tuple[list[dict], list[dict], list[str], list[list[int]], int]:
     traces = snapshot.get("device_traces", [])
     if device >= len(traces):
-        return [], [], [], [], [], 0
+        return [], [], [], [], 0
 
     frame_to_idx: dict[str, int] = {}
     frames: list[str] = []
@@ -168,8 +158,7 @@ def process_snapshot(
         poly["ts"].append(timestep)
         poly["offsets"].append(poly["offsets"][-1])
 
-    categories = [_categorize_stack([frames[fi] for fi in stack]) for stack in stacks]
-    return timeline, alloc_polys, frames, stacks, categories, timestep
+    return timeline, alloc_polys, frames, stacks, timestep
 
 
 def generate_memory_html(
@@ -177,16 +166,9 @@ def generate_memory_html(
     device: int = 0,
     title: str = "Memory Timeline",
 ) -> str:
-    timeline, alloc_polys, frames, stacks, categories, max_ts = process_snapshot(snapshot, device)
+    timeline, alloc_polys, frames, stacks, max_ts = process_snapshot(snapshot, device)
     hwm = max((p["h"] for p in timeline), default=0)
     hwm_timestep = next((i for i, p in enumerate(timeline) if p["a"] == hwm), 0)
-
-    cat_to_idx: dict[str, int] = {}
-    for cat in categories:
-        if cat not in cat_to_idx:
-            cat_to_idx[cat] = len(cat_to_idx)
-    cat_indices = [cat_to_idx.get(c, 0) for c in categories]
-
     max_at_time = [e["a"] for e in timeline]
 
     meta = {
@@ -196,7 +178,6 @@ def generate_memory_html(
         "num_allocs": len(alloc_polys),
         "high_water_mark_bytes": hwm,
         "hwm_timestep": hwm_timestep,
-        "num_categories": len(cat_to_idx),
         "max_timestep": max_ts,
     }
 
@@ -206,7 +187,6 @@ def generate_memory_html(
         .replace("__ALLOCS__", json.dumps(alloc_polys))
         .replace("__FRAMES__", json.dumps(frames))
         .replace("__STACKS__", json.dumps(stacks))
-        .replace("__CATEGORIES__", json.dumps(cat_indices))
         .replace("__META__", json.dumps(meta))
     )
 
@@ -255,7 +235,50 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
     flex-shrink: 0;
   }
 
-  #header h1 { font-size: 14px; font-weight: 500; font-family: var(--mono); letter-spacing: 0.03em; text-transform: uppercase; }
+  #header h1 { font-size: 14px; font-weight: 500; font-family: var(--mono); letter-spacing: 0.03em; text-transform: uppercase; flex-shrink: 0; }
+
+  #header-mid {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex: 1;
+    justify-content: center;
+  }
+
+  #help-dropdown {
+    display: none;
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    margin-top: 6px;
+    background: var(--tooltip-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 10px 14px;
+    white-space: nowrap;
+    z-index: 50;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 2;
+    color: var(--text-muted);
+  }
+
+  #help-dropdown kbd {
+    display: inline-block;
+    padding: 1px 5px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text);
+    min-width: 18px;
+    text-align: center;
+  }
+
+  #help-trigger:hover #help-dropdown { display: block; }
 
   #controls {
     display: flex;
@@ -302,7 +325,7 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
 
   #chart-container {
     flex: 1;
-    padding: 8px 16px 16px;
+    padding: 0;
     min-height: 0;
     position: relative;
   }
@@ -447,11 +470,6 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
 
   .hwm-line { stroke: var(--hwm-color); stroke-width: 0.75; stroke-dasharray: 8 4; }
   .hwm-label { fill: var(--hwm-color); font-size: 11px; font-family: var(--mono); font-weight: 500; letter-spacing: 0.02em; }
-
-  .alloc-poly { stroke: rgba(0,0,0,0.5); stroke-width: 0.5; cursor: pointer; transition: opacity 0.15s; }
-  .alloc-poly:hover { stroke: rgba(255,255,255,0.8); stroke-width: 1; }
-  .alloc-poly.dimmed { opacity: 0.08 !important; }
-  .alloc-poly.highlighted { stroke: rgba(255,255,255,0.9); stroke-width: 1.5; }
 
   #search-input {
     background: rgba(255,255,255,0.04);
@@ -656,18 +674,37 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
 <body>
 <div id="header">
   <h1>__TITLE__</h1>
+  <div id="header-mid">
+    <span class="stat">Peak: <strong id="peak-stat"></strong></span>
+    <span class="stat">Allocs: <strong id="allocs-stat"></strong></span>
+    <span class="stat">Events: <strong id="events-stat"></strong></span>
+    <span id="help-trigger" class="stat" style="cursor:help;position:relative;">
+      ? controls
+      <div id="help-dropdown">
+        <div><kbd>scroll</kbd> zoom X</div>
+        <div><kbd>drag</kbd> pan X</div>
+        <div><kbd>shift+drag</kbd> box zoom (X+Y)</div>
+        <div><kbd>dbl-click</kbd> reset view</div>
+        <div><kbd>click</kbd> inspect allocation stack</div>
+        <div><kbd>A</kbd><kbd>D</kbd> pan &nbsp; <kbd>W</kbd><kbd>S</kbd> zoom</div>
+        <div><kbd>[</kbd><kbd>]</kbd> change speed</div>
+        <div><kbd>/</kbd> search &nbsp; <kbd>esc</kbd> clear</div>
+      </div>
+    </span>
+  </div>
   <div id="controls">
     <div style="display:flex;align-items:center;gap:0;">
       <input type="text" id="search-input" placeholder="/ search allocations...">
       <button id="regex-toggle" title="Toggle regex mode">.*</button>
     </div>
     <label class="toggle">
+      <input type="checkbox" id="autofit-toggle">
+      Auto-fit Y
+    </label>
+    <label class="toggle">
       <input type="checkbox" id="hwm-toggle" checked>
       High Water Mark
     </label>
-    <span class="stat">Peak: <strong id="peak-stat"></strong></span>
-    <span class="stat">Allocs: <strong id="allocs-stat"></strong></span>
-    <span class="zoom-hint">scroll to zoom, drag to pan, dbl-click to reset, <kbd>?</kbd> shortcuts</span>
   </div>
 </div>
 <div id="main">
@@ -705,7 +742,6 @@ const TIMELINE = __TIMELINE__;
 const ALLOCS = __ALLOCS__;
 const FRAMES = __FRAMES__;
 const STACKS = __STACKS__;
-const CATEGORIES = __CATEGORIES__;
 const META = __META__;
 
 function resolveStack(stackIdx) {
@@ -722,6 +758,7 @@ function formatBytes(b) {
 
 document.getElementById('peak-stat').textContent = formatBytes(META.high_water_mark_bytes);
 document.getElementById('allocs-stat').textContent = META.num_allocs.toLocaleString();
+document.getElementById('events-stat').textContent = META.num_events.toLocaleString();
 
 const PALETTE = [
   '#3E93CC', '#2E7DB5', '#5BA8D9', '#78BBE3',
@@ -875,13 +912,13 @@ const yScale = d3.scaleLinear().domain([0, META.high_water_mark_bytes * 1.05]).r
 const xAxis = d3.axisBottom(xScale).ticks(10);
 const yAxisFn = d3.axisLeft(yScale).ticks(8).tickFormat(d => formatBytes(d));
 
-g.append('g').attr('class', 'grid')
+const gridG = g.append('g').attr('class', 'grid')
   .call(d3.axisLeft(yScale).ticks(8).tickSize(-width).tickFormat(''));
 
 const xAxisG = g.append('g').attr('class', 'axis x-axis')
   .attr('transform', `translate(0,${height})`).call(xAxis);
 
-g.append('g').attr('class', 'axis y-axis').call(yAxisFn);
+const yAxisG = g.append('g').attr('class', 'axis y-axis').call(yAxisFn);
 
 const chartArea = g.append('g').attr('clip-path', 'url(#clip)');
 
@@ -914,11 +951,18 @@ function drawCanvas() {
   ctx.rect(0, 0, width, height);
   ctx.clip();
 
+  const pxPerTs = width / (d1 - d0);
+  const minVisPx = 0.5;
+
   for (let ai = 0; ai < ALLOCS.length; ai++) {
     const d = ALLOCS[ai];
     const tStart = d.ts[0];
     const tEnd = d.ts[d.ts.length - 1];
     if (tEnd < d0 || tStart > d1) continue;
+
+    const visW = (Math.min(tEnd, d1) - Math.max(tStart, d0)) * pxPerTs;
+    const visH = yScale(0) - yScale(d.s);
+    if (visW < minVisPx && visH < minVisPx) continue;
 
     const ts = d.ts;
     const offsets = d.offsets;
@@ -985,17 +1029,58 @@ function hitTest(mx, my) {
   return best;
 }
 
+let yMode = 'fixed';
+const fullYDomain = [0, META.high_water_mark_bytes * 1.05];
+let customYDomain = null;
+
+function getBaseYDomain(d0, d1) {
+  if (yMode === 'autofit') {
+    let maxY = 0;
+    for (const d of ALLOCS) {
+      const tStart = d.ts[0];
+      const tEnd = d.ts[d.ts.length - 1];
+      if (tEnd < d0 || tStart > d1) continue;
+      for (let i = 0; i < d.ts.length; i++) {
+        if (d.ts[i] >= d0 && d.ts[i] <= d1) {
+          maxY = Math.max(maxY, d.offsets[i] + d.s);
+        }
+      }
+    }
+    if (maxY === 0) maxY = META.high_water_mark_bytes;
+    return [0, maxY * 1.1];
+  }
+  return fullYDomain;
+}
+
 function updateChart(transform) {
   currentTransform = transform;
   const newX = transform.rescaleX(xScale);
+  const [d0, d1] = newX.domain();
+
+  yScale.domain(customYDomain || getBaseYDomain(d0, d1));
+
   xAxisG.call(xAxis.scale(newX));
   xAxisG.selectAll('text').attr('fill', 'var(--text-muted)');
   xAxisG.selectAll('line, path').attr('stroke', 'var(--border)');
+
+  yAxisG.call(yAxisFn);
+  yAxisG.selectAll('text').attr('fill', 'var(--text-muted)');
+  yAxisG.selectAll('line, path').attr('stroke', 'var(--border)');
+
+  gridG.call(d3.axisLeft(yScale).ticks(8).tickSize(-width).tickFormat(''));
+  gridG.selectAll('line').attr('stroke', 'var(--grid)');
+  gridG.selectAll('path').attr('stroke', 'none');
+
+  const hwmY = yScale(META.high_water_mark_bytes);
+  hwmG.select('.hwm-line').attr('y1', hwmY).attr('y2', hwmY);
+  hwmG.select('.hwm-label').attr('y', hwmY - 6);
+
   drawCanvas();
 }
 
 const zoom = d3.zoom()
   .scaleExtent([1, 2000])
+  .filter(event => !event.shiftKey)
   .translateExtent([[0, 0], [width, height]])
   .extent([[0, 0], [width, height]])
   .on('zoom', (event) => updateChart(event.transform));
@@ -1004,6 +1089,60 @@ const zoomRect = chartArea.append('rect')
   .attr('width', width).attr('height', height)
   .attr('fill', 'none').attr('pointer-events', 'all')
   .call(zoom);
+
+// Box zoom: shift+drag to select a region
+let boxStart = null;
+const boxRect = chartArea.append('rect')
+  .attr('fill', 'rgba(62, 147, 204, 0.15)')
+  .attr('stroke', 'var(--accent)')
+  .attr('stroke-width', 1)
+  .attr('stroke-dasharray', '4 2')
+  .style('display', 'none')
+  .attr('pointer-events', 'none');
+
+svg.node().addEventListener('pointerdown', function(event) {
+  if (!event.shiftKey || event.button !== 0) return;
+  event.preventDefault();
+  const [mx, my] = d3.pointer(event, g.node());
+  boxStart = { x: Math.max(0, Math.min(width, mx)), y: Math.max(0, Math.min(height, my)) };
+  boxRect.style('display', null).attr('width', 0).attr('height', 0);
+  svg.node().setPointerCapture(event.pointerId);
+});
+
+svg.node().addEventListener('pointermove', function(event) {
+  if (!boxStart) return;
+  const [mx, my] = d3.pointer(event, g.node());
+  const cx = Math.max(0, Math.min(width, mx));
+  const cy = Math.max(0, Math.min(height, my));
+  boxRect
+    .attr('x', Math.min(boxStart.x, cx))
+    .attr('y', Math.min(boxStart.y, cy))
+    .attr('width', Math.abs(cx - boxStart.x))
+    .attr('height', Math.abs(cy - boxStart.y));
+});
+
+svg.node().addEventListener('pointerup', function(event) {
+  if (!boxStart) return;
+  const [mx, my] = d3.pointer(event, g.node());
+  const x0 = Math.max(0, Math.min(boxStart.x, mx));
+  const x1 = Math.min(width, Math.max(boxStart.x, mx));
+  const y0 = Math.max(0, Math.min(boxStart.y, my));
+  const y1 = Math.min(height, Math.max(boxStart.y, my));
+  boxStart = null;
+  boxRect.style('display', 'none');
+
+  if (x1 - x0 < 5 || y1 - y0 < 5) return;
+
+  const newX = currentTransform.rescaleX(xScale);
+  const dataX0 = newX.invert(x0);
+  const dataX1 = newX.invert(x1);
+  customYDomain = [yScale.invert(y1), yScale.invert(y0)];
+
+  const newK = META.max_timestep / (dataX1 - dataX0);
+  const newTx = -dataX0 * width / (dataX1 - dataX0);
+  const t = d3.zoomIdentity.translate(newTx, 0).scale(newK);
+  zoomRect.transition().duration(300).call(zoom.transform, t);
+});
 
 zoomRect.on('mousemove', function(event) {
   const [mx, my] = d3.pointer(event, svg.node());
@@ -1032,6 +1171,12 @@ zoomRect.on('click', function(event) {
   const [mx, my] = d3.pointer(event, svg.node());
   const hit = hitTest(mx, my);
   if (hit) renderStack(hit.si, formatBytes(hit.s));
+});
+
+zoomRect.on('dblclick.zoom', null);
+zoomRect.on('dblclick', function() {
+  customYDomain = null;
+  zoomRect.transition().duration(300).call(zoom.transform, d3.zoomIdentity);
 });
 
 drawCanvas();
@@ -1104,6 +1249,12 @@ document.addEventListener('keyup', function(event) {
 
 document.getElementById('hwm-toggle').onchange = function() {
   hwmG.style('display', this.checked ? null : 'none');
+};
+
+document.getElementById('autofit-toggle').onchange = function() {
+  yMode = this.checked ? 'autofit' : 'fixed';
+  customYDomain = null;
+  updateChart(currentTransform);
 };
 
 // --- Feature 1: Search & Filter ---
@@ -1236,18 +1387,11 @@ const miniG = miniSvg.append('g')
 const miniX = d3.scaleLinear().domain([0, META.max_timestep]).range([0, minimapW]);
 const miniY = d3.scaleLinear().domain([0, META.high_water_mark_bytes * 1.05]).range([minimapH, 0]);
 
-const miniArea = d3.area()
-  .x((d, i) => miniX(i))
-  .y0(minimapH)
-  .y1(d => miniY(d));
-
-const miniData = TIMELINE;
-
 miniG.append('path')
-  .datum(miniData)
+  .datum(TIMELINE)
   .attr('class', 'minimap-area')
   .attr('d', d3.area()
-    .x((d, i) => i * minimapW / miniData.length)
+    .x((d, i) => i * minimapW / TIMELINE.length)
     .y0(minimapH)
     .y1(d => miniY(d))
   );

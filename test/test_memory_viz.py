@@ -12,12 +12,6 @@ from transformer_nuggets.utils.memory_viz import (
 )
 
 
-def _unpack(snapshot, device=0):
-    timeline, allocs, frames, stacks, categories, max_ts = process_snapshot(snapshot, device)
-    resolved_stacks = [[frames[fi] for fi in s] for s in stacks]
-    return timeline, allocs, resolved_stacks, categories, max_ts
-
-
 DATA_DIR = Path(__file__).parent / "data"
 SNAPSHOT_PATH = DATA_DIR / "mini_snapshot.pickle"
 
@@ -85,12 +79,11 @@ class TestHelpers:
 
 class TestProcessSnapshot:
     def test_returns_correct_tuple_shape(self, snapshot):
-        timeline, allocs, frames, stacks, categories, max_ts = process_snapshot(snapshot)
+        timeline, allocs, frames, stacks, max_ts = process_snapshot(snapshot)
         assert len(timeline) > 0
         assert len(allocs) > 0
         assert len(frames) > 0
         assert len(stacks) > 0
-        assert len(categories) == len(stacks)
         assert max_ts > 0
 
     def test_stacks_reference_valid_frame_indices(self, snapshot):
@@ -131,7 +124,7 @@ class TestProcessSnapshot:
 
     def test_empty_device_returns_empty(self, snapshot):
         result = process_snapshot(snapshot, device=99)
-        assert result == ([], [], [], [], [], 0)
+        assert result == ([], [], [], [], 0)
 
     def test_polygon_offsets_non_negative(self, snapshot):
         _, allocs, *_ = process_snapshot(snapshot)
@@ -152,7 +145,6 @@ class TestGenerateHTML:
             "__TIMELINE__",
             "__ALLOCS__",
             "__STACKS__",
-            "__CATEGORIES__",
             "__META__",
         ]:
             assert placeholder not in html
