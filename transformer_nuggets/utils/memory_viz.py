@@ -65,14 +65,30 @@ def process_snapshot(
             frames.append(f)
         return frame_to_idx[f]
 
+    id_cache: dict[int, int] = {}
+    content_cache: dict[tuple, int] = {}
+
     def get_stack_idx(raw_frames: list[dict]) -> int:
+        raw_id = id(raw_frames)
+        if raw_id in id_cache:
+            return id_cache[raw_id]
+        content_key = tuple(
+            (f.get("filename", ""), f.get("name", ""), f.get("line", 0)) for f in raw_frames
+        )
+        if content_key in content_cache:
+            result = content_cache[content_key]
+            id_cache[raw_id] = result
+            return result
         extracted = _extract_frames(raw_frames)
         frame_indices = [intern_frame(f) for f in extracted]
         key = tuple(frame_indices)
         if key not in stack_to_idx:
             stack_to_idx[key] = len(stacks)
             stacks.append(frame_indices)
-        return stack_to_idx[key]
+        result = stack_to_idx[key]
+        id_cache[raw_id] = result
+        content_cache[content_key] = result
+        return result
 
     allocated = 0
     reserved = 0
@@ -81,6 +97,7 @@ def process_snapshot(
     last_time = 0
 
     current_stack: list[int] = []
+    stack_pos: dict[int, int] = {}
     alloc_id_by_addr: dict[int, int] = {}
 
     alloc_polys: list[dict] = []
@@ -107,6 +124,7 @@ def process_snapshot(
                         "offsets": [offset],
                     }
                 )
+                stack_pos[alloc_id] = len(current_stack)
                 current_stack.append(alloc_id)
                 alloc_id_by_addr[addr] = alloc_id
                 timestep += 1
@@ -119,9 +137,11 @@ def process_snapshot(
                     poly["ts"].append(timestep)
                     poly["offsets"].append(poly["offsets"][-1])
 
-                    if freed_id in current_stack:
-                        idx_in_stack = current_stack.index(freed_id)
+                    idx_in_stack = stack_pos.pop(freed_id, None)
+                    if idx_in_stack is not None:
                         current_stack.pop(idx_in_stack)
+                        for j in range(idx_in_stack, len(current_stack)):
+                            stack_pos[current_stack[j]] = j
                         for above_id in current_stack[idx_in_stack:]:
                             above = alloc_polys[above_id]
                             above["ts"].append(timestep)
@@ -634,6 +654,20 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
 
   .zoom-hint { font-size: 11px; color: var(--text-muted); opacity: 0.5; }
 
+  #perf-display {
+    position: fixed;
+    bottom: 8px;
+    left: 8px;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-muted);
+    background: rgba(0,0,0,0.7);
+    padding: 3px 8px;
+    border-radius: 3px;
+    z-index: 200;
+    pointer-events: none;
+  }
+
   #shortcut-bar {
     display: flex;
     align-items: center;
@@ -735,6 +769,7 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
   <span><kbd>?</kbd> toggle shortcuts</span>
 </div>
 <div id="tooltip"></div>
+<div id="perf-display"></div>
 
 <script src="https://d3js.org/d3.v7.min.js"></script>
 <script>
@@ -937,10 +972,55 @@ let currentTransform = d3.zoomIdentity;
 let searchMatcher = null;
 let hoveredAlloc = null;
 
-// Precompute colors for each alloc
+// Precompute colors and start/end arrays for fast access
 const allocColors = ALLOCS.map(d => getColor(d.si));
+const allocStarts = new Float64Array(ALLOCS.length);
+const allocEnds = new Float64Array(ALLOCS.length);
+for (let i = 0; i < ALLOCS.length; i++) {
+  allocStarts[i] = ALLOCS[i].ts[0];
+  allocEnds[i] = ALLOCS[i].ts[ALLOCS[i].ts.length - 1];
+}
+
+// Bucket index for O(bucket_size) hit testing instead of O(n)
+const NUM_HIT_BUCKETS = Math.max(1, Math.min(2000, META.max_timestep));
+const hitBucketSize = META.max_timestep / NUM_HIT_BUCKETS;
+const hitBuckets = new Array(NUM_HIT_BUCKETS + 1);
+for (let b = 0; b <= NUM_HIT_BUCKETS; b++) hitBuckets[b] = [];
+for (let ai = 0; ai < ALLOCS.length; ai++) {
+  const b0 = Math.max(0, Math.floor(allocStarts[ai] / hitBucketSize));
+  const b1 = Math.min(NUM_HIT_BUCKETS, Math.floor(allocEnds[ai] / hitBucketSize));
+  for (let b = b0; b <= b1; b++) hitBuckets[b].push(ai);
+}
+
+// Search match cache: precompute on search change instead of per-frame
+let searchMatchSet = null;
+function updateSearchCache() {
+  if (!searchMatcher) { searchMatchSet = null; return; }
+  searchMatchSet = new Set();
+  for (let ai = 0; ai < ALLOCS.length; ai++) {
+    const stack = resolveStack(ALLOCS[ai].si);
+    if (stack.some(f => searchMatcher.test(f))) searchMatchSet.add(ai);
+  }
+}
+
+function tracePoly(ai, newX) {
+  const d = ALLOCS[ai];
+  const ts = d.ts, offsets = d.offsets, size = d.s;
+  ctx.moveTo(newX(ts[0]), yScale(offsets[0]));
+  for (let i = 1; i < ts.length; i++) {
+    ctx.lineTo(newX(ts[i]), yScale(offsets[i]));
+  }
+  for (let i = ts.length - 1; i >= 0; i--) {
+    ctx.lineTo(newX(ts[i]), yScale(offsets[i] + size));
+  }
+  ctx.closePath();
+}
+
+const perfEl = document.getElementById('perf-display');
+let perfFrames = 0, perfSum = 0, perfLastUpdate = performance.now();
 
 function drawCanvas() {
+  const t0 = performance.now();
   const newX = currentTransform.rescaleX(xScale);
   const [d0, d1] = newX.domain();
 
@@ -954,67 +1034,80 @@ function drawCanvas() {
   const pxPerTs = width / (d1 - d0);
   const minVisPx = 0.5;
 
-  for (let ai = 0; ai < ALLOCS.length; ai++) {
-    const d = ALLOCS[ai];
-    const tStart = d.ts[0];
-    const tEnd = d.ts[d.ts.length - 1];
-    if (tEnd < d0 || tStart > d1) continue;
+  // Batch visible allocs by color+alpha to minimize Canvas state changes
+  const batches = {};
+  let hoveredIdx = -1;
 
-    const visW = (Math.min(tEnd, d1) - Math.max(tStart, d0)) * pxPerTs;
-    const visH = yScale(0) - yScale(d.s);
+  for (let ai = 0; ai < ALLOCS.length; ai++) {
+    if (allocEnds[ai] < d0 || allocStarts[ai] > d1) continue;
+
+    const visW = (Math.min(allocEnds[ai], d1) - Math.max(allocStarts[ai], d0)) * pxPerTs;
+    const visH = yScale(0) - yScale(ALLOCS[ai].s);
     if (visW < minVisPx && visH < minVisPx) continue;
 
-    const ts = d.ts;
-    const offsets = d.offsets;
-    const size = d.s;
-
-    ctx.beginPath();
-    // Bottom edge left to right
-    for (let i = 0; i < ts.length; i++) {
-      const x = newX(ts[i]);
-      const y = yScale(offsets[i]);
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    }
-    // Top edge right to left
-    for (let i = ts.length - 1; i >= 0; i--) {
-      ctx.lineTo(newX(ts[i]), yScale(offsets[i] + size));
-    }
-    ctx.closePath();
+    if (ALLOCS[ai] === hoveredAlloc) { hoveredIdx = ai; continue; }
 
     let alpha = 0.85;
-    if (searchMatcher) {
-      const stack = resolveStack(d.si);
-      alpha = stack.some(f => searchMatcher.test(f)) ? 0.9 : 0.06;
+    if (searchMatchSet !== null) {
+      alpha = searchMatchSet.has(ai) ? 0.9 : 0.06;
     }
-    if (d === hoveredAlloc) alpha = 1.0;
 
-    ctx.globalAlpha = alpha;
-    ctx.fillStyle = allocColors[ai];
+    const key = allocColors[ai] + alpha;
+    if (!batches[key]) batches[key] = { color: allocColors[ai], alpha, indices: [] };
+    batches[key].indices.push(ai);
+  }
+
+  for (const batch of Object.values(batches)) {
+    ctx.beginPath();
+    for (const ai of batch.indices) tracePoly(ai, newX);
+    ctx.globalAlpha = batch.alpha;
+    ctx.fillStyle = batch.color;
     ctx.fill();
-    ctx.globalAlpha = d === hoveredAlloc ? 1.0 : 0.3;
-    ctx.strokeStyle = d === hoveredAlloc ? 'rgba(255,255,255,0.9)' : 'rgba(0,0,0,0.5)';
-    ctx.lineWidth = d === hoveredAlloc ? 1.5 : 0.5;
+    ctx.globalAlpha = Math.min(batch.alpha, 0.3);
+    ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+    ctx.lineWidth = 0.5;
+    ctx.stroke();
+  }
+
+  if (hoveredIdx >= 0) {
+    ctx.beginPath();
+    tracePoly(hoveredIdx, newX);
+    ctx.globalAlpha = 1.0;
+    ctx.fillStyle = allocColors[hoveredIdx];
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+    ctx.lineWidth = 1.5;
     ctx.stroke();
   }
 
   ctx.restore();
+
+  const elapsed = performance.now() - t0;
+  perfFrames++; perfSum += elapsed;
+  const now = performance.now();
+  if (now - perfLastUpdate > 500) {
+    const avg = perfSum / perfFrames;
+    perfEl.textContent = `draw: ${avg.toFixed(1)}ms (${perfFrames} frames)`;
+    perfFrames = 0; perfSum = 0; perfLastUpdate = now;
+  }
 }
 
-// Hit testing: find allocation under mouse
+// Hit testing: bucket lookup instead of full scan
 function hitTest(mx, my) {
   const newX = currentTransform.rescaleX(xScale);
   const dataX = newX.invert(mx - margin.left);
   const dataY = yScale.invert(my - margin.top);
 
+  const bi = Math.max(0, Math.min(NUM_HIT_BUCKETS, Math.floor(dataX / hitBucketSize)));
+  const candidates = hitBuckets[bi];
+
   let best = null;
   let bestSize = Infinity;
 
-  for (const d of ALLOCS) {
-    const tStart = d.ts[0];
-    const tEnd = d.ts[d.ts.length - 1];
-    if (dataX < tStart || dataX > tEnd) continue;
+  for (const ai of candidates) {
+    if (dataX < allocStarts[ai] || dataX > allocEnds[ai]) continue;
 
-    // Find the offset at this timestep via linear search of keyframes
+    const d = ALLOCS[ai];
     let offset = d.offsets[0];
     for (let i = 1; i < d.ts.length; i++) {
       if (d.ts[i] > dataX) break;
@@ -1036,10 +1129,9 @@ let customYDomain = null;
 function getBaseYDomain(d0, d1) {
   if (yMode === 'autofit') {
     let maxY = 0;
-    for (const d of ALLOCS) {
-      const tStart = d.ts[0];
-      const tEnd = d.ts[d.ts.length - 1];
-      if (tEnd < d0 || tStart > d1) continue;
+    for (let ai = 0; ai < ALLOCS.length; ai++) {
+      if (allocEnds[ai] < d0 || allocStarts[ai] > d1) continue;
+      const d = ALLOCS[ai];
       for (let i = 0; i < d.ts.length; i++) {
         if (d.ts[i] >= d0 && d.ts[i] <= d1) {
           maxY = Math.max(maxY, d.offsets[i] + d.s);
@@ -1278,6 +1370,7 @@ function applySearch(query) {
     const q = query.toLowerCase();
     searchMatcher = { test: (s) => s.toLowerCase().includes(q) };
   }
+  updateSearchCache();
   drawCanvas();
 }
 
