@@ -616,6 +616,10 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
     border-radius: 2px;
   }
 
+  .breakdown-row .bd-bar-fill.leak-bar {
+    background: #e74c3c;
+  }
+
   .breakdown-row .bd-frame {
     flex: 1;
     overflow: hidden;
@@ -749,6 +753,7 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
         <button class="detail-tab active" data-tab="stack">Stack Trace</button>
         <button class="detail-tab" data-tab="breakdown">Breakdown</button>
         <button class="detail-tab" data-tab="peak">At Peak</button>
+        <button class="detail-tab" data-tab="leaks">Leaks</button>
       </div>
       <span class="detail-stats" id="detail-stats"></span>
     </div>
@@ -1417,6 +1422,61 @@ hwmG.on('click', function() {
   showPeakBreakdown();
 });
 
+// --- Feature 5: Leak Detection (never-freed allocations) ---
+function showLeaks() {
+  const maxTs = META.max_timestep;
+  const earlyThreshold = maxTs * 0.05;
+
+  const candidates = [];
+  for (let ai = 0; ai < ALLOCS.length; ai++) {
+    if (allocEnds[ai] >= maxTs && allocStarts[ai] > earlyThreshold) {
+      candidates.push(ai);
+    }
+  }
+
+  if (candidates.length === 0) {
+    detailStats.textContent = 'No potential leaks';
+    detailBody.innerHTML = '<div class="empty-detail">No potential memory leaks detected.<br>All allocations born after the setup phase were freed.</div>';
+    searchMatchSet = null;
+    drawCanvas();
+    return;
+  }
+
+  const byFrame = {};
+  let totalLeaked = 0;
+  for (const ai of candidates) {
+    const d = ALLOCS[ai];
+    const f = bestFrame(d.si);
+    if (!byFrame[f]) byFrame[f] = { frame: f, si: d.si, count: 0, totalBytes: 0 };
+    byFrame[f].count++;
+    byFrame[f].totalBytes += d.s;
+    totalLeaked += d.s;
+  }
+
+  const groups = Object.values(byFrame).sort((a, b) => b.totalBytes - a.totalBytes);
+  const maxBytes = groups[0]?.totalBytes || 1;
+
+  detailStats.textContent = `${candidates.length} allocs, ${formatBytes(totalLeaked)}`;
+
+  searchMatchSet = new Set(candidates);
+  drawCanvas();
+
+  let html = '<div class="peak-label">Never-freed allocations (excluding setup phase)</div>';
+  html += groups.map(g => {
+    const pct = (g.totalBytes / totalLeaked * 100).toFixed(1);
+    const barW = (g.totalBytes / maxBytes * 100).toFixed(0);
+    return `<div class="breakdown-row" onclick="applySearch('${g.frame.replace(/'/g, "\\'")}')">
+      <span class="bd-size">${formatBytes(g.totalBytes)}</span>
+      <span class="bd-count">\u00d7${g.count}</span>
+      <span class="bd-pct">${pct}%</span>
+      <span class="bd-bar"><span class="bd-bar-fill leak-bar" style="width:${barW}%"></span></span>
+      <span class="bd-frame">${g.frame}</span>
+    </div>`;
+  }).join('');
+
+  detailBody.innerHTML = html;
+}
+
 // --- Feature 3: Memory Breakdown ---
 function showBreakdown() {
   const byFrame = {};
@@ -1455,6 +1515,7 @@ document.querySelectorAll('.detail-tab').forEach(tab => {
     setActiveTab(this.dataset.tab);
     if (this.dataset.tab === 'breakdown') showBreakdown();
     else if (this.dataset.tab === 'peak') showPeakBreakdown();
+    else if (this.dataset.tab === 'leaks') showLeaks();
     else {
       searchInput.value = '';
       applySearch('');
