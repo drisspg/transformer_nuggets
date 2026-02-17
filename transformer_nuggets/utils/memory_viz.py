@@ -177,9 +177,7 @@ def generate_memory_html(
     device: int = 0,
     title: str = "Memory Timeline",
 ) -> str:
-    timeline, alloc_polys, frames, stacks, categories, max_ts = process_snapshot(
-        snapshot, device
-    )
+    timeline, alloc_polys, frames, stacks, categories, max_ts = process_snapshot(snapshot, device)
     hwm = max((p["h"] for p in timeline), default=0)
     hwm_timestep = next((i for i, p in enumerate(timeline) if p["a"] == hwm), 0)
 
@@ -306,9 +304,17 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
     flex: 1;
     padding: 8px 16px 16px;
     min-height: 0;
+    position: relative;
   }
 
-  svg { width: 100%; height: 100%; }
+  #alloc-canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    pointer-events: none;
+  }
+
+  svg { width: 100%; height: 100%; position: relative; z-index: 1; }
 
   #detail-panel {
     width: 480px;
@@ -836,34 +842,27 @@ function renderStack(stackIdx, label) {
   }).join('');
 }
 
-// Build polygon points for each allocation
-// Each alloc has ts[] (timesteps) and offsets[] (bottom y at each timestep)
-// Polygon: bottom-left → bottom-right → top-right → top-left
-function buildPolygonPoints(d, xScale, yScale) {
-  const ts = d.ts;
-  const offsets = d.offsets;
-  const size = d.s;
-  const points = [];
-  // Bottom edge: left to right
-  for (let i = 0; i < ts.length; i++) {
-    points.push([xScale(ts[i]), yScale(offsets[i])]);
-  }
-  // Top edge: right to left
-  for (let i = ts.length - 1; i >= 0; i--) {
-    points.push([xScale(ts[i]), yScale(offsets[i] + size)]);
-  }
-  return points.map(p => p.join(',')).join(' ');
-}
-
 // --- Chart setup ---
 const container = document.getElementById('chart-container');
-const rect = container.getBoundingClientRect();
+const containerRect = container.getBoundingClientRect();
 const margin = { top: 20, right: 60, bottom: 40, left: 80 };
-const width = rect.width - margin.left - margin.right;
-const height = rect.height - margin.top - margin.bottom;
+const width = containerRect.width - margin.left - margin.right;
+const height = containerRect.height - margin.top - margin.bottom;
 
+// Canvas for allocation polygons (behind SVG)
+const canvas = document.createElement('canvas');
+canvas.id = 'alloc-canvas';
+canvas.width = containerRect.width * devicePixelRatio;
+canvas.height = containerRect.height * devicePixelRatio;
+canvas.style.width = containerRect.width + 'px';
+canvas.style.height = containerRect.height + 'px';
+container.insertBefore(canvas, container.firstChild);
+const ctx = canvas.getContext('2d');
+ctx.scale(devicePixelRatio, devicePixelRatio);
+
+// SVG for axes, grid, HWM, zoom overlay
 const svg = d3.select('#chart-container').append('svg')
-  .attr('viewBox', `0 0 ${rect.width} ${rect.height}`);
+  .attr('viewBox', `0 0 ${containerRect.width} ${containerRect.height}`);
 
 const g = svg.append('g').attr('transform', `translate(${margin.left},${margin.top})`);
 
@@ -896,30 +895,95 @@ hwmG.append('text').attr('class', 'hwm-label')
   .attr('text-anchor', 'end')
   .text('HWM: ' + formatBytes(META.high_water_mark_bytes));
 
-// Draw allocation polygons
-const polysG = chartArea.append('g');
-
-polysG.selectAll('.alloc-poly')
-  .data(ALLOCS)
-  .join('polygon')
-  .attr('class', 'alloc-poly')
-  .attr('points', d => buildPolygonPoints(d, xScale, yScale))
-  .attr('fill', d => getColor(d.si))
-  .attr('opacity', 0.85)
-  .on('mousemove', function(event, d) {
-    const bf = bestFrame(d.si);
-    showTooltip(event, [
-      `<div class="tt-row"><span class="tt-label">Size:</span><span class="tt-value">${formatBytes(d.s)}</span></div>`,
-      bf ? `<div class="tt-hint">${bf}</div>` : '',
-    ].join(''));
-  })
-  .on('mouseleave', hideTooltip)
-  .on('click', function(event, d) {
-    renderStack(d.si, formatBytes(d.s));
-  });
-
-// Zoom
+// --- Canvas rendering ---
 let currentTransform = d3.zoomIdentity;
+let searchMatcher = null;
+let hoveredAlloc = null;
+
+// Precompute colors for each alloc
+const allocColors = ALLOCS.map(d => getColor(d.si));
+
+function drawCanvas() {
+  const newX = currentTransform.rescaleX(xScale);
+  const [d0, d1] = newX.domain();
+
+  ctx.clearRect(0, 0, containerRect.width, containerRect.height);
+  ctx.save();
+  ctx.translate(margin.left, margin.top);
+  ctx.beginPath();
+  ctx.rect(0, 0, width, height);
+  ctx.clip();
+
+  for (let ai = 0; ai < ALLOCS.length; ai++) {
+    const d = ALLOCS[ai];
+    const tStart = d.ts[0];
+    const tEnd = d.ts[d.ts.length - 1];
+    if (tEnd < d0 || tStart > d1) continue;
+
+    const ts = d.ts;
+    const offsets = d.offsets;
+    const size = d.s;
+
+    ctx.beginPath();
+    // Bottom edge left to right
+    for (let i = 0; i < ts.length; i++) {
+      const x = newX(ts[i]);
+      const y = yScale(offsets[i]);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    // Top edge right to left
+    for (let i = ts.length - 1; i >= 0; i--) {
+      ctx.lineTo(newX(ts[i]), yScale(offsets[i] + size));
+    }
+    ctx.closePath();
+
+    let alpha = 0.85;
+    if (searchMatcher) {
+      const stack = resolveStack(d.si);
+      alpha = stack.some(f => searchMatcher.test(f)) ? 0.9 : 0.06;
+    }
+    if (d === hoveredAlloc) alpha = 1.0;
+
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = allocColors[ai];
+    ctx.fill();
+    ctx.globalAlpha = d === hoveredAlloc ? 1.0 : 0.3;
+    ctx.strokeStyle = d === hoveredAlloc ? 'rgba(255,255,255,0.9)' : 'rgba(0,0,0,0.5)';
+    ctx.lineWidth = d === hoveredAlloc ? 1.5 : 0.5;
+    ctx.stroke();
+  }
+
+  ctx.restore();
+}
+
+// Hit testing: find allocation under mouse
+function hitTest(mx, my) {
+  const newX = currentTransform.rescaleX(xScale);
+  const dataX = newX.invert(mx - margin.left);
+  const dataY = yScale.invert(my - margin.top);
+
+  let best = null;
+  let bestSize = Infinity;
+
+  for (const d of ALLOCS) {
+    const tStart = d.ts[0];
+    const tEnd = d.ts[d.ts.length - 1];
+    if (dataX < tStart || dataX > tEnd) continue;
+
+    // Find the offset at this timestep via linear search of keyframes
+    let offset = d.offsets[0];
+    for (let i = 1; i < d.ts.length; i++) {
+      if (d.ts[i] > dataX) break;
+      offset = d.offsets[i];
+    }
+
+    if (dataY >= offset && dataY <= offset + d.s && d.s < bestSize) {
+      best = d;
+      bestSize = d.s;
+    }
+  }
+  return best;
+}
 
 function updateChart(transform) {
   currentTransform = transform;
@@ -927,9 +991,7 @@ function updateChart(transform) {
   xAxisG.call(xAxis.scale(newX));
   xAxisG.selectAll('text').attr('fill', 'var(--text-muted)');
   xAxisG.selectAll('line, path').attr('stroke', 'var(--border)');
-
-  polysG.selectAll('.alloc-poly')
-    .attr('points', d => buildPolygonPoints(d, newX, yScale));
+  drawCanvas();
 }
 
 const zoom = d3.zoom()
@@ -943,8 +1005,36 @@ const zoomRect = chartArea.append('rect')
   .attr('fill', 'none').attr('pointer-events', 'all')
   .call(zoom);
 
-// Raise polys above the zoom rect
-polysG.raise();
+zoomRect.on('mousemove', function(event) {
+  const [mx, my] = d3.pointer(event, svg.node());
+  const hit = hitTest(mx, my);
+  if (hit !== hoveredAlloc) {
+    hoveredAlloc = hit;
+    drawCanvas();
+  }
+  if (hit) {
+    const bf = bestFrame(hit.si);
+    showTooltip(event, [
+      `<div class="tt-row"><span class="tt-label">Size:</span><span class="tt-value">${formatBytes(hit.s)}</span></div>`,
+      bf ? `<div class="tt-hint">${bf}</div>` : '',
+    ].join(''));
+  } else {
+    hideTooltip();
+  }
+});
+
+zoomRect.on('mouseleave', function() {
+  if (hoveredAlloc) { hoveredAlloc = null; drawCanvas(); }
+  hideTooltip();
+});
+
+zoomRect.on('click', function(event) {
+  const [mx, my] = d3.pointer(event, svg.node());
+  const hit = hitTest(mx, my);
+  if (hit) renderStack(hit.si, formatBytes(hit.s));
+});
+
+drawCanvas();
 
 // WASD / arrow key navigation (Perfetto-style, smooth)
 const activeKeys = new Set();
@@ -1029,26 +1119,15 @@ regexToggle.addEventListener('click', () => {
 
 function applySearch(query) {
   searchInput.value = query;
-  let matcher;
   if (!query) {
-    matcher = null;
+    searchMatcher = null;
   } else if (useRegex) {
-    try { matcher = new RegExp(query, 'i'); } catch(e) { matcher = null; }
+    try { searchMatcher = new RegExp(query, 'i'); } catch(e) { searchMatcher = null; }
   } else {
     const q = query.toLowerCase();
-    matcher = { test: (s) => s.toLowerCase().includes(q) };
+    searchMatcher = { test: (s) => s.toLowerCase().includes(q) };
   }
-
-  polysG.selectAll('.alloc-poly').each(function(d) {
-    const el = d3.select(this);
-    if (!matcher) {
-      el.classed('dimmed', false).classed('highlighted', false);
-      return;
-    }
-    const stack = resolveStack(d.si) || [];
-    const match = stack.some(f => matcher.test(f));
-    el.classed('dimmed', !match).classed('highlighted', match);
-  });
+  drawCanvas();
 }
 
 searchInput.addEventListener('input', (e) => applySearch(e.target.value));

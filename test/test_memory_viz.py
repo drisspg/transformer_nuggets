@@ -11,10 +11,12 @@ from transformer_nuggets.utils.memory_viz import (
     process_snapshot,
 )
 
+
 def _unpack(snapshot, device=0):
     timeline, allocs, frames, stacks, categories, max_ts = process_snapshot(snapshot, device)
     resolved_stacks = [[frames[fi] for fi in s] for s in stacks]
     return timeline, allocs, resolved_stacks, categories, max_ts
+
 
 DATA_DIR = Path(__file__).parent / "data"
 SNAPSHOT_PATH = DATA_DIR / "mini_snapshot.pickle"
@@ -145,7 +147,14 @@ class TestGenerateHTML:
 
     def test_no_remaining_placeholders(self, snapshot):
         html = generate_memory_html(snapshot, title="Test")
-        for placeholder in ["__TITLE__", "__TIMELINE__", "__ALLOCS__", "__STACKS__", "__CATEGORIES__", "__META__"]:
+        for placeholder in [
+            "__TITLE__",
+            "__TIMELINE__",
+            "__ALLOCS__",
+            "__STACKS__",
+            "__CATEGORIES__",
+            "__META__",
+        ]:
             assert placeholder not in html
 
     def test_title_appears_in_html(self, snapshot):
