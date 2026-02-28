@@ -77,8 +77,11 @@ def benchmark_cuda_function_in_microseconds(func: Callable, *args, **kwargs) -> 
     never leaks into the benchmarked callable.
     """
     num_iters = kwargs.pop("NUM_ITERS", 100)
+    is_vetted_benchmarking = kwargs.pop("IS_VETTED_BENCHMARKING", False)
     no_args = lambda: func(*args, **kwargs)
-    time = do_bench_using_profiling(no_args, rep=num_iters)
+    time = do_bench_using_profiling(
+        no_args, rep=num_iters, is_vetted_benchmarking=is_vetted_benchmarking
+    )
     return time * 1e3
 
 
