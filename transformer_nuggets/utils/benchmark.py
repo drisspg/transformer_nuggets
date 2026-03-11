@@ -18,6 +18,44 @@ logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
 
+@contextmanager
+def locked_clocks(device: int = 0, clock_mhz: int | None = None):
+    """Lock GPU SM clocks for stable benchmarking.
+
+    Uses ``sudo nvidia-smi -lgc`` to lock and ``sudo nvidia-smi -rgc`` to
+    reset. Will prompt for a password in interactive terminals.
+
+    Args:
+        device: CUDA device index.
+        clock_mhz: SM clock frequency in MHz. If None, locks to the GPU's max SM clock.
+    """
+    import subprocess
+
+    if clock_mhz is None:
+        clock_mhz = int(
+            subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    "-i",
+                    str(device),
+                    "--query-gpu=clocks.max.sm",
+                    "--format=csv,noheader,nounits",
+                ],
+                text=True,
+            ).strip()
+        )
+
+    subprocess.check_call(
+        ["sudo", "nvidia-smi", "-i", str(device), "-lgc", f"{clock_mhz},{clock_mhz}"]
+    )
+    logger.info(f"Locked GPU {device} SM clocks to {clock_mhz} MHz")
+    try:
+        yield clock_mhz
+    finally:
+        subprocess.call(["sudo", "nvidia-smi", "-i", str(device), "-rgc"])
+        logger.info(f"Reset GPU {device} SM clocks")
+
+
 def lazy_import_error(error_msg: str):
     """Decorator that allows functions with imports to be defined without the dependency"""
 
@@ -60,40 +98,48 @@ class ProfileConfig:
 
 
 def benchmark_torch_function_in_microseconds(func: Callable, *args, **kwargs) -> float:
-    # warmup
-    for _ in range(5):
-        func(*args, **kwargs)
-    t0 = benchmark.Timer(
-        stmt="func(*args, **kwargs)",
-        globals={"args": args, "kwargs": kwargs, "func": func},
-    )
-    return t0.adaptive_autorange(min_run_time=0.1).median * 1e6
+    lock = kwargs.pop("LOCK_CLOCKS", False)
+    ctx = locked_clocks() if lock else nullcontext()
+    with ctx:
+        for _ in range(5):
+            func(*args, **kwargs)
+        t0 = benchmark.Timer(
+            stmt="func(*args, **kwargs)",
+            globals={"args": args, "kwargs": kwargs, "func": func},
+        )
+        return t0.adaptive_autorange(min_run_time=0.1).median * 1e6
 
 
 def benchmark_cuda_function_in_microseconds(func: Callable, *args, **kwargs) -> float:
     """Thin wrapper around do_bench_using_profiling.
 
-    Accepts NUM_ITERS as a kwarg but removes it before calling func so it
-    never leaks into the benchmarked callable.
+    Accepts NUM_ITERS, IS_VETTED_BENCHMARKING, and lock_clocks as kwargs but
+    removes them before calling func so they never leak into the benchmarked callable.
     """
     num_iters = kwargs.pop("NUM_ITERS", 100)
     is_vetted_benchmarking = kwargs.pop("IS_VETTED_BENCHMARKING", False)
-    no_args = lambda: func(*args, **kwargs)
-    time = do_bench_using_profiling(
-        no_args, rep=num_iters, is_vetted_benchmarking=is_vetted_benchmarking
-    )
-    return time * 1e3
+    lock = kwargs.pop("LOCK_CLOCKS", False)
+    ctx = locked_clocks() if lock else nullcontext()
+    with ctx:
+        no_args = lambda: func(*args, **kwargs)
+        return (
+            do_bench_using_profiling(
+                no_args, rep=num_iters, is_vetted_benchmarking=is_vetted_benchmarking
+            )
+            * 1e3
+        )
 
 
 @lazy_import_error("This function requires Triton. Please install it with: pip install triton")
 def benchmark_cuda_function_in_microseconds_triton(func: Callable, *args, **kwargs) -> float:
     """Thin wrapper around do_bench"""
-    from triton.testing import do_bench  # Python caches this automatically
+    from triton.testing import do_bench
 
-    no_args = lambda: func(*args, **kwargs)
-    time = do_bench(no_args)
-
-    return time * 1e3
+    lock = kwargs.pop("LOCK_CLOCKS", False)
+    ctx = locked_clocks() if lock else nullcontext()
+    with ctx:
+        no_args = lambda: func(*args, **kwargs)
+        return do_bench(no_args) * 1e3
 
 
 def profile_function(
