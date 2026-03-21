@@ -104,6 +104,19 @@ def compute_errors(baseline: torch.Tensor, test: torch.Tensor) -> dict[str, floa
     }
 
 
+def analyze_output_values(output: torch.Tensor, expected_value: float) -> dict[str, float]:
+    expected = output.new_tensor(expected_value)
+    diff = output.to(torch.float32) - expected_value
+    return {
+        "non_expected_ratio": (output != expected).to(torch.float32).mean().item(),
+        "values_too_small": int((output < expected).sum().item()),
+        "values_too_high": int((output > expected).sum().item()),
+        "signed_error": diff.sum().item(),
+        "output_min": output.min().item(),
+        "output_max": output.max().item(),
+    }
+
+
 def run_experiment(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -111,6 +124,7 @@ def run_experiment(
     chunk_sizes: list[int],
     precisions: list[torch.dtype],
     use_exp2: bool = False,
+    expected_value: float | None = None,
 ) -> pd.DataFrame:
     q_fp64 = q.to(torch.float64)
     k_fp64 = k.to(torch.float64)
@@ -148,6 +162,11 @@ def run_experiment(
                     "alpha_mean": alpha_mean,
                     "alpha_std": alpha_std,
                     **errors,
+                    **(
+                        analyze_output_values(output, expected_value)
+                        if expected_value is not None
+                        else {}
+                    ),
                 }
             )
 
@@ -215,10 +234,14 @@ def qkv_factory(
                 v = v.repeat_interleave(n_rep, dim=1)
 
             return q, k, v
+        case "horace":
+            q = torch.randn(shape, device=device, dtype=dtype) * 1000
+            k = torch.randn(shape, device=device, dtype=dtype) * 1000
+            v = torch.ones(shape, device=device, dtype=dtype)
         case _:
             raise ValueError(
                 f"Unknown factory: {factory}. Must be 'rand', 'make_tensor', "
-                "'sorted_scores', 'descending_scores', or 'qwen'"
+                "'sorted_scores', 'descending_scores', 'qwen', or 'horace'"
             )
 
     scale = head_dim**-0.5
@@ -262,7 +285,7 @@ def main(
         head_dim: Head dimension
         device: Device to run on
         chunk_sizes: Chunk sizes to test
-        factory: Factory method for creating Q, K, V tensors (rand, make_tensor, sorted_scores, descending_scores, or qwen)
+        factory: Factory method for creating Q, K, V tensors (rand, make_tensor, sorted_scores, descending_scores, qwen, or horace)
         qwen_model: Qwen model name (only used with factory=qwen)
         qwen_layer: Qwen layer to extract (only used with factory=qwen)
         qwen_prompt: Prompt for Qwen inference (only used with factory=qwen)
@@ -302,7 +325,16 @@ def main(
 
     wrapped_print("RUNNING EXPERIMENTS")
 
-    results_df = run_experiment(q, k, v, chunk_sizes, precisions, use_exp2=use_exp2)
+    expected_value = 1.0 if factory == "horace" else None
+    results_df = run_experiment(
+        q,
+        k,
+        v,
+        chunk_sizes,
+        precisions,
+        use_exp2=use_exp2,
+        expected_value=expected_value,
+    )
 
     print_precision_sections(
         results_df,
@@ -315,6 +347,21 @@ def main(
         ["chunk_size", "delta_mean", "delta_std", "alpha_mean", "alpha_std"],
         "DELTA / ALPHA STATISTICS BY PRECISION",
     )
+
+    if expected_value is not None:
+        print_precision_sections(
+            results_df,
+            [
+                "chunk_size",
+                "non_expected_ratio",
+                "values_too_small",
+                "values_too_high",
+                "signed_error",
+                "output_min",
+                "output_max",
+            ],
+            "OUTPUT VALUE ANALYSIS",
+        )
 
     wrapped_print("KEY INSIGHTS")
 
