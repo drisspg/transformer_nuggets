@@ -12,6 +12,22 @@ _CPYTHON_MARKERS = (
     "/cpython/",
 )
 
+_BARE_NOISE_PREFIXES = (
+    "_Py",
+    "Py_",
+    "Py",
+    "pyrun",
+    "pymain",
+    "run_mod",
+    "slot_",
+    "method_",
+    "cfunction_",
+    "vectorcall",
+    "_call",
+    "__libc_",
+    "_start",
+)
+
 
 def _is_cpython_c_frame(fn: str, name: str) -> bool:
     if any(m in fn for m in _CPYTHON_MARKERS):
@@ -19,6 +35,10 @@ def _is_cpython_c_frame(fn: str, name: str) -> bool:
     if fn.endswith(".c") and name.startswith(("_Py", "Py", "pyrun", "pymain", "run_")):
         return True
     return False
+
+
+def _is_bare_noise(name: str) -> bool:
+    return name.startswith(_BARE_NOISE_PREFIXES) or ".llvm." in name
 
 
 def _shorten_path(path: str) -> str:
@@ -42,17 +62,17 @@ def _extract_frames(frames: list[dict]) -> list[str]:
             continue
         if fn and fn != "??" and fn != "":
             result.append(f"{_shorten_path(fn)}:{line} {name}")
-        elif name:
+        elif name and not _is_bare_noise(name):
             result.append(name)
     return result
 
 
 def process_snapshot(
     snapshot: dict, device: int = 0
-) -> tuple[list[dict], list[dict], list[str], list[list[int]], int]:
+) -> tuple[list[dict], list[dict], list[str], list[list[int]], int, int]:
     traces = snapshot.get("device_traces", [])
     if device >= len(traces):
-        return [], [], [], [], 0
+        return [], [], [], [], 0, 0
 
     frame_to_idx: dict[str, int] = {}
     frames: list[str] = []
@@ -93,8 +113,8 @@ def process_snapshot(
     allocated = 0
     reserved = 0
     hwm = 0
+    hwm_at_timestep = 0
     timeline: list[dict] = []
-    last_time = 0
 
     current_stack: list[int] = []
     stack_pos: dict[int, int] = {}
@@ -103,12 +123,58 @@ def process_snapshot(
     alloc_polys: list[dict] = []
     timestep = 0
 
+    for seg in snapshot.get("segments", []):
+        if seg.get("device", 0) != device:
+            continue
+        for block in seg.get("blocks", []):
+            if block.get("state", "") not in ("active_allocated", "active_pending_free"):
+                continue
+            size = block.get("size", 0)
+            addr = block.get("addr", seg.get("address", 0))
+            raw_frames = block.get("frames", [])
+            if not raw_frames and "history" in block and block["history"]:
+                raw_frames = block["history"][0].get("frames", [])
+            si = get_stack_idx(raw_frames)
+            offset = allocated
+            allocated += size
+            alloc_id = len(alloc_polys)
+            alloc_polys.append(
+                {
+                    "si": si,
+                    "s": size,
+                    "ts": [timestep],
+                    "offsets": [offset],
+                    "addr": f"0x{addr:x}",
+                    "stream": seg.get("stream", 0),
+                    "time_us": 0,
+                    "ctx": "",
+                }
+            )
+            stack_pos[alloc_id] = len(current_stack)
+            current_stack.append(alloc_id)
+            alloc_id_by_addr[addr] = alloc_id
+    if allocated > 0:
+        timestep += 1
+        if allocated > hwm:
+            hwm = allocated
+            hwm_at_timestep = 0
+        timeline.append(
+            {
+                "t": 0,
+                "a": allocated,
+                "r": 0,
+                "h": hwm,
+                "act": "preexisting",
+                "s": allocated,
+                "si": 0,
+            }
+        )
+
     for i, entry in enumerate(traces[device]):
         action = entry.get("action", "")
         addr = entry.get("addr", 0)
         size = entry.get("size", 0)
         time_us = entry.get("time_us", i)
-        last_time = max(last_time, time_us)
         si = get_stack_idx(entry.get("frames", []))
 
         match action:
@@ -122,6 +188,10 @@ def process_snapshot(
                         "s": size,
                         "ts": [timestep],
                         "offsets": [offset],
+                        "addr": f"0x{addr:x}",
+                        "stream": entry.get("stream", 0),
+                        "time_us": time_us,
+                        "ctx": entry.get("compile_context") or "",
                     }
                 )
                 stack_pos[alloc_id] = len(current_stack)
@@ -129,38 +199,39 @@ def process_snapshot(
                 alloc_id_by_addr[addr] = alloc_id
                 timestep += 1
 
-            case "free_completed":
+            case "free_completed" | "free_requested":
+                if addr not in alloc_id_by_addr:
+                    continue
                 allocated -= size
-                if addr in alloc_id_by_addr:
-                    freed_id = alloc_id_by_addr.pop(addr)
-                    poly = alloc_polys[freed_id]
-                    poly["ts"].append(timestep)
-                    poly["offsets"].append(poly["offsets"][-1])
+                freed_id = alloc_id_by_addr.pop(addr)
+                poly = alloc_polys[freed_id]
+                poly["ts"].append(timestep)
+                poly["offsets"].append(poly["offsets"][-1])
 
-                    idx_in_stack = stack_pos.pop(freed_id, None)
-                    if idx_in_stack is not None:
-                        current_stack.pop(idx_in_stack)
-                        for j in range(idx_in_stack, len(current_stack)):
-                            stack_pos[current_stack[j]] = j
-                        for above_id in current_stack[idx_in_stack:]:
-                            above = alloc_polys[above_id]
-                            above["ts"].append(timestep)
-                            above["offsets"].append(above["offsets"][-1])
-                            above["ts"].append(timestep + 1)
-                            above["offsets"].append(above["offsets"][-1] - size)
+                idx_in_stack = stack_pos.pop(freed_id, None)
+                if idx_in_stack is not None:
+                    current_stack.pop(idx_in_stack)
+                    for j in range(idx_in_stack, len(current_stack)):
+                        stack_pos[current_stack[j]] = j
+                    for above_id in current_stack[idx_in_stack:]:
+                        above = alloc_polys[above_id]
+                        above["ts"].append(timestep)
+                        above["offsets"].append(above["offsets"][-1])
+                        above["ts"].append(timestep + 1)
+                        above["offsets"].append(above["offsets"][-1] - size)
 
-                    timestep += 2
+                timestep += 2
 
             case "segment_alloc":
                 reserved += size
             case "segment_free":
                 reserved -= size
-            case "snapshot":
-                continue
             case _:
                 pass
 
-        hwm = max(hwm, allocated)
+        if allocated > hwm:
+            hwm = allocated
+            hwm_at_timestep = timestep
         timeline.append(
             {
                 "t": time_us,
@@ -178,7 +249,7 @@ def process_snapshot(
         poly["ts"].append(timestep)
         poly["offsets"].append(poly["offsets"][-1])
 
-    return timeline, alloc_polys, frames, stacks, timestep
+    return timeline, alloc_polys, frames, stacks, timestep, hwm_at_timestep
 
 
 def generate_memory_html(
@@ -186,9 +257,10 @@ def generate_memory_html(
     device: int = 0,
     title: str = "Memory Timeline",
 ) -> str:
-    timeline, alloc_polys, frames, stacks, max_ts = process_snapshot(snapshot, device)
+    timeline, alloc_polys, frames, stacks, max_ts, hwm_timestep = process_snapshot(
+        snapshot, device
+    )
     hwm = max((p["h"] for p in timeline), default=0)
-    hwm_timestep = next((i for i, p in enumerate(timeline) if p["a"] == hwm), 0)
     max_at_time = [e["a"] for e in timeline]
 
     meta = {
@@ -357,7 +429,12 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
     pointer-events: none;
   }
 
-  svg { width: 100%; height: 100%; position: relative; z-index: 1; }
+  #chart-container > svg {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    z-index: 1;
+  }
 
   #detail-panel {
     width: 480px;
@@ -367,7 +444,49 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
     flex-direction: column;
     flex-shrink: 0;
     overflow: hidden;
+    position: relative;
+    transition: width 0.15s, min-width 0.15s;
+    min-width: 480px;
   }
+
+  #detail-panel.collapsed {
+    width: 0 !important;
+    min-width: 0 !important;
+    border-left: none;
+    overflow: hidden;
+  }
+
+  #panel-toggle {
+    position: absolute;
+    left: -24px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 24px;
+    height: 48px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-right: none;
+    border-radius: 4px 0 0 4px;
+    cursor: pointer;
+    color: var(--text-muted);
+    font-size: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 10;
+  }
+  #panel-toggle:hover { color: var(--text); background: rgba(255,255,255,0.06); }
+
+  #resize-handle {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 4px;
+    height: 100%;
+    cursor: col-resize;
+    z-index: 11;
+  }
+  #resize-handle:hover, #resize-handle.dragging { background: var(--accent); }
 
   #detail-header {
     padding: 12px 16px;
@@ -389,6 +508,13 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
     font-size: 12px;
   }
 
+  #detail-header .detail-actions {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+  }
+
+
   #detail-body {
     flex: 1;
     overflow-y: auto;
@@ -399,82 +525,81 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
   #detail-body::-webkit-scrollbar-track { background: transparent; }
   #detail-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 
-  .stack-group {
-    border-bottom: 1px solid rgba(255,255,255,0.05);
-  }
-
-  .stack-group-header {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 6px 16px;
-    font-family: var(--mono);
-    font-size: 10px;
-    font-weight: 500;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--text-muted);
-    cursor: pointer;
-    user-select: none;
-    background: rgba(255,255,255,0.02);
-  }
-
-  .stack-group-header:hover { background: rgba(255,255,255,0.04); }
-
-  .stack-group-header .chevron {
-    display: inline-block;
-    width: 12px;
-    font-size: 8px;
-    transition: transform 0.15s;
-    color: rgba(255,255,255,0.3);
-  }
-
-  .stack-group.collapsed .chevron { transform: rotate(-90deg); }
-  .stack-group.collapsed .stack-group-frames { display: none; }
-
-  .stack-group-header .group-count {
-    margin-left: auto;
-    font-size: 9px;
-    color: rgba(255,255,255,0.25);
-  }
-
-  .stack-group-header .group-tag {
-    padding: 1px 6px;
-    border-radius: 2px;
-    font-size: 9px;
-  }
-
-  .group-tag.user { background: rgba(73, 201, 99, 0.15); color: #49C963; }
-  .group-tag.internal { background: rgba(255, 255, 255, 0.06); color: var(--text-muted); }
-
   .stack-frame {
-    padding: 3px 16px 3px 34px;
+    padding: 3px 16px;
     font-family: var(--mono);
     font-size: 11px;
     line-height: 1.5;
-    color: var(--text-muted);
     cursor: pointer;
     overflow: hidden;
+    border-left: 2px solid transparent;
   }
 
   .stack-frame .frame-text {
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    white-space: pre-wrap;
+    word-break: break-all;
     display: block;
   }
 
-  .stack-frame.expanded .frame-text {
-    white-space: pre-wrap;
-    word-break: break-all;
+  .stack-frame:hover { background: rgba(255,255,255,0.04); }
+
+  .stack-frame.frame-user {
+    color: var(--text);
+    border-left-color: #49C963;
+    background: rgba(73, 201, 99, 0.04);
+  }
+  .stack-frame.frame-user .frame-func { color: #49C963; font-weight: 500; }
+  .stack-frame.frame-user .frame-basename { color: var(--text); }
+  .stack-frame.frame-user .frame-file { color: rgba(255,255,255,0.4); }
+
+  .stack-frame.frame-library {
+    color: rgba(255,255,255,0.6);
+    border-left-color: #3E93CC;
+  }
+  .stack-frame.frame-library .frame-func { color: #5BA8D9; }
+  .stack-frame.frame-library .frame-basename { color: rgba(255,255,255,0.7); }
+  .stack-frame.frame-library .frame-file { color: rgba(255,255,255,0.25); }
+
+  .stack-frame.frame-native {
+    color: rgba(255,255,255,0.35);
+  }
+  .stack-frame.frame-native .frame-cpp { color: rgba(189, 147, 249, 0.5); }
+  .stack-frame.frame-native .frame-basename { color: rgba(255,255,255,0.5); }
+
+  .stack-frame.frame-noise {
+    color: rgba(255,255,255,0.18);
+    font-size: 10px;
   }
 
-  .stack-frame:hover { background: rgba(255,255,255,0.03); color: var(--text); }
+  #detail-body.hide-noise .frame-noise { display: none; }
 
-  .stack-frame .frame-cpp { color: #bd93f9; }
-  .stack-frame .frame-file { color: #3E93CC; }
-  .stack-frame .frame-func { color: #49C963; }
-  .stack-frame .frame-basename { color: var(--text); }
+  .alloc-details {
+    padding: 12px 16px;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+
+  .alloc-details table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+
+  .alloc-details td {
+    padding: 6px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+    vertical-align: top;
+  }
+
+  .alloc-details td:first-child {
+    color: var(--text-muted);
+    width: 100px;
+    padding-right: 12px;
+  }
+
+  .alloc-details td:last-child {
+    color: var(--text);
+    word-break: break-all;
+  }
 
   .empty-detail {
     padding: 24px 16px;
@@ -655,8 +780,9 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
     margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--border);
     color: var(--text-muted); font-size: 10px; font-style: italic;
   }
+  #tooltip .tt-api { color: #78BBE3; font-size: 11px; font-weight: 500; }
+  #tooltip .tt-user { color: #49C963; font-size: 10px; }
 
-  .zoom-hint { font-size: 11px; color: var(--text-muted); opacity: 0.5; }
 
   #perf-display {
     position: fixed;
@@ -743,19 +869,28 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
       <input type="checkbox" id="hwm-toggle" checked>
       High Water Mark
     </label>
+    <label class="toggle" title="Hide allocations that were never freed during recording (weights, buffers, etc.) and zoom to dynamic range">
+      <input type="checkbox" id="dim-persistent-toggle">
+      Hide never-freed
+    </label>
   </div>
 </div>
 <div id="main">
   <div id="chart-container"></div>
   <div id="detail-panel">
+    <div id="panel-toggle" title="Toggle detail panel">◀</div>
+    <div id="resize-handle"></div>
     <div id="detail-header">
       <div class="detail-tabs">
         <button class="detail-tab active" data-tab="stack">Stack Trace</button>
-        <button class="detail-tab" data-tab="breakdown">Breakdown</button>
+        <button class="detail-tab" data-tab="details">Details</button>
         <button class="detail-tab" data-tab="peak">At Peak</button>
         <button class="detail-tab" data-tab="leaks">Leaks</button>
       </div>
-      <span class="detail-stats" id="detail-stats"></span>
+      <div class="detail-actions">
+        <label class="toggle" style="font-size:10px"><input type="checkbox" id="hide-noise-toggle" checked>Hide noise</label>
+        <span class="detail-stats" id="detail-stats"></span>
+      </div>
     </div>
     <div id="detail-body">
       <div class="empty-detail">Click an allocation to inspect its stack trace</div>
@@ -809,16 +944,12 @@ const PALETTE = [
   '#C9CC3E', '#D9DB5B', '#B5B72E', '#E3E478',
 ];
 
-function hashStr(s) {
-  let h = 0;
-  for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
-  return Math.abs(h);
+function getColor(stackIdx) {
+  return PALETTE[stackIdx % PALETTE.length];
 }
 
-function getColor(stackIdx) {
-  const frame = bestFrame(stackIdx);
-  return PALETTE[hashStr(frame) % PALETTE.length];
-}
+const PERSISTENT_COLOR = '#8A8F98';
+const PERSISTENT_ALPHAS = [0.18, 0.24, 0.3];
 
 const tooltipEl = document.getElementById('tooltip');
 const detailBody = document.getElementById('detail-body');
@@ -836,13 +967,37 @@ function hideTooltip() { tooltipEl.style.display = 'none'; }
 
 let lastStackIdx = -1;
 let lastStackLabel = '';
+let lastClickedAlloc = null;
 
 function classifyFrame(frame) {
-  if (frame.includes('::')) return 'internal';
-  if (frame.includes('/site-packages/') || frame.includes('/torch/')) return 'internal';
-  if (frame.includes('/lib/python') || frame.includes('/conda/') || frame.includes('lib/python')) return 'internal';
-  if (frame.includes('.cpp:') || frame.includes('.c:')) return 'internal';
+  if (frame.includes('::')) return 'native';
+  if (frame.includes('.cpp:') || frame.includes('.c:')) return 'native';
+  if (!frame.includes('/') && !frame.includes('.py')) return 'noise';
+  if (frame.includes('/site-packages/') || frame.includes('/torch/')) return 'library';
+  if (frame.includes('/lib/python') || frame.includes('/conda/') || frame.includes('lib/python')) return 'library';
   return 'user';
+}
+
+const NOISE_FRAMES = new Set([
+  'cfunction_call', '_PyEval_EvalFrameDefault', 'PyEval_EvalCode',
+  '_PyObject_Call_Prepend', 'slot_tp_call', 'PyObject_Call',
+  '_PyObject_MakeTpCall', '_PyFunction_Vectorcall', 'pymain_run_file',
+  'pyrun_file', '_PyRun_SimpleFileObject', '_PyRun_AnyFileObject',
+  'Py_RunMain', 'pymain_run_file_obj', 'pymain_run_module',
+  '_start', '__libc_start_main', '__libc_init_first', 'main',
+]);
+
+function frameFunc(frame) {
+  if (frame.includes('::')) return frame.split('::').pop();
+  const sp = frame.indexOf(' ', frame.lastIndexOf(':'));
+  return sp > 0 ? frame.substring(sp + 1) : frame;
+}
+
+function isNoiseFrame(frame) {
+  const fn = frameFunc(frame);
+  return NOISE_FRAMES.has(fn) || fn.startsWith('_Py') || fn.startsWith('Py_')
+    || fn.startsWith('pymain_') || fn.startsWith('pyrun_')
+    || /^run_mod\.llvm\.|^pymain_main\.llvm\./.test(fn);
 }
 
 function bestFrame(stackIdx) {
@@ -851,9 +1006,34 @@ function bestFrame(stackIdx) {
     if (classifyFrame(f) === 'user') return f;
   }
   for (const f of stack) {
-    if (f.includes('.py')) return f;
+    if (f.includes('.py') && !isNoiseFrame(f)) return f;
   }
-  return stack[stack.length - 1] || '';
+  for (const f of stack) {
+    if (f.includes('::') && !isNoiseFrame(f)) return f;
+  }
+  for (const f of stack) {
+    if (!isNoiseFrame(f)) return f;
+  }
+  return stack[0] || '';
+}
+
+function tooltipFrameInfo(stackIdx) {
+  const stack = resolveStack(stackIdx);
+  let userFrame = null, apiFrame = null;
+  for (const f of stack) {
+    if (classifyFrame(f) === 'user') { userFrame = f; break; }
+  }
+  for (const f of stack) {
+    if (f.includes('.py') && !isNoiseFrame(f) && classifyFrame(f) === 'library') {
+      apiFrame = f; break;
+    }
+  }
+  if (!apiFrame) {
+    for (const f of stack) {
+      if (f.includes('::') && !isNoiseFrame(f)) { apiFrame = f; break; }
+    }
+  }
+  return { userFrame, apiFrame };
 }
 
 function renderFrame(frame) {
@@ -880,8 +1060,6 @@ function renderFrame(frame) {
   return frame;
 }
 
-const GROUP_LABELS = { user: 'Your Code', internal: 'Internals' };
-
 function renderStack(stackIdx, label) {
   lastStackIdx = stackIdx;
   lastStackLabel = label;
@@ -892,30 +1070,9 @@ function renderStack(stackIdx, label) {
     return;
   }
 
-  const groups = [];
-  let cur = null;
-  for (const frame of stack) {
-    const cls = classifyFrame(frame);
-    if (!cur || cur.cls !== cls) {
-      cur = { cls, frames: [] };
-      groups.push(cur);
-    }
-    cur.frames.push(frame);
-  }
-
-  detailBody.innerHTML = groups.map(g => {
-    const collapsed = g.cls !== 'user' ? ' collapsed' : '';
-    const framesHtml = g.frames.map(f =>
-      `<div class="stack-frame" onclick="event.stopPropagation();this.classList.toggle('expanded')"><span class="frame-text">${renderFrame(f)}</span></div>`
-    ).join('');
-    return `<div class="stack-group${collapsed}">
-      <div class="stack-group-header" onclick="this.parentElement.classList.toggle('collapsed')">
-        <span class="chevron">▼</span>
-        <span class="group-tag ${g.cls}">${GROUP_LABELS[g.cls]}</span>
-        <span class="group-count">${g.frames.length}</span>
-      </div>
-      <div class="stack-group-frames">${framesHtml}</div>
-    </div>`;
+  detailBody.innerHTML = stack.map(f => {
+    const cls = classifyFrame(f);
+    return `<div class="stack-frame frame-${cls}"><span class="frame-text">${renderFrame(f)}</span></div>`;
   }).join('');
 }
 
@@ -939,7 +1096,8 @@ ctx.scale(devicePixelRatio, devicePixelRatio);
 
 // SVG for axes, grid, HWM, zoom overlay
 const svg = d3.select('#chart-container').append('svg')
-  .attr('viewBox', `0 0 ${containerRect.width} ${containerRect.height}`);
+  .attr('viewBox', `0 0 ${containerRect.width} ${containerRect.height}`)
+  .attr('preserveAspectRatio', 'none');
 
 const g = svg.append('g').attr('transform', `translate(${margin.left},${margin.top})`);
 
@@ -978,13 +1136,28 @@ let searchMatcher = null;
 let hoveredAlloc = null;
 
 // Precompute colors and start/end arrays for fast access
-const allocColors = ALLOCS.map(d => getColor(d.si));
 const allocStarts = new Float64Array(ALLOCS.length);
 const allocEnds = new Float64Array(ALLOCS.length);
 for (let i = 0; i < ALLOCS.length; i++) {
   allocStarts[i] = ALLOCS[i].ts[0];
   allocEnds[i] = ALLOCS[i].ts[ALLOCS[i].ts.length - 1];
 }
+
+const allocPersistent = new Uint8Array(ALLOCS.length);
+const allocColors = new Array(ALLOCS.length);
+const allocAlphas = new Float64Array(ALLOCS.length);
+let persistentAlphaIdx = 0;
+for (let i = 0; i < ALLOCS.length; i++) {
+  const isPersistent = allocEnds[i] >= META.max_timestep;
+  allocPersistent[i] = isPersistent ? 1 : 0;
+  allocColors[i] = isPersistent
+    ? PERSISTENT_COLOR
+    : getColor(ALLOCS[i].si);
+  allocAlphas[i] = isPersistent
+    ? PERSISTENT_ALPHAS[persistentAlphaIdx++ % PERSISTENT_ALPHAS.length]
+    : 0.85;
+}
+let dimPersistent = false;
 
 // Bucket index for O(bucket_size) hit testing instead of O(n)
 const NUM_HIT_BUCKETS = Math.max(1, Math.min(2000, META.max_timestep));
@@ -1050,9 +1223,11 @@ function drawCanvas() {
     const visH = yScale(0) - yScale(ALLOCS[ai].s);
     if (visW < minVisPx && visH < minVisPx) continue;
 
+    if (dimPersistent && allocPersistent[ai]) continue;
+
     if (ALLOCS[ai] === hoveredAlloc) { hoveredIdx = ai; continue; }
 
-    let alpha = 0.85;
+    let alpha = allocAlphas[ai];
     if (searchMatchSet !== null) {
       alpha = searchMatchSet.has(ai) ? 0.9 : 0.06;
     }
@@ -1132,19 +1307,23 @@ const fullYDomain = [0, META.high_water_mark_bytes * 1.05];
 let customYDomain = null;
 
 function getBaseYDomain(d0, d1) {
-  if (yMode === 'autofit') {
-    let maxY = 0;
+  if (yMode === 'autofit' || dimPersistent) {
+    let minY = Infinity, maxY = 0;
     for (let ai = 0; ai < ALLOCS.length; ai++) {
       if (allocEnds[ai] < d0 || allocStarts[ai] > d1) continue;
+      if (dimPersistent && allocPersistent[ai]) continue;
       const d = ALLOCS[ai];
       for (let i = 0; i < d.ts.length; i++) {
         if (d.ts[i] >= d0 && d.ts[i] <= d1) {
+          minY = Math.min(minY, d.offsets[i]);
           maxY = Math.max(maxY, d.offsets[i] + d.s);
         }
       }
     }
-    if (maxY === 0) maxY = META.high_water_mark_bytes;
-    return [0, maxY * 1.1];
+    if (maxY === 0) { minY = 0; maxY = META.high_water_mark_bytes; }
+    if (minY === Infinity) minY = 0;
+    const pad = (maxY - minY) * 0.05;
+    return [Math.max(0, minY - pad), maxY + pad];
   }
   return fullYDomain;
 }
@@ -1249,11 +1428,13 @@ zoomRect.on('mousemove', function(event) {
     drawCanvas();
   }
   if (hit) {
-    const bf = bestFrame(hit.si);
-    showTooltip(event, [
-      `<div class="tt-row"><span class="tt-label">Size:</span><span class="tt-value">${formatBytes(hit.s)}</span></div>`,
-      bf ? `<div class="tt-hint">${bf}</div>` : '',
-    ].join(''));
+    const info = tooltipFrameInfo(hit.si);
+    const primary = info.userFrame || info.apiFrame;
+    const secondary = info.userFrame && info.apiFrame ? info.apiFrame : null;
+    const lines = [`<div class="tt-row"><span class="tt-label">Size:</span><span class="tt-value">${formatBytes(hit.s)}</span></div>`];
+    if (primary) lines.push(`<div class="tt-${info.userFrame ? 'user' : 'api'}">${primary}</div>`);
+    if (secondary) lines.push(`<div class="tt-api">${secondary}</div>`);
+    showTooltip(event, lines.join(''));
   } else {
     hideTooltip();
   }
@@ -1267,7 +1448,14 @@ zoomRect.on('mouseleave', function() {
 zoomRect.on('click', function(event) {
   const [mx, my] = d3.pointer(event, svg.node());
   const hit = hitTest(mx, my);
-  if (hit) renderStack(hit.si, formatBytes(hit.s));
+  if (hit) {
+    lastClickedAlloc = hit;
+    lastStackIdx = hit.si;
+    lastStackLabel = formatBytes(hit.s);
+    const activeTab = document.querySelector('.detail-tab.active')?.dataset.tab || 'stack';
+    if (activeTab === 'details') showDetails();
+    else renderStack(hit.si, formatBytes(hit.s));
+  }
 });
 
 zoomRect.on('dblclick.zoom', null);
@@ -1354,6 +1542,12 @@ document.getElementById('autofit-toggle').onchange = function() {
   updateChart(currentTransform);
 };
 
+document.getElementById('dim-persistent-toggle').onchange = function() {
+  dimPersistent = this.checked;
+  customYDomain = null;
+  updateChart(currentTransform);
+};
+
 // --- Feature 1: Search & Filter ---
 const searchInput = document.getElementById('search-input');
 const regexToggle = document.getElementById('regex-toggle');
@@ -1392,6 +1586,25 @@ document.addEventListener('keydown', function(event) {
     searchInput.blur();
   }
 });
+
+// --- Allocation Details ---
+function showDetails() {
+  const d = lastClickedAlloc;
+  if (!d) {
+    detailBody.innerHTML = '<div class="empty-detail">Click an allocation to see its details</div>';
+    return;
+  }
+  const ts = d.time_us ? new Date(d.time_us / 1000).toLocaleString() : 'N/A';
+  detailStats.textContent = formatBytes(d.s);
+  detailBody.innerHTML = `<div class="alloc-details"><table>
+    <tr><td>Size</td><td>${formatBytes(d.s)} (${d.s.toLocaleString()} bytes)</td></tr>
+    <tr><td>Address</td><td>${d.addr || 'N/A'}</td></tr>
+    <tr><td>Stream</td><td>${d.stream ?? 'N/A'}</td></tr>
+    <tr><td>Timestamp</td><td>${ts}</td></tr>
+    <tr><td>Compile ctx</td><td>${d.ctx || 'None'}</td></tr>
+    <tr><td>Lifetime</td><td>ts ${d.ts[0]} \u2192 ${d.ts[d.ts.length - 1]}${d.ts[d.ts.length - 1] >= META.max_timestep ? ' (never freed)' : ''}</td></tr>
+  </table></div>`;
+}
 
 // --- Feature 2: What's at Peak ---
 function showPeakBreakdown() {
@@ -1477,33 +1690,43 @@ function showLeaks() {
   detailBody.innerHTML = html;
 }
 
-// --- Feature 3: Memory Breakdown ---
-function showBreakdown() {
-  const byFrame = {};
-  for (const d of ALLOCS) {
-    const f = bestFrame(d.si);
-    if (!byFrame[f]) byFrame[f] = { frame: f, totalBytes: 0, count: 0, si: d.si };
-    byFrame[f].totalBytes += d.s;
-    byFrame[f].count += 1;
-  }
-  const rows = Object.values(byFrame).sort((a, b) => b.totalBytes - a.totalBytes);
-  const maxBytes = rows[0]?.totalBytes || 1;
-  const totalBytes = rows.reduce((s, r) => s + r.totalBytes, 0);
 
-  detailStats.textContent = `${rows.length} call sites`;
+const hideNoiseToggle = document.getElementById('hide-noise-toggle');
+hideNoiseToggle.onchange = function() {
+  detailBody.classList.toggle('hide-noise', this.checked);
+};
+detailBody.classList.add('hide-noise');
 
-  detailBody.innerHTML = rows.slice(0, 30).map(r => {
-    const pct = (r.totalBytes / totalBytes * 100).toFixed(1);
-    const barW = (r.totalBytes / maxBytes * 100).toFixed(0);
-    return `<div class="breakdown-row" onclick="applySearch('${r.frame.replace(/'/g, "\\'")}')">
-      <span class="bd-size">${formatBytes(r.totalBytes)}</span>
-      <span class="bd-count">×${r.count}</span>
-      <span class="bd-pct">${pct}%</span>
-      <span class="bd-bar"><span class="bd-bar-fill" style="width:${barW}%"></span></span>
-      <span class="bd-frame">${r.frame}</span>
-    </div>`;
-  }).join('');
-}
+// --- Panel toggle & resize ---
+const detailPanel = document.getElementById('detail-panel');
+const panelToggle = document.getElementById('panel-toggle');
+const resizeHandle = document.getElementById('resize-handle');
+
+panelToggle.addEventListener('click', () => {
+  const collapsed = detailPanel.classList.toggle('collapsed');
+  panelToggle.textContent = collapsed ? '▶' : '◀';
+  setTimeout(() => { updateChart(currentTransform); }, 200);
+});
+
+let resizing = false;
+resizeHandle.addEventListener('pointerdown', (e) => {
+  resizing = true;
+  resizeHandle.classList.add('dragging');
+  resizeHandle.setPointerCapture(e.pointerId);
+  e.preventDefault();
+});
+document.addEventListener('pointermove', (e) => {
+  if (!resizing) return;
+  const newW = Math.max(200, window.innerWidth - e.clientX);
+  detailPanel.style.width = newW + 'px';
+  detailPanel.style.minWidth = newW + 'px';
+});
+document.addEventListener('pointerup', () => {
+  if (!resizing) return;
+  resizing = false;
+  resizeHandle.classList.remove('dragging');
+  updateChart(currentTransform);
+});
 
 // --- Detail panel tabs ---
 function setActiveTab(tab) {
@@ -1513,7 +1736,7 @@ function setActiveTab(tab) {
 document.querySelectorAll('.detail-tab').forEach(tab => {
   tab.addEventListener('click', function() {
     setActiveTab(this.dataset.tab);
-    if (this.dataset.tab === 'breakdown') showBreakdown();
+    if (this.dataset.tab === 'details') showDetails();
     else if (this.dataset.tab === 'peak') showPeakBreakdown();
     else if (this.dataset.tab === 'leaks') showLeaks();
     else {

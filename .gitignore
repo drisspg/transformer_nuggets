@@ -6,6 +6,9 @@ transformer_nuggets/llama/data/*
 plots/*
 data/*
 
+# have fun kids!
+agent_space
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

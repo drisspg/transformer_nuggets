@@ -299,7 +299,7 @@ def save_memory_snapshot(file_path: Path | str, viz: Literal["torch", "d3"] = "t
             raise ValueError(f"{file_path} is a directory")
 
     file_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.cuda.memory._record_memory_history()
+    torch.cuda.memory._record_memory_history(stacks="all")
     try:
         yield
     finally:
@@ -397,7 +397,7 @@ def attach_oom_observer(
             logging.error(f"Failed to save memory snapshot: {e}")
 
     torch._C._cuda_attach_out_of_memory_observer(oom_observer)  # type: ignore
-    torch.cuda.memory._record_memory_history(max_entries=max_entries)
+    torch.cuda.memory._record_memory_history(max_entries=max_entries, stacks="all")
 
 
 def get_process_rank():

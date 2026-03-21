@@ -96,7 +96,7 @@ class TestHelpers:
 
 class TestProcessSnapshot:
     def test_returns_correct_tuple_shape(self, snapshot):
-        timeline, allocs, frames, stacks, max_ts = process_snapshot(snapshot)
+        timeline, allocs, frames, stacks, max_ts, hwm_ts = process_snapshot(snapshot)
         assert len(timeline) > 0
         assert len(allocs) > 0
         assert len(frames) > 0
@@ -141,7 +141,7 @@ class TestProcessSnapshot:
 
     def test_empty_device_returns_empty(self, snapshot):
         result = process_snapshot(snapshot, device=99)
-        assert result == ([], [], [], [], 0)
+        assert result == ([], [], [], [], 0, 0)
 
     def test_polygon_offsets_non_negative(self, snapshot):
         _, allocs, *_ = process_snapshot(snapshot)
@@ -206,7 +206,7 @@ class TestNeverFreedAllocations:
             _make_event("alloc", 0x1000, 1024, time_us=1),
             _make_event("alloc", 0x2000, 2048, time_us=2),
         ]
-        _, allocs, _, _, max_ts = process_snapshot(_make_snapshot(events))
+        _, allocs, _, _, max_ts, _ = process_snapshot(_make_snapshot(events))
         assert len(allocs) == 2
         for poly in allocs:
             assert poly["ts"][-1] == max_ts
@@ -217,7 +217,7 @@ class TestNeverFreedAllocations:
             _make_event("alloc", 0x2000, 2048, time_us=2),
             _make_event("free_completed", 0x1000, 1024, time_us=3),
         ]
-        _, allocs, _, _, max_ts = process_snapshot(_make_snapshot(events))
+        _, allocs, _, _, max_ts, _ = process_snapshot(_make_snapshot(events))
         freed = [a for a in allocs if a["ts"][-1] < max_ts]
         alive = [a for a in allocs if a["ts"][-1] == max_ts]
         assert len(freed) == 1
@@ -226,11 +226,16 @@ class TestNeverFreedAllocations:
         assert alive[0]["s"] == 2048
 
     def test_real_snapshot_has_both(self, snapshot):
-        _, allocs, _, _, max_ts = process_snapshot(snapshot)
+        _, allocs, _, _, max_ts, _ = process_snapshot(snapshot)
         freed = [a for a in allocs if a["ts"][-1] < max_ts]
         alive = [a for a in allocs if a["ts"][-1] == max_ts]
         assert len(freed) > 0
         assert len(alive) > 0
+
+    def test_html_uses_dedicated_persistent_palette(self, snapshot):
+        html = generate_memory_html(snapshot, title="Test")
+        assert "const PERSISTENT_COLOR = '#8A8F98';" in html
+        assert "const PERSISTENT_ALPHAS = [0.18, 0.24, 0.3];" in html
 
 
 class TestStackDeduplication:
@@ -239,7 +244,7 @@ class TestStackDeduplication:
             _make_event("alloc", 0x1000, 1024, filename="a.py", name="foo", line=10),
             _make_event("alloc", 0x2000, 2048, filename="a.py", name="foo", line=10),
         ]
-        _, allocs, frames, stacks, _ = process_snapshot(_make_snapshot(events))
+        _, allocs, frames, stacks, *_ = process_snapshot(_make_snapshot(events))
         assert allocs[0]["si"] == allocs[1]["si"]
         assert len(stacks) == 1
 
@@ -248,12 +253,12 @@ class TestStackDeduplication:
             _make_event("alloc", 0x1000, 1024, filename="a.py", name="foo", line=10),
             _make_event("alloc", 0x2000, 2048, filename="b.py", name="bar", line=20),
         ]
-        _, allocs, _, stacks, _ = process_snapshot(_make_snapshot(events))
+        _, allocs, _, stacks, *_ = process_snapshot(_make_snapshot(events))
         assert allocs[0]["si"] != allocs[1]["si"]
         assert len(stacks) == 2
 
     def test_real_snapshot_deduplicates(self, snapshot):
-        _, allocs, _, stacks, _ = process_snapshot(snapshot)
+        _, allocs, _, stacks, *_ = process_snapshot(snapshot)
         used_stacks = {a["si"] for a in allocs}
         assert len(used_stacks) < len(allocs)
 
@@ -265,7 +270,7 @@ class TestFreeShiftsAbove:
             _make_event("alloc", 0x2000, 200, time_us=2, name="top"),
             _make_event("free_completed", 0x1000, 100, time_us=3),
         ]
-        _, allocs, _, _, _ = process_snapshot(_make_snapshot(events))
+        _, allocs, *_ = process_snapshot(_make_snapshot(events))
         bottom = next(a for a in allocs if a["s"] == 100)
         top = next(a for a in allocs if a["s"] == 200)
         assert bottom["offsets"][0] == 0
@@ -279,7 +284,7 @@ class TestFreeShiftsAbove:
             _make_event("alloc", 0x3000, 300, time_us=3, name="c"),
             _make_event("free_completed", 0x2000, 200, time_us=4),
         ]
-        _, allocs, _, _, _ = process_snapshot(_make_snapshot(events))
+        _, allocs, *_ = process_snapshot(_make_snapshot(events))
         a = next(p for p in allocs if p["s"] == 100)
         c = next(p for p in allocs if p["s"] == 300)
         assert a["offsets"][-1] == 0
@@ -293,7 +298,7 @@ class TestSegmentEvents:
             _make_event("alloc", 0x1000, 1024, time_us=2),
             _make_event("segment_free", 0xA000, 4096, time_us=3),
         ]
-        timeline, allocs, _, _, _ = process_snapshot(_make_snapshot(events))
+        timeline, allocs, *_ = process_snapshot(_make_snapshot(events))
         assert len(allocs) == 1
         assert allocs[0]["s"] == 1024
 
@@ -303,7 +308,7 @@ class TestSegmentEvents:
             _make_event("alloc", 0x1000, 1024, time_us=2),
             _make_event("segment_free", 0xA000, 4096, time_us=3),
         ]
-        timeline, _, _, _, _ = process_snapshot(_make_snapshot(events))
+        timeline, *_ = process_snapshot(_make_snapshot(events))
         reserved_values = [e["r"] for e in timeline]
         assert reserved_values[0] == 4096
         assert reserved_values[-1] == 0
@@ -311,13 +316,13 @@ class TestSegmentEvents:
 
 class TestTimelineConsistency:
     def test_max_at_time_matches_timeline(self, snapshot):
-        timeline, _, _, _, _ = process_snapshot(snapshot)
+        timeline, *_ = process_snapshot(snapshot)
         max_at_time = [e["a"] for e in timeline]
         assert len(max_at_time) == len(timeline)
         assert all(m >= 0 for m in max_at_time)
 
     def test_hwm_monotonically_increases(self, snapshot):
-        timeline, _, _, _, _ = process_snapshot(snapshot)
+        timeline, *_ = process_snapshot(snapshot)
         hwm_values = [e["h"] for e in timeline]
         for i in range(1, len(hwm_values)):
             assert hwm_values[i] >= hwm_values[i - 1]
@@ -328,7 +333,7 @@ class TestTimelineConsistency:
             _make_event("alloc", 0x2000, 200, time_us=2),
             _make_event("free_completed", 0x1000, 100, time_us=3),
         ]
-        timeline, _, _, _, _ = process_snapshot(_make_snapshot(events))
+        timeline, *_ = process_snapshot(_make_snapshot(events))
         assert timeline[0]["a"] == 100
         assert timeline[1]["a"] == 300
         assert timeline[2]["a"] == 200
@@ -352,14 +357,14 @@ class TestLeakDetection:
             _make_event("free_completed", 0x1000, 100, time_us=3),
             _make_event("free_completed", 0x2000, 200, time_us=4),
         ]
-        _, allocs, _, _, max_ts = process_snapshot(_make_snapshot(events))
+        _, allocs, _, _, max_ts, _ = process_snapshot(_make_snapshot(events))
         assert len(_find_leaks(allocs, max_ts)) == 0
 
     def test_early_alloc_filtered_out(self):
         events = [
             _make_event("alloc", 0x1000, 100, time_us=1, name="model_param"),
         ]
-        _, allocs, _, _, max_ts = process_snapshot(_make_snapshot(events))
+        _, allocs, _, _, max_ts, _ = process_snapshot(_make_snapshot(events))
         assert len(_find_leaks(allocs, max_ts)) == 0
 
     def test_late_never_freed_is_candidate(self):
@@ -370,7 +375,7 @@ class TestLeakDetection:
             )
             events.append(_make_event("free_completed", 0x1000 + i * 0x100, 100, time_us=i + 100))
         events.append(_make_event("alloc", 0x9000, 512, time_us=500, name="leaked"))
-        _, allocs, _, _, max_ts = process_snapshot(_make_snapshot(events))
+        _, allocs, _, _, max_ts, _ = process_snapshot(_make_snapshot(events))
         candidates = _find_leaks(allocs, max_ts)
         assert len(candidates) == 1
         assert allocs[candidates[0]]["s"] == 512
@@ -386,7 +391,7 @@ class TestLeakDetection:
             events.append(
                 _make_event("alloc", 0x9000 + i * 0x100, 200, time_us=60 + i, name="leaky_append")
             )
-        _, allocs, _, _, max_ts = process_snapshot(_make_snapshot(events))
+        _, allocs, _, _, max_ts, _ = process_snapshot(_make_snapshot(events))
         candidates = _find_leaks(allocs, max_ts)
         assert len(candidates) == 3
         for c in candidates:
@@ -402,7 +407,7 @@ class TestLeakDetection:
                 _make_event("free_completed", 0x2000 + i * 0x100, 50, time_us=10 + i + 1)
             )
         events.append(_make_event("alloc", 0x9000, 300, time_us=500, name="leaked"))
-        _, allocs, _, _, max_ts = process_snapshot(_make_snapshot(events))
+        _, allocs, _, _, max_ts, _ = process_snapshot(_make_snapshot(events))
         candidates = _find_leaks(allocs, max_ts)
         assert len(candidates) == 1
         assert allocs[candidates[0]]["s"] == 300
