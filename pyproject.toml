@@ -25,7 +25,8 @@ dependencies = [
     "rich",
     "matplotlib",
     "pandas",
-    "seaborn"
+    "seaborn",
+    "typer",
 ]
 
 [project.optional-dependencies]
@@ -48,6 +49,9 @@ llama = [
     "fire==0.5.0",
     "float8_experimental",
 ]
+
+[project.scripts]
+merge-traces = "transformer_nuggets.utils.merge_traces:app"
 
 # ---------- TOOL CONFIGURATIONS ------------
 [tool.hatch.version]
