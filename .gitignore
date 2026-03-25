@@ -8,6 +8,7 @@ data/*
 
 # have fun kids!
 agent_space
+plans
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
