@@ -256,7 +256,7 @@ class cuda_memory_usage:
 
 
 @contextmanager
-def save_memory_snapshot(file_path: Path | str, viz: Literal["torch", "d3"] = "torch"):
+def save_memory_snapshot(file_path: Path | str, viz: Literal["torch", "d3", "pickle"] = "torch"):
     """Save a memory snapshot information to a folder
 
     Args:
@@ -304,25 +304,41 @@ def save_memory_snapshot(file_path: Path | str, viz: Literal["torch", "d3"] = "t
         yield
     finally:
         s = torch.cuda.memory._snapshot()
+        if viz == "pickle":
+            import pickle
+
+            suffix = ".pickle"
+        else:
+            suffix = ".html"
+
         if dist_avail:
             local_rank = dist.get_rank()
-            output_path = file_path / f"_rank_{local_rank}.html"
+            output_path = file_path / f"_rank_{local_rank}{suffix}"
         else:
-            output_path = file_path.with_suffix(".html")
+            output_path = file_path.with_suffix(suffix)
 
         match viz:
+            case "pickle":
+                import pickle
+
+                with open(output_path, "wb") as fb:
+                    pickle.dump(s, fb)
             case "torch":
                 html = torch.cuda._memory_viz.trace_plot(s)  # type: ignore
+                with open(output_path, "w") as f:
+                    f.write(html)
             case "d3":
                 from transformer_nuggets.utils.memory_viz import generate_memory_html
 
                 html = generate_memory_html(s, title=file_path.stem)
+                with open(output_path, "w") as f:
+                    f.write(html)
             case _:
-                raise ValueError(f"Unknown viz backend: {viz!r}, expected 'torch' or 'd3'")
+                raise ValueError(
+                    f"Unknown viz backend: {viz!r}, expected 'torch', 'd3', or 'pickle'"
+                )
 
-        with open(output_path, "w") as f:
-            f.write(html)
-            logger.info(f"💾 Trace file 📄 saved to: {bcolors.OKGREEN}{output_path}{bcolors.ENDC}")
+        logger.info(f"💾 Trace file 📄 saved to: {bcolors.OKGREEN}{output_path}{bcolors.ENDC}")
 
 
 def _is_distributed():

@@ -7,6 +7,7 @@ from transformer_nuggets.utils.memory_viz import (
     _extract_frames,
     _is_cpython_c_frame,
     _shorten_path,
+    generate_memory_comparison_html,
     generate_memory_html,
     process_snapshot,
 )
@@ -159,16 +160,29 @@ class TestGenerateHTML:
         html = generate_memory_html(snapshot, title="Test")
         for placeholder in [
             "__TITLE__",
-            "__TIMELINE__",
-            "__ALLOCS__",
-            "__STACKS__",
-            "__META__",
+            "__DOCUMENT_TITLE__",
+            "__VISIBLE_TITLE__",
+            "__BOOTSTRAP__",
+            "__TITLE_LEFT__",
+            "__TITLE_RIGHT__",
         ]:
             assert placeholder not in html
 
     def test_title_appears_in_html(self, snapshot):
         html = generate_memory_html(snapshot, title="My Custom Title")
         assert "My Custom Title" in html
+        assert "<h1>My Custom Title</h1>" in html
+
+    def test_title_and_bootstrap_are_escaped(self, snapshot):
+        title = '</script><script>alert("x")</script>'
+        html = generate_memory_html(snapshot, title=title)
+        assert (
+            "<title>&lt;/script&gt;&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;</title>"
+            in html
+        )
+        assert "<h1>&lt;/script&gt;&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;</h1>" in html
+        assert title not in html
+        assert r"\u003c/script>\u003cscript>alert(\"x\")\u003c/script>" in html
 
     def test_d3_loaded(self, snapshot):
         html = generate_memory_html(snapshot, title="Test")
@@ -185,11 +199,14 @@ class TestGenerateHTML:
     def test_minimap_present(self, snapshot):
         html = generate_memory_html(snapshot, title="Test")
         assert "minimap" in html
+        assert "const chartUpdateHooks = [];" in html
+        assert "chartUpdateHooks.push(updateMinimap);" in html
 
-    def test_leaks_tab_present(self, snapshot):
+    def test_leaks_view_present_in_registry(self, snapshot):
         html = generate_memory_html(snapshot, title="Test")
-        assert 'data-tab="leaks"' in html
-        assert "Leaks" in html
+        assert "const detailViews = [" in html
+        assert "id: 'leaks'" in html
+        assert "label: 'Leaks'" in html
 
     def test_show_leaks_function_present(self, snapshot):
         html = generate_memory_html(snapshot, title="Test")
@@ -198,6 +215,35 @@ class TestGenerateHTML:
     def test_leak_bar_css_present(self, snapshot):
         html = generate_memory_html(snapshot, title="Test")
         assert "leak-bar" in html
+
+    def test_precomputes_derived_view_data(self, snapshot):
+        html = generate_memory_html(snapshot, title="Test")
+        assert "function buildDerivedData()" in html
+        assert "const derivedData = buildDerivedData();" in html
+        assert "stackSummaries" in html
+        assert "peakAllocIndices" in html
+        assert "leakGroups" in html
+
+
+class TestGenerateComparisonHTML:
+    def test_includes_trace_toggle_controls(self, snapshot):
+        html = generate_memory_comparison_html(
+            snapshot,
+            snapshot,
+            title_left="Trace A",
+            title_right="Trace B",
+        )
+        assert 'id="trace-toggle-group"' in html
+        assert 'data-trace-side="left"' in html
+        assert 'data-trace-side="right"' in html
+        assert "Trace A" in html
+        assert "Trace B" in html
+
+    def test_uses_fixed_layout_instead_of_splitter(self, snapshot):
+        html = generate_memory_comparison_html(snapshot, snapshot)
+        assert "function applyPaneLayout()" in html
+        assert "window.addEventListener('resize', applyPaneLayout);" in html
+        assert 'id="splitter"' not in html
 
 
 class TestNeverFreedAllocations:
@@ -234,8 +280,7 @@ class TestNeverFreedAllocations:
 
     def test_html_uses_dedicated_persistent_palette(self, snapshot):
         html = generate_memory_html(snapshot, title="Test")
-        assert "const PERSISTENT_COLOR = '#8A8F98';" in html
-        assert "const PERSISTENT_ALPHAS = [0.18, 0.24, 0.3];" in html
+        assert "const PERSISTENT_ALPHAS = [0.55, 0.62, 0.70];" in html
 
 
 class TestStackDeduplication:

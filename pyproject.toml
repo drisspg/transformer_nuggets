@@ -52,6 +52,7 @@ llama = [
 
 [project.scripts]
 merge-traces = "transformer_nuggets.utils.merge_traces:app"
+compare-memory = "transformer_nuggets.utils.compare_memory:app"
 
 # ---------- TOOL CONFIGURATIONS ------------
 [tool.hatch.version]
