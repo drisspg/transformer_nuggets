@@ -15,15 +15,15 @@ _CPYTHON_MARKERS = (
 _BARE_NOISE_PREFIXES = (
     "_Py",
     "Py_",
-    "Py",
+    "PyEval_",
+    "PyObject_",
+    "PyRun_",
     "pyrun",
     "pymain",
     "run_mod",
-    "slot_",
-    "method_",
+    "slot_tp_",
     "cfunction_",
     "vectorcall",
-    "_call",
     "__libc_",
     "_start",
 )
@@ -325,6 +325,8 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
     padding: 12px 24px;
     border-bottom: 1px solid var(--border);
     flex-shrink: 0;
+    position: relative;
+    z-index: 60;
   }
 
   #header h1 { font-size: 14px; font-weight: 500; font-family: var(--mono); letter-spacing: 0.03em; text-transform: uppercase; flex-shrink: 0; }
@@ -371,6 +373,45 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
   }
 
   #help-trigger:hover #help-dropdown { display: block; }
+
+  #settings-trigger {
+    cursor: pointer;
+    position: relative;
+    font-size: 14px;
+    opacity: 0.6;
+    transition: opacity 0.15s;
+    user-select: none;
+  }
+  #settings-trigger:hover { opacity: 1; }
+  #settings-dropdown {
+    display: none;
+    position: absolute;
+    top: 100%;
+    right: 0;
+    margin-top: 6px;
+    background: var(--tooltip-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 8px 12px;
+    white-space: nowrap;
+    z-index: 50;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+  #settings-trigger.open #settings-dropdown { display: block; }
+  #settings-dropdown label { display: flex; align-items: center; gap: 6px; }
+  #settings-dropdown select {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 2px 4px;
+    font-size: 11px;
+    font-family: var(--mono);
+    cursor: pointer;
+  }
 
   #controls {
     display: flex;
@@ -873,6 +914,16 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
       <input type="checkbox" id="dim-persistent-toggle">
       Hide never-freed
     </label>
+    <span id="settings-trigger" title="Settings">&#9881;
+      <div id="settings-dropdown">
+        <label>Color by
+          <select id="color-mode">
+            <option value="stack">stack</option>
+            <option value="size">size</option>
+          </select>
+        </label>
+      </div>
+    </span>
   </div>
 </div>
 <div id="main">
@@ -948,8 +999,38 @@ function getColor(stackIdx) {
   return PALETTE[stackIdx % PALETTE.length];
 }
 
-const PERSISTENT_COLOR = '#8A8F98';
-const PERSISTENT_ALPHAS = [0.18, 0.24, 0.3];
+const SIZE_PALETTE = [
+  '#2E7DB5', '#3E93CC', '#5BA8D9', '#78BBE3',
+  '#3ECCC1', '#49C963', '#6DD883', '#8DE49D',
+  '#C9CC3E', '#D9DB5B', '#E0C05B', '#CC6B3E',
+  '#E08A5B', '#bd93f9', '#a06eed', '#F0A478',
+];
+
+const allocSizes = ALLOCS.map(a => a.s);
+const sortedSizes = [...new Set(allocSizes)].sort((a, b) => a - b);
+const sizeToColorIdx = new Map();
+sortedSizes.forEach((s, i) => sizeToColorIdx.set(s, i % SIZE_PALETTE.length));
+
+function getSizeColor(allocIdx) {
+  return SIZE_PALETTE[sizeToColorIdx.get(ALLOCS[allocIdx].s)];
+}
+
+let colorMode = 'stack';
+
+function recolorAllocs() {
+  let pIdx = 0;
+  for (let i = 0; i < ALLOCS.length; i++) {
+    const isPersistent = allocPersistent[i];
+    allocColors[i] = colorMode === 'size'
+      ? getSizeColor(i)
+      : getColor(ALLOCS[i].si);
+    allocAlphas[i] = isPersistent
+      ? PERSISTENT_ALPHAS[pIdx++ % PERSISTENT_ALPHAS.length]
+      : 0.85;
+  }
+}
+
+const PERSISTENT_ALPHAS = [0.55, 0.62, 0.70];
 
 const tooltipEl = document.getElementById('tooltip');
 const detailBody = document.getElementById('detail-body');
@@ -1146,17 +1227,10 @@ for (let i = 0; i < ALLOCS.length; i++) {
 const allocPersistent = new Uint8Array(ALLOCS.length);
 const allocColors = new Array(ALLOCS.length);
 const allocAlphas = new Float64Array(ALLOCS.length);
-let persistentAlphaIdx = 0;
 for (let i = 0; i < ALLOCS.length; i++) {
-  const isPersistent = allocEnds[i] >= META.max_timestep;
-  allocPersistent[i] = isPersistent ? 1 : 0;
-  allocColors[i] = isPersistent
-    ? PERSISTENT_COLOR
-    : getColor(ALLOCS[i].si);
-  allocAlphas[i] = isPersistent
-    ? PERSISTENT_ALPHAS[persistentAlphaIdx++ % PERSISTENT_ALPHAS.length]
-    : 0.85;
+  allocPersistent[i] = allocEnds[i] >= META.max_timestep ? 1 : 0;
 }
+recolorAllocs();
 let dimPersistent = false;
 
 // Bucket index for O(bucket_size) hit testing instead of O(n)
@@ -1532,6 +1606,12 @@ document.addEventListener('keyup', function(event) {
   activeKeys.delete(event.key.toLowerCase());
 });
 
+const settingsTrigger = document.getElementById('settings-trigger');
+settingsTrigger.addEventListener('click', function(e) {
+  if (e.target.closest('#settings-dropdown')) return;
+  this.classList.toggle('open');
+});
+
 document.getElementById('hwm-toggle').onchange = function() {
   hwmG.style('display', this.checked ? null : 'none');
 };
@@ -1546,6 +1626,12 @@ document.getElementById('dim-persistent-toggle').onchange = function() {
   dimPersistent = this.checked;
   customYDomain = null;
   updateChart(currentTransform);
+};
+
+document.getElementById('color-mode').onchange = function() {
+  colorMode = this.value;
+  recolorAllocs();
+  drawCanvas();
 };
 
 // --- Feature 1: Search & Filter ---

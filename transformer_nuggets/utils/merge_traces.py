@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import gzip
 import json
-import sys
 from pathlib import Path
 from typing import Annotated
 
@@ -52,7 +51,9 @@ def merge_traces(input_paths: list[str], output_path: str) -> None:
 
 @app.command()
 def main(
-    traces: Annotated[list[Path], typer.Argument(help="Input trace files, one per rank, in rank order.")],
+    traces: Annotated[
+        list[Path], typer.Argument(help="Input trace files, one per rank, in rank order.")
+    ],
     output: Annotated[Path, typer.Option("-o", "--output", help="Output path.")] = Path(
         "merged_trace.json.gz"
     ),
