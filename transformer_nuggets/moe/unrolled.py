@@ -10,7 +10,10 @@ import torch.nn as nn
 
 class LoopMoE(nn.Module):
     """
-    loop Mixture of Experts module. Expert choice
+    Reference token-choice Mixture of Experts module.
+
+    This implementation materializes routed token-expert assignments on each
+    forward pass, so it is not CUDA-graph compatible.
 
     Args:
         hidden_size: Size of the input hidden states
@@ -53,7 +56,6 @@ class LoopMoE(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        expert_map: torch.Tensor | None = None,
         renormalize: bool = False,
     ) -> torch.Tensor:
         """
@@ -61,7 +63,6 @@ class LoopMoE(nn.Module):
 
         Args:
             hidden_states: Input tensor of shape [..., hidden_size]
-            expert_map: Optional tensor mapping experts to different indices
             renormalize: Whether to renormalize weights after top-k selection
 
         Returns:
@@ -88,32 +89,38 @@ class LoopMoE(nn.Module):
 
         topk_weights = topk_weights.to(dtype)
 
-        if expert_map is not None:
-            selected_experts = expert_map[selected_experts]
+        flat_token_indices = torch.arange(
+            num_tokens, device=hidden_states.device
+        ).repeat_interleave(self.topk)
+        flat_experts = selected_experts.reshape(-1)
+        flat_topk_weights = topk_weights.reshape(-1)
 
-        # Process through experts
-        final_hidden_states = None
-        for expert_idx in range(self.num_experts):
-            expert_w1 = self.w1[expert_idx]
-            expert_w2 = self.w2[expert_idx]
-            expert_mask = selected_experts == expert_idx
-            expert_weights = (topk_weights * expert_mask).sum(dim=-1, keepdim=True)
+        routed_hidden_states = hidden_states.index_select(0, flat_token_indices)
+        routed_w1 = self.w1.index_select(0, flat_experts)
+        x = torch.bmm(
+            routed_hidden_states.unsqueeze(1),
+            routed_w1.transpose(-1, -2),
+        ).squeeze(1)
+        gate = F.silu(x[:, : self.intermediate_size])
+        x = x[:, self.intermediate_size :] * gate
 
-            # Apply expert transformation
-            x = F.linear(hidden_states, expert_w1)
-            gate = F.silu(x[:, : self.intermediate_size])
-            x = x[:, self.intermediate_size :] * gate
-            x = F.linear(x, expert_w2)
+        routed_w2 = self.w2.index_select(0, flat_experts)
+        x = torch.bmm(
+            x.unsqueeze(1),
+            routed_w2.transpose(-1, -2),
+        ).squeeze(1)
 
-            # Weight and accumulate expert outputs
-            current_hidden_states = x * expert_weights
-            if final_hidden_states is None:
-                final_hidden_states = current_hidden_states
-            else:
-                final_hidden_states = final_hidden_states + current_hidden_states
-
-        # Reshape back to original shape
-
+        final_hidden_states = torch.zeros(
+            num_tokens,
+            hidden_size,
+            dtype=x.dtype,
+            device=x.device,
+        )
+        final_hidden_states.index_add_(
+            0,
+            flat_token_indices,
+            x * flat_topk_weights.unsqueeze(-1),
+        )
         return final_hidden_states.view(orig_shape)
 
 
@@ -150,16 +157,6 @@ def main():
     with profiler(Path("/tmp/loop_moe")):
         output = moe(hidden_states)
     torch.cuda.synchronize()
-
-    # Create CUDA graph
-    g = torch.cuda.CUDAGraph()
-
-    with torch.cuda.graph(g):
-        _ = moe(hidden_states)
-
-    with profiler(Path("/tmp/loop_moe_cuda_graph")):
-        g.replay()
-        torch.cuda.synchronize()
 
     print(output.shape)
 
