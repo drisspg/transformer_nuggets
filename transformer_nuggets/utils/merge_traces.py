@@ -18,31 +18,48 @@ def _open_trace(path: str, mode: str):
     return open(path, mode, encoding="utf-8")
 
 
-def merge_traces(input_paths: list[str], output_path: str) -> None:
+def _get_min_ts(events: list[dict]) -> float:
+    return min(
+        (ev["ts"] for ev in events if "ts" in ev and ev.get("ph") != "M"),
+        default=0.0,
+    )
+
+
+def merge_traces(
+    input_paths: list[str],
+    output_path: str,
+    labels: list[str] | None = None,
+    align_timestamps: bool = False,
+) -> None:
     merged_events: list[dict] = []
 
-    for rank, path in enumerate(input_paths):
+    for idx, path in enumerate(input_paths):
         with _open_trace(path, "r") as f:
             data = json.load(f)
 
         events = data.get("traceEvents", data) if isinstance(data, dict) else data
 
+        ts_offset = _get_min_ts(events) if align_timestamps else 0.0
+        label = labels[idx] if labels else f"Rank {idx}"
+
         merged_events.append(
             {
                 "ph": "M",
                 "name": "process_name",
-                "pid": rank,
+                "pid": idx,
                 "tid": 0,
-                "args": {"name": f"Rank {rank}"},
+                "args": {"name": label},
             }
         )
 
         for ev in events:
             if ev.get("ph") == "M" and ev.get("name") == "process_name":
                 continue
-            ev["pid"] = rank
+            ev["pid"] = idx
+            if align_timestamps and "ts" in ev:
+                ev["ts"] = ev["ts"] - ts_offset
             if "id" in ev and ev.get("ph") in ("s", "t", "f"):
-                ev["id"] = ev["id"] + rank * (1 << 32)
+                ev["id"] = ev["id"] + idx * (1 << 32)
             merged_events.append(ev)
 
     with _open_trace(output_path, "w") as f:
@@ -57,6 +74,13 @@ def main(
     output: Annotated[Path, typer.Option("-o", "--output", help="Output path.")] = Path(
         "merged_trace.json.gz"
     ),
+    label: Annotated[
+        list[str] | None,
+        typer.Option("-l", "--label", help="Label for each trace (repeat for each file)."),
+    ] = None,
+    align: Annotated[
+        bool, typer.Option("--align", help="Align timestamps so all traces start at t=0.")
+    ] = False,
 ):
     """Merge per-rank Chrome/Perfetto traces into a single multi-process Perfetto trace."""
     for p in traces:
@@ -64,7 +88,7 @@ def main(
             typer.echo(f"Error: {p} not found", err=True)
             raise typer.Exit(1)
 
-    merge_traces([str(p) for p in traces], str(output))
+    merge_traces([str(p) for p in traces], str(output), labels=label, align_timestamps=align)
     typer.echo(f"Merged {len(traces)} traces -> {output}")
 
 
