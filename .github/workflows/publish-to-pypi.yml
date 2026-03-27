@@ -1,6 +1,17 @@
 name: Publish Python 🐍 distribution 📦 to PyPI
 
-on: push
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -9,18 +20,30 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: "3.x"
-    - name: Install pypa/build
+        python-version: "3.10"
+    - name: Install build tools
       run: >-
         python3 -m
         pip install
         build
+        twine
         --user
     - name: Build a binary wheel and a source tarball
       run: python3 -m build
+    - name: Check distribution metadata
+      run: python3 -m twine check dist/*
+    - name: Smoke test wheel install
+      run: |
+        python3 -m venv .venv-smoke
+        . .venv-smoke/bin/activate
+        python -m pip install --upgrade pip
+        python -m pip install --no-deps dist/*.whl
+        python -c "import importlib.metadata as metadata; print(metadata.version('transformer_nuggets'))"
     - name: Store the distribution packages
       uses: actions/upload-artifact@v4
       with:
@@ -30,15 +53,15 @@ jobs:
   publish-to-pypi:
     name: >-
       Publish Python 🐍 distribution 📦 to PyPI
-    if: startsWith(github.ref, 'refs/tags/')  # only publish to PyPI on tag pushes
+    if: startsWith(github.ref, 'refs/tags/v')
     needs:
     - build
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/transformer_nuggets # Replace <package-name> with your PyPI project name
+      url: https://pypi.org/p/transformer_nuggets
     permissions:
-      id-token: write  # IMPORTANT: mandatory for trusted publishing
+      id-token: write
 
     steps:
     - name: Download all the dists
@@ -48,18 +71,21 @@ jobs:
         path: dist/
     - name: Publish distribution 📦 to PyPI
       uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        skip-existing: true
 
   github-release:
     name: >-
       Sign the Python 🐍 distribution 📦 with Sigstore
       and upload them to GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
     needs:
     - publish-to-pypi
     runs-on: ubuntu-latest
 
     permissions:
-      contents: write  # IMPORTANT: mandatory for making GitHub Releases
-      id-token: write  # IMPORTANT: mandatory for sigstore
+      contents: write
+      id-token: write
 
     steps:
     - name: Download all the dists
@@ -76,18 +102,15 @@ jobs:
     - name: Create GitHub Release
       env:
         GITHUB_TOKEN: ${{ github.token }}
-      run: >-
-        gh release create
-        '${{ github.ref_name }}'
-        --repo '${{ github.repository }}'
-        --notes ""
+      run: |
+        if ! gh release view '${{ github.ref_name }}' --repo '${{ github.repository }}' >/dev/null 2>&1; then
+          gh release create '${{ github.ref_name }}' --repo '${{ github.repository }}' --notes ""
+        fi
     - name: Upload artifact signatures to GitHub Release
       env:
         GITHUB_TOKEN: ${{ github.token }}
-      # Upload to GitHub Release using the `gh` CLI.
-      # `dist/` contains the built packages, and the
-      # sigstore-produced signatures and certificates.
       run: >-
         gh release upload
         '${{ github.ref_name }}' dist/**
+        --clobber
         --repo '${{ github.repository }}'
