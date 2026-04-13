@@ -304,6 +304,7 @@ def save_memory_snapshot(file_path: Path | str, viz: Literal["torch", "d3", "pic
         yield
     finally:
         s = torch.cuda.memory._snapshot()
+        snapshot_device = torch.cuda.current_device()
         if viz == "pickle":
             import pickle
 
@@ -330,7 +331,7 @@ def save_memory_snapshot(file_path: Path | str, viz: Literal["torch", "d3", "pic
             case "d3":
                 from transformer_nuggets.utils.memory_viz import generate_memory_html
 
-                html = generate_memory_html(s, title=file_path.stem)
+                html = generate_memory_html(s, device=snapshot_device, title=file_path.stem)
                 with open(output_path, "w") as f:
                     f.write(html)
             case _:
@@ -402,7 +403,7 @@ def attach_oom_observer(
                 case "d3":
                     from transformer_nuggets.utils.memory_viz import generate_memory_html
 
-                    html = generate_memory_html(snapshot, title=f"OOM rank {rank}")
+                    html = generate_memory_html(snapshot, device=device, title=f"OOM rank {rank}")
                 case _:
                     html = torch.cuda._memory_viz.trace_plot(snapshot)  # type: ignore
 

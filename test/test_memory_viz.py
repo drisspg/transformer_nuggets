@@ -1,3 +1,4 @@
+import json
 import pickle
 from pathlib import Path
 
@@ -38,6 +39,13 @@ def _make_event(action, addr, size, time_us=0, filename="test.py", name="func", 
 
 def _make_snapshot(events):
     return {"device_traces": [events], "segments": [], "allocator_settings": {}}
+
+
+def _extract_bootstrap(html):
+    marker = '<script id="memory-viz-bootstrap" type="application/json">'
+    start = html.index(marker) + len(marker)
+    end = html.index("</script>", start)
+    return json.loads(html[start:end])
 
 
 class TestExtractFrames:
@@ -223,6 +231,34 @@ class TestGenerateHTML:
         assert "stackSummaries" in html
         assert "peakAllocIndices" in html
         assert "leakGroups" in html
+
+    def test_uses_requested_device(self):
+        snapshot = {
+            "device_traces": [
+                [],
+                [_make_event("alloc", 0x2000, 256, time_us=5, filename="rank1.py", name="alloc")],
+            ],
+            "segments": [
+                {
+                    "device": 1,
+                    "stream": 0,
+                    "address": 0x1000,
+                    "blocks": [
+                        {
+                            "state": "active_allocated",
+                            "size": 128,
+                            "addr": 0x1000,
+                            "frames": [{"filename": "rank1.py", "name": "seed", "line": 1}],
+                        }
+                    ],
+                }
+            ],
+            "allocator_settings": {},
+        }
+        bootstrap = _extract_bootstrap(generate_memory_html(snapshot, device=1, title="Rank 1"))
+        assert bootstrap["meta"]["device"] == 1
+        assert bootstrap["meta"]["num_events"] == 2
+        assert bootstrap["meta"]["num_allocs"] == 2
 
 
 class TestGenerateComparisonHTML:
