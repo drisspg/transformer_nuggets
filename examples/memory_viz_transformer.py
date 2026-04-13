@@ -9,7 +9,7 @@ Usage:
     python examples/memory_viz_transformer.py --batch_size 2 --seq_len 1024
 
     # Then visualize:
-    compare-memory data/snapshot_a.pickle data/snapshot_b.pickle -o comparison.html
+    merge-memory data/snapshot_a.pickle data/snapshot_b.pickle -o merged_memory.html
 """
 
 import torch

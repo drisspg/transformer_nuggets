@@ -81,7 +81,7 @@ def main(
     compare_cmd = [
         sys.executable,
         "-m",
-        "transformer_nuggets.utils.compare_memory",
+        "transformer_nuggets.utils.merge_memory",
         str(left_output_path),
         str(right_output_path),
         "-o",
