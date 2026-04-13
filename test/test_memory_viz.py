@@ -48,6 +48,13 @@ def _extract_bootstrap(html):
     return json.loads(html[start:end])
 
 
+def _extract_named_bootstrap(html, script_id):
+    marker = f'<script id="{script_id}" type="application/json">'
+    start = html.index(marker) + len(marker)
+    end = html.index("</script>", start)
+    return json.loads(html[start:end])
+
+
 class TestExtractFrames:
     def test_filters_unwind_frames(self):
         frames = [
@@ -280,6 +287,65 @@ class TestGenerateComparisonHTML:
         assert "function applyPaneLayout()" in html
         assert "window.addEventListener('resize', applyPaneLayout);" in html
         assert 'id="splitter"' not in html
+
+    def test_uses_requested_devices_per_side(self):
+        snapshot_left = {
+            "device_traces": [
+                [_make_event("alloc", 0x1000, 128, time_us=1, filename="left.py", name="left")]
+            ],
+            "segments": [
+                {
+                    "device": 0,
+                    "stream": 0,
+                    "address": 0x1000,
+                    "blocks": [
+                        {
+                            "state": "active_allocated",
+                            "size": 64,
+                            "addr": 0x1000,
+                            "frames": [{"filename": "left.py", "name": "seed", "line": 1}],
+                        }
+                    ],
+                }
+            ],
+            "allocator_settings": {},
+        }
+        snapshot_right = {
+            "device_traces": [
+                [],
+                [_make_event("alloc", 0x2000, 256, time_us=2, filename="right.py", name="right")],
+            ],
+            "segments": [
+                {
+                    "device": 1,
+                    "stream": 0,
+                    "address": 0x2000,
+                    "blocks": [
+                        {
+                            "state": "active_allocated",
+                            "size": 128,
+                            "addr": 0x2000,
+                            "frames": [{"filename": "right.py", "name": "seed", "line": 1}],
+                        }
+                    ],
+                }
+            ],
+            "allocator_settings": {},
+        }
+        html = generate_memory_comparison_html(
+            snapshot_left,
+            snapshot_right,
+            device_left=0,
+            device_right=1,
+            title_left="Rank 0",
+            title_right="Rank 1",
+        )
+        bootstrap_left = _extract_named_bootstrap(html, "bootstrap-left")
+        bootstrap_right = _extract_named_bootstrap(html, "bootstrap-right")
+        assert bootstrap_left["meta"]["device"] == 0
+        assert bootstrap_right["meta"]["device"] == 1
+        assert bootstrap_left["meta"]["num_allocs"] == 2
+        assert bootstrap_right["meta"]["num_allocs"] == 2
 
 
 class TestNeverFreedAllocations:

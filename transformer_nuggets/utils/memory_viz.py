@@ -296,9 +296,15 @@ def generate_memory_comparison_html(
     snapshot_left: dict,
     snapshot_right: dict,
     device: int = 0,
+    device_left: int | None = None,
+    device_right: int | None = None,
     title_left: str = "Left",
     title_right: str = "Right",
 ) -> str:
+    if device_left is None:
+        device_left = device
+    if device_right is None:
+        device_right = device
     doc_title = f"{title_left} vs {title_right}"
     return (
         _MEMORY_COMPARISON_TEMPLATE.replace("__DOCUMENT_TITLE__", html.escape(doc_title))
@@ -306,11 +312,11 @@ def generate_memory_comparison_html(
         .replace("__TITLE_RIGHT__", html.escape(title_right))
         .replace(
             "__BOOTSTRAP_LEFT__",
-            _json_for_html(_build_memory_viz_data(snapshot_left, device, title_left)),
+            _json_for_html(_build_memory_viz_data(snapshot_left, device_left, title_left)),
         )
         .replace(
             "__BOOTSTRAP_RIGHT__",
-            _json_for_html(_build_memory_viz_data(snapshot_right, device, title_right)),
+            _json_for_html(_build_memory_viz_data(snapshot_right, device_right, title_right)),
         )
     )
 

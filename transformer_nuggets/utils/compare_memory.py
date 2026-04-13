@@ -19,6 +19,8 @@ def main(
         "memory_comparison.html"
     ),
     device: Annotated[int, typer.Option("--device", help="CUDA device index.")] = 0,
+    device_left: Annotated[int | None, typer.Option("--device-left")] = None,
+    device_right: Annotated[int | None, typer.Option("--device-right")] = None,
     title_left: Annotated[str | None, typer.Option("--title-left")] = None,
     title_right: Annotated[str | None, typer.Option("--title-right")] = None,
 ):
@@ -39,6 +41,8 @@ def main(
         snapshot_left,
         snapshot_right,
         device=device,
+        device_left=device_left,
+        device_right=device_right,
         title_left=title_left or left.stem,
         title_right=title_right or right.stem,
     )
