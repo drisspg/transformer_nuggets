@@ -1,10 +1,14 @@
+import ctypes
+import ctypes.util
 import logging
+import os
 import random
+import statistics
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import torch
 import torch.utils.benchmark as benchmark
@@ -18,12 +22,43 @@ logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
 
+def _nvml():
+    library_path = ctypes.util.find_library("nvidia-ml") or "libnvidia-ml.so.1"
+    try:
+        return ctypes.CDLL(library_path)
+    except OSError as exc:
+        raise RuntimeError(f"Unable to load NVML from {library_path}") from exc
+
+
+def _check_nvml_status(status: int, operation: str):
+    if status != 0:
+        raise RuntimeError(f"NVML call failed for {operation} with status {status}")
+
+
+def _get_nvml_handle(nvml, device: int = 0):
+    handle = ctypes.c_void_p()
+    get_handle = getattr(nvml, "nvmlDeviceGetHandleByIndex_v2", None)
+    if get_handle is None:
+        get_handle = nvml.nvmlDeviceGetHandleByIndex
+    status = get_handle(ctypes.c_uint(device), ctypes.byref(handle))
+    _check_nvml_status(status, f"device handle for device {device}")
+    return handle
+
+
+def _get_max_sm_clock(nvml, handle) -> int:
+    nvml_clock_type_sm = ctypes.c_uint(1)
+    clock_mhz = ctypes.c_uint()
+    status = nvml.nvmlDeviceGetMaxClockInfo(handle, nvml_clock_type_sm, ctypes.byref(clock_mhz))
+    _check_nvml_status(status, "max SM clock")
+    return int(clock_mhz.value)
+
+
 @contextmanager
 def locked_clocks(device: int = 0, clock_mhz: int | None = None):
     """Lock GPU SM clocks for stable benchmarking.
 
-    Uses ``sudo nvidia-smi -lgc`` to lock and ``sudo nvidia-smi -rgc`` to
-    reset. Will prompt for a password in interactive terminals.
+    Requires root and uses ``nvidia-smi -lgc`` to lock and ``nvidia-smi -rgc``
+    to reset.
 
     Args:
         device: CUDA device index.
@@ -31,28 +66,25 @@ def locked_clocks(device: int = 0, clock_mhz: int | None = None):
     """
     import subprocess
 
-    if clock_mhz is None:
-        clock_mhz = int(
-            subprocess.check_output(
-                [
-                    "nvidia-smi",
-                    "-i",
-                    str(device),
-                    "--query-gpu=clocks.max.sm",
-                    "--format=csv,noheader,nounits",
-                ],
-                text=True,
-            ).strip()
-        )
+    if os.geteuid() != 0:
+        raise RuntimeError("Requires root to lock GPU clocks")
 
-    subprocess.check_call(
-        ["sudo", "nvidia-smi", "-i", str(device), "-lgc", f"{clock_mhz},{clock_mhz}"]
-    )
+    if clock_mhz is None:
+        nvml = _nvml()
+        status = nvml.nvmlInit()
+        _check_nvml_status(status, "nvmlInit")
+        try:
+            clock_mhz = _get_max_sm_clock(nvml, _get_nvml_handle(nvml, device))
+        finally:
+            shutdown = nvml.nvmlShutdown()
+            _check_nvml_status(shutdown, "nvmlShutdown")
+
+    subprocess.check_call(["nvidia-smi", "-i", str(device), "-lgc", f"{clock_mhz},{clock_mhz}"])
     logger.info(f"Locked GPU {device} SM clocks to {clock_mhz} MHz")
     try:
         yield clock_mhz
     finally:
-        subprocess.call(["sudo", "nvidia-smi", "-i", str(device), "-rgc"])
+        subprocess.call(["nvidia-smi", "-i", str(device), "-rgc"])
         logger.info(f"Reset GPU {device} SM clocks")
 
 
@@ -95,6 +127,186 @@ class ProfileConfig:
     extra_kwargs: dict = field(default_factory=dict)
     memory_profile_path: str | None = None
     row_limit: int = 10
+
+
+@dataclass(frozen=True)
+class CudaBenchmarkStats:
+    samples_us: tuple[float, ...]
+    median_us: float
+    median_ci_us: tuple[float, float]
+    quantiles_us: tuple[float, float, float]
+    confidence: float
+
+    @staticmethod
+    def quantile(samples: Sequence[float], q: float) -> float:
+        if not 0.0 <= q <= 1.0:
+            raise ValueError(f"q must be in [0, 1], got {q}")
+        if len(samples) == 0:
+            raise ValueError("samples must be non-empty")
+
+        ordered = sorted(float(sample) for sample in samples)
+        if len(ordered) == 1:
+            return ordered[0]
+
+        position = (len(ordered) - 1) * q
+        lower_idx = int(position)
+        upper_idx = min(lower_idx + 1, len(ordered) - 1)
+        if lower_idx == upper_idx:
+            return ordered[lower_idx]
+
+        weight = position - lower_idx
+        lower = ordered[lower_idx]
+        upper = ordered[upper_idx]
+        return lower + (upper - lower) * weight
+
+    @classmethod
+    def bootstrap_median_confidence_interval(
+        cls,
+        samples: Sequence[float],
+        confidence: float = 0.95,
+        n_resamples: int = 1000,
+        seed: int = 0,
+    ) -> tuple[float, float]:
+        """Estimate a percentile bootstrap confidence interval for the sample median.
+
+        This uses the standard nonparametric bootstrap: resample the observed
+        timings with replacement, compute the median of each resample, then take
+        lower and upper quantiles of that bootstrap distribution. The intuition
+        is that the empirical sample distribution stands in for the unknown
+        underlying timing distribution, so repeated draws from the observed
+        samples approximate repeated draws from the process that produced them.
+
+        This does not assume a specific parametric input distribution such as a
+        Gaussian. It does assume the timings are a reasonable sample from one
+        stable benchmark regime and are approximately exchangeable, which in
+        practice means: same workload, after warmup, without strong time-order
+        effects such as thermal drift, autotuning phase changes, or one-time
+        allocator/startup behavior dominating the run.
+
+        Like any bootstrap interval, this can be unstable with very small sample
+        counts. There is no universal minimum, but single-digit samples are weak
+        and even low tens should be treated cautiously. For benchmark summaries,
+        this is most credible once you have enough steady-state samples that the
+        median is no longer moving much when a few points are added or removed.
+        """
+        if not 0 < confidence < 1:
+            raise ValueError(f"confidence must be in (0, 1), got {confidence}")
+        if len(samples) == 0:
+            raise ValueError("samples must be non-empty")
+        if len(samples) == 1:
+            value = float(samples[0])
+            return value, value
+
+        rng = random.Random(seed)
+        estimates = [
+            statistics.median(rng.choices(samples, k=len(samples)))
+            for _ in range(max(1, n_resamples))
+        ]
+        alpha = 1.0 - confidence
+        return cls.quantile(estimates, alpha / 2), cls.quantile(estimates, 1.0 - alpha / 2)
+
+    @classmethod
+    def from_samples(
+        cls,
+        samples_us: Sequence[float],
+        confidence: float = 0.95,
+        n_resamples: int = 1000,
+        seed: int = 0,
+    ) -> "CudaBenchmarkStats":
+        samples = tuple(float(sample) for sample in samples_us)
+        quantiles_us = (
+            cls.quantile(samples, 0.05),
+            cls.quantile(samples, 0.50),
+            cls.quantile(samples, 0.95),
+        )
+        return cls(
+            samples_us=samples,
+            median_us=quantiles_us[1],
+            median_ci_us=cls.bootstrap_median_confidence_interval(
+                samples,
+                confidence=confidence,
+                n_resamples=n_resamples,
+                seed=seed,
+            ),
+            quantiles_us=quantiles_us,
+            confidence=confidence,
+        )
+
+    @property
+    def p05_us(self) -> float:
+        return self.quantiles_us[0]
+
+    @property
+    def p50_us(self) -> float:
+        return self.quantiles_us[1]
+
+    @property
+    def p95_us(self) -> float:
+        return self.quantiles_us[2]
+
+
+def benchmark_cuda_function_stats(func: Callable, *args, **kwargs) -> CudaBenchmarkStats:
+    """Benchmark a CUDA callable and return median-centered summary stats.
+
+    This collects per-iteration timings from Inductor's GPU benchmarker and
+    returns the raw samples, the sample median, a bootstrap confidence interval
+    for that median, and `(p05, p50, p95)` sample quantiles.
+
+    Args:
+        func: Callable to benchmark.
+        *args: Positional arguments forwarded to ``func``.
+        **kwargs: Benchmark configuration and keyword arguments forwarded to
+            ``func``. The following benchmark-control keys are consumed by this
+            helper before calling ``func``: ``NUM_ITERS``,
+            ``MEMORY_WARMUP_ITERS``, ``CONFIDENCE``, ``N_RESAMPLES``, ``SEED``,
+            and ``IS_VETTED_BENCHMARKING``.
+
+    Returns:
+        CudaBenchmarkStats with raw samples, the sample median, a bootstrap
+        median confidence interval, and `(p05, p50, p95)` sample quantiles.
+
+    Notes:
+        The bootstrap interval assumes the collected timings are representative
+        samples from a single steady-state benchmark regime. It is most useful
+        after warmup, when samples are not dominated by obvious drift or phase
+        changes such as autotuning, thermal throttling, or one-time allocator
+        effects.
+
+    Examples:
+        Basic usage::
+
+            stats = benchmark_cuda_function_stats(lambda: kernel(x, y), NUM_ITERS=200)
+            print(stats.median_us)
+            print(stats.median_ci_us)
+            print(stats.quantiles_us)
+
+        With locked clocks::
+
+            with locked_clocks():
+                stats = benchmark_cuda_function_stats(lambda: kernel(x, y), NUM_ITERS=200)
+    """
+    num_iters = kwargs.pop("NUM_ITERS", 100)
+    memory_warmup_iters = kwargs.pop("MEMORY_WARMUP_ITERS", 100)
+    confidence = kwargs.pop("CONFIDENCE", 0.95)
+    n_resamples = kwargs.pop("N_RESAMPLES", 1000)
+    seed = kwargs.pop("SEED", 0)
+    is_vetted_benchmarking = kwargs.pop("IS_VETTED_BENCHMARKING", False)
+    no_args = lambda: func(*args, **kwargs)
+    from torch._inductor.runtime.benchmarking import benchmarker
+
+    samples_ms = benchmarker.benchmark_gpu(
+        no_args,
+        benchmark_iters=num_iters,
+        memory_warmup_iters=memory_warmup_iters,
+        return_mode="all",
+        is_vetted_benchmarking=is_vetted_benchmarking,
+    )
+    return CudaBenchmarkStats.from_samples(
+        (float(sample) * 1e3 for sample in samples_ms),
+        confidence=confidence,
+        n_resamples=n_resamples,
+        seed=seed,
+    )
 
 
 def benchmark_torch_function_in_microseconds(func: Callable, *args, **kwargs) -> float:
