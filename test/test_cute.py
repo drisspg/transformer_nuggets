@@ -16,7 +16,7 @@ except ImportError:
 
 from operator import add, mul
 from transformer_nuggets.cute import get_cache_stats, clear_cute_cache, auto_compile_and_cache
-from transformer_nuggets.cute.dynamic_args import elementwise_op_dynamic
+from transformer_nuggets.cute.dynamic_args import DynamicElementwiseOp, elementwise_op_dynamic
 from transformer_nuggets.cute.utils import get_tensor_alignment
 
 
@@ -230,6 +230,7 @@ def test_different_sizes_use_different_configs():
     clear_cute_cache()
 
     shapes = [(256, 256), (2048, 2048), (8192, 8192)]
+    expected_configs = {DynamicElementwiseOp(add)._select_parameters(M, N) for M, N in shapes}
 
     for M, N in shapes:
         a = torch.randn(M, N, device="cuda", dtype=torch.float16)
@@ -239,9 +240,8 @@ def test_different_sizes_use_different_configs():
         expected = a + b
         torch.testing.assert_close(out, expected, rtol=1e-3, atol=1e-3)
 
-    # Should have multiple cache entries for different configurations
     stats = get_cache_stats()
-    assert stats["cache_size"] >= len(shapes)
+    assert stats["cache_size"] == len(expected_configs)
 
 
 if __name__ == "__main__":
