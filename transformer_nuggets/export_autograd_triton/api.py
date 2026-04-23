@@ -28,19 +28,27 @@ def export_autograd_triton(
     specializations: list[Specialization],
     out: str | Path,
     exported_name: str | None = None,
+    source_backend: str = "clean_triton",
+    max_autotune: bool = False,
+    inductor_config_patches: dict[str, Any] | None = None,
 ) -> ExportedAutogradSource:
     signature = _validate_signature(fn)
+    if source_backend not in {"inductor", "clean_triton"}:
+        raise ValueError("source_backend must be 'inductor' or 'clean_triton'")
     if not specializations:
         raise ValueError("At least one specialization is required")
 
+    config_patches = dict(inductor_config_patches or {})
+    if max_autotune:
+        config_patches["max_autotune"] = True
     captured_specializations = [
-        _capture_specialization(fn, signature, specialization, index)
+        _capture_specialization(fn, signature, specialization, index, config_patches)
         for index, specialization in enumerate(specializations)
     ]
     output_path = Path(out)
     public_name = exported_name or f"{fn.__name__}_compiled"
     source = generate_autograd_source(fn, public_name, captured_specializations)
-    write_autograd_source(output_path, source)
+    write_autograd_source(output_path, source, captured_specializations, source_backend)
     return ExportedAutogradSource(
         output_path=output_path,
         exported_name=public_name,
@@ -66,6 +74,7 @@ def _capture_specialization(
     signature: inspect.Signature,
     specialization: Specialization,
     index: int,
+    inductor_config_patches: dict[str, Any],
 ) -> CapturedSpecialization:
     if specialization.additional_inputs:
         raise NotImplementedError(
@@ -103,6 +112,7 @@ def _capture_specialization(
     compiled_sources = capture_compiled_autograd_sources(
         tensor_only_fn,
         tuple(bound.arguments[name] for name in runtime_tensor_names),
+        inductor_config_patches=inductor_config_patches,
     )
     return CapturedSpecialization(
         name=specialization.name or f"spec_{index}",

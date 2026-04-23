@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Callable
 import inspect
 from pathlib import Path
+import pprint
+import re
 from textwrap import indent
 
 from transformer_nuggets.export_autograd_triton.specs import CapturedSpecialization
@@ -15,28 +17,37 @@ def generate_autograd_source(
 ) -> str:
     signature = inspect.signature(fn)
     wrapper = _generate_public_wrapper(exported_name, signature)
-    specs_literal = repr([_spec_to_metadata(spec) for spec in specializations])
-    forward_sources = repr([spec.forward_source for spec in specializations])
-    backward_sources = repr([spec.backward_source for spec in specializations])
+    specs_literal = pprint.pformat(
+        [_spec_to_metadata(index, spec) for index, spec in enumerate(specializations)],
+        width=100,
+        sort_dicts=False,
+    )
     return f"""from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
 
 import torch
 
+_ARTIFACTS_DIR = Path(__file__).with_name(f"{{Path(__file__).stem}}_artifacts")
+
 _SPECS = {specs_literal}
-_FORWARD_SOURCES = {forward_sources}
-_BACKWARD_SOURCES = {backward_sources}
 
 
-def _make_runner(source):
-    namespace = {{"__file__": __file__}}
-    exec(source, namespace)
-    return namespace["call"]
+def _load_runner(module_filename):
+    if module_filename is None:
+        return None
+    module_path = _ARTIFACTS_DIR / module_filename
+    spec = importlib.util.spec_from_file_location(module_path.stem, module_path)
+    module = importlib.util.module_from_spec(spec)
+    if spec.loader is None:
+        raise RuntimeError(f"Could not load compiled source module {{module_path}}")
+    spec.loader.exec_module(module)
+    return module.call
 
 
-_FORWARD_RUNNERS = [_make_runner(source) for source in _FORWARD_SOURCES]
-_BACKWARD_RUNNERS = [
-    _make_runner(source) if source is not None else None for source in _BACKWARD_SOURCES
-]
+_FORWARD_RUNNERS = [_load_runner(spec["forward_module"]) for spec in _SPECS]
+_BACKWARD_RUNNERS = [_load_runner(spec["backward_module"]) for spec in _SPECS]
 
 
 class _CompiledAutogradFunction(torch.autograd.Function):
@@ -171,9 +182,40 @@ def _format_no_match(bound_args, failures):
 """
 
 
-def write_autograd_source(path: Path, source: str) -> None:
+def write_autograd_source(
+    path: Path,
+    source: str,
+    specializations: list[CapturedSpecialization],
+    source_backend: str,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(source)
+    artifact_dir = path.with_name(f"{path.stem}_artifacts")
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    for index, spec in enumerate(specializations):
+        forward_path = artifact_dir / _module_filename(index, spec, "forward")
+        _write_compiled_module(forward_path, spec.forward_source, source_backend)
+        if spec.backward_source is not None:
+            _write_compiled_module(
+                artifact_dir / _module_filename(index, spec, "backward"),
+                spec.backward_source,
+                source_backend,
+            )
+
+
+def _write_compiled_module(path: Path, source: str, source_backend: str) -> None:
+    path.write_text(source)
+    if source_backend == "clean_triton" and "async_compile.triton(" in source:
+        _rewrite_module_as_clean_triton(path)
+
+
+def _rewrite_module_as_clean_triton(path: Path) -> None:
+    from torch.utils._get_clean_triton import get_clean_triton
+
+    get_clean_triton(path.resolve(), path.resolve(), auto_generate_params=True)
+    launch_params_path = Path(f"{path}.launch_params")
+    if launch_params_path.exists():
+        launch_params_path.unlink()
 
 
 def _generate_public_wrapper(exported_name: str, signature: inspect.Signature) -> str:
@@ -182,7 +224,7 @@ def _generate_public_wrapper(exported_name: str, signature: inspect.Signature) -
     )
 
 
-def _spec_to_metadata(spec: CapturedSpecialization) -> dict[str, object]:
+def _spec_to_metadata(index: int, spec: CapturedSpecialization) -> dict[str, object]:
     return {
         "name": spec.name,
         "runtime_tensor_names": spec.runtime_tensor_names,
@@ -191,4 +233,17 @@ def _spec_to_metadata(spec: CapturedSpecialization) -> dict[str, object]:
         "num_user_outputs": spec.num_user_outputs,
         "output_kind": spec.output_kind,
         "needs_autograd": spec.needs_autograd,
+        "forward_module": _module_filename(index, spec, "forward"),
+        "backward_module": (
+            _module_filename(index, spec, "backward") if spec.backward_source is not None else None
+        ),
     }
+
+
+def _module_filename(index: int, spec: CapturedSpecialization, direction: str) -> str:
+    return f"spec_{index}_{_safe_name(spec.name)}_{direction}.py"
+
+
+def _safe_name(name: str) -> str:
+    safe = re.sub(r"[^0-9a-zA-Z_]+", "_", name).strip("_").lower()
+    return safe or "unnamed"

@@ -39,6 +39,10 @@ def integer_tensor_output(x):
     return x.argmax(dim=-1)
 
 
+def trig_pointwise(x):
+    return torch.sin(x) + torch.cos(x)
+
+
 def list_outputs(x, w):
     y = x @ w
     return [torch.relu(y), torch.sigmoid(y)]
@@ -118,11 +122,14 @@ def _clone_inputs(x, w):
     return _clone_tensor(x), _clone_tensor(w)
 
 
-def _source_kernel_marker_count(source):
-    return (
-        source.count("async_compile.triton(")
+def _source_kernel_marker_count(generated_path):
+    artifact_dir = generated_path.with_name(f"{generated_path.stem}_artifacts")
+    return sum(
+        source.count("@triton.jit")
+        + source.count("async_compile.triton(")
         + source.count("async_compile.cpp")
         + source.count("extern_kernels.")
+        for source in (path.read_text() for path in artifact_dir.glob("*.py"))
     )
 
 
@@ -268,7 +275,7 @@ def test_export_multi_kernel_graph(tmp_path):
     )
     module = _import_generated(generated_path)
 
-    assert _source_kernel_marker_count(exported.source) > 1
+    assert _source_kernel_marker_count(exported.output_path) > 1
     eager_x, eager_w1, eager_w2 = (_clone_tensor(x), _clone_tensor(w1), _clone_tensor(w2))
     compiled_x, compiled_w1, compiled_w2 = (_clone_tensor(x), _clone_tensor(w1), _clone_tensor(w2))
     eager = two_matmuls_layernorm(eager_x, eager_w1, eager_w2, residual=True)
@@ -474,6 +481,26 @@ def test_export_exotic_cases_compare_eager(tmp_path, case):
         rtol=rtol,
         atol=atol,
     )
+
+
+def test_max_autotune_config_is_threaded_to_inductor(tmp_path):
+    _requires_export_runtime()
+    x = torch.randn(16, device="cuda", requires_grad=True)
+    generated_path = tmp_path / "generated_max_autotune.py"
+
+    export_autograd_triton(
+        trig_pointwise,
+        [Specialization(args=(x,), name="max_autotune")],
+        generated_path,
+        source_backend="inductor",
+        max_autotune=True,
+    )
+    artifact_source = "\n".join(
+        path.read_text()
+        for path in generated_path.with_name("generated_max_autotune_artifacts").glob("*.py")
+    )
+
+    assert "'max_autotune': True" in artifact_source
 
 
 def test_dynamic_shape_paths_are_explicitly_guarded(tmp_path):

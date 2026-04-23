@@ -26,6 +26,7 @@ class CapturedCompiledSources:
 def capture_compiled_autograd_sources(
     fn: Callable[..., Any],
     runtime_tensors: tuple[torch.Tensor, ...],
+    inductor_config_patches: dict[str, Any] | None = None,
 ) -> CapturedCompiledSources:
     try:
         from torch._functorch.aot_autograd import aot_function, make_boxed_compiler
@@ -52,17 +53,29 @@ def capture_compiled_autograd_sources(
         output for output in tensor_outputs if output.requires_grad and _is_differentiable(output)
     ]
     if not differentiable_outputs:
-        return _capture_forward_only(fn, sample_tensors, len(tensor_outputs), output_kind)
+        return _capture_forward_only(
+            fn,
+            sample_tensors,
+            len(tensor_outputs),
+            output_kind,
+            inductor_config_patches,
+        )
 
     if not any(tensor.requires_grad for tensor in runtime_tensors):
-        return _capture_forward_only(fn, sample_tensors, len(tensor_outputs), output_kind)
+        return _capture_forward_only(
+            fn,
+            sample_tensors,
+            len(tensor_outputs),
+            output_kind,
+            inductor_config_patches,
+        )
 
     records: list[CompiledGraphSource] = []
 
     def compiler(
         gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]
     ) -> Callable[..., Any]:
-        compiled = compile_fx(gm, example_inputs)
+        compiled = compile_fx(gm, example_inputs, config_patches=inductor_config_patches)
         records.append(_compiled_graph_source(gm, compiled))
         return compiled
 
@@ -98,6 +111,7 @@ def _capture_forward_only(
     sample_tensors: tuple[torch.Tensor, ...],
     num_user_outputs: int,
     output_kind: str,
+    inductor_config_patches: dict[str, Any] | None,
 ) -> CapturedCompiledSources:
     try:
         export_result = torch._dynamo.export(fn, aten_graph=True)(*sample_tensors)
@@ -105,7 +119,11 @@ def _capture_forward_only(
         raise RuntimeError("Forward-only export requires torch._dynamo.export") from exc
     from torch._inductor.compile_fx import compile_fx
 
-    compiled = compile_fx(export_result.graph_module, list(sample_tensors))
+    compiled = compile_fx(
+        export_result.graph_module,
+        list(sample_tensors),
+        config_patches=inductor_config_patches,
+    )
     return CapturedCompiledSources(
         forward=_compiled_graph_source(export_result.graph_module, compiled),
         backward=None,
