@@ -8,6 +8,8 @@ from transformer_nuggets.fp8.scaled_quant import (
     scaled_quant,
 )
 
+pytestmark = pytest.mark.slow
+
 
 @pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")

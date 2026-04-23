@@ -43,16 +43,7 @@ python transformer_nuggets/llama/train.py \
     --fp8_linear_type "delayed" --compile True
 ```
 
-
-To finetune model with qlora on single GPU
-``` Shell
-python transformer_nuggets/llama/finetune.py
-```
-
-To finetune model with qlora + FSDP on 2 GPUs
-``` Shell
-python transformer_nuggets/llama/finetune.py --fsdp_num_gpus 2
-```
+Quantization/QLoRA finetuning experiments were removed from this repo; use torchao for that functionality.
 
  ### Notes
 To get the Llama2 tokenizer go to https://huggingface.co/meta-llama/Llama-2-7b and go through steps to obtain access. This will get you pretrained weights as well as the tokenizer.

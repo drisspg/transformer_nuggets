@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from transformer_nuggets import quant as quant, utils as utils, numerics as numerics
+from transformer_nuggets import utils as utils, numerics as numerics
 import logging
 
 DATA_DIR = Path(__file__).parent.parent / "data"

@@ -40,9 +40,6 @@ dev = [
     "docstring-parser",
 ]
 
-qlora = ['bitsandbytes']
-flash = ['triton']
-
 llama = [
     "sentencepiece==0.1.99",
     "datasets==2.15.0",
@@ -91,6 +88,12 @@ exclude = [
     "node_modules",
     "site-packages",
     "venv",
+]
+
+[tool.pytest.ini_options]
+addopts = "-m 'not slow'"
+markers = [
+    "slow: long-running tests skipped by default; run with `pytest -m slow`",
 ]
 
 [tool.ruff.lint]
