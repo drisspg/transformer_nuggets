@@ -27,6 +27,7 @@ dependencies = [
     "pandas",
     "seaborn",
     "typer",
+    "jinja2",
 ]
 
 [project.optional-dependencies]

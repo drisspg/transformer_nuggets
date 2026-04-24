@@ -11,13 +11,13 @@ from transformer_nuggets.export_autograd_triton import (
     export_autograd_triton,
     load_exported_module,
 )
-from transformer_nuggets.utils.benchmark import benchmark_cuda_function_in_microseconds
+from transformer_nuggets.utils.benchmark import benchmark_cuda_function_in_microseconds_triton
 
 
 HIDDEN_SIZE = 4096
 SAMPLE_TOKENS = 128
 MAX_TOKENS = 2048
-BENCHMARK_TOKENS = 512
+TOKEN_COUNTS = (1, 17, SAMPLE_TOKENS, 512)
 DTYPE = torch.bfloat16
 EPS = 1e-5
 
@@ -99,7 +99,7 @@ def _export_rms_norm(
 
 
 def _validate(compiled_fn: Callable, weight: torch.Tensor) -> None:
-    for tokens in (1, 17, SAMPLE_TOKENS, BENCHMARK_TOKENS):
+    for tokens in TOKEN_COUNTS:
         runtime_x = torch.randn(
             tokens,
             HIDDEN_SIZE,
@@ -122,26 +122,26 @@ def _validate(compiled_fn: Callable, weight: torch.Tensor) -> None:
 
 
 def _benchmark_memory_bandwidth(label: str, compiled_fn: Callable, weight: torch.Tensor) -> None:
-    benchmark_x = torch.randn(
-        BENCHMARK_TOKENS,
-        HIDDEN_SIZE,
-        device="cuda",
-        dtype=DTYPE,
-    )
+    print("forward bandwidth (assumes 2 x reads + 1 weight read + 1 output write):")
+    for tokens in TOKEN_COUNTS:
+        benchmark_x = torch.randn(
+            tokens,
+            HIDDEN_SIZE,
+            device="cuda",
+            dtype=DTYPE,
+        )
 
-    def run_forward():
-        with torch.no_grad():
-            return compiled_fn(benchmark_x, weight, eps=EPS)
+        def run_forward():
+            with torch.no_grad():
+                return compiled_fn(benchmark_x, weight, eps=EPS)
 
-    time_us = benchmark_cuda_function_in_microseconds(run_forward, NUM_ITERS=100)
-    bandwidth_gb_s = _forward_memory_bytes(benchmark_x) / (time_us * 1e-6) / 1e9
-    print(
-        f"{label} forward: {time_us:.2f} us, ~{bandwidth_gb_s:.1f} GB/s effective memory bandwidth"
-    )
+        time_us = benchmark_cuda_function_in_microseconds_triton(run_forward)
+        bandwidth_gb_s = _forward_memory_bytes(benchmark_x) / (time_us * 1e-6) / 1e9
+        print(f"  tokens={tokens}: {time_us:.2f} us, ~{bandwidth_gb_s:.1f} GB/s")
 
 
 def _forward_memory_bytes(x: torch.Tensor) -> int:
-    return 3 * x.numel() * x.element_size()
+    return 4 * x.numel() * x.element_size()
 
 
 def _print_artifact_summary(output_path: Path) -> None:
