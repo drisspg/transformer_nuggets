@@ -1,5 +1,6 @@
 import ctypes
 import ctypes.util
+import inspect
 import logging
 import os
 import random
@@ -245,12 +246,78 @@ class CudaBenchmarkStats:
         return self.quantiles_us[2]
 
 
+def _call_do_bench_using_profiling(
+    fn: Callable[[], object],
+    *,
+    rep: int,
+    is_vetted_benchmarking: bool,
+) -> float:
+    """Call Inductor's profiler benchmark across torch versions.
+
+    Torch versions differ in whether ``do_bench_using_profiling`` accepts the
+    ``is_vetted_benchmarking`` kwarg. Detect that at runtime so the benchmark
+    helper works on both older and newer torch builds.
+    """
+    params = inspect.signature(do_bench_using_profiling).parameters
+    call_kwargs = {"rep": rep}
+    if "is_vetted_benchmarking" in params:
+        call_kwargs["is_vetted_benchmarking"] = is_vetted_benchmarking
+    return do_bench_using_profiling(fn, **call_kwargs)
+
+
+
+def _benchmark_cuda_graph_replay_samples_us(
+    func: Callable,
+    *args,
+    **kwargs,
+) -> list[float]:
+    """Capture one CUDA graph and return per-replay CUDA-event timings in us.
+
+    This measures steady-state replay latency. It intentionally excludes host
+    launch gaps that dominate tiny eager kernels. Any GPU-side work inside the
+    captured callable is included. Host-to-device copy-in from CPU tensors is
+    not represented unless the callable stages data into static GPU buffers as
+    part of the captured region.
+    """
+    num_iters = kwargs.pop("NUM_ITERS", 100)
+    warmup_iters = kwargs.pop("CUDAGRAPH_WARMUP_ITERS", max(10, min(25, num_iters)))
+    lock = kwargs.pop("LOCK_CLOCKS", False)
+    ctx = locked_clocks() if lock else nullcontext()
+    with ctx:
+        no_args = lambda: func(*args, **kwargs)
+        for _ in range(warmup_iters):
+            no_args()
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            no_args()
+        torch.cuda.synchronize()
+
+        for _ in range(warmup_iters):
+            graph.replay()
+        torch.cuda.synchronize()
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        samples_us = []
+        for _ in range(num_iters):
+            start.record()
+            graph.replay()
+            end.record()
+            torch.cuda.synchronize()
+            samples_us.append(start.elapsed_time(end) * 1e3)
+        return samples_us
+
+
+
 def benchmark_cuda_function_stats(func: Callable, *args, **kwargs) -> CudaBenchmarkStats:
     """Benchmark a CUDA callable and return median-centered summary stats.
 
-    This collects per-iteration timings from Inductor's GPU benchmarker and
-    returns the raw samples, the sample median, a bootstrap confidence interval
-    for that median, and `(p05, p50, p95)` sample quantiles.
+    By default this collects per-iteration timings from Inductor's GPU
+    benchmarker. With ``USE_CUDA_GRAPHS=True`` it instead captures one static
+    CUDA graph and returns per-replay timings, which is often closer to NCU for
+    tiny static kernels.
 
     Args:
         func: Callable to benchmark.
@@ -259,7 +326,8 @@ def benchmark_cuda_function_stats(func: Callable, *args, **kwargs) -> CudaBenchm
             ``func``. The following benchmark-control keys are consumed by this
             helper before calling ``func``: ``NUM_ITERS``,
             ``MEMORY_WARMUP_ITERS``, ``CONFIDENCE``, ``N_RESAMPLES``, ``SEED``,
-            and ``IS_VETTED_BENCHMARKING``.
+            ``IS_VETTED_BENCHMARKING``, ``LOCK_CLOCKS``, ``USE_CUDA_GRAPHS``,
+            and ``CUDAGRAPH_WARMUP_ITERS``.
 
     Returns:
         CudaBenchmarkStats with raw samples, the sample median, a bootstrap
@@ -271,19 +339,6 @@ def benchmark_cuda_function_stats(func: Callable, *args, **kwargs) -> CudaBenchm
         after warmup, when samples are not dominated by obvious drift or phase
         changes such as autotuning, thermal throttling, or one-time allocator
         effects.
-
-    Examples:
-        Basic usage::
-
-            stats = benchmark_cuda_function_stats(lambda: kernel(x, y), NUM_ITERS=200)
-            print(stats.median_us)
-            print(stats.median_ci_us)
-            print(stats.quantiles_us)
-
-        With locked clocks::
-
-            with locked_clocks():
-                stats = benchmark_cuda_function_stats(lambda: kernel(x, y), NUM_ITERS=200)
     """
     num_iters = kwargs.pop("NUM_ITERS", 100)
     memory_warmup_iters = kwargs.pop("MEMORY_WARMUP_ITERS", 100)
@@ -291,16 +346,39 @@ def benchmark_cuda_function_stats(func: Callable, *args, **kwargs) -> CudaBenchm
     n_resamples = kwargs.pop("N_RESAMPLES", 1000)
     seed = kwargs.pop("SEED", 0)
     is_vetted_benchmarking = kwargs.pop("IS_VETTED_BENCHMARKING", False)
-    no_args = lambda: func(*args, **kwargs)
-    from torch._inductor.runtime.benchmarking import benchmarker
+    use_cuda_graphs = kwargs.pop("USE_CUDA_GRAPHS", False)
 
-    samples_ms = benchmarker.benchmark_gpu(
-        no_args,
-        benchmark_iters=num_iters,
-        memory_warmup_iters=memory_warmup_iters,
-        return_mode="all",
-        is_vetted_benchmarking=is_vetted_benchmarking,
-    )
+    if use_cuda_graphs:
+        samples_us = _benchmark_cuda_graph_replay_samples_us(
+            func,
+            *args,
+            NUM_ITERS=num_iters,
+            CUDAGRAPH_WARMUP_ITERS=kwargs.pop(
+                "CUDAGRAPH_WARMUP_ITERS", memory_warmup_iters
+            ),
+            LOCK_CLOCKS=kwargs.pop("LOCK_CLOCKS", False),
+            **kwargs,
+        )
+        return CudaBenchmarkStats.from_samples(
+            samples_us,
+            confidence=confidence,
+            n_resamples=n_resamples,
+            seed=seed,
+        )
+
+    lock = kwargs.pop("LOCK_CLOCKS", False)
+    ctx = locked_clocks() if lock else nullcontext()
+    with ctx:
+        no_args = lambda: func(*args, **kwargs)
+        from torch._inductor.runtime.benchmarking import benchmarker
+
+        samples_ms = benchmarker.benchmark_gpu(
+            no_args,
+            benchmark_iters=num_iters,
+            memory_warmup_iters=memory_warmup_iters,
+            return_mode="all",
+            is_vetted_benchmarking=is_vetted_benchmarking,
+        )
     return CudaBenchmarkStats.from_samples(
         (float(sample) * 1e3 for sample in samples_ms),
         confidence=confidence,
@@ -323,20 +401,43 @@ def benchmark_torch_function_in_microseconds(func: Callable, *args, **kwargs) ->
 
 
 def benchmark_cuda_function_in_microseconds(func: Callable, *args, **kwargs) -> float:
-    """Thin wrapper around do_bench_using_profiling.
+    """Benchmark a CUDA callable and return median latency in microseconds.
 
-    Accepts NUM_ITERS, IS_VETTED_BENCHMARKING, and lock_clocks as kwargs but
-    removes them before calling func so they never leak into the benchmarked callable.
+    By default this uses Inductor's profiler-based benchmark helper. With
+    ``USE_CUDA_GRAPHS=True`` it instead captures one static CUDA graph and times
+    replay latency with CUDA events.
+
+    Consumed benchmark kwargs:
+      - ``NUM_ITERS``
+      - ``IS_VETTED_BENCHMARKING``
+      - ``LOCK_CLOCKS``
+      - ``USE_CUDA_GRAPHS``
+      - ``CUDAGRAPH_WARMUP_ITERS``
     """
     num_iters = kwargs.pop("NUM_ITERS", 100)
     is_vetted_benchmarking = kwargs.pop("IS_VETTED_BENCHMARKING", False)
+    use_cuda_graphs = kwargs.pop("USE_CUDA_GRAPHS", False)
+
+    if use_cuda_graphs:
+        samples_us = _benchmark_cuda_graph_replay_samples_us(
+            func,
+            *args,
+            NUM_ITERS=num_iters,
+            LOCK_CLOCKS=kwargs.pop("LOCK_CLOCKS", False),
+            CUDAGRAPH_WARMUP_ITERS=kwargs.pop("CUDAGRAPH_WARMUP_ITERS", max(10, min(25, num_iters))),
+            **kwargs,
+        )
+        return statistics.median(samples_us)
+
     lock = kwargs.pop("LOCK_CLOCKS", False)
     ctx = locked_clocks() if lock else nullcontext()
     with ctx:
         no_args = lambda: func(*args, **kwargs)
         return (
-            do_bench_using_profiling(
-                no_args, rep=num_iters, is_vetted_benchmarking=is_vetted_benchmarking
+            _call_do_bench_using_profiling(
+                no_args,
+                rep=num_iters,
+                is_vetted_benchmarking=is_vetted_benchmarking,
             )
             * 1e3
         )
