@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-import importlib.util
 from pathlib import Path
 
 import torch
 
-from transformer_nuggets.export_autograd_triton import Specialization, export_autograd_triton
+from transformer_nuggets.export_autograd_triton import (
+    Specialization,
+    export_autograd_triton,
+    load_exported_module,
+)
 
 
 def tiny_mlp(x, w1, w2, *, activation="relu"):
@@ -17,14 +20,6 @@ def tiny_mlp(x, w1, w2, *, activation="relu"):
     else:
         raise ValueError(f"unsupported activation: {activation}")
     return hidden @ w2
-
-
-def import_python_file(path: Path):
-    spec = importlib.util.spec_from_file_location(path.stem, path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
 
 
 def main():
@@ -50,7 +45,7 @@ def main():
         max_autotune=True,
     )
 
-    generated = import_python_file(output_path)
+    generated = load_exported_module(output_path)
     eager_x = x.detach().clone().requires_grad_()
     eager_w1 = w1.detach().clone().requires_grad_()
     eager_w2 = w2.detach().clone().requires_grad_()

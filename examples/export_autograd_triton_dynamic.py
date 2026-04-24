@@ -1,23 +1,18 @@
 from __future__ import annotations
 
-import importlib.util
 from pathlib import Path
 
 import torch
 
-from transformer_nuggets.export_autograd_triton import Specialization, export_autograd_triton
+from transformer_nuggets.export_autograd_triton import (
+    Specialization,
+    export_autograd_triton,
+    load_exported_module,
+)
 
 
 def affine_relu(x, w):
     return torch.relu(x @ w)
-
-
-def import_python_file(path: Path):
-    spec = importlib.util.spec_from_file_location(path.stem, path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
 
 
 def main():
@@ -38,15 +33,24 @@ def main():
             )
         ],
         out=output_path,
-        source_backend="inductor",
+        source_backend="clean_triton",
     )
 
-    generated = import_python_file(output_path)
+    generated = load_exported_module(output_path)
     for batch in (1, 4, 16):
-        dynamic_x = torch.randn(batch, 8, device="cuda", requires_grad=True)
-        eager = affine_relu(dynamic_x, w)
-        compiled = generated.affine_relu_compiled(dynamic_x, w)
+        eager_x = torch.randn(batch, 8, device="cuda", requires_grad=True)
+        compiled_x = eager_x.detach().clone().requires_grad_()
+        eager_w = w.detach().clone().requires_grad_()
+        compiled_w = w.detach().clone().requires_grad_()
+
+        eager = affine_relu(eager_x, eager_w)
+        compiled = generated.affine_relu_compiled(compiled_x, compiled_w)
         torch.testing.assert_close(compiled, eager)
+
+        eager_grads = torch.autograd.grad(eager.sum(), (eager_x, eager_w))
+        compiled_grads = torch.autograd.grad(compiled.sum(), (compiled_x, compiled_w))
+        for compiled_grad, eager_grad in zip(compiled_grads, eager_grads, strict=True):
+            torch.testing.assert_close(compiled_grad, eager_grad)
         print(f"batch={batch}: {compiled.shape}")
 
     print(f"generated file: {output_path}")

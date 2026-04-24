@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import inspect
 import os
 from pathlib import Path
@@ -8,7 +7,11 @@ from pathlib import Path
 import pytest
 import torch
 
-from transformer_nuggets.export_autograd_triton import Specialization, export_autograd_triton
+from transformer_nuggets.export_autograd_triton import (
+    Specialization,
+    export_autograd_triton,
+    load_exported_module,
+)
 
 os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
 
@@ -98,11 +101,7 @@ def _requires_export_runtime():
 
 
 def _import_generated(path: Path):
-    spec = importlib.util.spec_from_file_location(path.stem, path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+    return load_exported_module(path)
 
 
 def _clone_tensor(tensor):
@@ -521,13 +520,16 @@ def test_dynamic_batch_specialization_dispatches_across_batch_sizes(tmp_path):
             )
         ],
         generated_path,
-        source_backend="inductor",
+        source_backend="clean_triton",
     )
     module = _import_generated(generated_path)
-    assert "s" in "\n".join(
+    artifact_source = "\n".join(
         path.read_text()
         for path in generated_path.with_name("generated_dynamic_artifacts").glob("*.py")
     )
+    assert "@triton.jit" in artifact_source
+    assert "async_compile.triton" not in artifact_source
+    assert "triton.cdiv" in artifact_source
 
     for batch_size in (1, 7, 16):
         dynamic_x = torch.randn(batch_size, 8, device="cuda", requires_grad=True)
@@ -560,11 +562,12 @@ def test_dynamic_shape_limitations_are_explicitly_guarded(tmp_path):
     x = torch.randn(2, 4, device="cuda", requires_grad=True)
     w = torch.randn(4, 5, device="cuda", requires_grad=True)
 
-    with pytest.raises(ValueError, match="source_backend='inductor'"):
+    with pytest.raises(NotImplementedError, match="forward-only"):
         export_autograd_triton(
-            affine_activation,
-            [Specialization(args=(x, w), dynamic_shapes={"x": {0: "batch"}})],
-            tmp_path / "generated_dynamic_clean.py",
+            integer_tensor_output,
+            [Specialization(args=(x,), dynamic_shapes={"x": {0: "batch"}})],
+            tmp_path / "generated_dynamic_forward_only.py",
+            source_backend="inductor",
         )
 
     with pytest.raises(NotImplementedError, match="dynamic dim 0"):

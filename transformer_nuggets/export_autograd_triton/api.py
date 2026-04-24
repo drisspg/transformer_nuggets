@@ -37,11 +37,6 @@ def export_autograd_triton(
         raise ValueError("source_backend must be 'inductor' or 'clean_triton'")
     if not specializations:
         raise ValueError("At least one specialization is required")
-    if source_backend == "clean_triton" and any(
-        specialization.dynamic_shapes is not None for specialization in specializations
-    ):
-        raise ValueError("dynamic_shapes require source_backend='inductor' for now")
-
     config_patches = dict(inductor_config_patches or {})
     if max_autotune:
         config_patches["max_autotune"] = True

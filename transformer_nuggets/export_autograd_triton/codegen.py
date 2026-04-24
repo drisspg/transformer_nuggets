@@ -232,9 +232,38 @@ def _rewrite_module_as_clean_triton(path: Path) -> None:
     from torch.utils._get_clean_triton import get_clean_triton
 
     get_clean_triton(path.resolve(), path.resolve(), auto_generate_params=True)
+    _patch_dynamic_pointwise_grids(path)
     launch_params_path = Path(f"{path}.launch_params")
     if launch_params_path.exists():
         launch_params_path.unlink()
+
+
+def _patch_dynamic_pointwise_grids(path: Path) -> None:
+    source = path.read_text()
+    for xnumel_name in sorted(set(re.findall(r"(\w+_xnumel)\s*=", source))):
+        kernel_name = xnumel_name.removesuffix("_xnumel")
+        source = re.sub(
+            rf"{kernel_name}\[\(\d+, \d+, \d+\)\]\((?P<args>[^\n]*?), \d+, XBLOCK=(?P<xblock>\d+),",
+            lambda match: _dynamic_pointwise_launch_replacement(
+                kernel_name,
+                xnumel_name,
+                match,
+            ),
+            source,
+        )
+    path.write_text(source)
+
+
+def _dynamic_pointwise_launch_replacement(
+    kernel_name: str,
+    xnumel_name: str,
+    match: re.Match[str],
+) -> str:
+    xblock = match.group("xblock")
+    return (
+        f"{kernel_name}[(triton.cdiv({xnumel_name}, {xblock}), 1, 1)]("
+        f"{match.group('args')}, {xnumel_name}, XBLOCK={xblock},"
+    )
 
 
 def _generate_public_wrapper(exported_name: str, signature: inspect.Signature) -> str:
