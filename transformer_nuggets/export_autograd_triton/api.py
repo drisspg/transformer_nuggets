@@ -46,7 +46,12 @@ def export_autograd_triton(
     ]
     output_path = Path(out)
     public_name = exported_name or f"{fn.__name__}_compiled"
-    source = generate_autograd_source(fn, public_name, captured_specializations)
+    source = generate_autograd_source(
+        fn,
+        public_name,
+        captured_specializations,
+        artifact_dir_name=f"{output_path.stem}_artifacts",
+    )
     write_autograd_source(output_path, source, captured_specializations, source_backend)
     return ExportedAutogradSource(
         output_path=output_path,

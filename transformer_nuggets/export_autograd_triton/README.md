@@ -55,18 +55,29 @@ agent_space/generated_rms_norm_artifacts/
   spec_0_backward.py
 ```
 
-The top-level generated wrapper is intentionally small. It contains:
+The top-level generated wrapper is intentionally small and labeled, but keeps the autograd node
+visible. It contains:
 
-- `_SPECS`: specialization metadata and tensor guards
+- a generated artifact index with direct relative paths to each forward/backward artifact
+- one `_SPEC_<n>` block per specialization, with metadata and tensor guards
+- `_SPECS`: the ordered specialization list used for dispatch
 - `_RUNTIME = ExportedAutogradRuntime(...)`
-- one public function such as `rms_norm_compiled(...)`
+- one explicit `torch.autograd.Function` subclass whose `forward` and `backward` call the
+  generated artifact runners through the runtime helper
+- one documented public function such as `rms_norm_compiled(...)` that selects a specialization,
+  gathers runtime tensors, and invokes the generated autograd function
+
+Artifact files start with a short generated-artifact docstring that names the specialization,
+forward/backward direction, runtime tensor order, static arguments, tensor guards, output
+metadata, and saved-residual order. The artifact directory is recreated on each export so stale
+kernels from earlier runs do not hang around.
 
 Shared runtime behavior lives in `runtime.py`, not in every generated file:
 
 - artifact module loading
 - specialization dispatch
 - static/tensor guard checking
-- generated autograd function
+- autograd forward/backward helper plumbing
 - saved residual reordering for backward graphs
 - non-differentiable output marking
 - no-match diagnostics
@@ -89,7 +100,10 @@ Use this when:
 
 Runs `torch.utils._get_clean_triton.get_clean_triton(...)` and then applies the dynamic-clean validation/patching layer in `clean_triton.py`.
 
-The goal is readable inline `@triton.jit` artifacts without `async_compile.triton(...)` while preserving dynamic launch arguments.
+The goal is readable inline `@triton.jit` artifacts without `async_compile.triton(...)` while
+preserving dynamic launch arguments. The cleaner also removes unused imports/top-level aliases,
+standalone benchmark scaffolding (`get_args`, `benchmark_compiled_module`,
+`if __name__ == "__main__"`), and formats patched dynamic launches as multiline Triton calls.
 
 Supported dynamic clean families today:
 
@@ -229,6 +243,5 @@ python examples/export_autograd_triton/dynamic.py
 - Symbolic stride guards for broader dynamic layouts
 - Dynamic CUDA device ordinal support
 - More dynamic clean-Triton families and variants as Inductor output changes
-- Cleaner metadata formatting in generated wrappers if `_SPECS` grows large
+- Semantic names for common generated symbols such as `arg0_1`, `buf*`, and `s*`
 - Optional Nsight Compute-based bandwidth measurement for exact HBM traffic
-- Tests that compare generated wrapper readability/size directly

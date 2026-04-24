@@ -57,6 +57,7 @@ def clean_triton_source(
     dynamic: bool,
     original_source: str | None = None,
 ) -> CleanTritonResult:
+    source = _cleanup_clean_source(_strip_benchmark_tail(source))
     if not dynamic:
         return CleanTritonResult(source=source, patched_launches=[], unsupported_launches=[])
 
@@ -195,12 +196,13 @@ def _template_launch_patch(
         return None
 
     grid_args = raw_args[len(launch.call.args) : len(launch.call.args) + 3]
-    args = [*positional_args, *keyword_args]
+    args = [arg for arg in [*positional_args, *keyword_args] if arg is not None]
     return _Patch(
         start=_node_start(line_offsets, launch.call),
         end=_node_end(line_offsets, launch.call),
-        replacement=f"{launch.kernel_name}[({', '.join(grid_args)})]("
-        f"{', '.join(arg for arg in args if arg is not None)})",
+        replacement=_format_triton_launch(
+            launch.kernel_name, grid_args, args, launch.call.col_offset
+        ),
         kernel_name=launch.kernel_name,
     )
 
@@ -238,17 +240,238 @@ def _numel_launch_patch(
     if any(keyword is None for keyword in keyword_args):
         return None
 
-    args = [*positional_args, *keyword_args]
-    replacement = (
-        f"{launch.kernel_name}[(triton.cdiv({numel_expression}, {xblock}), 1, 1)]("
-        f"{', '.join(arg for arg in args if arg is not None)})"
-    )
+    args = [arg for arg in [*positional_args, *keyword_args] if arg is not None]
     return _Patch(
         start=_node_start(line_offsets, launch.call),
         end=_node_end(line_offsets, launch.call),
-        replacement=replacement,
+        replacement=_format_triton_launch(
+            launch.kernel_name,
+            [f"triton.cdiv({numel_expression}, {xblock})", "1", "1"],
+            args,
+            launch.call.col_offset,
+        ),
         kernel_name=launch.kernel_name,
     )
+
+
+def _format_triton_launch(
+    kernel_name: str,
+    grid_args: list[str],
+    args: list[str],
+    indent_columns: int,
+) -> str:
+    indent = " " * indent_columns
+    inner_indent = " " * (indent_columns + 4)
+    grid = "\n".join(f"{inner_indent}{arg}," for arg in grid_args)
+    call_args = "\n".join(f"{inner_indent}{arg}," for arg in args)
+    return f"{kernel_name}[(\n{grid}\n{indent})](\n{call_args}\n{indent})"
+
+
+def _strip_benchmark_tail(source: str) -> str:
+    marker = "\n\ndef get_args():\n"
+    index = source.rfind(marker)
+    if index == -1:
+        return source
+    tail = source[index:]
+    try:
+        body = ast.parse(tail).body
+    except SyntaxError:
+        return source
+    if len(body) != 3:
+        return source
+    if not _is_function_named(body[0], "get_args"):
+        return source
+    if not _is_function_named(body[1], "benchmark_compiled_module"):
+        return source
+    if not _is_main_guard(body[2]):
+        return source
+    return source[:index].rstrip() + "\n"
+
+
+def _is_function_named(node: ast.AST, name: str) -> bool:
+    return isinstance(node, ast.FunctionDef) and node.name == name
+
+
+def _is_main_guard(node: ast.AST) -> bool:
+    if not isinstance(node, ast.If):
+        return False
+    test = node.test
+    return (
+        isinstance(test, ast.Compare)
+        and isinstance(test.left, ast.Name)
+        and test.left.id == "__name__"
+        and len(test.ops) == 1
+        and isinstance(test.ops[0], ast.Eq)
+        and len(test.comparators) == 1
+        and isinstance(test.comparators[0], ast.Constant)
+        and test.comparators[0].value == "__main__"
+    )
+
+
+def _cleanup_clean_source(source: str) -> str:
+    return _collapse_blank_runs(
+        _remove_unused_top_level_assignments(
+            _remove_unused_imports(_prune_unused_import_aliases(_remove_duplicate_imports(source)))
+        )
+    )
+
+
+def _remove_duplicate_imports(source: str) -> str:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+    seen = set()
+    removable_lines = set()
+    for node in tree.body:
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        key = ast.get_source_segment(source, node)
+        if key is None:
+            continue
+        if key in seen:
+            removable_lines.update(range(node.lineno, node.end_lineno + 1))
+        else:
+            seen.add(key)
+    return _remove_lines(source, removable_lines)
+
+
+def _prune_unused_import_aliases(source: str) -> str:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+    loaded_names = _loaded_names(tree)
+    replacements = {}
+    for node in tree.body:
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        if node.lineno != node.end_lineno:
+            continue
+        used_aliases = [alias for alias in node.names if _imported_name(alias) in loaded_names]
+        if not used_aliases or len(used_aliases) == len(node.names):
+            continue
+        replacements[node.lineno] = _format_import_node(node, used_aliases)
+    if not replacements:
+        return source
+    lines = source.splitlines()
+    for line_number, replacement in replacements.items():
+        lines[line_number - 1] = replacement
+    return "\n".join(lines) + "\n"
+
+
+def _format_import_node(node: ast.Import | ast.ImportFrom, aliases: list[ast.alias]) -> str:
+    if isinstance(node, ast.Import):
+        return "import " + ", ".join(_format_import_alias(alias) for alias in aliases)
+    module = "." * node.level + (node.module or "")
+    return f"from {module} import " + ", ".join(_format_import_alias(alias) for alias in aliases)
+
+
+def _format_import_alias(alias: ast.alias) -> str:
+    if alias.asname is None:
+        return alias.name
+    return f"{alias.name} as {alias.asname}"
+
+
+def _remove_unused_imports(source: str) -> str:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+    loaded_names = _loaded_names(tree)
+    removable_lines = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import) and _all_import_aliases_unused(node.names, loaded_names):
+            removable_lines.update(range(node.lineno, node.end_lineno + 1))
+        elif isinstance(node, ast.ImportFrom) and _all_import_aliases_unused(
+            node.names, loaded_names
+        ):
+            removable_lines.update(range(node.lineno, node.end_lineno + 1))
+    return _remove_lines(source, removable_lines)
+
+
+def _remove_unused_top_level_assignments(source: str) -> str:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+    loaded_names = _loaded_names(tree)
+    removable_lines = set()
+    for node in tree.body:
+        target_name = _single_assignment_target_name(node)
+        if target_name is None or target_name in {"call", "recursively_apply_fns"}:
+            continue
+        if target_name in loaded_names or _assignment_may_have_side_effects(node):
+            continue
+        removable_lines.update(range(node.lineno, node.end_lineno + 1))
+    return _remove_lines(source, removable_lines)
+
+
+def _single_assignment_target_name(node: ast.AST) -> str | None:
+    if (
+        isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+    ):
+        return node.targets[0].id
+    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        return node.target.id
+    return None
+
+
+def _assignment_may_have_side_effects(node: ast.AST) -> bool:
+    value = node.value if isinstance(node, (ast.Assign, ast.AnnAssign)) else None
+    if value is None:
+        return False
+    return any(
+        isinstance(child, (ast.Call, ast.Yield, ast.YieldFrom, ast.Await))
+        for child in ast.walk(value)
+    )
+
+
+def _remove_lines(source: str, removable_lines: set[int]) -> str:
+    if not removable_lines:
+        return source
+    return (
+        "\n".join(
+            line
+            for line_number, line in enumerate(source.splitlines(), start=1)
+            if line_number not in removable_lines
+        )
+        + "\n"
+    )
+
+
+def _loaded_names(tree: ast.AST) -> set[str]:
+    return {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    }
+
+
+def _all_import_aliases_unused(aliases: list[ast.alias], loaded_names: set[str]) -> bool:
+    return all(_imported_name(alias) not in loaded_names for alias in aliases)
+
+
+def _imported_name(alias: ast.alias) -> str:
+    if alias.asname is not None:
+        return alias.asname
+    return alias.name.split(".", 1)[0]
+
+
+def _collapse_blank_runs(source: str) -> str:
+    lines = source.splitlines()
+    collapsed = []
+    blank_count = 0
+    for line in lines:
+        if line.strip():
+            blank_count = 0
+            collapsed.append(line)
+        elif blank_count < 1:
+            blank_count += 1
+            collapsed.append(line)
+    return "\n".join(collapsed).rstrip() + "\n"
 
 
 def _patched_positional_args(
