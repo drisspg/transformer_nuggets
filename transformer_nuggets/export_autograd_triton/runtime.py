@@ -14,15 +14,15 @@ class ExportedAutogradRuntime:
         self.forward_runners = [self._load_runner(spec["forward_module"]) for spec in specs]
         self.backward_runners = [self._load_runner(spec["backward_module"]) for spec in specs]
 
-    def run_with_bound_args(self, bound_args: dict[str, Any]) -> Any:
+    def run_with_bound_args(self, bound_args: dict[str, Any], autograd_function: Any) -> Any:
         spec_id = self.select_spec(bound_args)
         runtime_tensors = self.runtime_tensors(spec_id, bound_args)
-        if self.needs_autograd(spec_id):
-            return self.restore_output_container(
-                spec_id,
-                _CompiledAutogradFunction.apply(self, spec_id, *runtime_tensors),
-            )
-        return self.run_forward_only(spec_id, runtime_tensors)
+        if not self.needs_autograd(spec_id):
+            return self.run_forward_only(spec_id, runtime_tensors)
+        return self.restore_output_container(
+            spec_id,
+            autograd_function.apply(spec_id, *runtime_tensors),
+        )
 
     def select_spec(self, bound_args: dict[str, Any]) -> int:
         return self._select_spec(bound_args)
@@ -150,76 +150,6 @@ class ExportedAutogradRuntime:
                 f"Ambiguous export_autograd_triton specializations matched: {names}"
             )
         raise RuntimeError(_format_no_match(bound_args, failures))
-
-
-class _CompiledAutogradFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, runtime: ExportedAutogradRuntime, spec_id: int, *runtime_tensors):
-        spec = runtime.specs[spec_id]
-        outputs = runtime.forward_runners[spec_id](list(runtime_tensors))
-        if not isinstance(outputs, tuple):
-            outputs = tuple(outputs)
-        user_outputs = outputs[: spec["num_user_outputs"]]
-        residuals = outputs[spec["num_user_outputs"] :]
-        named_residuals = tuple(zip(spec["forward_residual_names"], residuals, strict=True))
-        ctx.runtime = runtime
-        ctx.spec_id = spec_id
-        ctx.runtime_tensor_count = len(runtime_tensors)
-        ctx.saved_tensor_residual_names = tuple(
-            name for name, residual in named_residuals if isinstance(residual, torch.Tensor)
-        )
-        ctx.saved_non_tensor_residuals = {
-            name: residual
-            for name, residual in named_residuals
-            if not isinstance(residual, torch.Tensor)
-        }
-        ctx.save_for_backward(
-            *(residual for _, residual in named_residuals if isinstance(residual, torch.Tensor))
-        )
-        non_differentiable_outputs = tuple(
-            output
-            for output, is_differentiable in zip(
-                user_outputs,
-                spec["differentiable_output_mask"],
-                strict=True,
-            )
-            if isinstance(output, torch.Tensor) and not is_differentiable
-        )
-        if non_differentiable_outputs:
-            ctx.mark_non_differentiable(*non_differentiable_outputs)
-        if spec["output_kind"] == "single":
-            return user_outputs[0]
-        return tuple(user_outputs)
-
-    @staticmethod
-    def backward(ctx, *grad_outputs):
-        runtime = ctx.runtime
-        spec = runtime.specs[ctx.spec_id]
-        grad_outputs = tuple(
-            grad_output.contiguous() if isinstance(grad_output, torch.Tensor) else grad_output
-            for index, grad_output in enumerate(grad_outputs)
-            if spec["differentiable_output_mask"][index]
-        )
-        backward_runner = runtime.backward_runners[ctx.spec_id]
-        if backward_runner is None:
-            raise RuntimeError(
-                "Selected export_autograd_triton specialization has no backward graph"
-            )
-        saved_residuals = dict(ctx.saved_non_tensor_residuals)
-        saved_residuals.update(
-            zip(ctx.saved_tensor_residual_names, ctx.saved_tensors, strict=True)
-        )
-        backward_saved_inputs = tuple(
-            saved_residuals[name] for name in spec["backward_saved_input_names"]
-        )
-        grads = backward_runner(list(backward_saved_inputs + grad_outputs))
-        if not isinstance(grads, tuple):
-            grads = tuple(grads)
-        if len(grads) < ctx.runtime_tensor_count:
-            grads = grads + (None,) * (ctx.runtime_tensor_count - len(grads))
-        if len(grads) > ctx.runtime_tensor_count:
-            grads = grads[: ctx.runtime_tensor_count]
-        return (None, None, *grads)
 
 
 def _mismatch_reasons(spec: dict[str, Any], bound_args: dict[str, Any]) -> list[str]:

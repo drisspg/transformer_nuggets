@@ -93,18 +93,22 @@ def _capture_specialization(
     if not runtime_tensor_names:
         raise ValueError("A specialization must include at least one Tensor argument")
 
+    normalized_dynamic_shapes = _normalize_dynamic_shapes(
+        specialization.dynamic_shapes,
+        runtime_tensor_names,
+    )
     static_args = tuple(
         validate_static_value(name, value)
         for name, value in bound.arguments.items()
         if not isinstance(value, torch.Tensor)
     )
     tensor_guards = tuple(
-        tensor_guard_for(
-            name,
-            bound.arguments[name],
-            _dynamic_shape_for(specialization.dynamic_shapes, name),
+        tensor_guard_for(name, bound.arguments[name], dynamic_shape)
+        for name, dynamic_shape in zip(
+            runtime_tensor_names,
+            normalized_dynamic_shapes or (None,) * len(runtime_tensor_names),
+            strict=True,
         )
-        for name in runtime_tensor_names
     )
 
     def tensor_only_fn(*runtime_tensors: torch.Tensor) -> Any:
@@ -116,16 +120,13 @@ def _capture_specialization(
         arguments.update(zip(runtime_tensor_names, runtime_tensors, strict=True))
         return _call_with_bound_arguments(fn, signature, arguments)
 
-    dynamic = specialization.dynamic_shapes is not None
+    dynamic = normalized_dynamic_shapes is not None
     compiled_sources = capture_compiled_autograd_sources(
         tensor_only_fn,
         tuple(bound.arguments[name] for name in runtime_tensor_names),
         inductor_config_patches=inductor_config_patches,
         dynamic=dynamic,
-        dynamic_shapes=_runtime_dynamic_shapes(
-            specialization.dynamic_shapes,
-            runtime_tensor_names,
-        ),
+        dynamic_shapes=normalized_dynamic_shapes,
     )
     return CapturedSpecialization(
         name=specialization.name or f"spec_{index}",
@@ -148,22 +149,18 @@ def _capture_specialization(
     )
 
 
-def _dynamic_shape_for(dynamic_shapes: Any | None, name: str) -> Any | None:
-    if dynamic_shapes is None:
-        return None
-    if not isinstance(dynamic_shapes, dict):
-        raise TypeError("dynamic_shapes must be a dict keyed by argument name")
-    return dynamic_shapes.get(name)
-
-
-def _runtime_dynamic_shapes(
+def _normalize_dynamic_shapes(
     dynamic_shapes: Any | None,
     runtime_tensor_names: tuple[str, ...],
-) -> Any | None:
+) -> tuple[Any | None, ...] | None:
     if dynamic_shapes is None:
         return None
     if not isinstance(dynamic_shapes, dict):
         raise TypeError("dynamic_shapes must be a dict keyed by argument name")
+    unknown_names = set(dynamic_shapes) - set(runtime_tensor_names)
+    if unknown_names:
+        names = ", ".join(sorted(str(name) for name in unknown_names))
+        raise ValueError(f"dynamic_shapes contains unknown Tensor argument names: {names}")
     return tuple(dynamic_shapes.get(name) for name in runtime_tensor_names)
 
 

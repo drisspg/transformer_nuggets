@@ -67,6 +67,14 @@ def trig_pointwise(x):
     return torch.sin(x) + torch.cos(x)
 
 
+def shared_batch_pointwise(x, y):
+    return torch.sin(x) + torch.cos(y)
+
+
+def dict_output(x):
+    return {"y": torch.sin(x)}
+
+
 def sum_last_dim(x):
     return x.sum(dim=-1)
 
@@ -291,10 +299,9 @@ def test_generated_wrapper_source_is_labeled_and_splits_specs():
     assert "return _RUNTIME.autograd_forward(ctx, spec_id, runtime_tensors)" in source
     assert "return _RUNTIME.autograd_backward(ctx, *grad_outputs)" in source
     assert (
-        "result = _TrigPointwiseCompiledAutogradFunction.apply(spec_id, *runtime_tensors)"
+        "return _RUNTIME.run_with_bound_args(locals(), _TrigPointwiseCompiledAutogradFunction)"
         in source
     )
-    assert "return _RUNTIME.restore_output_container(spec_id, result)" in source
     assert "Run the exported autograd/Triton specialization" in source
 
 
@@ -380,6 +387,40 @@ def test_artifact_header_escapes_docstring_metadata(tmp_path):
     artifact_source = artifact_path.read_text()
     compile(artifact_source, str(artifact_path), "exec")
     assert 'Specialization: bad\\"\\"\\"name\\nline' in artifact_source
+
+
+def test_rejects_unknown_dynamic_shape_argument_name(tmp_path):
+    x = torch.randn(2, 4, requires_grad=True)
+    w = torch.randn(4, 5, requires_grad=True)
+
+    with pytest.raises(ValueError, match="unknown Tensor argument names: missing"):
+        export_autograd_triton(
+            affine_activation,
+            [Specialization(args=(x, w), dynamic_shapes={"missing": {0: "batch"}})],
+            tmp_path / "generated_unknown_dynamic.py",
+        )
+
+
+def test_rejects_unsupported_static_container(tmp_path):
+    x = torch.randn(2, 4, requires_grad=True)
+
+    with pytest.raises(TypeError, match="Static argument 'factors' has unsupported value"):
+        export_autograd_triton(
+            mixed_tensor_and_static_tuple,
+            [Specialization(args=(x,), kwargs={"factors": [2, 3]})],
+            tmp_path / "generated_bad_static.py",
+        )
+
+
+def test_rejects_unsupported_output_container(tmp_path):
+    x = torch.randn(2, 4, requires_grad=True)
+
+    with pytest.raises(TypeError, match="only supports a Tensor, tuple"):
+        export_autograd_triton(
+            dict_output,
+            [Specialization(args=(x,))],
+            tmp_path / "generated_dict_output.py",
+        )
 
 
 def test_export_static_specialization_forward_backward_signature_and_errors(tmp_path):
@@ -760,6 +801,67 @@ def test_dynamic_batch_specialization_dispatches_across_batch_sizes(tmp_path):
             w,
             activation="relu",
         )
+
+
+def test_dynamic_shared_symbol_across_tensor_guards(tmp_path):
+    _requires_export_runtime()
+    batch = torch.export.Dim("batch", min=1, max=16)
+    x = torch.randn(4, 8, device="cuda", requires_grad=True)
+    y = torch.randn(4, 8, device="cuda", requires_grad=True)
+    generated_path = tmp_path / "generated_dynamic_shared_symbol.py"
+
+    export_autograd_triton(
+        shared_batch_pointwise,
+        [
+            Specialization(
+                args=(x, y),
+                dynamic_shapes={"x": {0: batch}, "y": {0: batch}},
+                name="shared_batch",
+            )
+        ],
+        generated_path,
+        source_backend="inductor",
+    )
+    module = _import_generated(generated_path)
+
+    for batch_size in (1, 7, 16):
+        _compare_eager_and_compiled(
+            shared_batch_pointwise,
+            module.shared_batch_pointwise_compiled,
+            (
+                torch.randn(batch_size, 8, device="cuda", requires_grad=True),
+                torch.randn(batch_size, 8, device="cuda", requires_grad=True),
+            ),
+        )
+
+    with pytest.raises(RuntimeError, match="does not equal batch=4"):
+        module.shared_batch_pointwise_compiled(
+            torch.randn(4, 8, device="cuda", requires_grad=True),
+            torch.randn(5, 8, device="cuda", requires_grad=True),
+        )
+
+
+def test_dynamic_stride_and_device_mismatch_diagnostics(tmp_path):
+    _requires_export_runtime()
+    batch = torch.export.Dim("batch", min=1, max=16)
+    x = torch.randn(4, 8, device="cuda", requires_grad=True)
+    generated_path = tmp_path / "generated_dynamic_guard_diagnostics.py"
+
+    export_autograd_triton(
+        trig_pointwise,
+        [Specialization(args=(x,), dynamic_shapes={"x": {0: batch}})],
+        generated_path,
+        source_backend="inductor",
+    )
+    module = _import_generated(generated_path)
+
+    with pytest.raises(RuntimeError, match="stride"):
+        module.trig_pointwise_compiled(
+            torch.randn(4, 16, device="cuda", requires_grad=True)[:, ::2]
+        )
+
+    with pytest.raises(RuntimeError, match="device type cpu != cuda"):
+        module.trig_pointwise_compiled(torch.randn(4, 8, requires_grad=True))
 
 
 def test_dynamic_clean_triton_view_residual_ordering(tmp_path):

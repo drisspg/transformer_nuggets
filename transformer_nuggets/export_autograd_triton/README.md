@@ -64,8 +64,8 @@ visible. It contains:
 - `_RUNTIME = ExportedAutogradRuntime(...)`
 - one explicit `torch.autograd.Function` subclass whose `forward` and `backward` call the
   generated artifact runners through the runtime helper
-- one documented public function such as `rms_norm_compiled(...)` that selects a specialization,
-  gathers runtime tensors, and invokes the generated autograd function
+- one documented public function such as `rms_norm_compiled(...)` that binds the public
+  signature and delegates dispatch/execution to the shared runtime
 
 Artifact files start with a short generated-artifact docstring that names the specialization,
 forward/backward direction, runtime tensor order, static arguments, tensor guards, output
@@ -122,6 +122,7 @@ Current supported dynamic shape scope:
 - tensor dimensions are guarded by `Specialization.dynamic_shapes`
 - dim `0` dynamic is supported
 - `torch.export.Dim(...)` and string symbols are accepted
+- `dynamic_shapes` keys must name Tensor arguments exactly
 - bounded and unbounded `torch.export.Dim` are represented in guards
 - symbol equality across tensor guards is checked at runtime
 

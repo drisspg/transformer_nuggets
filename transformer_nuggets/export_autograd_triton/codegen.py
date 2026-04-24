@@ -117,14 +117,7 @@ def _generate_public_wrapper(exported_name: str, signature: inspect.Signature) -
     class_name = _autograd_class_name(exported_name)
     body = (
         '"""Run the exported autograd/Triton specialization matching these inputs."""\n'
-        "bound_args = locals()\n"
-        "spec_id = _RUNTIME.select_spec(bound_args)\n"
-        "runtime_tensors = _RUNTIME.runtime_tensors(spec_id, bound_args)\n"
-        "if not _RUNTIME.needs_autograd(spec_id):\n"
-        "    return _RUNTIME.run_forward_only(spec_id, runtime_tensors)\n"
-        "result = "
-        f"{class_name}.apply(spec_id, *runtime_tensors)\n"
-        "return _RUNTIME.restore_output_container(spec_id, result)\n"
+        f"return _RUNTIME.run_with_bound_args(locals(), {class_name})\n"
     )
     return f"def {exported_name}{signature}:\n" + indent(body, "    ")
 

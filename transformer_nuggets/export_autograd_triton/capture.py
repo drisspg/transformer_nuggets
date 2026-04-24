@@ -35,15 +35,6 @@ def capture_compiled_autograd_sources(
     dynamic: bool = False,
     dynamic_shapes: Any | None = None,
 ) -> CapturedCompiledSources:
-    try:
-        from torch._functorch.aot_autograd import aot_function, make_boxed_compiler
-        from torch._inductor.compile_fx import compile_fx
-    except ImportError as exc:
-        raise RuntimeError(
-            "export_autograd_triton requires PyTorch nightly internals: "
-            "torch._functorch.aot_autograd and torch._inductor.compile_fx"
-        ) from exc
-
     if not runtime_tensors:
         raise ValueError("At least one tensor runtime argument is required")
 
@@ -59,16 +50,10 @@ def capture_compiled_autograd_sources(
     differentiable_output_mask = tuple(
         output.requires_grad and _is_differentiable(output) for output in tensor_outputs
     )
-    differentiable_outputs = [
-        output
-        for output, is_differentiable in zip(
-            tensor_outputs,
-            differentiable_output_mask,
-            strict=True,
-        )
-        if is_differentiable
-    ]
-    if not differentiable_outputs:
+    is_forward_only = not any(differentiable_output_mask) or not any(
+        tensor.requires_grad for tensor in runtime_tensors
+    )
+    if is_forward_only:
         if dynamic_shapes is not None:
             raise NotImplementedError(
                 "dynamic_shapes for forward-only exports are not implemented yet"
@@ -83,20 +68,14 @@ def capture_compiled_autograd_sources(
             differentiable_output_mask,
         )
 
-    if not any(tensor.requires_grad for tensor in runtime_tensors):
-        if dynamic_shapes is not None:
-            raise NotImplementedError(
-                "dynamic_shapes for forward-only exports are not implemented yet"
-            )
-        return _capture_forward_only(
-            fn,
-            sample_tensors,
-            len(tensor_outputs),
-            output_kind,
-            inductor_config_patches,
-            dynamic_shapes,
-            differentiable_output_mask,
-        )
+    try:
+        from torch._functorch.aot_autograd import aot_function, make_boxed_compiler
+        from torch._inductor.compile_fx import compile_fx
+    except ImportError as exc:
+        raise RuntimeError(
+            "export_autograd_triton requires PyTorch nightly internals: "
+            "torch._functorch.aot_autograd and torch._inductor.compile_fx"
+        ) from exc
 
     records: list[CompiledGraphSource] = []
 
