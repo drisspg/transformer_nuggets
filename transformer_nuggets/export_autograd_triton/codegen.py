@@ -77,7 +77,7 @@ def _write_compiled_module(
 
 def _generate_public_wrapper(exported_name: str, signature: inspect.Signature) -> str:
     return f"def {exported_name}{signature}:\n" + indent(
-        "return _run_with_bound_args(locals())\n", "    "
+        "return _RUNTIME.run_with_bound_args(locals())\n", "    "
     )
 
 

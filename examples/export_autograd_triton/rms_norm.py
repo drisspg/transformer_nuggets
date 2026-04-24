@@ -16,8 +16,8 @@ from transformer_nuggets.utils.benchmark import benchmark_cuda_function_in_micro
 
 HIDDEN_SIZE = 4096
 SAMPLE_TOKENS = 128
-MAX_TOKENS = 2048
-TOKEN_COUNTS = (1, 17, SAMPLE_TOKENS, 512)
+MAX_TOKENS = 4096
+TOKEN_COUNTS = (1, 17, SAMPLE_TOKENS, 512, MAX_TOKENS)
 DTYPE = torch.bfloat16
 EPS = 1e-5
 
@@ -57,6 +57,17 @@ def main():
             dynamic_tokens,
             max_autotune=True,
         ),
+        "clean_triton_max_autotune_coordesc": _export_rms_norm(
+            Path("agent_space/generated_rms_norm_max_autotune_coordesc.py"),
+            sample_x,
+            weight,
+            dynamic_tokens,
+            max_autotune=True,
+            inductor_config_patches={
+                "coordinate_descent_tuning": True,
+                "coordinate_descent_check_all_directions": True,
+            },
+        ),
     }
 
     for label, output_path in exports.items():
@@ -75,6 +86,7 @@ def _export_rms_norm(
     dynamic_tokens: object,
     *,
     max_autotune: bool,
+    inductor_config_patches: dict[str, object] | None = None,
 ) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     artifact_dir = output_path.with_name(f"{output_path.stem}_artifacts")
@@ -94,6 +106,7 @@ def _export_rms_norm(
         out=output_path,
         source_backend="clean_triton",
         max_autotune=max_autotune,
+        inductor_config_patches=inductor_config_patches,
     )
     return output_path
 
@@ -122,7 +135,7 @@ def _validate(compiled_fn: Callable, weight: torch.Tensor) -> None:
 
 
 def _benchmark_memory_bandwidth(label: str, compiled_fn: Callable, weight: torch.Tensor) -> None:
-    print("forward bandwidth (assumes 2 x reads + 1 weight read + 1 output write):")
+    print("forward logical bandwidth (2 x reads + 1 weight read + 1 output write):")
     for tokens in TOKEN_COUNTS:
         benchmark_x = torch.randn(
             tokens,
