@@ -12,6 +12,11 @@ from transformer_nuggets.export_autograd_triton import (
     export_autograd_triton,
     load_exported_module,
 )
+from transformer_nuggets.export_autograd_triton.clean_triton import (
+    CleanTritonUnsupportedError,
+    clean_triton_source,
+)
+from transformer_nuggets.export_autograd_triton.guards import tensor_guard_for
 
 os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
 
@@ -38,12 +43,24 @@ def tuple_outputs(x, w):
     return torch.relu(y), torch.sigmoid(y)
 
 
+def mixed_differentiable_and_integer_outputs(x):
+    return torch.sin(x), x.argmax(dim=-1)
+
+
+def mixed_differentiable_and_detached_float_outputs(x):
+    return torch.sin(x), x.detach() * 2
+
+
 def integer_tensor_output(x):
     return x.argmax(dim=-1)
 
 
 def trig_pointwise(x):
     return torch.sin(x) + torch.cos(x)
+
+
+def sum_last_dim(x):
+    return x.sum(dim=-1)
 
 
 def list_outputs(x, w):
@@ -160,30 +177,55 @@ def _differentiable_loss(value):
 
 def _compare_eager_and_compiled(fn, compiled_fn, args, kwargs=None, rtol=1e-4, atol=1e-4):
     kwargs = kwargs or {}
-    eager_args = _clone_args(args)
-    compiled_args = _clone_args(args)
-    eager = fn(*eager_args, **kwargs)
-    compiled = compiled_fn(*compiled_args, **kwargs)
+    shared_args = _clone_args(args)
+    eager = fn(*shared_args, **kwargs)
+    compiled = compiled_fn(*shared_args, **kwargs)
     eager_tensors = _flatten_tensors(eager)
     compiled_tensors = _flatten_tensors(compiled)
     assert len(compiled_tensors) == len(eager_tensors)
     for compiled_tensor, eager_tensor in zip(compiled_tensors, eager_tensors, strict=True):
         torch.testing.assert_close(compiled_tensor, eager_tensor, rtol=rtol, atol=atol)
+        assert compiled_tensor.requires_grad == eager_tensor.requires_grad
 
     eager_loss = _differentiable_loss(eager)
     compiled_loss = _differentiable_loss(compiled)
     if eager_loss is None or compiled_loss is None:
         assert eager_loss is compiled_loss
         return
-    eager_loss.backward()
-    compiled_loss.backward()
-    for compiled_arg, eager_arg in zip(compiled_args, eager_args, strict=True):
-        if not isinstance(eager_arg, torch.Tensor) or not eager_arg.requires_grad:
-            continue
-        if eager_arg.grad is None or compiled_arg.grad is None:
-            assert eager_arg.grad is compiled_arg.grad
+
+    differentiable_args = tuple(
+        arg
+        for arg in shared_args
+        if isinstance(arg, torch.Tensor)
+        and arg.requires_grad
+        and (arg.is_floating_point() or arg.is_complex())
+    )
+    eager_grads = torch.autograd.grad(
+        eager_loss,
+        differentiable_args,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    compiled_grads = torch.autograd.grad(
+        compiled_loss,
+        differentiable_args,
+        allow_unused=True,
+    )
+    for compiled_grad, eager_grad in zip(compiled_grads, eager_grads, strict=True):
+        if eager_grad is None or compiled_grad is None:
+            assert eager_grad is compiled_grad
         else:
-            torch.testing.assert_close(compiled_arg.grad, eager_arg.grad, rtol=rtol, atol=atol)
+            torch.testing.assert_close(compiled_grad, eager_grad, rtol=rtol, atol=atol)
+
+
+def test_unbounded_dynamic_dim_guard_uses_none_for_symbolic_max():
+    guard = tensor_guard_for(
+        "x",
+        torch.empty(4, 8),
+        {0: torch.export.Dim("batch")},
+    )
+
+    assert guard.shape[0] == {"symbol": "batch", "min": 0, "max": None}
 
 
 def test_export_static_specialization_forward_backward_signature_and_errors(tmp_path):
@@ -206,26 +248,22 @@ def test_export_static_specialization_forward_backward_signature_and_errors(tmp_
         inspect.signature(affine_activation)
     )
 
-    eager_x, eager_w = _clone_inputs(x, w)
-    compiled_x, compiled_w = _clone_inputs(x, w)
-    eager = affine_activation(eager_x, eager_w, activation="relu")
-    compiled = module.affine_activation_compiled(compiled_x, compiled_w, activation="relu")
-
-    torch.testing.assert_close(compiled, eager)
-    eager.sum().backward()
-    compiled.sum().backward()
-    torch.testing.assert_close(compiled_x.grad, eager_x.grad)
-    torch.testing.assert_close(compiled_w.grad, eager_w.grad)
+    _compare_eager_and_compiled(
+        affine_activation,
+        module.affine_activation_compiled,
+        (x, w),
+        {"activation": "relu"},
+    )
 
     with pytest.raises(RuntimeError, match="No export_autograd_triton specialization matched"):
         module.affine_activation_compiled(
             torch.randn(5, 8, device="cuda", requires_grad=True),
-            compiled_w,
+            w,
             activation="relu",
         )
 
     with pytest.raises(RuntimeError, match="static activation='gelu' != 'relu'"):
-        module.affine_activation_compiled(compiled_x, compiled_w, activation="gelu")
+        module.affine_activation_compiled(x, w, activation="gelu")
 
 
 def test_export_multiple_static_specializations_dispatch(tmp_path):
@@ -245,19 +283,12 @@ def test_export_multiple_static_specializations_dispatch(tmp_path):
     module = _import_generated(generated_path)
 
     for activation in ("relu", "gelu"):
-        eager_x, eager_w = _clone_inputs(x, w)
-        compiled_x, compiled_w = _clone_inputs(x, w)
-        eager = affine_activation(eager_x, eager_w, activation=activation)
-        compiled = module.affine_activation_compiled(
-            compiled_x,
-            compiled_w,
-            activation=activation,
+        _compare_eager_and_compiled(
+            affine_activation,
+            module.affine_activation_compiled,
+            (x, w),
+            {"activation": activation},
         )
-        torch.testing.assert_close(compiled, eager)
-        eager.sum().backward()
-        compiled.sum().backward()
-        torch.testing.assert_close(compiled_x.grad, eager_x.grad)
-        torch.testing.assert_close(compiled_w.grad, eager_w.grad)
 
 
 def test_export_multi_kernel_graph(tmp_path):
@@ -275,22 +306,14 @@ def test_export_multi_kernel_graph(tmp_path):
     module = _import_generated(generated_path)
 
     assert _source_kernel_marker_count(exported.output_path) > 1
-    eager_x, eager_w1, eager_w2 = (_clone_tensor(x), _clone_tensor(w1), _clone_tensor(w2))
-    compiled_x, compiled_w1, compiled_w2 = (_clone_tensor(x), _clone_tensor(w1), _clone_tensor(w2))
-    eager = two_matmuls_layernorm(eager_x, eager_w1, eager_w2, residual=True)
-    compiled = module.two_matmuls_layernorm_compiled(
-        compiled_x,
-        compiled_w1,
-        compiled_w2,
-        residual=True,
+    _compare_eager_and_compiled(
+        two_matmuls_layernorm,
+        module.two_matmuls_layernorm_compiled,
+        (x, w1, w2),
+        {"residual": True},
+        rtol=2e-4,
+        atol=2e-4,
     )
-
-    torch.testing.assert_close(compiled, eager, rtol=2e-4, atol=2e-4)
-    eager.sum().backward()
-    compiled.sum().backward()
-    torch.testing.assert_close(compiled_x.grad, eager_x.grad, rtol=2e-4, atol=2e-4)
-    torch.testing.assert_close(compiled_w1.grad, eager_w1.grad, rtol=2e-4, atol=2e-4)
-    torch.testing.assert_close(compiled_w2.grad, eager_w2.grad, rtol=2e-4, atol=2e-4)
 
 
 def test_export_tuple_outputs(tmp_path):
@@ -306,18 +329,46 @@ def test_export_tuple_outputs(tmp_path):
     )
     module = _import_generated(generated_path)
 
-    eager_x, eager_w = _clone_inputs(x, w)
-    compiled_x, compiled_w = _clone_inputs(x, w)
-    eager = tuple_outputs(eager_x, eager_w)
-    compiled = module.tuple_outputs_compiled(compiled_x, compiled_w)
+    assert isinstance(module.tuple_outputs_compiled(x, w), tuple)
+    _compare_eager_and_compiled(tuple_outputs, module.tuple_outputs_compiled, (x, w))
 
-    assert isinstance(compiled, tuple)
-    for compiled_output, eager_output in zip(compiled, eager, strict=True):
-        torch.testing.assert_close(compiled_output, eager_output)
-    sum(output.sum() for output in eager).backward()
-    sum(output.sum() for output in compiled).backward()
-    torch.testing.assert_close(compiled_x.grad, eager_x.grad)
-    torch.testing.assert_close(compiled_w.grad, eager_w.grad)
+
+def test_export_mixed_differentiable_and_integer_outputs(tmp_path):
+    _requires_export_runtime()
+    x = torch.randn(4, 8, device="cuda", requires_grad=True)
+    generated_path = tmp_path / "generated_mixed_outputs.py"
+
+    export_autograd_triton(
+        mixed_differentiable_and_integer_outputs,
+        [Specialization(args=(x,), name="mixed")],
+        generated_path,
+    )
+    module = _import_generated(generated_path)
+
+    _compare_eager_and_compiled(
+        mixed_differentiable_and_integer_outputs,
+        module.mixed_differentiable_and_integer_outputs_compiled,
+        (x,),
+    )
+
+
+def test_export_mixed_differentiable_and_detached_float_outputs(tmp_path):
+    _requires_export_runtime()
+    x = torch.randn(4, 8, device="cuda", requires_grad=True)
+    generated_path = tmp_path / "generated_detached_float_outputs.py"
+
+    export_autograd_triton(
+        mixed_differentiable_and_detached_float_outputs,
+        [Specialization(args=(x,), name="detached_float")],
+        generated_path,
+    )
+    module = _import_generated(generated_path)
+
+    _compare_eager_and_compiled(
+        mixed_differentiable_and_detached_float_outputs,
+        module.mixed_differentiable_and_detached_float_outputs_compiled,
+        (x,),
+    )
 
 
 def test_export_forward_only_integer_tensor_output(tmp_path):
@@ -555,6 +606,198 @@ def test_dynamic_batch_specialization_dispatches_across_batch_sizes(tmp_path):
             w,
             activation="relu",
         )
+
+
+def test_dynamic_clean_triton_view_residual_ordering(tmp_path):
+    _requires_export_runtime()
+    batch = torch.export.Dim("batch", min=1, max=16)
+    x = torch.randn(4, 8, device="cuda", requires_grad=True)
+    generated_path = tmp_path / "generated_dynamic_view.py"
+
+    export_autograd_triton(
+        view_output,
+        [
+            Specialization(
+                args=(x,),
+                dynamic_shapes={"x": {0: batch}},
+                name="dynamic_batch_view",
+            )
+        ],
+        generated_path,
+        source_backend="clean_triton",
+    )
+    module = _import_generated(generated_path)
+
+    for batch_size in (1, 7, 16):
+        dynamic_x = torch.randn(batch_size, 8, device="cuda", requires_grad=True)
+        _compare_eager_and_compiled(
+            view_output,
+            module.view_output_compiled,
+            (dynamic_x,),
+        )
+
+
+def test_dynamic_clean_triton_source_patches_multiple_pointwise_launches():
+    source = """
+import triton
+
+def call(args):
+    s0 = args[0].size(0)
+    triton_poi_fused_sin_0_xnumel = s0 * 8
+    triton_poi_fused_cos_1_xnumel = s0 * 16
+    triton_poi_fused_sin_0[(1, 1, 1)](buf0, 32, XBLOCK=32, num_warps=1)
+    triton_poi_fused_cos_1[(1, 1, 1)](
+        buf1,
+        64,
+        XBLOCK=64,
+        num_warps=2,
+    )
+"""
+
+    result = clean_triton_source(source, dynamic=True)
+
+    assert result.patched_launches == ["triton_poi_fused_sin_0", "triton_poi_fused_cos_1"]
+    assert "triton.cdiv(triton_poi_fused_sin_0_xnumel, 32)" in result.source
+    assert "triton.cdiv(triton_poi_fused_cos_1_xnumel, 64)" in result.source
+    assert "buf0, triton_poi_fused_sin_0_xnumel, XBLOCK=32" in result.source
+    assert "buf1, triton_poi_fused_cos_1_xnumel, XBLOCK=64" in result.source
+    assert "[(1, 1, 1)]" not in result.source
+
+
+def test_dynamic_clean_triton_source_patches_repeated_kernel_launches_by_occurrence():
+    original_source = """
+def call(args):
+    s0 = args[0].size(0)
+    s1 = args[1].size(0)
+    triton_poi_fused_same_0.run(buf0, s0, stream=stream0)
+    triton_poi_fused_same_0.run(buf1, s1, stream=stream0)
+"""
+    source = """
+import triton
+
+def call(args):
+    s0 = args[0].size(0)
+    s1 = args[1].size(0)
+    triton_poi_fused_same_0[(1, 1, 1)](buf0, 4, XBLOCK=4)
+    triton_poi_fused_same_0[(2, 1, 1)](buf1, 8, XBLOCK=4)
+"""
+
+    result = clean_triton_source(source, dynamic=True, original_source=original_source)
+
+    assert "triton.cdiv(s0, 4), 1, 1)](buf0, s0" in result.source
+    assert "triton.cdiv(s1, 4), 1, 1)](buf1, s1" in result.source
+
+
+def test_dynamic_clean_triton_reduction(tmp_path):
+    _requires_export_runtime()
+    batch = torch.export.Dim("batch", min=1, max=16)
+    x = torch.randn(4, 128, device="cuda", requires_grad=True)
+    generated_path = tmp_path / "generated_dynamic_reduction.py"
+
+    export_autograd_triton(
+        sum_last_dim,
+        [
+            Specialization(
+                args=(x,),
+                dynamic_shapes={"x": {0: batch}},
+                name="dynamic_batch_sum",
+            )
+        ],
+        generated_path,
+        source_backend="clean_triton",
+    )
+    module = _import_generated(generated_path)
+    artifact_source = "\n".join(
+        path.read_text()
+        for path in generated_path.with_name("generated_dynamic_reduction_artifacts").glob("*.py")
+    )
+    assert "@triton.jit" in artifact_source
+    assert "async_compile.triton" not in artifact_source
+    assert "triton.cdiv(s" in artifact_source
+    assert "[(2, 1, 1)]" not in artifact_source
+
+    for batch_size in (1, 7, 16):
+        dynamic_x = torch.randn(batch_size, 128, device="cuda", requires_grad=True)
+        _compare_eager_and_compiled(
+            sum_last_dim,
+            module.sum_last_dim_compiled,
+            (dynamic_x,),
+            rtol=2e-4,
+            atol=2e-4,
+        )
+
+
+def test_dynamic_clean_triton_matmul_dynamic_m(tmp_path):
+    _requires_export_runtime()
+    batch = torch.export.Dim("batch", min=1, max=64)
+    x = torch.randn(16, 128, device="cuda", requires_grad=True)
+    w = torch.randn(128, 256, device="cuda", requires_grad=True)
+    generated_path = tmp_path / "generated_dynamic_matmul.py"
+
+    export_autograd_triton(
+        affine_activation,
+        [
+            Specialization(
+                args=(x, w),
+                kwargs={"activation": "relu"},
+                dynamic_shapes={"x": {0: batch}},
+                name="dynamic_batch_matmul",
+            )
+        ],
+        generated_path,
+        source_backend="clean_triton",
+        max_autotune=True,
+    )
+    module = _import_generated(generated_path)
+    artifact_source = "\n".join(
+        path.read_text()
+        for path in generated_path.with_name("generated_dynamic_matmul_artifacts").glob("*.py")
+    )
+    assert "@triton.jit" in artifact_source
+    assert "async_compile.triton" not in artifact_source
+    assert "triton_tem_" in artifact_source
+    assert "[((" in artifact_source
+    assert "[(4, 1, 1)]" not in artifact_source
+
+    for batch_size in (1, 7, 32):
+        dynamic_x = torch.randn(batch_size, 128, device="cuda", requires_grad=True)
+        _compare_eager_and_compiled(
+            affine_activation,
+            module.affine_activation_compiled,
+            (dynamic_x, w),
+            {"activation": "relu"},
+            rtol=2e-4,
+            atol=2e-4,
+        )
+
+
+def test_dynamic_clean_triton_source_rejects_one_dimensional_baked_launch():
+    source = """
+import triton
+
+def call(args):
+    s0 = args[0].size(0)
+    triton_unknown_0_xnumel = s0
+    triton_unknown_0[(1,)](buf0, 4, XBLOCK=4)
+"""
+
+    with pytest.raises(CleanTritonUnsupportedError, match="triton_unknown_0"):
+        clean_triton_source(source, dynamic=True)
+
+
+def test_dynamic_clean_triton_source_rejects_unsupported_baked_launch():
+    source = """
+import triton
+
+def call(args):
+    s0 = args[0].size(0)
+    triton_red_fused_sum_0_xnumel = s0
+    triton_red_fused_sum_0_rnumel = 128
+    triton_red_fused_sum_0[(1, 1, 1)](buf0, buf1, 4, 128, XBLOCK=4, RBLOCK=128)
+"""
+
+    with pytest.raises(CleanTritonUnsupportedError, match='source_backend=\\"inductor\\"'):
+        clean_triton_source(source, dynamic=True)
 
 
 def test_dynamic_shape_limitations_are_explicitly_guarded(tmp_path):

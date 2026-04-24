@@ -1,3 +1,10 @@
+"""Dynamic export example.
+
+Use source_backend="clean_triton" when the exporter can rewrite every dynamic
+Triton launch family in the artifact. Use source_backend="inductor" when an
+unsupported dynamic family should keep Inductor's symbolic launch runtime.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -29,7 +36,6 @@ def main():
             Specialization(
                 args=(x, w),
                 dynamic_shapes={"x": {0: torch.export.Dim("batch", min=1, max=16)}},
-                name="dynamic_batch",
             )
         ],
         out=output_path,
@@ -38,17 +44,14 @@ def main():
 
     generated = load_exported_module(output_path)
     for batch in (1, 4, 16):
-        eager_x = torch.randn(batch, 8, device="cuda", requires_grad=True)
-        compiled_x = eager_x.detach().clone().requires_grad_()
-        eager_w = w.detach().clone().requires_grad_()
-        compiled_w = w.detach().clone().requires_grad_()
+        dynamic_x = torch.randn(batch, 8, device="cuda", requires_grad=True)
 
-        eager = affine_relu(eager_x, eager_w)
-        compiled = generated.affine_relu_compiled(compiled_x, compiled_w)
+        eager = affine_relu(dynamic_x, w)
+        compiled = generated.affine_relu_compiled(dynamic_x, w)
         torch.testing.assert_close(compiled, eager)
 
-        eager_grads = torch.autograd.grad(eager.sum(), (eager_x, eager_w))
-        compiled_grads = torch.autograd.grad(compiled.sum(), (compiled_x, compiled_w))
+        eager_grads = torch.autograd.grad(eager.sum(), (dynamic_x, w), retain_graph=True)
+        compiled_grads = torch.autograd.grad(compiled.sum(), (dynamic_x, w))
         for compiled_grad, eager_grad in zip(compiled_grads, eager_grads, strict=True):
             torch.testing.assert_close(compiled_grad, eager_grad)
         print(f"batch={batch}: {compiled.shape}")

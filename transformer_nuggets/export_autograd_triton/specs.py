@@ -50,3 +50,7 @@ class CapturedSpecialization:
     num_user_outputs: int
     output_kind: str
     needs_autograd: bool
+    dynamic: bool
+    differentiable_output_mask: tuple[bool, ...]
+    forward_residual_names: tuple[str, ...]
+    backward_saved_input_names: tuple[str, ...]

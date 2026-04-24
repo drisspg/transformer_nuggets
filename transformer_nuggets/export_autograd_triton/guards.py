@@ -53,9 +53,17 @@ def _dynamic_dim_guard(dim_spec: Any) -> dict[str, Any]:
         raise TypeError("dynamic_shapes dim specs must be torch.export.Dim or str")
     return {
         "symbol": name,
-        "min": getattr(dim_spec, "min", None),
-        "max": getattr(dim_spec, "max", None),
+        "min": _dim_bound(getattr(dim_spec, "min", None)),
+        "max": _dim_bound(getattr(dim_spec, "max", None)),
     }
+
+
+def _dim_bound(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    return None
 
 
 def validate_static_value(name: str, value: Any) -> StaticArgSpec:

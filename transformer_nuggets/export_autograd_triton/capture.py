@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ast
 from collections.abc import Callable
 from dataclasses import dataclass
+from textwrap import dedent
 from typing import Any
 
 import torch
@@ -21,6 +23,9 @@ class CapturedCompiledSources:
     num_user_outputs: int
     output_kind: str
     needs_autograd: bool
+    differentiable_output_mask: tuple[bool, ...]
+    forward_residual_names: tuple[str, ...]
+    backward_saved_input_names: tuple[str, ...]
 
 
 def capture_compiled_autograd_sources(
@@ -51,8 +56,17 @@ def capture_compiled_autograd_sources(
     if not tensor_outputs:
         raise ValueError("Exported function must produce at least one tensor output")
     output_kind = _output_kind(original_outputs)
+    differentiable_output_mask = tuple(
+        output.requires_grad and _is_differentiable(output) for output in tensor_outputs
+    )
     differentiable_outputs = [
-        output for output in tensor_outputs if output.requires_grad and _is_differentiable(output)
+        output
+        for output, is_differentiable in zip(
+            tensor_outputs,
+            differentiable_output_mask,
+            strict=True,
+        )
+        if is_differentiable
     ]
     if not differentiable_outputs:
         if dynamic_shapes is not None:
@@ -66,6 +80,7 @@ def capture_compiled_autograd_sources(
             output_kind,
             inductor_config_patches,
             dynamic_shapes,
+            differentiable_output_mask,
         )
 
     if not any(tensor.requires_grad for tensor in runtime_tensors):
@@ -80,6 +95,7 @@ def capture_compiled_autograd_sources(
             output_kind,
             inductor_config_patches,
             dynamic_shapes,
+            differentiable_output_mask,
         )
 
     records: list[CompiledGraphSource] = []
@@ -110,12 +126,22 @@ def capture_compiled_autograd_sources(
     if len(records) < 2:
         raise RuntimeError("AOTAutograd did not compile both forward and backward graphs")
 
+    forward_residual_names = _forward_residual_names(
+        records[0].graph_code,
+        len(tensor_outputs),
+    )
     return CapturedCompiledSources(
         forward=records[0],
         backward=records[1],
         num_user_outputs=len(tensor_outputs),
         output_kind=output_kind,
         needs_autograd=True,
+        differentiable_output_mask=differentiable_output_mask,
+        forward_residual_names=forward_residual_names,
+        backward_saved_input_names=_backward_saved_input_names(
+            records[1].graph_code,
+            sum(differentiable_output_mask),
+        ),
     )
 
 
@@ -126,6 +152,7 @@ def _capture_forward_only(
     output_kind: str,
     inductor_config_patches: dict[str, Any] | None,
     dynamic_shapes: Any | None,
+    differentiable_output_mask: tuple[bool, ...],
 ) -> CapturedCompiledSources:
     try:
         export_result = torch._dynamo.export(
@@ -148,6 +175,9 @@ def _capture_forward_only(
         num_user_outputs=num_user_outputs,
         output_kind=output_kind,
         needs_autograd=False,
+        differentiable_output_mask=differentiable_output_mask,
+        forward_residual_names=(),
+        backward_saved_input_names=(),
     )
 
 
@@ -158,6 +188,49 @@ def _compiled_graph_source(
     if source_code is None:
         raise RuntimeError("Inductor did not expose source_code for the compiled FX graph")
     return CompiledGraphSource(graph_code=gm.code, source_code=source_code)
+
+
+def _forward_residual_names(graph_code: str, num_user_outputs: int) -> tuple[str, ...]:
+    return tuple(_graph_return_names(graph_code)[num_user_outputs:])
+
+
+def _backward_saved_input_names(
+    graph_code: str, differentiable_output_count: int
+) -> tuple[str, ...]:
+    input_names = _graph_input_names(graph_code)
+    if differentiable_output_count > len(input_names):
+        raise RuntimeError(
+            "AOTAutograd backward graph has fewer inputs than differentiable outputs"
+        )
+    if differentiable_output_count == 0:
+        return tuple(input_names)
+    return tuple(input_names[:-differentiable_output_count])
+
+
+def _graph_return_names(graph_code: str) -> tuple[str, ...]:
+    function = _graph_function(graph_code)
+    returns = [node for node in ast.walk(function) if isinstance(node, ast.Return)]
+    if len(returns) != 1:
+        raise RuntimeError("AOTAutograd graph code must have exactly one return statement")
+    value = returns[0].value
+    if value is None:
+        return ()
+    if isinstance(value, ast.Tuple):
+        return tuple(ast.unparse(element) for element in value.elts)
+    return (ast.unparse(value),)
+
+
+def _graph_input_names(graph_code: str) -> tuple[str, ...]:
+    return tuple(arg.arg for arg in _graph_function(graph_code).args.args[1:])
+
+
+def _graph_function(graph_code: str) -> ast.FunctionDef:
+    functions = [
+        node for node in ast.parse(dedent(graph_code)).body if isinstance(node, ast.FunctionDef)
+    ]
+    if len(functions) != 1:
+        raise RuntimeError("AOTAutograd graph code must contain exactly one function")
+    return functions[0]
 
 
 def _clone_for_capture(tensor: torch.Tensor) -> torch.Tensor:

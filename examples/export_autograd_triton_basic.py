@@ -25,14 +25,21 @@ def main():
 
     export_autograd_triton(
         affine_relu,
-        [Specialization(args=(x, w), name="static_4x8_8x3")],
+        [Specialization(args=(x, w))],
         output_path,
     )
     generated = load_exported_module(output_path)
-    y = generated.affine_relu_compiled(x, w)
-    y.sum().backward()
+    eager = affine_relu(x, w)
+    compiled = generated.affine_relu_compiled(x, w)
+    torch.testing.assert_close(compiled, eager)
+
+    eager_grads = torch.autograd.grad(eager.sum(), (x, w), retain_graph=True)
+    compiled_grads = torch.autograd.grad(compiled.sum(), (x, w))
+    for compiled_grad, eager_grad in zip(compiled_grads, eager_grads, strict=True):
+        torch.testing.assert_close(compiled_grad, eager_grad)
+
     print(f"wrote {output_path}")
-    print(y)
+    print(compiled)
 
 
 if __name__ == "__main__":

@@ -37,7 +37,6 @@ def main():
             Specialization(
                 args=(x, w1, w2),
                 kwargs={"activation": "relu"},
-                name="relu_4x8_8x16_16x3",
             )
         ],
         out=output_path,
@@ -46,27 +45,14 @@ def main():
     )
 
     generated = load_exported_module(output_path)
-    eager_x = x.detach().clone().requires_grad_()
-    eager_w1 = w1.detach().clone().requires_grad_()
-    eager_w2 = w2.detach().clone().requires_grad_()
-    compiled_x = x.detach().clone().requires_grad_()
-    compiled_w1 = w1.detach().clone().requires_grad_()
-    compiled_w2 = w2.detach().clone().requires_grad_()
-
-    eager = tiny_mlp(eager_x, eager_w1, eager_w2, activation="relu")
-    compiled = generated.tiny_mlp_compiled(
-        compiled_x,
-        compiled_w1,
-        compiled_w2,
-        activation="relu",
-    )
+    eager = tiny_mlp(x, w1, w2, activation="relu")
+    compiled = generated.tiny_mlp_compiled(x, w1, w2, activation="relu")
     torch.testing.assert_close(compiled, eager)
 
-    eager.sum().backward()
-    compiled.sum().backward()
-    torch.testing.assert_close(compiled_x.grad, eager_x.grad)
-    torch.testing.assert_close(compiled_w1.grad, eager_w1.grad)
-    torch.testing.assert_close(compiled_w2.grad, eager_w2.grad)
+    eager_grads = torch.autograd.grad(eager.sum(), (x, w1, w2), retain_graph=True)
+    compiled_grads = torch.autograd.grad(compiled.sum(), (x, w1, w2))
+    for compiled_grad, eager_grad in zip(compiled_grads, eager_grads, strict=True):
+        torch.testing.assert_close(compiled_grad, eager_grad)
 
     print(f"exported_name: {exported.exported_name}")
     print(f"specializations: {exported.specializations}")

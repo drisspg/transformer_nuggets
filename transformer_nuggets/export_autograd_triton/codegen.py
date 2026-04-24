@@ -7,6 +7,7 @@ import pprint
 import re
 from textwrap import indent
 
+from transformer_nuggets.export_autograd_triton.clean_triton import clean_triton_module
 from transformer_nuggets.export_autograd_triton.specs import CapturedSpecialization
 
 
@@ -58,23 +59,51 @@ class _CompiledAutogradFunction(torch.autograd.Function):
         if not isinstance(outputs, tuple):
             outputs = tuple(outputs)
         user_outputs = outputs[: spec["num_user_outputs"]]
+        residuals = outputs[spec["num_user_outputs"] :]
+        named_residuals = tuple(zip(spec["forward_residual_names"], residuals, strict=True))
         ctx.spec_id = spec_id
         ctx.runtime_tensor_count = len(runtime_tensors)
-        ctx.save_for_backward(*outputs[spec["num_user_outputs"] :])
+        ctx.saved_tensor_residual_names = tuple(
+            name for name, residual in named_residuals if isinstance(residual, torch.Tensor)
+        )
+        ctx.saved_non_tensor_residuals = {{
+            name: residual for name, residual in named_residuals if not isinstance(residual, torch.Tensor)
+        }}
+        ctx.save_for_backward(
+            *(residual for _, residual in named_residuals if isinstance(residual, torch.Tensor))
+        )
+        non_differentiable_outputs = tuple(
+            output
+            for output, is_differentiable in zip(
+                user_outputs,
+                spec["differentiable_output_mask"],
+                strict=True,
+            )
+            if isinstance(output, torch.Tensor) and not is_differentiable
+        )
+        if non_differentiable_outputs:
+            ctx.mark_non_differentiable(*non_differentiable_outputs)
         if spec["output_kind"] == "single":
             return user_outputs[0]
         return tuple(user_outputs)
 
     @staticmethod
     def backward(ctx, *grad_outputs):
+        spec = _SPECS[ctx.spec_id]
         grad_outputs = tuple(
             grad_output.contiguous() if isinstance(grad_output, torch.Tensor) else grad_output
-            for grad_output in grad_outputs
+            for index, grad_output in enumerate(grad_outputs)
+            if spec["differentiable_output_mask"][index]
         )
         backward_runner = _BACKWARD_RUNNERS[ctx.spec_id]
         if backward_runner is None:
             raise RuntimeError("Selected export_autograd_triton specialization has no backward graph")
-        grads = backward_runner(list(ctx.saved_tensors + grad_outputs))
+        saved_residuals = dict(ctx.saved_non_tensor_residuals)
+        saved_residuals.update(zip(ctx.saved_tensor_residual_names, ctx.saved_tensors, strict=True))
+        backward_saved_inputs = tuple(
+            saved_residuals[name] for name in spec["backward_saved_input_names"]
+        )
+        grads = backward_runner(list(backward_saved_inputs + grad_outputs))
         if not isinstance(grads, tuple):
             grads = tuple(grads)
         if len(grads) < ctx.runtime_tensor_count:
@@ -213,57 +242,31 @@ def write_autograd_source(
     artifact_dir.mkdir(parents=True, exist_ok=True)
     for index, spec in enumerate(specializations):
         forward_path = artifact_dir / _module_filename(index, spec, "forward")
-        _write_compiled_module(forward_path, spec.forward_source, source_backend)
+        _write_compiled_module(
+            forward_path,
+            spec.forward_source,
+            source_backend,
+            dynamic=spec.dynamic,
+        )
         if spec.backward_source is not None:
             _write_compiled_module(
                 artifact_dir / _module_filename(index, spec, "backward"),
                 spec.backward_source,
                 source_backend,
+                dynamic=spec.dynamic,
             )
 
 
-def _write_compiled_module(path: Path, source: str, source_backend: str) -> None:
+def _write_compiled_module(
+    path: Path,
+    source: str,
+    source_backend: str,
+    *,
+    dynamic: bool,
+) -> None:
     path.write_text(source)
     if source_backend == "clean_triton" and "async_compile.triton(" in source:
-        _rewrite_module_as_clean_triton(path)
-
-
-def _rewrite_module_as_clean_triton(path: Path) -> None:
-    from torch.utils._get_clean_triton import get_clean_triton
-
-    get_clean_triton(path.resolve(), path.resolve(), auto_generate_params=True)
-    _patch_dynamic_pointwise_grids(path)
-    launch_params_path = Path(f"{path}.launch_params")
-    if launch_params_path.exists():
-        launch_params_path.unlink()
-
-
-def _patch_dynamic_pointwise_grids(path: Path) -> None:
-    source = path.read_text()
-    for xnumel_name in sorted(set(re.findall(r"(\w+_xnumel)\s*=", source))):
-        kernel_name = xnumel_name.removesuffix("_xnumel")
-        source = re.sub(
-            rf"{kernel_name}\[\(\d+, \d+, \d+\)\]\((?P<args>[^\n]*?), \d+, XBLOCK=(?P<xblock>\d+),",
-            lambda match: _dynamic_pointwise_launch_replacement(
-                kernel_name,
-                xnumel_name,
-                match,
-            ),
-            source,
-        )
-    path.write_text(source)
-
-
-def _dynamic_pointwise_launch_replacement(
-    kernel_name: str,
-    xnumel_name: str,
-    match: re.Match[str],
-) -> str:
-    xblock = match.group("xblock")
-    return (
-        f"{kernel_name}[(triton.cdiv({xnumel_name}, {xblock}), 1, 1)]("
-        f"{match.group('args')}, {xnumel_name}, XBLOCK={xblock},"
-    )
+        clean_triton_module(path, dynamic=dynamic)
 
 
 def _generate_public_wrapper(exported_name: str, signature: inspect.Signature) -> str:
@@ -281,6 +284,9 @@ def _spec_to_metadata(index: int, spec: CapturedSpecialization) -> dict[str, obj
         "num_user_outputs": spec.num_user_outputs,
         "output_kind": spec.output_kind,
         "needs_autograd": spec.needs_autograd,
+        "differentiable_output_mask": spec.differentiable_output_mask,
+        "forward_residual_names": spec.forward_residual_names,
+        "backward_saved_input_names": spec.backward_saved_input_names,
         "forward_module": _module_filename(index, spec, "forward"),
         "backward_module": (
             _module_filename(index, spec, "backward") if spec.backward_source is not None else None
@@ -289,7 +295,10 @@ def _spec_to_metadata(index: int, spec: CapturedSpecialization) -> dict[str, obj
 
 
 def _module_filename(index: int, spec: CapturedSpecialization, direction: str) -> str:
-    return f"spec_{index}_{_safe_name(spec.name)}_{direction}.py"
+    default_name = f"spec_{index}"
+    if spec.name == default_name:
+        return f"{default_name}_{direction}.py"
+    return f"{default_name}_{_safe_name(spec.name)}_{direction}.py"
 
 
 def _safe_name(name: str) -> str:

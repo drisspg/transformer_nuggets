@@ -111,11 +111,12 @@ def _capture_specialization(
         arguments.update(zip(runtime_tensor_names, runtime_tensors, strict=True))
         return _call_with_bound_arguments(fn, signature, arguments)
 
+    dynamic = specialization.dynamic_shapes is not None
     compiled_sources = capture_compiled_autograd_sources(
         tensor_only_fn,
         tuple(bound.arguments[name] for name in runtime_tensor_names),
         inductor_config_patches=inductor_config_patches,
-        dynamic=specialization.dynamic_shapes is not None,
+        dynamic=dynamic,
         dynamic_shapes=_runtime_dynamic_shapes(
             specialization.dynamic_shapes,
             runtime_tensor_names,
@@ -135,6 +136,10 @@ def _capture_specialization(
         num_user_outputs=compiled_sources.num_user_outputs,
         output_kind=compiled_sources.output_kind,
         needs_autograd=compiled_sources.needs_autograd,
+        dynamic=dynamic,
+        differentiable_output_mask=compiled_sources.differentiable_output_mask,
+        forward_residual_names=compiled_sources.forward_residual_names,
+        backward_saved_input_names=compiled_sources.backward_saved_input_names,
     )
 
 
