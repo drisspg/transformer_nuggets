@@ -37,6 +37,10 @@ def export_autograd_triton(
         raise ValueError("source_backend must be 'inductor' or 'clean_triton'")
     if not specializations:
         raise ValueError("At least one specialization is required")
+    if source_backend == "clean_triton" and any(
+        specialization.dynamic_shapes is not None for specialization in specializations
+    ):
+        raise ValueError("dynamic_shapes require source_backend='inductor' for now")
 
     config_patches = dict(inductor_config_patches or {})
     if max_autotune:
@@ -80,8 +84,6 @@ def _capture_specialization(
         raise NotImplementedError(
             "additional_inputs dynamic-shape inference is not implemented yet"
         )
-    if specialization.dynamic_shapes is not None:
-        raise NotImplementedError("Explicit dynamic_shapes are not implemented yet")
 
     bound = signature.bind(*specialization.args, **(specialization.kwargs or {}))
     bound.apply_defaults()
@@ -97,7 +99,12 @@ def _capture_specialization(
         if not isinstance(value, torch.Tensor)
     )
     tensor_guards = tuple(
-        tensor_guard_for(name, bound.arguments[name]) for name in runtime_tensor_names
+        tensor_guard_for(
+            name,
+            bound.arguments[name],
+            _dynamic_shape_for(specialization.dynamic_shapes, name),
+        )
+        for name in runtime_tensor_names
     )
 
     def tensor_only_fn(*runtime_tensors: torch.Tensor) -> Any:
@@ -113,6 +120,11 @@ def _capture_specialization(
         tensor_only_fn,
         tuple(bound.arguments[name] for name in runtime_tensor_names),
         inductor_config_patches=inductor_config_patches,
+        dynamic=specialization.dynamic_shapes is not None,
+        dynamic_shapes=_runtime_dynamic_shapes(
+            specialization.dynamic_shapes,
+            runtime_tensor_names,
+        ),
     )
     return CapturedSpecialization(
         name=specialization.name or f"spec_{index}",
@@ -129,6 +141,25 @@ def _capture_specialization(
         output_kind=compiled_sources.output_kind,
         needs_autograd=compiled_sources.needs_autograd,
     )
+
+
+def _dynamic_shape_for(dynamic_shapes: Any | None, name: str) -> Any | None:
+    if dynamic_shapes is None:
+        return None
+    if not isinstance(dynamic_shapes, dict):
+        raise TypeError("dynamic_shapes must be a dict keyed by argument name")
+    return dynamic_shapes.get(name)
+
+
+def _runtime_dynamic_shapes(
+    dynamic_shapes: Any | None,
+    runtime_tensor_names: tuple[str, ...],
+) -> Any | None:
+    if dynamic_shapes is None:
+        return None
+    if not isinstance(dynamic_shapes, dict):
+        raise TypeError("dynamic_shapes must be a dict keyed by argument name")
+    return tuple(dynamic_shapes.get(name) for name in runtime_tensor_names)
 
 
 def _call_with_bound_arguments(

@@ -11,16 +11,51 @@ from transformer_nuggets.export_autograd_triton.specs import StaticArgSpec, Tens
 _SUPPORTED_STATIC_TYPES = (str, int, float, bool, type(None))
 
 
-def tensor_guard_for(name: str, tensor: torch.Tensor) -> TensorGuardSpec:
+def tensor_guard_for(
+    name: str,
+    tensor: torch.Tensor,
+    dynamic_shape: Any | None = None,
+) -> TensorGuardSpec:
     return TensorGuardSpec(
         name=name,
         rank=tensor.dim(),
-        shape=tuple(int(dim) for dim in tensor.shape),
+        shape=_shape_guard(tensor, dynamic_shape),
         stride=tuple(int(stride) for stride in tensor.stride()),
         dtype=str(tensor.dtype).removeprefix("torch."),
         device_type=tensor.device.type,
         device_index=tensor.device.index,
     )
+
+
+def _shape_guard(
+    tensor: torch.Tensor,
+    dynamic_shape: Any | None,
+) -> tuple[int | dict[str, Any], ...]:
+    shape: list[int | dict[str, Any]] = [int(dim) for dim in tensor.shape]
+    if dynamic_shape is None:
+        return tuple(shape)
+    if not isinstance(dynamic_shape, dict):
+        raise TypeError(
+            "MVP dynamic_shapes entries must be dicts mapping dim index to torch.export.Dim"
+        )
+    for dim, dim_spec in dynamic_shape.items():
+        if dim != 0:
+            raise NotImplementedError("MVP dynamic_shapes only supports dynamic dim 0")
+        shape[dim] = _dynamic_dim_guard(dim_spec)
+    return tuple(shape)
+
+
+def _dynamic_dim_guard(dim_spec: Any) -> dict[str, Any]:
+    if isinstance(dim_spec, str):
+        return {"symbol": dim_spec, "min": None, "max": None}
+    name = getattr(dim_spec, "__name__", None)
+    if name is None:
+        raise TypeError("dynamic_shapes dim specs must be torch.export.Dim or str")
+    return {
+        "symbol": name,
+        "min": getattr(dim_spec, "min", None),
+        "max": getattr(dim_spec, "max", None),
+    }
 
 
 def validate_static_value(name: str, value: Any) -> StaticArgSpec:

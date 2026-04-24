@@ -26,7 +26,7 @@ class ExportedAutogradSource:
 class TensorGuardSpec:
     name: str
     rank: int
-    shape: tuple[int, ...]
+    shape: tuple[int | dict[str, Any], ...]
     stride: tuple[int, ...]
     dtype: str
     device_type: str

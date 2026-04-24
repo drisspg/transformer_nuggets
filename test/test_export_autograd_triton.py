@@ -503,16 +503,76 @@ def test_max_autotune_config_is_threaded_to_inductor(tmp_path):
     assert "'max_autotune': True" in artifact_source
 
 
-def test_dynamic_shape_paths_are_explicitly_guarded(tmp_path):
+def test_dynamic_batch_specialization_dispatches_across_batch_sizes(tmp_path):
+    _requires_export_runtime()
+    batch = torch.export.Dim("batch", min=1, max=16)
+    x = torch.randn(4, 8, device="cuda", requires_grad=True)
+    w = torch.randn(8, 3, device="cuda", requires_grad=True)
+    generated_path = tmp_path / "generated_dynamic.py"
+
+    export_autograd_triton(
+        affine_activation,
+        [
+            Specialization(
+                args=(x, w),
+                kwargs={"activation": "relu"},
+                dynamic_shapes={"x": {0: batch}},
+                name="dynamic_batch_relu",
+            )
+        ],
+        generated_path,
+        source_backend="inductor",
+    )
+    module = _import_generated(generated_path)
+    assert "s" in "\n".join(
+        path.read_text()
+        for path in generated_path.with_name("generated_dynamic_artifacts").glob("*.py")
+    )
+
+    for batch_size in (1, 7, 16):
+        dynamic_x = torch.randn(batch_size, 8, device="cuda", requires_grad=True)
+        _compare_eager_and_compiled(
+            affine_activation,
+            module.affine_activation_compiled,
+            (dynamic_x, w),
+            {"activation": "relu"},
+            rtol=2e-4,
+            atol=2e-4,
+        )
+
+    with pytest.raises(RuntimeError, match="greater than batch max 16"):
+        module.affine_activation_compiled(
+            torch.randn(17, 8, device="cuda", requires_grad=True),
+            w,
+            activation="relu",
+        )
+
+    with pytest.raises(RuntimeError, match="shape dim 1=9 != 8"):
+        module.affine_activation_compiled(
+            torch.randn(4, 9, device="cuda", requires_grad=True),
+            w,
+            activation="relu",
+        )
+
+
+def test_dynamic_shape_limitations_are_explicitly_guarded(tmp_path):
     _requires_export_runtime()
     x = torch.randn(2, 4, device="cuda", requires_grad=True)
     w = torch.randn(4, 5, device="cuda", requires_grad=True)
 
-    with pytest.raises(NotImplementedError, match="dynamic_shapes"):
+    with pytest.raises(ValueError, match="source_backend='inductor'"):
         export_autograd_triton(
             affine_activation,
             [Specialization(args=(x, w), dynamic_shapes={"x": {0: "batch"}})],
-            tmp_path / "generated_dynamic.py",
+            tmp_path / "generated_dynamic_clean.py",
+        )
+
+    with pytest.raises(NotImplementedError, match="dynamic dim 0"):
+        export_autograd_triton(
+            affine_activation,
+            [Specialization(args=(x, w), dynamic_shapes={"x": {1: "hidden"}})],
+            tmp_path / "generated_dynamic_inner.py",
+            source_backend="inductor",
         )
 
     with pytest.raises(NotImplementedError, match="additional_inputs"):

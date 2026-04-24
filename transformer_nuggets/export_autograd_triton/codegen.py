@@ -128,19 +128,20 @@ def _select_spec(bound_args):
 
 def _mismatch_reasons(spec, bound_args):
     reasons = []
+    symbols = {{}}
     for name, expected in spec["static_args"].items():
         actual = bound_args.get(name)
         if actual != expected:
             reasons.append(f"static {{name}}={{actual!r}} != {{expected!r}}")
     for guard in spec["tensor_guards"]:
         tensor = bound_args.get(guard["name"])
-        reason = _tensor_mismatch_reason(tensor, guard)
+        reason = _tensor_mismatch_reason(tensor, guard, symbols)
         if reason is not None:
             reasons.append(reason)
     return reasons
 
 
-def _tensor_mismatch_reason(tensor, guard):
+def _tensor_mismatch_reason(tensor, guard, symbols):
     name = guard["name"]
     if not isinstance(tensor, torch.Tensor):
         return f"{{name}} is {{type(tensor).__name__}}, expected Tensor"
@@ -153,10 +154,28 @@ def _tensor_mismatch_reason(tensor, guard):
         return f"{{name}} device index {{tensor.device.index}} != {{guard['device_index']}}"
     if tensor.dim() != guard["rank"]:
         return f"{{name}} rank {{tensor.dim()}} != {{guard['rank']}}"
-    if tuple(tensor.shape) != tuple(guard["shape"]):
-        return f"{{name}} shape {{tuple(tensor.shape)}} != {{tuple(guard['shape'])}}"
+    shape_reason = _shape_mismatch_reason(name, tensor, guard, symbols)
+    if shape_reason is not None:
+        return shape_reason
     if tuple(tensor.stride()) != tuple(guard["stride"]):
         return f"{{name}} stride {{tuple(tensor.stride())}} != {{tuple(guard['stride'])}}"
+    return None
+
+
+def _shape_mismatch_reason(name, tensor, guard, symbols):
+    for dim, expected in enumerate(guard["shape"]):
+        actual = int(tensor.shape[dim])
+        if isinstance(expected, dict):
+            symbol = expected["symbol"]
+            if expected["min"] is not None and actual < expected["min"]:
+                return f"{{name}} shape dim {{dim}}={{actual}} is less than {{symbol}} min {{expected['min']}}"
+            if expected["max"] is not None and actual > expected["max"]:
+                return f"{{name}} shape dim {{dim}}={{actual}} is greater than {{symbol}} max {{expected['max']}}"
+            if symbol in symbols and symbols[symbol] != actual:
+                return f"{{name}} shape dim {{dim}}={{actual}} does not equal {{symbol}}={{symbols[symbol]}}"
+            symbols[symbol] = actual
+        elif actual != expected:
+            return f"{{name}} shape dim {{dim}}={{actual}} != {{expected}}"
     return None
 
 

@@ -27,6 +27,8 @@ def capture_compiled_autograd_sources(
     fn: Callable[..., Any],
     runtime_tensors: tuple[torch.Tensor, ...],
     inductor_config_patches: dict[str, Any] | None = None,
+    dynamic: bool = False,
+    dynamic_shapes: Any | None = None,
 ) -> CapturedCompiledSources:
     try:
         from torch._functorch.aot_autograd import aot_function, make_boxed_compiler
@@ -53,21 +55,31 @@ def capture_compiled_autograd_sources(
         output for output in tensor_outputs if output.requires_grad and _is_differentiable(output)
     ]
     if not differentiable_outputs:
+        if dynamic_shapes is not None:
+            raise NotImplementedError(
+                "dynamic_shapes for forward-only exports are not implemented yet"
+            )
         return _capture_forward_only(
             fn,
             sample_tensors,
             len(tensor_outputs),
             output_kind,
             inductor_config_patches,
+            dynamic_shapes,
         )
 
     if not any(tensor.requires_grad for tensor in runtime_tensors):
+        if dynamic_shapes is not None:
+            raise NotImplementedError(
+                "dynamic_shapes for forward-only exports are not implemented yet"
+            )
         return _capture_forward_only(
             fn,
             sample_tensors,
             len(tensor_outputs),
             output_kind,
             inductor_config_patches,
+            dynamic_shapes,
         )
 
     records: list[CompiledGraphSource] = []
@@ -83,6 +95,7 @@ def capture_compiled_autograd_sources(
         fn,
         fw_compiler=make_boxed_compiler(compiler),
         bw_compiler=make_boxed_compiler(compiler),
+        dynamic=dynamic,
     )
     outputs = compiled_fn(*sample_tensors)
     flat_outputs, _ = tree_flatten(outputs)
@@ -112,9 +125,14 @@ def _capture_forward_only(
     num_user_outputs: int,
     output_kind: str,
     inductor_config_patches: dict[str, Any] | None,
+    dynamic_shapes: Any | None,
 ) -> CapturedCompiledSources:
     try:
-        export_result = torch._dynamo.export(fn, aten_graph=True)(*sample_tensors)
+        export_result = torch._dynamo.export(
+            fn,
+            aten_graph=True,
+            dynamic_shapes=dynamic_shapes,
+        )(*sample_tensors)
     except AttributeError as exc:
         raise RuntimeError("Forward-only export requires torch._dynamo.export") from exc
     from torch._inductor.compile_fx import compile_fx
