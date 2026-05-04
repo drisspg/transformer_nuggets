@@ -5,6 +5,7 @@ import logging
 import os
 import random
 import statistics
+import warnings
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,6 +19,10 @@ import functools
 
 from torch.cuda._memory_viz import profile_plot  # type: ignore
 from torch.profiler import profile, ProfilerActivity, record_function, schedule
+
+warnings.filterwarnings("ignore", message=".*SyncActivityProfilerHandler.*")
+warnings.filterwarnings("ignore", message=".*profiler_start.*")
+warnings.filterwarnings("ignore", message=".*profiler_stop.*")
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -265,7 +270,6 @@ def _call_do_bench_using_profiling(
     return do_bench_using_profiling(fn, **call_kwargs)
 
 
-
 def _benchmark_cuda_graph_replay_samples_us(
     func: Callable,
     *args,
@@ -310,7 +314,6 @@ def _benchmark_cuda_graph_replay_samples_us(
         return samples_us
 
 
-
 def benchmark_cuda_function_stats(func: Callable, *args, **kwargs) -> CudaBenchmarkStats:
     """Benchmark a CUDA callable and return median-centered summary stats.
 
@@ -353,9 +356,7 @@ def benchmark_cuda_function_stats(func: Callable, *args, **kwargs) -> CudaBenchm
             func,
             *args,
             NUM_ITERS=num_iters,
-            CUDAGRAPH_WARMUP_ITERS=kwargs.pop(
-                "CUDAGRAPH_WARMUP_ITERS", memory_warmup_iters
-            ),
+            CUDAGRAPH_WARMUP_ITERS=kwargs.pop("CUDAGRAPH_WARMUP_ITERS", memory_warmup_iters),
             LOCK_CLOCKS=kwargs.pop("LOCK_CLOCKS", False),
             **kwargs,
         )
@@ -424,7 +425,9 @@ def benchmark_cuda_function_in_microseconds(func: Callable, *args, **kwargs) -> 
             *args,
             NUM_ITERS=num_iters,
             LOCK_CLOCKS=kwargs.pop("LOCK_CLOCKS", False),
-            CUDAGRAPH_WARMUP_ITERS=kwargs.pop("CUDAGRAPH_WARMUP_ITERS", max(10, min(25, num_iters))),
+            CUDAGRAPH_WARMUP_ITERS=kwargs.pop(
+                "CUDAGRAPH_WARMUP_ITERS", max(10, min(25, num_iters))
+            ),
             **kwargs,
         )
         return statistics.median(samples_us)

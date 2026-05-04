@@ -6,7 +6,6 @@ This benchmark has no dependencies on other flash-attn components.
 
 import csv
 import itertools
-import warnings
 from dataclasses import dataclass, asdict
 from typing import Literal
 
@@ -20,10 +19,6 @@ from tqdm import tqdm
 from torch.nn.attention import sdpa_kernel, SDPBackend
 
 from transformer_nuggets.utils.benchmark import benchmark_cuda_function_in_microseconds
-
-warnings.filterwarnings("ignore", message=".*SyncActivityProfilerHandler.*")
-warnings.filterwarnings("ignore", message=".*profiler_start.*")
-warnings.filterwarnings("ignore", message=".*profiler_stop.*")
 
 try:
     from flash_attn.cute import flash_attn_func
