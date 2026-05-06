@@ -1,3 +1,5 @@
+import warnings
+
 import pytest
 
 from transformer_nuggets.utils.benchmark import (
@@ -57,3 +59,26 @@ def test_benchmark_cuda_function_stats_singleton(monkeypatch):
     assert stats.quantiles_us == pytest.approx((10.0, 10.0, 10.0))
     assert stats.median_us == pytest.approx(10.0)
     assert stats.median_ci_us == pytest.approx((10.0, 10.0))
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "CUDA warning: SyncActivityProfilerHandler::start failed to stop cleanly",
+        "Detected call of profiler_start while another profiler is active",
+        "Detected call of profiler_stop without a matching start",
+    ],
+)
+def test_benchmark_utils_suppresses_known_profiler_warnings(message):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.warn(message, UserWarning, stacklevel=1)
+
+    assert caught == []
+
+
+def test_benchmark_utils_does_not_suppress_unrelated_warnings():
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.warn("transformer-nuggets unrelated benchmark warning", UserWarning, stacklevel=1)
+
+    assert len(caught) == 1
+    assert str(caught[0].message) == "transformer-nuggets unrelated benchmark warning"
