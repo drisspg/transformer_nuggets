@@ -4,6 +4,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.nvgpu import cpasync
+from cutlass.utils.block import block_copy
 
 from transformer_nuggets.utils.benchmark import benchmark_cuda_function_in_microseconds
 from transformer_nuggets.cute.cache import (
@@ -64,20 +65,8 @@ class DirectCopy(CuteOp[[torch.Tensor], torch.Tensor]):
         gA_tiled = cute.zipped_divide(tma_tensor_load, tiler)
         gB_tiled = cute.zipped_divide(tma_tensor_store, tiler)
 
-        tAsA_load, tAgA = cpasync.tma_partition(
-            load_atom,
-            0,
-            cute.make_layout(1),
-            sA,
-            gA_tiled[(None, bidx)],
-        )
-        tAsA_store, tBgB = cpasync.tma_partition(
-            store_atom,
-            0,
-            cute.make_layout(1),
-            sA,
-            gB_tiled[(None, bidx)],
-        )
+        src_tile = gA_tiled[(None, bidx)]
+        dst_tile = gB_tiled[(None, bidx)]
 
         load_mbar_ptr = storage.load_mbar_ptr.data_ptr()
 
@@ -94,11 +83,11 @@ class DirectCopy(CuteOp[[torch.Tensor], torch.Tensor]):
                 cute.arch.mbarrier_arrive_and_expect_tx(load_mbar_ptr, tma_load_bytes)
 
         if warp_idx == 0:
-            cute.copy(load_atom, tAgA, tAsA_load, tma_bar_ptr=load_mbar_ptr)
+            block_copy(load_atom, src_tile, sA, tma_bar_ptr=load_mbar_ptr)
 
         cute.arch.mbarrier_wait(load_mbar_ptr, 0)
         if warp_idx == 1:
-            cute.copy(store_atom, tAsA_store, tBgB)
+            block_copy(store_atom, sA, dst_tile)
         cute.arch.cp_async_bulk_commit_group()
         cute.arch.cp_async_bulk_wait_group(0)
 
