@@ -1,22 +1,38 @@
 import torch
+from dataclasses import dataclass
 from functools import partial
 from operator import mul, add
 
 import cutlass
 import cutlass.cute as cute
+from cuda.bindings import driver as cuda
 from cutlass.cute.runtime import from_dlpack
 
 from transformer_nuggets.utils.benchmark import benchmark_cuda_function_in_microseconds
-from transformer_nuggets.cute.cache import compile_and_cache, get_cache_stats
+from transformer_nuggets.cute.cache import compile_tvm_ffi_and_cache, get_cache_stats
 from transformer_nuggets.cute.base import CuteOp
+from transformer_nuggets.cute.utils import (
+    fake_stream,
+    make_fake_compact_tensor,
+    torch_dtype_to_cute_dtype,
+)
+
+
+@dataclass(frozen=True)
+class ElementwiseConfig:
+    thr_m: int = 4
+    thr_n: int = 32
+    val_m: int = 4
+    val_n: int = 8
 
 
 class ElementwiseOp(CuteOp[[torch.Tensor, torch.Tensor, torch.Tensor], None]):
     """Elementwise operation using CUTE kernels."""
 
-    def __init__(self, op: cutlass.Constexpr):
+    def __init__(self, op: cutlass.Constexpr, config: ElementwiseConfig | None = None):
         super().__init__()
         self.op = op
+        self.config = config or ElementwiseConfig()
 
     @cute.kernel
     def kernel(
@@ -25,7 +41,9 @@ class ElementwiseOp(CuteOp[[torch.Tensor, torch.Tensor, torch.Tensor], None]):
         gA: cute.Tensor,
         gB: cute.Tensor,
         gC: cute.Tensor,
+        cC: cute.Tensor,
         tv_layout: cute.Layout,
+        shape: cute.Shape,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -35,55 +53,77 @@ class ElementwiseOp(CuteOp[[torch.Tensor, torch.Tensor, torch.Tensor], None]):
         blkA = gA[blk_coord]
         blkB = gB[blk_coord]
         blkC = gC[blk_coord]
+        blkCoord = cC[blk_coord]
 
         tidfrgA = cute.composition(blkA, tv_layout)
 
         tidfrgB = cute.composition(blkB, tv_layout)
 
         tidfrgC = cute.composition(blkC, tv_layout)
+        tidfrgCoord = cute.composition(blkCoord, tv_layout)
 
         thr_coord = (tidx, None)
 
         thrA = tidfrgA[thr_coord]
         thrB = tidfrgB[thr_coord]
         thrC = tidfrgC[thr_coord]
+        thrCoord = tidfrgCoord[thr_coord]
 
-        thrC[None] = op(thrA.load(), thrB.load())
+        for i in cutlass.range_constexpr(cute.size(thrC)):
+            if cute.elem_less(thrCoord[i], shape):
+                thrC[i] = op(thrA[i], thrB[i])
 
-    def get_key(self, *args, **kwargs) -> str:
-        """Generate cache key including operation type and tensor properties."""
-        op_name = getattr(self.op, "__name__", str(self.op))
-        key_parts = [self.__class__.__name__, f"op={op_name}"]
+    def get_name(self) -> str:
+        op_name = getattr(self.op, "__name__", str(self.op)).lower()
+        cfg = self.config
+        return f"elementwise_{op_name}_t{cfg.thr_m}x{cfg.thr_n}_v{cfg.val_m}x{cfg.val_n}"
 
-        # Add tensor properties to key
-        for arg in args:
-            if isinstance(arg, cute.Tensor):
-                key_parts.append(self._generate_tensor_key(arg))
-
-        return "_".join(key_parts)
+    def get_key(self, dtype: torch.dtype) -> str:
+        return f"{self.get_name()}_dtype={dtype}"
 
     def interface(
         self, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, *, assumed_align: int = 16
     ) -> None:
-        mA = from_dlpack(a, assumed_align=assumed_align)
-        mB = from_dlpack(b, assumed_align=assumed_align)
-        mC = from_dlpack(c, assumed_align=assumed_align)
-        return compile_and_cache(self, self.get_key(mA, mB, mC), self.op, mA, mB, mC)(mA, mB, mC)
+        dtype = torch_dtype_to_cute_dtype(c.dtype)
+        m, n = cute.sym_int(), cute.sym_int()
+        fake_a = make_fake_compact_tensor(dtype, (m, n), assumed_align=assumed_align)
+        fake_b = make_fake_compact_tensor(dtype, (m, n), assumed_align=assumed_align)
+        fake_c = make_fake_compact_tensor(dtype, (m, n), assumed_align=assumed_align)
+        compiled = compile_tvm_ffi_and_cache(
+            self,
+            self.get_key(c.dtype),
+            self.op,
+            fake_a,
+            fake_b,
+            fake_c,
+            fake_stream(),
+        )
+        return compiled(a, b, c)
 
     @cute.jit
-    def __call__(self, op: cutlass.Constexpr, mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
+    def __call__(
+        self,
+        op: cutlass.Constexpr,
+        mA: cute.Tensor,
+        mB: cute.Tensor,
+        mC: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
         """JIT function that launches the elementwise kernel."""
-        thr_layout = cute.make_layout((4, 32), stride=(32, 1))
-        val_layout = cute.make_layout((4, 8), stride=(8, 1))
+        cfg = self.config
+        thr_layout = cute.make_layout((cfg.thr_m, cfg.thr_n), stride=(cfg.thr_n, 1))
+        val_layout = cute.make_layout((cfg.val_m, cfg.val_n), stride=(cfg.val_n, 1))
         tiler_mn, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
 
         gA = cute.zipped_divide(mA, tiler_mn)
         gB = cute.zipped_divide(mB, tiler_mn)
         gC = cute.zipped_divide(mC, tiler_mn)
+        cC = cute.zipped_divide(cute.make_identity_tensor(mC.shape), tiler_mn)
 
-        self.kernel(op, gA, gB, gC, tv_layout).launch(
+        self.kernel(op, gA, gB, gC, cC, tv_layout, mC.shape, _name_prefix=self.get_name()).launch(
             grid=[cute.size(gC, mode=[1]), 1, 1],
             block=[cute.size(tv_layout, mode=[0]), 1, 1],
+            stream=stream,
         )
 
 

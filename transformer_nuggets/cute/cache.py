@@ -99,6 +99,15 @@ def _generate_cache_key(*args, use_hashing: bool = False, **kwargs) -> str:
         return key_str
 
 
+def _with_tvm_ffi_options(kwargs: dict[str, Any]) -> dict[str, Any]:
+    options = kwargs.get("options")
+    if options is None:
+        kwargs["options"] = "--enable-tvm-ffi"
+    elif "--enable-tvm-ffi" not in str(options):
+        kwargs["options"] = f"{options} --enable-tvm-ffi"
+    return kwargs
+
+
 def compile_and_cache(func: Callable, cache_key: str, *args, **kwargs):
     """
     Compile a @cute.jit decorated function with an explicit cache key.
@@ -133,6 +142,10 @@ def compile_and_cache(func: Callable, cache_key: str, *args, **kwargs):
     compiled_kernel = cute.compile(jit_func, *args, **kwargs)
     _kernel_cache.set(full_cache_key, compiled_kernel)
     return compiled_kernel
+
+
+def compile_tvm_ffi_and_cache(func: Callable, cache_key: str, *args, **kwargs):
+    return compile_and_cache(func, cache_key, *args, **_with_tvm_ffi_options(kwargs))
 
 
 def auto_compile_and_cache(func: Callable, *args, cache_extra=None, **kwargs):
@@ -175,6 +188,12 @@ def auto_compile_and_cache(func: Callable, *args, cache_extra=None, **kwargs):
         cache_key = f"{cache_key}_extra_{extra_str}"
 
     return compile_and_cache(jit_func, cache_key, *args, **kwargs)
+
+
+def auto_compile_tvm_ffi_and_cache(func: Callable, *args, cache_extra=None, **kwargs):
+    return auto_compile_and_cache(
+        func, *args, cache_extra=cache_extra, **_with_tvm_ffi_options(kwargs)
+    )
 
 
 def clear_cute_cache():

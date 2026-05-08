@@ -1,8 +1,65 @@
 import torch
 import hashlib
 from typing import Any
-import cutlass.cute as cute
 from pathlib import Path
+
+import cutlass
+import cutlass.cute as cute
+from cuda.bindings import driver as cuda
+
+
+def torch_dtype_to_cute_dtype(dtype: torch.dtype):
+    match dtype:
+        case torch.float16:
+            return cutlass.Float16
+        case torch.bfloat16:
+            return cutlass.BFloat16
+        case torch.float32:
+            return cutlass.Float32
+        case torch.uint8:
+            return cutlass.Uint8
+        case torch.int8:
+            return cutlass.Int8
+        case torch.int32:
+            return cutlass.Int32
+        case _:
+            raise TypeError(f"Unsupported torch dtype for CuTeDSL: {dtype}")
+
+
+def current_cuda_stream() -> cuda.CUstream:
+    return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+
+def fake_stream() -> cuda.CUstream:
+    return cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+
+def make_fake_tensor(dtype, shape: tuple, divisibility: int = 1, leading_dim: int = -1):
+    if leading_dim < 0:
+        leading_dim = len(shape) + leading_dim
+    stride = tuple(
+        1 if i == leading_dim else cute.sym_int64(divisibility=divisibility)
+        for i in range(len(shape))
+    )
+    return cute.runtime.make_fake_tensor(
+        dtype,
+        shape,
+        stride=stride,
+        assumed_align=max(1, divisibility * dtype.width // 8),
+    )
+
+
+def make_fake_compact_tensor(
+    dtype, shape: tuple, stride_order: tuple[int, ...] | None = None, assumed_align: int = 16
+):
+    if stride_order is None:
+        stride_order = tuple(reversed(range(len(shape))))
+    return cute.runtime.make_fake_compact_tensor(
+        dtype,
+        shape,
+        stride_order=stride_order,
+        assumed_align=assumed_align,
+    )
 
 
 def get_tensor_alignment(tensor: torch.Tensor, dim: int) -> int:

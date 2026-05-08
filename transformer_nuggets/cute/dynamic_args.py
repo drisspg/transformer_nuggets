@@ -1,24 +1,39 @@
 import torch
+from dataclasses import dataclass
 from operator import add
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
+from cuda.bindings import driver as cuda
 
 from transformer_nuggets.utils.benchmark import benchmark_cuda_function_in_microseconds
 from transformer_nuggets.cute.cache import (
-    compile_and_cache,
+    compile_tvm_ffi_and_cache,
     get_cache_stats,
     print_cache,
     set_cache_hashing,
 )
-from transformer_nuggets.cute.utils import get_tensor_alignment
+from transformer_nuggets.cute.utils import (
+    fake_stream,
+    get_tensor_alignment,
+    make_fake_compact_tensor,
+    torch_dtype_to_cute_dtype,
+)
 from transformer_nuggets.cute.base import CuteOp
 from rich import print
 from transformer_nuggets import init_logging
 import logging
 
 init_logging(logging.INFO)
+
+
+@dataclass(frozen=True)
+class DynamicElementwiseConfig:
+    thr_m: int
+    thr_n: int
+    val_m: int
+    val_n: int
+    order: tuple[int, int]
 
 
 class DynamicElementwiseOp(CuteOp[[torch.Tensor, torch.Tensor], torch.Tensor]):
@@ -35,7 +50,9 @@ class DynamicElementwiseOp(CuteOp[[torch.Tensor, torch.Tensor], torch.Tensor]):
         gA: cute.Tensor,
         gB: cute.Tensor,
         gC: cute.Tensor,
+        cC: cute.Tensor,
         tv_layout: cute.Layout,
+        shape: cute.Shape,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -45,49 +62,36 @@ class DynamicElementwiseOp(CuteOp[[torch.Tensor, torch.Tensor], torch.Tensor]):
         blkA = gA[blk_coord]
         blkB = gB[blk_coord]
         blkC = gC[blk_coord]
+        blkCoord = cC[blk_coord]
 
         tidfrgA = cute.composition(blkA, tv_layout)
 
         tidfrgB = cute.composition(blkB, tv_layout)
 
         tidfrgC = cute.composition(blkC, tv_layout)
+        tidfrgCoord = cute.composition(blkCoord, tv_layout)
 
         thr_coord = (tidx, None)
 
         thrA = tidfrgA[thr_coord]
         thrB = tidfrgB[thr_coord]
         thrC = tidfrgC[thr_coord]
+        thrCoord = tidfrgCoord[thr_coord]
 
-        thrC[None] = op(thrA.load(), thrB.load())
+        for i in cutlass.range_constexpr(cute.size(thrC)):
+            if cute.elem_less(thrCoord[i], shape):
+                thrC[i] = op(thrA[i], thrB[i])
 
-    def get_key(self, *args, **kwargs) -> str:
-        """Generate cache key including operation type, tensor properties, and dynamic parameters."""
-        op_name = getattr(self.op, "__name__", str(self.op))
-        key_parts = [self.__class__.__name__, f"op={op_name}"]
+    def get_name(self, config: DynamicElementwiseConfig) -> str:
+        op_name = getattr(self.op, "__name__", str(self.op)).lower()
+        return (
+            f"dynamic_elementwise_{op_name}"
+            f"_t{config.thr_m}x{config.thr_n}"
+            f"_v{config.val_m}x{config.val_n}"
+        )
 
-        # Extract parameters if provided in kwargs
-        if "params" in kwargs:
-            thr_m, thr_n, val_m, val_n, order = kwargs["params"]
-            key_parts.extend(
-                [
-                    f"thr_m={thr_m}",
-                    f"thr_n={thr_n}",
-                    f"val_m={val_m}",
-                    f"val_n={val_n}, order={order}",
-                ]
-            )
-
-        # Add tensor properties
-        for arg in args:
-            if isinstance(arg, cute.Tensor):
-                key_parts.append(self._generate_tensor_key(arg))
-
-        # Add alignment info if provided
-        if "alignments" in kwargs:
-            align_a, align_b, align_c = kwargs["alignments"]
-            key_parts.extend([f"align_a={align_a}", f"align_b={align_b}", f"align_c={align_c}"])
-
-        return "_".join(key_parts)
+    def get_key(self, dtype: torch.dtype, config: DynamicElementwiseConfig) -> str:
+        return f"{self.get_name(config)}_dtype={dtype}_order={config.order}"
 
     def _select_parameters(self, M: int, N: int) -> tuple[int, int, int, int]:
         """Choose parameters based on tensor size."""
@@ -99,38 +103,41 @@ class DynamicElementwiseOp(CuteOp[[torch.Tensor, torch.Tensor], torch.Tensor]):
 
     def interface(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         M, N = a.shape
-        c = torch.empty(M, N, device="cuda", dtype=torch.float16)
+        c = torch.empty(M, N, device=a.device, dtype=a.dtype)
 
         thr_m, thr_n, val_m, val_n = self._select_parameters(M, N)
-
-        align_a = get_tensor_alignment(a, dim=-1)
-        align_b = get_tensor_alignment(b, dim=-1)
-        align_c = get_tensor_alignment(c, dim=-1)
-
-        mA = from_dlpack(a, assumed_align=align_a).mark_layout_dynamic()
-        mB = from_dlpack(b, assumed_align=align_b).mark_layout_dynamic()
-        mC = from_dlpack(c, assumed_align=align_c).mark_layout_dynamic()
-
-        dim_orders = tuple(reversed(a.dim_order()))
-        compile_and_cache(
+        config = DynamicElementwiseConfig(
+            thr_m=thr_m,
+            thr_n=thr_n,
+            val_m=val_m,
+            val_n=val_n,
+            order=tuple(reversed(a.dim_order())),
+        )
+        dtype = torch_dtype_to_cute_dtype(c.dtype)
+        m, n = cute.sym_int(), cute.sym_int()
+        assumed_align = min(
+            get_tensor_alignment(a, dim=-1),
+            get_tensor_alignment(b, dim=-1),
+            get_tensor_alignment(c, dim=-1),
+        )
+        fake_a = make_fake_compact_tensor(dtype, (m, n), assumed_align=assumed_align)
+        fake_b = make_fake_compact_tensor(dtype, (m, n), assumed_align=assumed_align)
+        fake_c = make_fake_compact_tensor(dtype, (m, n), assumed_align=assumed_align)
+        compiled = compile_tvm_ffi_and_cache(
             self,
-            self.get_key(
-                mA,
-                mB,
-                mC,
-                params=(thr_m, thr_n, val_m, val_n, dim_orders),
-                alignments=(align_a, align_b, align_c),
-            ),
+            self.get_key(c.dtype, config),
             self.op,
-            mA,
-            mB,
-            mC,
-            thr_m,
-            thr_n,
-            val_m,
-            val_n,
-            dim_orders,
-        )(mA, mB, mC)
+            fake_a,
+            fake_b,
+            fake_c,
+            config.thr_m,
+            config.thr_n,
+            config.val_m,
+            config.val_n,
+            config.order,
+            fake_stream(),
+        )
+        compiled(a, b, c)
         return c
 
     @cute.jit
@@ -145,6 +152,7 @@ class DynamicElementwiseOp(CuteOp[[torch.Tensor, torch.Tensor], torch.Tensor]):
         val_m: cutlass.Constexpr,
         val_n: cutlass.Constexpr,
         order: cutlass.Constexpr,
+        stream: cuda.CUstream,
     ):
         """Parameterized kernel that accepts layout dimensions as constexpr"""
         thr_layout = cute.make_ordered_layout((thr_m, thr_n), order)
@@ -154,10 +162,14 @@ class DynamicElementwiseOp(CuteOp[[torch.Tensor, torch.Tensor], torch.Tensor]):
         gA = cute.zipped_divide(mA, tiler_mn)
         gB = cute.zipped_divide(mB, tiler_mn)
         gC = cute.zipped_divide(mC, tiler_mn)
+        cC = cute.zipped_divide(cute.make_identity_tensor(mC.shape), tiler_mn)
 
-        self.kernel(op, gA, gB, gC, tv_layout).launch(
+        op_name = getattr(self.op, "__name__", str(self.op)).lower()
+        kernel_name = f"dynamic_elementwise_{op_name}_t{thr_m}x{thr_n}_v{val_m}x{val_n}"
+        self.kernel(op, gA, gB, gC, cC, tv_layout, mC.shape, _name_prefix=kernel_name).launch(
             grid=[cute.size(gC, mode=[1]), 1, 1],
             block=[cute.size(tv_layout, mode=[0]), 1, 1],
+            stream=stream,
         )
 
 

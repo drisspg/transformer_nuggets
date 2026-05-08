@@ -1,6 +1,8 @@
 from transformer_nuggets.cute.cache import (
     compile_and_cache,
+    compile_tvm_ffi_and_cache,
     auto_compile_and_cache,
+    auto_compile_tvm_ffi_and_cache,
     clear_cute_cache,
     get_cache_stats,
     set_cache_size,

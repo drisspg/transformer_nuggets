@@ -3,9 +3,15 @@ import torch
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
+from cuda.bindings import driver as cuda
 
 from transformer_nuggets.cute.base import CuteOp
+from transformer_nuggets.cute.cache import compile_tvm_ffi_and_cache
+from transformer_nuggets.cute.utils import (
+    fake_stream,
+    make_fake_compact_tensor,
+    torch_dtype_to_cute_dtype,
+)
 
 
 class ToBlocked(CuteOp):
@@ -73,8 +79,11 @@ class ToBlocked(CuteOp):
         atom_stride = ((16, 4), 1)
         return cute.make_layout(atom_shape, stride=atom_stride)
 
+    def get_name(self) -> str:
+        return f"to_blocked_mx_kblocks{self.K_BLOCKS_PER_TB}"
+
     @cute.jit()
-    def __call__(self, input: cute.Tensor, output: cute.Tensor):
+    def __call__(self, input: cute.Tensor, output: cute.Tensor, stream: cuda.CUstream):
         block_scale_atom = self.get_block_swizzled_atom()
 
         # Tile the atom layout to the full output shape
@@ -102,10 +111,17 @@ class ToBlocked(CuteOp):
         gO_blocked = cute.zipped_divide(output_blocked, tiler_mn)
 
         self.kernel(
-            gI, gO_blocked, tv_layout_swizzle, tv_layout_linear, linear_layout, smem_swizzle
+            gI,
+            gO_blocked,
+            tv_layout_swizzle,
+            tv_layout_linear,
+            linear_layout,
+            smem_swizzle,
+            _name_prefix=self.get_name(),
         ).launch(
             grid=[cute.size(gI, mode=[1]), 1, 1],
             block=[cute.size(thread_layout), 1, 1],
+            stream=stream,
         )
 
     def interface(self, scales: torch.Tensor):
@@ -114,19 +130,19 @@ class ToBlocked(CuteOp):
         assumed_align = 512  # Scales are 128*4 byte aligned
         # K dimension must be divisible by 4 * K_BLOCKS_PER_TB
         k_divisibility = 4 * self.K_BLOCKS_PER_TB
-        input_cute = (
-            from_dlpack(scales, assumed_align=assumed_align)
-            .mark_layout_dynamic(leading_dim=1)
-            .mark_compact_shape_dynamic(mode=0, divisibility=128)
-            .mark_compact_shape_dynamic(mode=1, divisibility=k_divisibility)
+        dtype = torch_dtype_to_cute_dtype(scales.dtype)
+        m = cute.sym_int()
+        n = cute.sym_int()
+        input_cute = make_fake_compact_tensor(dtype, (m, n), assumed_align=assumed_align)
+        output_cute = make_fake_compact_tensor(dtype, (m, n), assumed_align=assumed_align)
+        compiled = compile_tvm_ffi_and_cache(
+            self,
+            f"{self.get_name()}_dtype={scales.dtype}_kdiv={k_divisibility}",
+            input_cute,
+            output_cute,
+            fake_stream(),
         )
-        output_cute = (
-            from_dlpack(output, assumed_align=assumed_align)
-            .mark_layout_dynamic(leading_dim=1)
-            .mark_compact_shape_dynamic(mode=0, divisibility=128)
-            .mark_compact_shape_dynamic(mode=1, divisibility=k_divisibility)
-        )
-        self(input_cute, output_cute)
+        compiled(scales, output)
         return output.view(-1, 32, 16)
 
 

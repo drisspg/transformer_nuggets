@@ -45,6 +45,10 @@ class CuteOp(Generic[_P, _R], ABC):
         """
         return self.__class__.__name__
 
+    def get_name(self) -> str:
+        """Return a stable prefix for profiler and dump artifact kernel names."""
+        return self.__class__.__name__.lower()
+
     def _generate_tensor_key(self, tensor: cute.Tensor) -> str:
         """Generate a cache key component for a CUTE tensor."""
         tensor_str = str(tensor)
