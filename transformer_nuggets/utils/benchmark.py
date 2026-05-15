@@ -5,7 +5,6 @@ import logging
 import os
 import random
 import statistics
-import warnings
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,12 +19,41 @@ import functools
 from torch.cuda._memory_viz import profile_plot  # type: ignore
 from torch.profiler import profile, ProfilerActivity, record_function, schedule
 
-warnings.filterwarnings("ignore", message=".*SyncActivityProfilerHandler.*")
-warnings.filterwarnings("ignore", message=".*profiler_start.*")
-warnings.filterwarnings("ignore", message=".*profiler_stop.*")
-
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
+
+_KINETO_LOG_LEVEL_ENV = "KINETO_LOG_LEVEL"
+_KINETO_SUPPRESS_ALL_LOGS_LEVEL = "6"
+_KEEP_KINETO_LOG_LEVEL_ENV = "TRANSFORMER_NUGGETS_KEEP_KINETO_LOG_LEVEL"
+
+
+@contextmanager
+def _suppress_sync_activity_profiler_logs():
+    """Suppress noisy Kineto profiler start/stop logs during benchmark timing.
+
+    Recent PyTorch nightlies can print lines like::
+
+        USDT:... SyncActivityProfilerHandler.cpp:52] profiler_start
+        USDT:... SyncActivityProfilerHandler.cpp:59] profiler_stop
+
+    These are emitted by Kineto native logging, not Python ``warnings``.
+    ``KINETO_LOG_LEVEL=6`` disables these logs and is read dynamically by
+    Kineto, so setting it only around the profiler-backed benchmark call avoids
+    subprocesses and fd-level stderr redirection.
+    """
+    if os.environ.get(_KEEP_KINETO_LOG_LEVEL_ENV):
+        yield
+        return
+
+    previous_level = os.environ.get(_KINETO_LOG_LEVEL_ENV)
+    os.environ[_KINETO_LOG_LEVEL_ENV] = _KINETO_SUPPRESS_ALL_LOGS_LEVEL
+    try:
+        yield
+    finally:
+        if previous_level is None:
+            os.environ.pop(_KINETO_LOG_LEVEL_ENV, None)
+        else:
+            os.environ[_KINETO_LOG_LEVEL_ENV] = previous_level
 
 
 def _nvml():
@@ -267,7 +295,8 @@ def _call_do_bench_using_profiling(
     call_kwargs = {"rep": rep}
     if "is_vetted_benchmarking" in params:
         call_kwargs["is_vetted_benchmarking"] = is_vetted_benchmarking
-    return do_bench_using_profiling(fn, **call_kwargs)
+    with _suppress_sync_activity_profiler_logs():
+        return do_bench_using_profiling(fn, **call_kwargs)
 
 
 def _benchmark_cuda_graph_replay_samples_us(
@@ -373,13 +402,14 @@ def benchmark_cuda_function_stats(func: Callable, *args, **kwargs) -> CudaBenchm
         no_args = lambda: func(*args, **kwargs)
         from torch._inductor.runtime.benchmarking import benchmarker
 
-        samples_ms = benchmarker.benchmark_gpu(
-            no_args,
-            benchmark_iters=num_iters,
-            memory_warmup_iters=memory_warmup_iters,
-            return_mode="all",
-            is_vetted_benchmarking=is_vetted_benchmarking,
-        )
+        with _suppress_sync_activity_profiler_logs():
+            samples_ms = benchmarker.benchmark_gpu(
+                no_args,
+                benchmark_iters=num_iters,
+                memory_warmup_iters=memory_warmup_iters,
+                return_mode="all",
+                is_vetted_benchmarking=is_vetted_benchmarking,
+            )
     return CudaBenchmarkStats.from_samples(
         (float(sample) * 1e3 for sample in samples_ms),
         confidence=confidence,

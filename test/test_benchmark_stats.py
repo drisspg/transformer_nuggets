@@ -1,9 +1,10 @@
-import warnings
+import os
 
 import pytest
 
 from transformer_nuggets.utils.benchmark import (
     CudaBenchmarkStats,
+    benchmark_cuda_function_in_microseconds,
     benchmark_cuda_function_stats,
 )
 
@@ -61,24 +62,56 @@ def test_benchmark_cuda_function_stats_singleton(monkeypatch):
     assert stats.median_ci_us == pytest.approx((10.0, 10.0))
 
 
-@pytest.mark.parametrize(
-    "message",
-    [
-        "CUDA warning: SyncActivityProfilerHandler::start failed to stop cleanly",
-        "Detected call of profiler_start while another profiler is active",
-        "Detected call of profiler_stop without a matching start",
-    ],
-)
-def test_benchmark_utils_suppresses_known_profiler_warnings(message):
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.warn(message, UserWarning, stacklevel=1)
+def test_benchmark_cuda_function_sets_kineto_log_level_around_profiler_call(monkeypatch):
+    monkeypatch.delenv("KINETO_LOG_LEVEL", raising=False)
 
-    assert caught == []
+    def fake_do_bench_using_profiling(fn, *, rep, is_vetted_benchmarking):
+        assert rep == 3
+        assert is_vetted_benchmarking is False
+        assert os.environ["KINETO_LOG_LEVEL"] == "6"
+        fn()
+        return 0.123
+
+    monkeypatch.setattr(
+        "transformer_nuggets.utils.benchmark.do_bench_using_profiling",
+        fake_do_bench_using_profiling,
+    )
+
+    latency_us = benchmark_cuda_function_in_microseconds(lambda: None, NUM_ITERS=3)
+
+    assert latency_us == pytest.approx(123.0)
+    assert "KINETO_LOG_LEVEL" not in os.environ
 
 
-def test_benchmark_utils_does_not_suppress_unrelated_warnings():
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.warn("transformer-nuggets unrelated benchmark warning", UserWarning, stacklevel=1)
+def test_benchmark_cuda_function_restores_existing_kineto_log_level(monkeypatch):
+    monkeypatch.setenv("KINETO_LOG_LEVEL", "2")
 
-    assert len(caught) == 1
-    assert str(caught[0].message) == "transformer-nuggets unrelated benchmark warning"
+    def fake_do_bench_using_profiling(fn, *, rep, is_vetted_benchmarking):
+        assert os.environ["KINETO_LOG_LEVEL"] == "6"
+        fn()
+        return 0.123
+
+    monkeypatch.setattr(
+        "transformer_nuggets.utils.benchmark.do_bench_using_profiling",
+        fake_do_bench_using_profiling,
+    )
+
+    benchmark_cuda_function_in_microseconds(lambda: None)
+
+    assert os.environ["KINETO_LOG_LEVEL"] == "2"
+
+
+def test_benchmark_cuda_function_stats_sets_kineto_log_level_around_profiler_call(monkeypatch):
+    class FakeBenchmarker:
+        def benchmark_gpu(self, fn, **kwargs):
+            assert os.environ["KINETO_LOG_LEVEL"] == "6"
+            fn()
+            return [0.010, 0.012, 0.011]
+
+    monkeypatch.delenv("KINETO_LOG_LEVEL", raising=False)
+    monkeypatch.setattr("torch._inductor.runtime.benchmarking.benchmarker", FakeBenchmarker())
+
+    stats = benchmark_cuda_function_stats(lambda: None)
+
+    assert stats.samples_us == pytest.approx((10.0, 12.0, 11.0))
+    assert "KINETO_LOG_LEVEL" not in os.environ
