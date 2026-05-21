@@ -22,22 +22,23 @@ Usage:
     self.kernel(x_c, prof.to_cute(), prof.max_events_per_unit, produce_tag, consume_tag).launch(...)
 
     events = decode_events(prof, tag_table)
-    events_to_perfetto(events, "trace.json", pid=0)
+    events_to_perfetto(events, "trace.json.gz", pid=0)
 
 Or use the context manager:
-    with profile_session(64, num_units=4, tag_names=["produce", "consume"], trace_path="trace.json") as (prof, tags):
+    with profile_session(64, num_units=4, tag_names=["produce", "consume"], trace_path="trace.json.gz") as (prof, tags):
         produce_tag = tags.id("produce")
         self.kernel(x_c, prof.to_cute(), prof.max_events_per_unit, produce_tag).launch(...)
 """
 
 from __future__ import annotations
 
-import json
 from contextlib import contextmanager
 from dataclasses import dataclass
 from collections.abc import Callable, Iterator
 
 import torch
+
+from transformer_nuggets.utils.perfetto import split_overlapping_slices, write_trace
 
 try:
     import cutlass.cute as cute
@@ -305,6 +306,7 @@ def events_to_perfetto(
     pid: int = 0,
     tid_prefix: int | None = None,
     unit_name: str = "Unit",
+    split_overlaps: bool = True,
 ) -> dict:
     """Export events to Perfetto-compatible Chrome trace JSON format.
 
@@ -323,6 +325,8 @@ def events_to_perfetto(
         tid_prefix: Optional prefix for thread IDs. If provided, tid = tid_prefix + event.tid.
                     This can satisfy Perfetto's pid/tid quirk where tid should start with pid.
         unit_name: Name for units in trace (e.g., "Block", "Warp"). Defaults to "Unit".
+        split_overlaps: If true, split overlapping duration slices on the same
+            track into adjacent lanes before returning/writing the trace.
 
     Returns:
         The trace dict (can be further modified before writing).
@@ -330,8 +334,7 @@ def events_to_perfetto(
     if not events:
         trace = {"traceEvents": []}
         if trace_path is not None:
-            with open(trace_path, "w") as f:
-                json.dump(trace, f)
+            write_trace(trace_path, trace)
         return trace
 
     trace_events = []
@@ -412,9 +415,11 @@ def events_to_perfetto(
         "traceEvents": trace_events,
     }
 
+    if split_overlaps:
+        trace = split_overlapping_slices(trace)
+
     if trace_path is not None:
-        with open(trace_path, "w") as f:
-            json.dump(trace, f, indent=2)
+        write_trace(trace_path, trace)
 
     return trace
 
@@ -430,6 +435,7 @@ def profile_session(
     pid: int = 0,
     post_process_events: Callable[[list[Event], PostProcessContext], list[Event]] | None = None,
     post_process_trace: Callable[[dict, PostProcessContext], dict] | None = None,
+    split_overlaps: bool = True,
 ) -> Iterator[tuple[ProfileBuf, TagTable]]:
     """Context manager for profiling a kernel session.
 
@@ -441,7 +447,7 @@ def profile_session(
             max_events_per_unit=64,
             num_units=(num_blocks, "Block"),  # Named units for nicer traces
             tag_names=["produce", "consume"],
-            trace_path="trace.json"
+            trace_path="trace.json.gz"
         ) as (prof, tags):
             TAG_PRODUCE = tags.id("produce")
             TAG_CONSUME = tags.id("consume")
@@ -475,6 +481,8 @@ def profile_session(
             Signature: (events, context) -> events. Can rename, filter, or regroup events.
         post_process_trace: Optional callback to mutate the Perfetto trace dict before writing.
             Signature: (trace_dict, context) -> trace_dict. Can add flow events, counters, etc.
+        split_overlaps: If true, split overlapping duration slices on the same
+            Perfetto track into adjacent lanes before writing the trace.
 
     Yields:
         Tuple of (ProfileBuf, TagTable).
@@ -506,10 +514,18 @@ def profile_session(
         events = post_process_events(events, ctx)
 
     if trace_path is not None:
-        trace = events_to_perfetto(events, trace_path=None, pid=pid, unit_name=prof.unit_name)
+        trace = events_to_perfetto(
+            events,
+            trace_path=None,
+            pid=pid,
+            unit_name=prof.unit_name,
+            split_overlaps=False,
+        )
 
         if post_process_trace is not None:
             trace = post_process_trace(trace, ctx)
 
-        with open(trace_path, "w") as f:
-            json.dump(trace, f, indent=2)
+        if split_overlaps:
+            trace = split_overlapping_slices(trace)
+
+        write_trace(trace_path, trace)

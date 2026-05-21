@@ -20,7 +20,7 @@ with profile_session(
     max_events_per_unit=64,
     num_units=(num_blocks, "Block"),
     tag_names=["compute"],
-    trace_path="trace.json",
+    trace_path="trace.json.gz",
 ) as (prof, _):
     my_kernel(output, prof.tensor, prof.max_events_per_unit)
 ```
@@ -69,7 +69,7 @@ You set `max_events_per_unit` to something larger than you need; the decoder sca
 | `profile_session(...)` | Context manager: allocate, yield, decode, write trace |
 | `allocate_profile_buffer(max_events_per_unit, num_units, device)` | Allocate buffer |
 | `decode_events(buf, tag_table)` | Decode to `Event` list |
-| `events_to_perfetto(events, path)` | Write Chrome trace JSON |
+| `events_to_perfetto(events, path)` | Write Chrome trace JSON/JSON.GZ and split overlapping slices into adjacent lanes by default |
 | `TagTable(names)` | Map tag names ↔ integer IDs |
 | `PostProcessContext` | Context passed to post-processing callbacks |
 
@@ -82,6 +82,8 @@ You set `max_events_per_unit` to something larger than you need; the decoder sca
 | `warp_atomic_alloc(...)` | Allocate event index atomically |
 
 ## Post-Processing
+
+Trace paths ending in `.gz` are written compressed. Overlapping duration slices on the same Perfetto track are split into adjacent `#0`, `#1`, ... lanes by default; pass `split_overlaps=False` to `profile_session` or `events_to_perfetto` to keep raw tracks.
 
 You can pass callbacks to `profile_session` to mutate events or the Perfetto trace before writing:
 

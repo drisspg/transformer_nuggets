@@ -19,6 +19,13 @@ import functools
 from torch.cuda._memory_viz import profile_plot  # type: ignore
 from torch.profiler import profile, ProfilerActivity, record_function, schedule
 
+from transformer_nuggets.utils.perfetto import (
+    default_trace_path,
+    read_trace,
+    split_overlapping_slices,
+    write_trace,
+)
+
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
@@ -161,6 +168,9 @@ class ProfileConfig:
     extra_kwargs: dict = field(default_factory=dict)
     memory_profile_path: str | None = None
     row_limit: int = 10
+    gzip_trace: bool = True
+    fix_overlapping_events: bool = True
+    overlap_track_pattern: str | None = "stream.*"
 
 
 @dataclass(frozen=True)
@@ -521,8 +531,24 @@ def profile_function(
                     torch.cuda.synchronize()
 
     if config.file_path is not None:
-        trace_path = Path(config.file_path).with_suffix(".json")
-        prof.export_chrome_trace(str(trace_path))
+        trace_path = default_trace_path(config.file_path, gzip_by_default=config.gzip_trace)
+        export_path = trace_path
+        if trace_path.suffix == ".gz":
+            export_path = trace_path.with_name(f"{trace_path.name}.tmp.json")
+
+        prof.export_chrome_trace(str(export_path))
+
+        if config.fix_overlapping_events or export_path != trace_path:
+            trace = read_trace(export_path)
+            if config.fix_overlapping_events:
+                trace = split_overlapping_slices(
+                    trace,
+                    track_pattern=config.overlap_track_pattern,
+                )
+            write_trace(trace_path, trace)
+            if export_path != trace_path:
+                export_path.unlink()
+
         logger.info(f"💾 Trace file 📄 saved to: {bcolors.OKGREEN}{trace_path}{bcolors.ENDC}")
 
     if profile_memory and config.memory_profile_path is not None:

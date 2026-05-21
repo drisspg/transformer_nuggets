@@ -21,7 +21,7 @@ Quick Start:
         max_events_per_unit=64,
         num_units=(num_blocks, "Block"),
         tag_names=["compute"],
-        trace_path="trace.json",
+        trace_path="trace.json.gz",
     ) as (prof, tag_table):
         my_kernel(output, prof.tensor, prof.max_events_per_unit)
 
