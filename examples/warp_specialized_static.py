@@ -110,7 +110,7 @@ def run():
         device=device,
     )
 
-    trace_path = transformer_nuggets.DATA_DIR / "profiler_warp_static_trace.json"
+    trace_path = transformer_nuggets.DATA_DIR / "profiler_warp_static_trace.pftrace"
 
     process_names = {i: f"CTA {i}" for i in range(NUM_BLOCKS)}
 

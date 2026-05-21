@@ -20,10 +20,9 @@ from torch.cuda._memory_viz import profile_plot  # type: ignore
 from torch.profiler import profile, ProfilerActivity, record_function, schedule
 
 from transformer_nuggets.utils.perfetto import (
-    default_trace_path,
+    perfetto_trace_path,
     read_trace,
-    split_overlapping_slices,
-    write_trace,
+    write_perfetto_trace,
 )
 
 logger = logging.getLogger(__name__)
@@ -171,6 +170,7 @@ class ProfileConfig:
     gzip_trace: bool = True
     fix_overlapping_events: bool = True
     overlap_track_pattern: str | None = "stream.*"
+    trace_format: Literal["chrome_json", "track_event"] = "track_event"
 
 
 @dataclass(frozen=True)
@@ -498,6 +498,38 @@ def benchmark_cuda_function_in_microseconds_triton(func: Callable, *args, **kwar
         return do_bench(no_args) * 1e3
 
 
+def _write_profiler_trace(
+    prof: torch.profiler.profile,
+    trace_path: Path,
+    *,
+    trace_format: Literal["chrome_json", "track_event"],
+    split_overlaps: bool,
+    track_pattern: str | None,
+    gzip_trace: bool = False,
+) -> None:
+    """Export a torch profiler trace through the canonical Perfetto writer."""
+    can_export_direct_json = (
+        trace_format == "chrome_json" and not split_overlaps and trace_path.suffix != ".gz"
+    )
+    if can_export_direct_json:
+        prof.export_chrome_trace(str(trace_path))
+        return
+
+    export_path = trace_path.with_name(f"{trace_path.name}.tmp.json")
+    try:
+        prof.export_chrome_trace(str(export_path))
+        write_perfetto_trace(
+            trace_path,
+            read_trace(export_path),
+            trace_format=trace_format,
+            split_overlaps=split_overlaps,
+            track_pattern=track_pattern,
+            gzip_trace=gzip_trace,
+        )
+    finally:
+        export_path.unlink(missing_ok=True)
+
+
 def profile_function(
     config: ProfileConfig, func: Callable, *args, **kwargs
 ) -> torch.profiler.profile:
@@ -531,24 +563,19 @@ def profile_function(
                     torch.cuda.synchronize()
 
     if config.file_path is not None:
-        trace_path = default_trace_path(config.file_path, gzip_by_default=config.gzip_trace)
-        export_path = trace_path
-        if trace_path.suffix == ".gz":
-            export_path = trace_path.with_name(f"{trace_path.name}.tmp.json")
-
-        prof.export_chrome_trace(str(export_path))
-
-        if config.fix_overlapping_events or export_path != trace_path:
-            trace = read_trace(export_path)
-            if config.fix_overlapping_events:
-                trace = split_overlapping_slices(
-                    trace,
-                    track_pattern=config.overlap_track_pattern,
-                )
-            write_trace(trace_path, trace)
-            if export_path != trace_path:
-                export_path.unlink()
-
+        trace_path = perfetto_trace_path(
+            config.file_path,
+            trace_format=config.trace_format,
+            gzip_trace=config.gzip_trace,
+        )
+        _write_profiler_trace(
+            prof,
+            trace_path,
+            trace_format=config.trace_format,
+            split_overlaps=config.fix_overlapping_events,
+            track_pattern=config.overlap_track_pattern,
+            gzip_trace=config.gzip_trace,
+        )
         logger.info(f"💾 Trace file 📄 saved to: {bcolors.OKGREEN}{trace_path}{bcolors.ENDC}")
 
     if profile_memory and config.memory_profile_path is not None:
@@ -799,6 +826,14 @@ def get_process_rank():
     return None
 
 
+def _ranked_trace_path(path: Path, rank: int) -> Path:
+    """Insert a distributed rank before a trace format suffix."""
+    if path.suffixes[-2:] == [".json", ".gz"]:
+        stem = path.name[: -len(".json.gz")]
+        return path.with_name(f"{stem}_rank_{rank}.json.gz")
+    return path.with_name(f"{path.stem}_rank_{rank}{path.suffix}")
+
+
 @contextmanager
 def profiler(
     path: Path | str,
@@ -809,6 +844,7 @@ def profiler(
     fix_overlapping_events: bool = True,
     overlap_track_pattern: str | None = "stream.*",
     gzip_trace: bool = False,
+    trace_format: Literal["chrome_json", "track_event"] = "track_event",
 ):
     """Thin wrapper around torch.profiler
 
@@ -822,15 +858,17 @@ def profiler(
             sibling lanes so Perfetto does not hide overlapped events.
         overlap_track_pattern: Regex for tracks to postprocess. Defaults to CUDA
             stream tracks; pass ``None`` to process every track.
-        gzip_trace: Write ``.json.gz`` instead of ``.json``.
+        gzip_trace: Write ``.json.gz`` instead of ``.json`` for Chrome JSON traces.
+        trace_format: ``"track_event"`` writes native Perfetto ``.pftrace`` output;
+            ``"chrome_json"`` writes Chrome JSON/JSON.GZ output.
 
     Usage:
     ```
-        with profiler(Path("trace.json")):
+        with profiler(Path("trace.pftrace")):
             # code to profile
 
         # With steps (e.g. in a training loop) this will record 7 iterations
-        with profiler(Path("trace.json"), warmup=3) as p:
+        with profiler(Path("trace.pftrace"), warmup=3) as p:
             for i in range(10):
                 # Your code for this step (e.g. forward, backward, optimize)
 
@@ -848,11 +886,11 @@ def profiler(
     rank = get_process_rank()
 
     # Create path with suffix
-    path = default_trace_path(path, gzip_by_default=gzip_trace)
+    path = perfetto_trace_path(path, trace_format=trace_format, gzip_trace=gzip_trace)
 
     # Add rank to filename if distributed
     if rank is not None:
-        path = path.parent / f"{path.stem}_rank_{rank}{path.suffix}"
+        path = _ranked_trace_path(path, rank)
 
     # make parent dir if it doesn't exist
     output_dir = path.parent
@@ -861,22 +899,14 @@ def profiler(
     logger.info(f"💾 Trace file 📄 saved to: {bcolors.OKGREEN}{path}{bcolors.ENDC}")
 
     def trace_handler(prof) -> None:
-        export_path = path
-        if path.suffix == ".gz":
-            export_path = path.with_name(f"{path.name}.tmp.json")
-
-        prof.export_chrome_trace(export_path.as_posix())
-
-        if fix_overlapping_events or export_path != path:
-            trace = read_trace(export_path)
-            if fix_overlapping_events:
-                trace = split_overlapping_slices(
-                    trace,
-                    track_pattern=overlap_track_pattern,
-                )
-            write_trace(path, trace)
-            if export_path != path:
-                export_path.unlink()
+        _write_profiler_trace(
+            prof,
+            path,
+            trace_format=trace_format,
+            split_overlaps=fix_overlapping_events,
+            track_pattern=overlap_track_pattern,
+            gzip_trace=gzip_trace,
+        )
 
     prof_sched = schedule(wait=0, warmup=warmup, active=int(1_000_000)) if warmup > 0 else None
     profiler = torch.profiler.profile(

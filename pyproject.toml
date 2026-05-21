@@ -28,6 +28,7 @@ dependencies = [
     "seaborn",
     "typer",
     "jinja2",
+    "perfetto",
 ]
 
 [project.optional-dependencies]

@@ -20,7 +20,7 @@ with profile_session(
     max_events_per_unit=64,
     num_units=(num_blocks, "Block"),
     tag_names=["compute"],
-    trace_path="trace.json.gz",
+    trace_path="trace.pftrace",
 ) as (prof, _):
     my_kernel(output, prof.tensor, prof.max_events_per_unit)
 ```
@@ -69,7 +69,7 @@ You set `max_events_per_unit` to something larger than you need; the decoder sca
 | `profile_session(...)` | Context manager: allocate, yield, decode, write trace |
 | `allocate_profile_buffer(max_events_per_unit, num_units, device)` | Allocate buffer |
 | `decode_events(buf, tag_table)` | Decode to `Event` list |
-| `events_to_perfetto(events, path)` | Write Chrome trace JSON/JSON.GZ and split overlapping slices into adjacent lanes by default |
+| `events_to_perfetto(events, path)` | Write native Perfetto TrackEvent `.pftrace` by default, or Chrome JSON/JSON.GZ with `trace_format="chrome_json"` |
 | `TagTable(names)` | Map tag names ↔ integer IDs |
 | `PostProcessContext` | Context passed to post-processing callbacks |
 
@@ -81,9 +81,17 @@ You set `max_events_per_unit` to something larger than you need; the decoder sca
 | `warp_start/warp_stop(...)` | Low-level start/stop (lane 0 of target_warp) |
 | `warp_atomic_alloc(...)` | Allocate event index atomically |
 
+## Trace Formats
+
+Two output formats are supported:
+
+- `track_event` (default): native Perfetto protobuf (`.pftrace` / `.perfetto-trace`). This is the preferred format for programmatically generated traces. Crossing overlaps on one logical track are encoded as multiple backing TrackEvent tracks with the same merge key, so Perfetto can display them as one logical row.
+- `chrome_json`: legacy Chrome JSON/JSON.GZ. Use this only for compatibility with tools that require Chrome JSON. Perfetto handles this format on a best-effort basis and requires duration events on a track to nest cleanly.
+
+Pass `trace_format="chrome_json"` to `profile_session` or `events_to_perfetto` to opt into legacy JSON output. Pass `split_overlaps=False` to keep raw tracks.
+
 ## Post-Processing
 
-Trace paths ending in `.gz` are written compressed. Overlapping duration slices on the same Perfetto track are split into adjacent `#0`, `#1`, ... lanes by default; pass `split_overlaps=False` to `profile_session` or `events_to_perfetto` to keep raw tracks.
 
 You can pass callbacks to `profile_session` to mutate events or the Perfetto trace before writing:
 

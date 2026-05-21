@@ -1,7 +1,7 @@
 """NVIDIA Intra-Kernel Profiling for CUTE DSL Kernels.
 
 This package provides utilities for profiling code regions *inside* GPU kernels,
-generating Chrome trace format files viewable in Perfetto (https://ui.perfetto.dev/).
+generating native Perfetto TrackEvent traces viewable in Perfetto (https://ui.perfetto.dev/).
 
 Two modes are supported:
 - Atomic mode: No event_idx needed, indices allocated via atomics (simple)
@@ -21,7 +21,7 @@ Quick Start:
         max_events_per_unit=64,
         num_units=(num_blocks, "Block"),
         tag_names=["compute"],
-        trace_path="trace.json.gz",
+        trace_path="trace.pftrace",
     ) as (prof, tag_table):
         my_kernel(output, prof.tensor, prof.max_events_per_unit)
 

@@ -1,8 +1,18 @@
 """Perfetto/Chrome trace helpers.
 
-The helpers here intentionally operate on plain trace dictionaries so they can
-be reused for both torch.profiler output and transformer-nuggets' lightweight
-CuTe profiler.
+Supported output formats:
+
+- ``track_event``: native Perfetto protobuf traces, written as ``.pftrace`` or
+  ``.perfetto-trace``. This is the default for programmatically generated
+  traces. It uses explicit TrackEvent descriptors and supports merged backing
+  tracks for crossing overlaps on one logical timeline.
+- ``chrome_json``: legacy Chrome JSON/JSON.GZ traces. This remains useful for
+  compatibility with tools that only consume Chrome JSON, but Perfetto treats
+  this format as best-effort and requires duration events on a track to nest.
+
+The Chrome JSON helpers intentionally operate on plain trace dictionaries so
+both torch.profiler output and transformer-nuggets' lightweight CuTe profiler
+can reuse them.
 """
 
 from __future__ import annotations
@@ -15,9 +25,13 @@ from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from collections.abc import Iterator
 from re import Pattern
+
+
+TraceFormat = Literal["chrome_json", "track_event"]
+"""Perfetto-compatible output format selector."""
 
 
 @contextmanager
@@ -49,7 +63,7 @@ def write_trace(path: str | Path, trace: dict[str, Any], *, indent: int | None =
 
 
 def default_trace_path(file_path: str | Path, *, gzip_by_default: bool = True) -> Path:
-    """Return a trace output path, treating suffix-less paths as trace stems.
+    """Return a Chrome JSON trace path, treating suffix-less paths as stems.
 
     Examples:
         ``"foo"`` -> ``"foo.json.gz"`` when ``gzip_by_default`` is true.
@@ -58,10 +72,8 @@ def default_trace_path(file_path: str | Path, *, gzip_by_default: bool = True) -
     """
     path = Path(file_path)
     suffixes = path.suffixes
-    if suffixes[-2:] == [".json", ".gz"] or path.suffix == ".gz":
+    if suffixes[-2:] == [".json", ".gz"] or path.suffix in {".json", ".gz"}:
         return path
-    if path.suffix == ".json":
-        return path.with_suffix(".json.gz") if gzip_by_default else path
     if path.suffix:
         return Path(f"{path}.json.gz") if gzip_by_default else Path(f"{path}.json")
     return path.with_suffix(".json.gz" if gzip_by_default else ".json")
@@ -412,3 +424,57 @@ def _reassign_sort_indices(
                 "args": {"sort_index": sort_index},
             }
         )
+
+
+from transformer_nuggets.utils.track_event import (
+    chrome_trace_to_track_event_trace,
+    default_track_event_path,
+    write_track_event_trace,
+)
+
+
+def perfetto_trace_path(
+    path: str | Path,
+    *,
+    trace_format: TraceFormat = "track_event",
+    gzip_trace: bool = False,
+) -> Path:
+    """Normalize a requested output path for the selected trace format."""
+    if trace_format == "track_event":
+        return default_track_event_path(path)
+    if trace_format == "chrome_json":
+        return default_trace_path(path, gzip_by_default=gzip_trace)
+    raise ValueError(f"Unsupported trace_format: {trace_format!r}")
+
+
+def write_perfetto_trace(
+    path: str | Path,
+    trace: dict[str, Any],
+    *,
+    trace_format: TraceFormat = "track_event",
+    split_overlaps: bool = True,
+    track_pattern: str | Pattern[str] | None = None,
+    gzip_trace: bool = False,
+) -> Path:
+    """Write a trace in the requested Perfetto-compatible format.
+
+    ``track_event`` writes native Perfetto protobuf ``.pftrace`` files.
+    ``chrome_json`` writes legacy Chrome JSON/JSON.GZ and optionally applies
+    JSON-only overlap lane splitting.
+    """
+    if trace_format == "track_event":
+        return write_track_event_trace(
+            path,
+            trace,
+            track_pattern=track_pattern,
+            split_overlaps=split_overlaps,
+        )
+
+    if trace_format != "chrome_json":
+        raise ValueError(f"Unsupported trace_format: {trace_format!r}")
+
+    path = default_trace_path(path, gzip_by_default=gzip_trace)
+    if split_overlaps:
+        trace = split_overlapping_slices(trace, track_pattern=track_pattern)
+    write_trace(path, trace)
+    return path

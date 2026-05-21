@@ -7,7 +7,7 @@ This example shows BOTH profiling modes:
 Run with:
     python -m transformer_nuggets.cute.profiler.example
 
-View the generated trace.json at https://ui.perfetto.dev/
+View the generated .pftrace files at https://ui.perfetto.dev/
 """
 
 import torch
@@ -158,7 +158,7 @@ def run_atomic_mode():
 
     import transformer_nuggets
 
-    trace_path = transformer_nuggets.DATA_DIR / "profiler_atomic_trace.json"
+    trace_path = transformer_nuggets.DATA_DIR / "profiler_atomic_trace.pftrace"
 
     with profile_session(
         max_events_per_unit=3 * NUM_ITERATIONS + 2,
@@ -191,7 +191,7 @@ def run_static_mode():
 
     import transformer_nuggets
 
-    trace_path = transformer_nuggets.DATA_DIR / "profiler_static_trace.json"
+    trace_path = transformer_nuggets.DATA_DIR / "profiler_static_trace.pftrace"
 
     with profile_session(
         max_events_per_unit=3 * NUM_ITERATIONS + 2,

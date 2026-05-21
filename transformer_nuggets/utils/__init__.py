@@ -18,9 +18,15 @@ from transformer_nuggets.utils.triton import print_sass
 from transformer_nuggets.utils.merge_traces import merge_traces
 from transformer_nuggets.utils.memory_viz import generate_memory_comparison_html
 from transformer_nuggets.utils.perfetto import (
+    TraceFormat,
+    chrome_trace_to_track_event_trace,
     default_trace_path,
+    default_track_event_path,
+    perfetto_trace_path,
     read_trace,
     split_overlapping_slices,
+    write_perfetto_trace,
     write_trace,
+    write_track_event_trace,
 )
 # from transformer_nuggets.utils.model_extraction import extract_attention_data
