@@ -806,6 +806,9 @@ def profiler(
     profile_memory: bool = False,
     with_stack: bool = False,
     warmup: int = 0,
+    fix_overlapping_events: bool = True,
+    overlap_track_pattern: str | None = "stream.*",
+    gzip_trace: bool = False,
 ):
     """Thin wrapper around torch.profiler
 
@@ -815,6 +818,11 @@ def profiler(
         profile_memory: Profile memory usage
         with_stack: Record stack traces - Blows up memory
         warmup: If greater than 0 then it will warmup record before recording
+        fix_overlapping_events: Postprocess overlapping duration slices into
+            sibling lanes so Perfetto does not hide overlapped events.
+        overlap_track_pattern: Regex for tracks to postprocess. Defaults to CUDA
+            stream tracks; pass ``None`` to process every track.
+        gzip_trace: Write ``.json.gz`` instead of ``.json``.
 
     Usage:
     ```
@@ -840,7 +848,7 @@ def profiler(
     rank = get_process_rank()
 
     # Create path with suffix
-    path = path.with_suffix(".json")
+    path = default_trace_path(path, gzip_by_default=gzip_trace)
 
     # Add rank to filename if distributed
     if rank is not None:
@@ -853,7 +861,22 @@ def profiler(
     logger.info(f"💾 Trace file 📄 saved to: {bcolors.OKGREEN}{path}{bcolors.ENDC}")
 
     def trace_handler(prof) -> None:
-        prof.export_chrome_trace(path.as_posix())
+        export_path = path
+        if path.suffix == ".gz":
+            export_path = path.with_name(f"{path.name}.tmp.json")
+
+        prof.export_chrome_trace(export_path.as_posix())
+
+        if fix_overlapping_events or export_path != path:
+            trace = read_trace(export_path)
+            if fix_overlapping_events:
+                trace = split_overlapping_slices(
+                    trace,
+                    track_pattern=overlap_track_pattern,
+                )
+            write_trace(path, trace)
+            if export_path != path:
+                export_path.unlink()
 
     prof_sched = schedule(wait=0, warmup=warmup, active=int(1_000_000)) if warmup > 0 else None
     profiler = torch.profiler.profile(

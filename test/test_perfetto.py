@@ -96,9 +96,7 @@ def test_split_overlapping_slices_remaps_flow_by_correlation_and_timestamp():
     }
 
     fixed = split_overlapping_slices(trace, track_pattern="stream.*")
-    flow_tids = [
-        event["tid"] for event in fixed["traceEvents"] if event.get("ph") == "f"
-    ]
+    flow_tids = [event["tid"] for event in fixed["traceEvents"] if event.get("ph") == "f"]
 
     assert flow_tids == [700, 701]
 

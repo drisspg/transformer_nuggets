@@ -15,7 +15,9 @@ from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Pattern
+from typing import Any
+from collections.abc import Iterator
+from re import Pattern
 
 
 @contextmanager
@@ -137,9 +139,7 @@ def _make_tid_allocator(events: list[dict[str, Any]]):
         base = original_int * 100
         candidates = [base + lane for lane in range(lane_count)]
         conflicts = [
-            tid
-            for tid in candidates
-            if tid in reserved_by_pid[pid] and tid != original_tid
+            tid for tid in candidates if tid in reserved_by_pid[pid] and tid != original_tid
         ]
         if conflicts:
             base = max_numeric_by_pid[pid] + 1
@@ -232,9 +232,7 @@ def split_overlapping_slices(
 
     correlation_tid_map: dict[tuple[Any, Any, Any, Any], Any] = {}
     metadata_needed: dict[tuple[Any, Any, int], dict[str, Any]] = {}
-    original_names = {
-        key: name for key, name in thread_names.items()
-    }
+    original_names = {key: name for key, name in thread_names.items()}
 
     for idx, event in enumerate(events):
         if idx not in event_lane_assignments:
