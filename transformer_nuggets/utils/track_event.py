@@ -411,28 +411,30 @@ def parse_chrome_trace(trace: TraceDict) -> ParsedChromeTrace:
     )
 
 
-def _slices_are_nesting_compatible(a: DurationSlice, b: DurationSlice) -> bool:
-    if a.end_us <= b.ts_us or b.end_us <= a.ts_us:
-        return True
-    a_contains_b = a.ts_us <= b.ts_us and a.end_us >= b.end_us
-    b_contains_a = b.ts_us <= a.ts_us and b.end_us >= a.end_us
-    return a_contains_b or b_contains_a
-
-
 def _assign_nesting_lanes(slices: list[DurationSlice]) -> dict[int, int]:
-    """Assign slices to lanes where each lane can be emitted as nested TrackEvents."""
-    lanes: list[list[DurationSlice]] = []
+    """Assign slices to lanes where each lane can be emitted as nested TrackEvents.
+
+    TrackEvent begin/end packets support properly nested slices on one track,
+    but not crossing intervals. Since slices are processed by start time with
+    longer equal-start slices first, a lane is valid when the new slice either
+    starts after the active stack or is contained by the current innermost
+    active slice. This keeps assignment close to O(number of slices * lanes)
+    instead of checking every earlier slice in the lane.
+    """
+    lane_end_stacks: list[list[float]] = []
     assignments: dict[int, int] = {}
 
     for slc in sorted(slices, key=lambda s: (s.ts_us, -s.end_us, s.index)):
-        for lane_idx, lane_slices in enumerate(lanes):
-            if all(_slices_are_nesting_compatible(slc, other) for other in lane_slices):
-                lane_slices.append(slc)
+        for lane_idx, end_stack in enumerate(lane_end_stacks):
+            while end_stack and end_stack[-1] <= slc.ts_us:
+                end_stack.pop()
+            if not end_stack or slc.end_us <= end_stack[-1]:
+                end_stack.append(slc.end_us)
                 assignments[slc.index] = lane_idx
                 break
         else:
-            assignments[slc.index] = len(lanes)
-            lanes.append([slc])
+            assignments[slc.index] = len(lane_end_stacks)
+            lane_end_stacks.append([slc.end_us])
 
     return assignments
 
