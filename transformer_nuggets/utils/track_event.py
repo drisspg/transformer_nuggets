@@ -51,10 +51,10 @@ class ChromeMetadata:
 
     def track_for(self, pid: Any, tid: Any) -> ChromeTrack:
         key = (pid, tid)
-        return self.tracks.get(
-            key,
-            ChromeTrack(pid=pid, tid=tid, name=_clean_track_name(pid, tid)),
-        )
+        track = self.tracks.get(key)
+        if track is not None:
+            return track
+        return ChromeTrack(pid=pid, tid=tid, name=_clean_track_name(pid, tid))
 
 
 @dataclass(frozen=True)
