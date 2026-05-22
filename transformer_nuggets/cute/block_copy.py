@@ -45,6 +45,7 @@ class TmaRowCopy(CuteOp[[torch.Tensor], torch.Tensor]):
         shared_storage: cutlass.Constexpr,
         tile_shape: cutlass.Constexpr,
         dtype: cutlass.Constexpr,
+        row_count: cutlass.Constexpr,
     ):
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(shared_storage)
@@ -97,17 +98,19 @@ class TmaRowCopy(CuteOp[[torch.Tensor], torch.Tensor]):
             )
             for row_step in cutlass.range(self.rows_per_cta, unroll=1):
                 load_pipeline.consumer_wait(consumer_state)
-                dst_tile = dst_tiles[(None, (batch_idx, row_base + row_step, 0))]
                 stage_smem_tile = smem_tile[(consumer_state.index, None, None, None)]
-                block_copy(
-                    store_atom,
-                    cute.group_modes(stage_smem_tile, 0, 3),
-                    cute.group_modes(dst_tile, 0, 1),
-                )
-                cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0)
-                cute.arch.fence_view_async_shared()
-                cute.arch.sync_warp()
+                # Tail CTAs may TMA-load full-OOB rows as zero-filled stages; skip their stores.
+                if row_base + row_step < row_count:
+                    dst_tile = dst_tiles[(None, (batch_idx, row_base + row_step, 0))]
+                    block_copy(
+                        store_atom,
+                        cute.group_modes(stage_smem_tile, 0, 3),
+                        cute.group_modes(dst_tile, 0, 1),
+                    )
+                    cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0)
+                    cute.arch.fence_view_async_shared()
+                    cute.arch.sync_warp()
                 load_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
 
@@ -139,6 +142,7 @@ class TmaRowCopy(CuteOp[[torch.Tensor], torch.Tensor]):
             shared_storage,
             tile_shape,
             src.element_type,
+            src.shape[1],
         ).launch(
             grid=[src.shape[0], cute.ceil_div(src.shape[1], self.rows_per_cta), 1],
             block=[threads, 1, 1],
@@ -161,9 +165,8 @@ class TmaRowCopy(CuteOp[[torch.Tensor], torch.Tensor]):
             raise ValueError(f"Expected a 3D tensor, got rank {src.ndim}")
         if src.data_ptr() % 16 != 0:
             raise ValueError("Input tensor must be 16-byte aligned")
-        if src.shape[1] % self.rows_per_cta != 0:
-            raise ValueError("Input row dimension must be divisible by rows_per_cta")
-
+        if src.shape[2] * src.element_size() % 16 != 0:
+            raise ValueError("Input innermost dimension must span a multiple of 16 bytes")
         dst = torch.empty_like(src)
         if dst.data_ptr() % 16 != 0:
             raise ValueError("Output tensor must be 16-byte aligned")
