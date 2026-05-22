@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import re
 import warnings
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from collections.abc import Iterable
@@ -20,8 +21,10 @@ TraceDict = dict[str, Any]
 TrackKey = tuple[Any, Any]
 """Chrome JSON track identity: ``(pid, tid)``."""
 
+_TRAILING_TRACK_LANE_RE = re.compile(r"\s+#\d+$")
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, slots=True)
 class ChromeTrack:
     """A logical Chrome JSON track derived from ``pid``/``tid`` metadata.
 
@@ -35,13 +38,13 @@ class ChromeTrack:
     tid: Any
     name: str
     sort_index: int = 0
+    key: TrackKey = field(init=False, repr=False, compare=False)
 
-    @property
-    def key(self) -> TrackKey:
-        return (self.pid, self.tid)
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "key", (self.pid, self.tid))
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ChromeMetadata:
     """Process and track metadata parsed from Chrome JSON ``ph='M'`` events."""
 
@@ -57,7 +60,7 @@ class ChromeMetadata:
         return ChromeTrack(pid=pid, tid=tid, name=_clean_track_name(pid, tid))
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class DurationSlice:
     """A Chrome JSON ``ph='X'`` duration event with normalized timing.
 
@@ -82,7 +85,7 @@ class DurationSlice:
         return self.ts_us + self.dur_us
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class InstantEvent:
     """A Chrome JSON instant event, ``ph='i'`` or ``ph='I'``."""
 
@@ -92,7 +95,7 @@ class InstantEvent:
     ts_us: float
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class CounterSample:
     """A numeric sample parsed from a Chrome JSON counter event, ``ph='C'``."""
 
@@ -104,7 +107,7 @@ class CounterSample:
     value: int | float
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class FlowInstant:
     """A Chrome JSON flow marker, ``ph='s'``/``'t'``/``'f'``.
 
@@ -118,7 +121,7 @@ class FlowInstant:
     ts_us: float
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ParsedChromeTrace:
     """Typed subset of a Chrome JSON trace before TrackEvent lane assignment.
 
@@ -141,7 +144,7 @@ class ParsedChromeTrace:
     unsupported_phases: frozenset[str]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class AssignedTrace:
     """Parsed Chrome trace after TrackEvent-compatible lane assignment."""
 
@@ -157,7 +160,7 @@ def _is_numeric_process_id(pid: Any) -> bool:
     return isinstance(pid, int) and not isinstance(pid, bool) and pid >= 0
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TrackEventProtos:
     """Perfetto protobuf classes loaded lazily from the ``perfetto`` package."""
 
@@ -166,7 +169,7 @@ class TrackEventProtos:
     TrackEvent: Any
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TrackIds:
     """Stable protobuf UUID mappings for emitted TrackEvent descriptors."""
 
@@ -176,15 +179,8 @@ class TrackIds:
     counter_track_uuids: dict[tuple[TrackKey, str], int]
 
 
-@dataclass(frozen=True)
-class Marker:
-    """Begin/end packet marker for a TrackEvent duration slice."""
-
-    ts_ns: int
-    is_begin: bool
-    duration_key: float
-    track_uuid: int
-    slice: DurationSlice
+Marker = tuple[int, int, float, int, int, bool, DurationSlice]
+"""Sortable begin/end packet marker for a TrackEvent duration slice."""
 
 
 def default_track_event_path(file_path: str | Path) -> Path:
@@ -223,6 +219,7 @@ def _timestamp_us_to_ns(value: Any) -> int:
     return int(round(float(value or 0) * 1000.0))
 
 
+@functools.cache
 def _load_perfetto_protos() -> TrackEventProtos:
     try:
         from perfetto.trace_builder.proto_builder import TraceProtoBuilder
@@ -243,18 +240,29 @@ def _event_args(event: TraceDict) -> dict[str, Any]:
     return args if isinstance(args, dict) else {}
 
 
-def _event_track(metadata: ChromeMetadata, event: TraceDict) -> ChromeTrack:
+def _event_track(
+    metadata: ChromeMetadata,
+    event: TraceDict,
+    annotation_track_cache: dict[TrackKey, ChromeTrack],
+) -> ChromeTrack:
     pid = event.get("pid", 0)
     tid = event.get("tid", 0)
     base_track = metadata.track_for(pid, tid)
-    if event.get("cat") == "gpu_user_annotation":
-        return ChromeTrack(
-            pid=pid,
-            tid=f"{tid}:gpu_user_annotation",
-            name=f"GPU annotations {base_track.name}",
-            sort_index=base_track.sort_index,
-        )
-    return base_track
+    if event.get("cat") != "gpu_user_annotation":
+        return base_track
+
+    key = base_track.key
+    annotation_track = annotation_track_cache.get(key)
+    if annotation_track is not None:
+        return annotation_track
+    annotation_track = ChromeTrack(
+        pid=pid,
+        tid=f"{tid}:gpu_user_annotation",
+        name=f"GPU annotations {base_track.name}",
+        sort_index=base_track.sort_index,
+    )
+    annotation_track_cache[key] = annotation_track
+    return annotation_track
 
 
 def _clean_process_name(pid: Any, name: Any | None = None) -> str:
@@ -269,7 +277,7 @@ def _clean_track_name(pid: Any, tid: Any, name: Any | None = None) -> str:
     if pid == -1:
         return "Kineto events"
     text = str(name if name is not None else f"track {tid}").rstrip()
-    text = re.sub(r"\s+#\d+$", "", text)
+    text = _TRAILING_TRACK_LANE_RE.sub("", text)
     if text.startswith("track ") and text != "track 0":
         text = text[len("track ") :]
     return text
@@ -349,13 +357,15 @@ def _parse_counter_samples(
 
 def parse_chrome_trace(trace: TraceDict) -> ParsedChromeTrace:
     """Parse loose Chrome JSON into explicit internal event models."""
-    events = list(trace.get("traceEvents", []))
+    raw_events = trace.get("traceEvents", [])
+    events = raw_events if isinstance(raw_events, list) else list(raw_events)
     metadata = _parse_metadata(events)
     duration_slices: list[DurationSlice] = []
     instants: list[InstantEvent] = []
     counters: list[CounterSample] = []
     flows: list[FlowInstant] = []
     unsupported: set[str] = set()
+    annotation_track_cache: dict[TrackKey, ChromeTrack] = {}
 
     for idx, event in enumerate(events):
         if _hide_chrome_event(event):
@@ -363,7 +373,7 @@ def parse_chrome_trace(trace: TraceDict) -> ParsedChromeTrace:
         ph = event.get("ph")
         if ph == "M":
             continue
-        track = _event_track(metadata, event)
+        track = _event_track(metadata, event, annotation_track_cache)
         if ph == "X":
             dur_us = float(event.get("dur", 0) or 0)
             if dur_us > 0:
@@ -604,10 +614,15 @@ def _add_debug_annotation(track_event: Any, name: str, value: Any) -> None:
         annotation.legacy_json_value = json.dumps(value, default=str)
 
 
-def _copy_event_payload(track_event: Any, event: TraceDict) -> None:
+def _copy_event_payload(
+    track_event: Any,
+    event: TraceDict,
+    args: dict[str, Any] | None = None,
+) -> None:
     if "cat" in event:
         track_event.categories.append(str(event["cat"]))
-    for name, value in _event_args(event).items():
+    event_args = _event_args(event) if args is None else args
+    for name, value in event_args.items():
         _add_debug_annotation(track_event, str(name), value)
 
 
@@ -652,8 +667,8 @@ def _process_sort_rank(trace: AssignedTrace, pid: Any) -> int:
     return trace.metadata.process_sort_indices.get(pid, 0)
 
 
-def _process_ids(trace: AssignedTrace) -> list[Any]:
-    pids = {track.pid for track in _sorted_tracks(trace)} | set(trace.metadata.process_names)
+def _process_ids(trace: AssignedTrace, tracks: list[ChromeTrack]) -> list[Any]:
+    pids = {track.pid for track in tracks} | set(trace.metadata.process_names)
     return sorted(pids, key=lambda pid: (_process_sort_rank(trace, pid), str(pid)))
 
 
@@ -668,9 +683,10 @@ def _define_process_tracks(
     builder: Any,
     trace: AssignedTrace,
     protos: TrackEventProtos,
+    tracks: list[ChromeTrack],
 ) -> dict[Any, int]:
     process_uuids: dict[Any, int] = {}
-    for pid in _process_ids(trace):
+    for pid in _process_ids(trace, tracks):
         process_uuid = _stable_uuid("process", pid)
         process_uuids[pid] = process_uuid
         packet = builder.add_packet()
@@ -697,10 +713,11 @@ def _define_duration_tracks(
     trace: AssignedTrace,
     process_uuids: dict[Any, int],
     protos: TrackEventProtos,
+    tracks: list[ChromeTrack],
 ) -> dict[tuple[TrackKey, int], int]:
     max_lane_by_track = _max_lane_by_track(trace)
     track_uuids: dict[tuple[TrackKey, int], int] = {}
-    for track in _sorted_tracks(trace):
+    for track in tracks:
         lane_count = max_lane_by_track.get(track.key, 0) + 1
         for lane in range(lane_count):
             track_uuid = _stable_uuid("track", track.pid, track.tid, lane)
@@ -745,13 +762,19 @@ def _define_counter_tracks(
 
 
 def _define_track_ids(builder: Any, trace: AssignedTrace, protos: TrackEventProtos) -> TrackIds:
-    process_uuids = _define_process_tracks(builder, trace, protos)
+    tracks = _sorted_tracks(trace)
+    process_uuids = _define_process_tracks(builder, trace, protos, tracks)
     return TrackIds(
         process_uuids=process_uuids,
-        duration_track_uuids=_define_duration_tracks(builder, trace, process_uuids, protos),
+        duration_track_uuids=_define_duration_tracks(
+            builder,
+            trace,
+            process_uuids,
+            protos,
+            tracks,
+        ),
         instant_track_uuids={
-            track.key: _stable_uuid("track", track.pid, track.tid, 0)
-            for track in _sorted_tracks(trace)
+            track.key: _stable_uuid("track", track.pid, track.tid, 0) for track in tracks
         },
         counter_track_uuids=_define_counter_tracks(builder, trace, process_uuids),
     )
@@ -762,33 +785,29 @@ def _duration_markers(trace: AssignedTrace, track_ids: TrackIds) -> list[Marker]
     for slc in trace.duration_slices:
         track_uuid = track_ids.duration_track_uuids[(slc.track.key, slc.lane)]
         markers.append(
-            Marker(
-                ts_ns=_timestamp_us_to_ns(slc.ts_us),
-                is_begin=True,
-                duration_key=-slc.dur_us,
-                track_uuid=track_uuid,
-                slice=slc,
+            (
+                _timestamp_us_to_ns(slc.ts_us),
+                0,
+                -slc.dur_us,
+                track_uuid,
+                slc.index,
+                True,
+                slc,
             )
         )
         markers.append(
-            Marker(
-                ts_ns=_timestamp_us_to_ns(slc.end_us),
-                is_begin=False,
-                duration_key=slc.dur_us,
-                track_uuid=track_uuid,
-                slice=slc,
+            (
+                _timestamp_us_to_ns(slc.end_us),
+                1,
+                slc.dur_us,
+                track_uuid,
+                slc.index,
+                False,
+                slc,
             )
         )
-    return sorted(
-        markers,
-        key=lambda marker: (
-            marker.ts_ns,
-            not marker.is_begin,
-            marker.duration_key,
-            marker.track_uuid,
-            marker.slice.index,
-        ),
-    )
+    markers.sort()
+    return markers
 
 
 def _emit_duration_markers(
@@ -798,22 +817,28 @@ def _emit_duration_markers(
     protos: TrackEventProtos,
     trusted_packet_sequence_id: int,
 ) -> None:
-    for marker in _duration_markers(trace, track_ids):
-        packet = builder.add_packet()
-        packet.timestamp = marker.ts_ns
+    add_packet = builder.add_packet
+    slice_begin = protos.TrackEvent.TYPE_SLICE_BEGIN
+    slice_end = protos.TrackEvent.TYPE_SLICE_END
+    for ts_ns, _begin_order, _duration_key, track_uuid, _slice_index, is_begin, slc in (
+        _duration_markers(trace, track_ids)
+    ):
+        packet = add_packet()
+        packet.timestamp = ts_ns
         packet.trusted_packet_sequence_id = trusted_packet_sequence_id
         track_event = packet.track_event
-        track_event.track_uuid = marker.track_uuid
-        if marker.is_begin:
-            event = marker.slice.event
-            track_event.type = protos.TrackEvent.TYPE_SLICE_BEGIN
+        track_event.track_uuid = track_uuid
+        if is_begin:
+            event = slc.event
+            event_args = _event_args(event)
+            track_event.type = slice_begin
             track_event.name = str(event.get("name", "slice"))
-            _copy_event_payload(track_event, event)
-            _add_correlation_id(track_event, _event_args(event).get("correlation"))
-            track_event.flow_ids.extend(marker.slice.flow_ids)
-            if marker.slice.flow_latencies_us:
-                for flow_id, latency_us in marker.slice.flow_latencies_us:
-                    suffix = "" if len(marker.slice.flow_latencies_us) == 1 else f"[{flow_id}]"
+            _copy_event_payload(track_event, event, event_args)
+            _add_correlation_id(track_event, event_args.get("correlation"))
+            track_event.flow_ids.extend(slc.flow_ids)
+            if slc.flow_latencies_us:
+                for flow_id, latency_us in slc.flow_latencies_us:
+                    suffix = "" if len(slc.flow_latencies_us) == 1 else f"[{flow_id}]"
                     _add_debug_annotation(
                         track_event,
                         f"launch_latency_us{suffix}",
@@ -821,7 +846,7 @@ def _emit_duration_markers(
                     )
                     _add_debug_annotation(track_event, f"launch_flow_id{suffix}", flow_id)
         else:
-            track_event.type = protos.TrackEvent.TYPE_SLICE_END
+            track_event.type = slice_end
 
 
 def _emit_instants(
