@@ -60,7 +60,7 @@ class ChromeMetadata:
         return ChromeTrack(pid=pid, tid=tid, name=_clean_track_name(pid, tid))
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class DurationSlice:
     """A Chrome JSON ``ph='X'`` duration event with normalized timing.
 
@@ -458,20 +458,6 @@ def _flow_id(value: Any) -> int | None:
         return None
 
 
-def _slice_correlation_id(slc: DurationSlice) -> int | None:
-    return _flow_id(_event_args(slc.event).get("correlation"))
-
-
-def _is_cuda_launch_slice(slc: DurationSlice) -> bool:
-    name = str(slc.event.get("name", ""))
-    return name.startswith(("cudaLaunch", "cuLaunch")) or "LaunchKernel" in name
-
-
-def _is_gpu_kernel_slice(slc: DurationSlice) -> bool:
-    args = _event_args(slc.event)
-    return "stream" in args and "device" in args and not _is_cuda_launch_slice(slc)
-
-
 def _smallest_containing_slice(
     slices: list[DurationSlice],
     flow: FlowInstant,
@@ -503,23 +489,35 @@ def _paired_flow_ids_by_slice(
         if flow_id is not None:
             flows_by_id[flow_id].append(flow)
 
-    slices_by_correlation: dict[int, list[DurationSlice]] = defaultdict(list)
+    launch_slices_by_correlation: dict[int, list[DurationSlice]] = defaultdict(list)
+    kernel_slices_by_correlation: dict[int, list[DurationSlice]] = defaultdict(list)
     for slc in slices:
-        correlation_id = _slice_correlation_id(slc)
-        if correlation_id is not None:
-            slices_by_correlation[correlation_id].append(slc)
+        args = _event_args(slc.event)
+        correlation_id = _flow_id(args.get("correlation"))
+        if correlation_id is None:
+            continue
+        name = str(slc.event.get("name", ""))
+        if name.startswith(("cudaLaunch", "cuLaunch")) or "LaunchKernel" in name:
+            launch_slices_by_correlation[correlation_id].append(slc)
+        elif "stream" in args and "device" in args:
+            kernel_slices_by_correlation[correlation_id].append(slc)
 
     flow_ids_by_slice: dict[int, set[int]] = defaultdict(set)
     latencies_by_slice: dict[int, dict[int, float]] = defaultdict(dict)
     for flow_id, markers in flows_by_id.items():
-        sources = [marker for marker in markers if marker.event.get("ph") in {"s", "t"}]
-        destinations = [marker for marker in markers if marker.event.get("ph") == "f"]
+        sources: list[FlowInstant] = []
+        destinations: list[FlowInstant] = []
+        for marker in markers:
+            ph = marker.event.get("ph")
+            if ph in {"s", "t"}:
+                sources.append(marker)
+            elif ph == "f":
+                destinations.append(marker)
         if not sources or not destinations:
             continue
 
-        correlated_slices = slices_by_correlation.get(flow_id, [])
-        launch_slices = [slc for slc in correlated_slices if _is_cuda_launch_slice(slc)]
-        kernel_slices = [slc for slc in correlated_slices if _is_gpu_kernel_slice(slc)]
+        launch_slices = launch_slices_by_correlation.get(flow_id, [])
+        kernel_slices = kernel_slices_by_correlation.get(flow_id, [])
 
         source = min(sources, key=lambda marker: marker.ts_us)
         source_slice = min(launch_slices, key=lambda slc: slc.ts_us) if launch_slices else None
@@ -575,21 +573,17 @@ def assign_trackevent_lanes(
     else:
         flow_ids_by_slice, latencies_by_slice = {}, {}
 
+    # Mutate the internal slice models in place instead of allocating a second
+    # DurationSlice for every Chrome ``X`` event. These objects are converter
+    # internals and are not reused after assignment in the public write path.
+    for slc in parsed.duration_slices:
+        slc.lane = lane_by_index[slc.index]
+        slc.flow_ids = tuple(sorted(flow_ids_by_slice.get(slc.index, ())))
+        slc.flow_latencies_us = tuple(sorted(latencies_by_slice.get(slc.index, {}).items()))
+
     return AssignedTrace(
         metadata=parsed.metadata,
-        duration_slices=[
-            DurationSlice(
-                event=slc.event,
-                index=slc.index,
-                track=slc.track,
-                ts_us=slc.ts_us,
-                dur_us=slc.dur_us,
-                lane=lane_by_index[slc.index],
-                flow_ids=tuple(sorted(flow_ids_by_slice.get(slc.index, ()))),
-                flow_latencies_us=tuple(sorted(latencies_by_slice.get(slc.index, {}).items())),
-            )
-            for slc in parsed.duration_slices
-        ],
+        duration_slices=parsed.duration_slices,
         instants=parsed.instants,
         counters=parsed.counters,
         flows=parsed.flows,
