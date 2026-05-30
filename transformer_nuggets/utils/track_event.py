@@ -527,10 +527,14 @@ def _paired_flow_ids_by_slice(
             flow_ids_by_slice[source_slice.index].add(flow_id)
 
         for destination in destinations:
-            destination_slice = min(
-                kernel_slices,
-                key=lambda slc: abs(slc.ts_us - destination.ts_us),
-            ) if kernel_slices else None
+            destination_slice = (
+                min(
+                    kernel_slices,
+                    key=lambda slc: abs(slc.ts_us - destination.ts_us),
+                )
+                if kernel_slices
+                else None
+            )
             if destination_slice is None:
                 destination_slice = _smallest_containing_slice(slices, destination)
             if destination_slice is None:
@@ -814,9 +818,15 @@ def _emit_duration_markers(
     add_packet = builder.add_packet
     slice_begin = protos.TrackEvent.TYPE_SLICE_BEGIN
     slice_end = protos.TrackEvent.TYPE_SLICE_END
-    for ts_ns, _begin_order, _duration_key, track_uuid, _slice_index, is_begin, slc in (
-        _duration_markers(trace, track_ids)
-    ):
+    for (
+        ts_ns,
+        _begin_order,
+        _duration_key,
+        track_uuid,
+        _slice_index,
+        is_begin,
+        slc,
+    ) in _duration_markers(trace, track_ids):
         packet = add_packet()
         packet.timestamp = ts_ns
         packet.trusted_packet_sequence_id = trusted_packet_sequence_id

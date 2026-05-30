@@ -24,10 +24,15 @@ import zlib
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Literal
 from collections.abc import Iterator
+from pathlib import Path
 from re import Pattern
+from typing import Any, Literal
+
+from transformer_nuggets.utils.track_event import (
+    default_track_event_path,
+    write_track_event_trace,
+)
 
 
 TraceFormat = Literal["chrome_json", "track_event"]
@@ -424,13 +429,6 @@ def _reassign_sort_indices(
                 "args": {"sort_index": sort_index},
             }
         )
-
-
-from transformer_nuggets.utils.track_event import (
-    chrome_trace_to_track_event_trace,
-    default_track_event_path,
-    write_track_event_trace,
-)
 
 
 def perfetto_trace_path(
