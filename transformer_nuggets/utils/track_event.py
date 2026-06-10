@@ -180,7 +180,13 @@ class TrackIds:
 
 
 Marker = tuple[int, int, float, int, int, bool, DurationSlice]
-"""Sortable begin/end packet marker for a TrackEvent duration slice."""
+"""Sortable begin/end packet marker for a TrackEvent duration slice.
+
+Ends sort before begins at the same timestamp so a back-to-back slice on a
+shared lane closes before the next one opens instead of falsely nesting.
+Zero-duration slices must never reach markers: their end would sort before
+their own begin.
+"""
 
 
 def default_track_event_path(file_path: str | Path) -> Path:
@@ -785,7 +791,7 @@ def _duration_markers(trace: AssignedTrace, track_ids: TrackIds) -> list[Marker]
         markers.append(
             (
                 _timestamp_us_to_ns(slc.ts_us),
-                0,
+                1,
                 -slc.dur_us,
                 track_uuid,
                 slc.index,
@@ -796,7 +802,7 @@ def _duration_markers(trace: AssignedTrace, track_ids: TrackIds) -> list[Marker]
         markers.append(
             (
                 _timestamp_us_to_ns(slc.end_us),
-                1,
+                0,
                 slc.dur_us,
                 track_uuid,
                 slc.index,
@@ -820,7 +826,7 @@ def _emit_duration_markers(
     slice_end = protos.TrackEvent.TYPE_SLICE_END
     for (
         ts_ns,
-        _begin_order,
+        _end_first_rank,
         _duration_key,
         track_uuid,
         _slice_index,

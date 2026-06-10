@@ -4,13 +4,13 @@ import json
 import pytest
 
 from transformer_nuggets.utils.perfetto import (
-    chrome_trace_to_track_event_trace,
     default_trace_path,
     default_track_event_path,
     read_trace,
     split_overlapping_slices,
     write_trace,
 )
+from transformer_nuggets.utils.track_event import chrome_trace_to_track_event_trace
 
 
 def _duration_events(trace):
@@ -299,3 +299,34 @@ def test_track_event_conversion_splits_crossing_slices_and_keeps_nested_slices()
     )
     assert crossing_desc.sibling_merge_behavior == outer_desc.sibling_merge_behavior
     assert crossing_desc.sibling_merge_key == outer_desc.sibling_merge_key
+
+
+def test_track_event_conversion_keeps_back_to_back_slices_separate():
+    from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import TrackEvent, Trace
+
+    trace = {
+        "traceEvents": [
+            {"ph": "M", "name": "thread_name", "pid": 0, "tid": 7, "args": {"name": "stream 7"}},
+            {"ph": "X", "name": "a", "pid": 0, "tid": 7, "ts": 10, "dur": 10},
+            {"ph": "X", "name": "b", "pid": 0, "tid": 7, "ts": 20, "dur": 10},
+        ]
+    }
+
+    parsed = Trace()
+    parsed.ParseFromString(chrome_trace_to_track_event_trace(trace))
+
+    open_stacks = {}
+    rendered = {}
+    for packet in parsed.packet:
+        if not packet.HasField("track_event"):
+            continue
+        event = packet.track_event
+        stack = open_stacks.setdefault(event.track_uuid, [])
+        if event.type == TrackEvent.TYPE_SLICE_BEGIN:
+            stack.append((event.name, packet.timestamp))
+        elif event.type == TrackEvent.TYPE_SLICE_END:
+            name, begin_ts = stack.pop()
+            rendered[name] = (begin_ts, packet.timestamp)
+
+    assert all(not stack for stack in open_stacks.values())
+    assert rendered == {"a": (10_000, 20_000), "b": (20_000, 30_000)}
