@@ -101,16 +101,22 @@ class ProfileBuf:
         max_events_per_unit: Maximum number of events per profiling unit.
         num_units: Number of profiling units (e.g., blocks, warps).
         unit_name: Name for units in trace output (e.g., "Block", "Warp").
+        compact: ``True`` if events use the 1xi64 packed format
+            ``[tag(8) | dur_ns(24) | ts_lo32(32)]`` with slot 0 holding a
+            64-bit anchor; ``False`` for the legacy 4xi64 record format.
     """
 
     tensor: torch.Tensor
     max_events_per_unit: int
     num_units: int
     unit_name: str = "Unit"
+    compact: bool = False
 
     @property
     def slice_size(self) -> int:
         """Size of each unit's buffer slice in int64 elements."""
+        if self.compact:
+            return 1 + self.max_events_per_unit
         return 1 + 4 * self.max_events_per_unit
 
     def to_cute(self) -> cute.Tensor:
@@ -203,24 +209,26 @@ def allocate_profile_buffer(
     num_units: int | tuple[int, str],
     device: torch.device | str | None = None,
     stream: torch.cuda.Stream | None = None,
+    compact: bool = False,
 ) -> ProfileBuf:
     """Allocate a profile buffer for intra-kernel profiling.
 
-    Uses static allocation: each profiling unit (block, warp, etc.) gets its own
-    pre-allocated buffer slice. This eliminates atomics from the profiling path.
+    Each profiling unit (block, warp, ...) owns a pre-allocated slice of the
+    buffer; no atomics are needed on the recording path.
 
     Args:
         max_events_per_unit: Maximum events each unit can record.
-        num_units: Number of profiling units. Can be:
-            - int: Just the count (uses "Unit" as name in traces)
-            - tuple[int, str]: (count, name) for nicer trace labels (e.g., (4, "Block"))
+        num_units: ``int`` (count, uses ``"Unit"`` as label) or
+            ``(count, name)`` for nicer trace labels (e.g. ``(4, "Block")``).
         device: Device to allocate on. Defaults to current CUDA device.
-        stream: CUDA stream for allocation (optional).
+        stream: Optional CUDA stream for allocation.
+        compact: ``True`` selects the 1xi64 packed record format used by
+            :func:`compact_event_stop` (slice size = ``1 + max_events``).
+            ``False`` keeps the legacy 4xi64 records (slice size =
+            ``1 + 4 * max_events``).
 
     Returns:
         ProfileBuf with the allocated tensor.
-
-    Buffer size: num_units * (1 + 4 * max_events_per_unit) int64s.
     """
     if isinstance(num_units, tuple):
         num_units_count, unit_name = num_units
@@ -233,7 +241,7 @@ def allocate_profile_buffer(
     elif isinstance(device, str):
         device = torch.device(device)
 
-    slice_size = 1 + 4 * max_events_per_unit
+    slice_size = (1 + max_events_per_unit) if compact else (1 + 4 * max_events_per_unit)
     total_size = num_units_count * slice_size
 
     if stream is not None:
@@ -247,6 +255,7 @@ def allocate_profile_buffer(
         max_events_per_unit=max_events_per_unit,
         num_units=num_units_count,
         unit_name=unit_name,
+        compact=compact,
     )
 
 
@@ -257,20 +266,24 @@ def decode_events(
 ) -> list[Event]:
     """Decode profiling events from the buffer.
 
-    Scans all event slots in each unit's slice, skipping empty slots.
-    This works with both atomic mode (counter auto-incremented) and
-    static mode (explicit event indices).
+    Dispatches on ``buf.compact``: legacy 4xi64 records or the 1xi64 packed
+    format produced by :func:`compact_event_stop`. Empty slots are skipped.
 
     Args:
         buf: Profile buffer (ProfileBuf).
         tag_table: TagTable for mapping tag IDs to names.
-        tid_base: Base offset for thread IDs.
+        tid_base: Base offset added to ``Event.tid``.
 
     Returns:
         List of Event objects from all units.
     """
-    cpu_buf = buf.tensor.cpu().numpy()
+    if buf.compact:
+        return _decode_events_compact(buf, tag_table, tid_base)
+    return _decode_events_legacy(buf, tag_table, tid_base)
 
+
+def _decode_events_legacy(buf: ProfileBuf, tag_table: TagTable, tid_base: int) -> list[Event]:
+    cpu_buf = buf.tensor.cpu().numpy()
     slice_size = buf.slice_size
     events = []
 
@@ -287,11 +300,9 @@ def decode_events(
             if start_ns == 0 and dur_ns == 0:
                 continue
 
-            if 0 <= tag_id < len(tag_table):
-                tag_name = tag_table.name(tag_id)
-            else:
-                tag_name = f"unknown_{tag_id}"
-
+            tag_name = (
+                tag_table.name(tag_id) if 0 <= tag_id < len(tag_table) else f"unknown_{tag_id}"
+            )
             events.append(
                 Event(
                     start_ns=start_ns,
@@ -303,6 +314,54 @@ def decode_events(
                 )
             )
 
+    return events
+
+
+def _decode_events_compact(buf: ProfileBuf, tag_table: TagTable, tid_base: int) -> list[Event]:
+    """Decode the 1xi64 packed records, reconstructing 64-bit ts from each unit's anchor.
+
+    Bit-unpacks every slot in one shot with torch, masks out empty / unitless
+    rows, and only iterates Python over the surviving valid events.
+    """
+    mask32 = (1 << 32) - 1
+    mask24 = (1 << 24) - 1
+
+    grid = buf.tensor.cpu().to(torch.int64).view(buf.num_units, buf.slice_size)
+    anchors = grid[:, 0]
+    records = grid[:, 1:]
+
+    valid = (records != 0) & (anchors != 0).unsqueeze(1)
+    if not valid.any():
+        return []
+
+    ts_lo = records & mask32
+    dur_ns = (records >> 32) & mask24
+    tag_ids = (records >> 56) & 0xFF
+    anchor_lo = anchors & mask32
+    anchor_hi = (anchors >> 32) << 32
+    wrap = (ts_lo < anchor_lo.unsqueeze(1)).to(torch.int64) << 32
+    start_ns = anchor_hi.unsqueeze(1) + wrap + ts_lo
+
+    unit_idx, _ = torch.nonzero(valid, as_tuple=True)
+    starts = start_ns[valid].tolist()
+    durs = dur_ns[valid].tolist()
+    tags = tag_ids[valid].tolist()
+    units = unit_idx.tolist()
+
+    n_tags = len(tag_table)
+    events = []
+    for s, d, t, u in zip(starts, durs, tags, units):
+        tag_name = tag_table.name(t) if 0 <= t < n_tags else f"unknown_{t}"
+        events.append(
+            Event(
+                start_ns=s,
+                dur_ns=d,
+                tag_id=t,
+                tag_name=tag_name,
+                tid=u + tid_base,
+                unit_id=u,
+            )
+        )
     return events
 
 
@@ -450,6 +509,7 @@ def profile_session(
     post_process_trace: Callable[[dict, PostProcessContext], dict] | None = None,
     split_overlaps: bool = True,
     trace_format: Literal["chrome_json", "track_event"] = "track_event",
+    compact: bool = False,
 ) -> Iterator[tuple[ProfileBuf, TagTable]]:
     """Context manager for profiling a kernel session.
 
@@ -499,6 +559,11 @@ def profile_session(
             Perfetto track into sibling lanes/tracks before writing the trace.
         trace_format: ``"track_event"`` writes native Perfetto ``.pftrace`` output;
             ``"chrome_json"`` writes Chrome JSON/JSON.GZ output.
+        compact: Use the 1xi64 packed record format (paired with
+            ``compact_event_stop`` / ``compact_anchor_init`` on the device
+            side). Slot 0 of each unit's slice is the 64-bit anchor; the
+            decoder reconstructs full timestamps from the anchor + each
+            record's low-32-bit timer reading.
 
     Yields:
         Tuple of (ProfileBuf, TagTable).
@@ -508,6 +573,7 @@ def profile_session(
         num_units=num_units,
         device=device,
         stream=stream,
+        compact=compact,
     )
     tag_table = TagTable(tag_names)
 

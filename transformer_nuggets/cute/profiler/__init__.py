@@ -41,6 +41,7 @@ from transformer_nuggets.cute.profiler.host import (
 
 from transformer_nuggets.cute.profiler.ops import (
     read_globaltimer,
+    read_globaltimer_lo32,
     static_start,
     static_stop,
     warp_atomic_alloc,
@@ -51,6 +52,8 @@ from transformer_nuggets.cute.profiler.ops import (
     region_end,
     RegionToken,
     raw_event_stop,
+    compact_event_stop,
+    compact_anchor_init,
 )
 
 from transformer_nuggets.cute.profiler.postprocessors import (
@@ -82,10 +85,13 @@ __all__ = [
     "warp_start",
     "warp_stop",
     "profile_region",
+    "read_globaltimer_lo32",
     "region_start",
     "region_end",
     "RegionToken",
     "raw_event_stop",
+    "compact_event_stop",
+    "compact_anchor_init",
     # Post-processors
     "group_by_unit",
     "group_by_tag",

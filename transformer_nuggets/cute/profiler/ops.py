@@ -41,6 +41,7 @@ from cutlass._mlir.dialects import llvm
 
 __all__ = [
     "read_globaltimer",
+    "read_globaltimer_lo32",
     "static_start",
     "static_stop",
     "warp_atomic_alloc",
@@ -51,6 +52,8 @@ __all__ = [
     "region_start",
     "region_end",
     "raw_event_stop",
+    "compact_event_stop",
+    "compact_anchor_init",
     "ENABLE_PROFILING",
     "ENABLE_PROFILING_CONST",
 ]
@@ -86,6 +89,71 @@ def raw_event_stop(
         _store_i64(base_ptr + byte_offset + Int64(8), dur_ns)
         _store_i64(base_ptr + byte_offset + Int64(16), Int64(tag))
         _store_i64(base_ptr + byte_offset + Int64(24), Int64(tid))
+
+
+@cute.jit
+def compact_anchor_init(
+    buf: cute.Tensor,
+    unit_id: Int32,
+    max_events_per_unit: Int32,
+) -> None:
+    """Write a full 64-bit globaltimer anchor to slot 0 of this unit's buffer.
+
+    Compact mode stores each event as a single packed int64 with only the low
+    32 bits of the timer. The decoder reconstructs full 64-bit timestamps by
+    combining each record's ts_lo32 with the upper 32 bits of this anchor (and
+    handling wraparound). Call once per CTA at the top of ``@cute.kernel``,
+    BEFORE any nested warp guards.
+
+    Only lane 0 of warp 0 performs the store.
+    """
+    warp_idx = cute.arch.warp_idx()
+    lane_idx = cute.arch.lane_idx()
+    if warp_idx == 0 and lane_idx == 0:
+        ts = read_globaltimer()
+        base_ptr = buf.iterator.toint()
+        slice_size = Int64(1 + max_events_per_unit)
+        byte_offset = Int64(unit_id) * slice_size * Int64(8)
+        _store_i64(base_ptr + byte_offset, ts)
+
+
+@cute.jit
+def compact_event_stop(
+    buf: cute.Tensor,
+    unit_id: Int32,
+    event_idx: Int32,
+    start_ts32: Int32,
+    tag: Int32,
+    max_events_per_unit: Int32,
+) -> None:
+    """Record one event in compact format: single packed int64 store, no warp guard.
+
+    Pair with :func:`read_globaltimer_lo32` for the start timestamp. The
+    packed record layout is::
+
+        bits  63..56  55..32     31..0
+              tag(8)  dur_ns(24) ts_lo32(32)
+
+    ``dur_ns`` saturates at ~16.7 ms (2^24 ns); regions longer than that
+    overflow silently — use the legacy 4xi64 path (:func:`raw_event_stop`) for
+    coarse outer regions if needed. ``tag`` is masked to 8 bits.
+
+    Only lane 0 of the calling warp performs the store; the caller is
+    responsible for any outer warp guard. The inner ``if lane_idx == 0:``
+    yields no value, so this primitive is safe in deeply nested control flow.
+    """
+    lane_idx = cute.arch.lane_idx()
+    end_ts32 = read_globaltimer_lo32()
+    if lane_idx == 0:
+        dur32 = end_ts32 - start_ts32
+        ts_u = Int64(start_ts32) & Int64(0xFFFFFFFF)
+        dur_u = Int64(dur32) & Int64(0xFFFFFF)
+        tag_u = Int64(tag) & Int64(0xFF)
+        packed = ts_u | (dur_u << 32) | (tag_u << 56)
+        base_ptr = buf.iterator.toint()
+        slice_size = Int64(1 + max_events_per_unit)
+        byte_offset = (Int64(unit_id) * slice_size + Int64(1 + event_idx)) * Int64(8)
+        _store_i64(base_ptr + byte_offset, packed)
 
 
 class RegionToken(NamedTuple):
@@ -146,6 +214,32 @@ def read_globaltimer(*, loc=None, ip=None) -> Int64:
         ip=ip,
     )
     return Int64(result)
+
+
+@dsl_user_op
+def read_globaltimer_lo32(*, loc=None, ip=None) -> Int32:
+    """Read the low 32 bits of ``%globaltimer`` (PTX ``mov.u32 ... %globaltimer_lo;``).
+
+    Lowers to a single ``CS2R.32 Rn, SR_GLOBALTIMERLO`` on Blackwell. One-third
+    the register pressure of :func:`read_globaltimer` and avoids the 64-bit
+    packing overhead, at the cost of ~4 s wraparound. The host decoder rebases
+    against a per-unit 64-bit anchor (see :func:`compact_anchor_init`).
+
+    Returns:
+        Int32: Low 32 bits of the current global timer in nanoseconds.
+    """
+    result = llvm.inline_asm(
+        T.i32(),
+        [],
+        "mov.u32 $0, %globaltimer_lo;",
+        "=r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(result)
 
 
 @dsl_user_op
