@@ -54,6 +54,9 @@ from transformer_nuggets.cute.profiler.ops import (
     raw_event_stop,
     compact_event_stop,
     compact_anchor_init,
+    compact_event_stop_smem,
+    compact_anchor_init_smem,
+    compact_flush_smem_to_gmem,
 )
 
 from transformer_nuggets.cute.profiler.postprocessors import (
@@ -92,6 +95,9 @@ __all__ = [
     "raw_event_stop",
     "compact_event_stop",
     "compact_anchor_init",
+    "compact_event_stop_smem",
+    "compact_anchor_init_smem",
+    "compact_flush_smem_to_gmem",
     # Post-processors
     "group_by_unit",
     "group_by_tag",

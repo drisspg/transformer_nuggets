@@ -54,6 +54,9 @@ __all__ = [
     "raw_event_stop",
     "compact_event_stop",
     "compact_anchor_init",
+    "compact_event_stop_smem",
+    "compact_anchor_init_smem",
+    "compact_flush_smem_to_gmem",
     "ENABLE_PROFILING",
     "ENABLE_PROFILING_CONST",
 ]
@@ -154,6 +157,82 @@ def compact_event_stop(
         slice_size = Int64(1 + max_events_per_unit)
         byte_offset = (Int64(unit_id) * slice_size + Int64(1 + event_idx)) * Int64(8)
         _store_i64(base_ptr + byte_offset, packed)
+
+
+@cute.jit
+def compact_anchor_init_smem(smem_buf: cute.Tensor) -> None:
+    """Write a 64-bit globaltimer anchor to slot 0 of a per-CTA smem profile buffer.
+
+    Companion to :func:`compact_event_stop_smem`. ``smem_buf`` is expected to
+    be the int64 tensor view of the caller's per-CTA smem ``MemRange``; the
+    slot 0 anchor lets the host decoder reconstruct full 64-bit timestamps
+    after :func:`compact_flush_smem_to_gmem` copies the slice out to global.
+    Call once at the top of ``@cute.kernel`` before any nested control flow.
+    Only lane 0 of warp 0 performs the write.
+    """
+    warp_idx = cute.arch.warp_idx()
+    lane_idx = cute.arch.lane_idx()
+    if warp_idx == 0 and lane_idx == 0:
+        smem_buf[0] = read_globaltimer()
+
+
+@cute.jit
+def compact_event_stop_smem(
+    smem_buf: cute.Tensor,
+    event_idx: Int32,
+    start_ts32: Int32,
+    tag: Int32,
+) -> None:
+    """Record one event into a per-CTA smem buffer; single STS, no warp guard.
+
+    Same packed layout as :func:`compact_event_stop` (``tag | dur24 | ts32``)
+    but writes to shared memory instead of global. Pair with
+    :func:`read_globaltimer_lo32` for the start timestamp and call
+    :func:`compact_flush_smem_to_gmem` once at kernel exit to copy the slice
+    out to global memory.
+
+    Only lane 0 of the calling warp performs the store; the caller is
+    responsible for any outer warp guard. The hot path is a single ``STS``
+    plus the timer read and bit-pack — no global address arithmetic.
+    """
+    lane_idx = cute.arch.lane_idx()
+    end_ts32 = read_globaltimer_lo32()
+    if lane_idx == 0:
+        dur32 = end_ts32 - start_ts32
+        ts_u = Int64(start_ts32) & Int64(0xFFFFFFFF)
+        dur_u = Int64(dur32) & Int64(0xFFFFFF)
+        tag_u = Int64(tag) & Int64(0xFF)
+        packed = ts_u | (dur_u << 32) | (tag_u << 56)
+        smem_buf[Int32(1) + event_idx] = packed
+
+
+@cute.jit
+def compact_flush_smem_to_gmem(
+    smem_buf: cute.Tensor,
+    gmem_buf: cute.Tensor,
+    unit_id: Int32,
+    max_events_per_unit: Int32,
+) -> None:
+    """Cooperative copy: smem profile slice -> per-unit slice in the gmem buffer.
+
+    Must be called once at kernel end, AFTER all events for this CTA have
+    been recorded via :func:`compact_event_stop_smem`. Issues a CTA-wide
+    ``__syncthreads`` first so pending event STS writes are visible to all
+    threads before the cooperative copy, then every thread copies a strided
+    subset of the ``1 + max_events_per_unit`` slots out to its position in
+    the global buffer (same layout as gmem-only compact mode).
+    """
+    cute.arch.barrier()
+    tidx, _, _ = cute.arch.thread_idx()
+    bdim, _, _ = cute.arch.block_dim()
+    slice_size = Int32(1) + max_events_per_unit
+    base_ptr = gmem_buf.iterator.toint()
+    base_byte_offset = Int64(unit_id) * Int64(slice_size) * Int64(8)
+    i = tidx
+    while i < slice_size:
+        # Cache-evict-first store: we never read these back from the device.
+        _store_i64(base_ptr + base_byte_offset + Int64(i) * Int64(8), smem_buf[i])
+        i = i + bdim
 
 
 class RegionToken(NamedTuple):
