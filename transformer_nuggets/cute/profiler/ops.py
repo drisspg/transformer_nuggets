@@ -20,13 +20,11 @@ Usage in kernels (using guarded helpers - recommended):
 
     start_ns = warp_start(prof_buf, unit_id, event_idx, max_events_per_unit, Int32(0))
     warp_stop(prof_buf, unit_id, event_idx, start_ns, TAG_X, tid, max_events_per_unit, Int32(0))
-    warp_flush(prof_buf, unit_id, event_idx, max_events_per_unit, Int32(0))
 
 Low-level usage (manual guards):
     if warp_idx == 0 and lane_idx == 0:
         start_ns = static_start(prof_buf, unit_id, event_idx, max_events_per_unit)
         static_stop(prof_buf, unit_id, event_idx, start_ns, TAG_X, tid, max_events_per_unit)
-        static_flush(prof_buf, unit_id, event_idx, max_events_per_unit)
 """
 
 import os
@@ -129,7 +127,14 @@ def compact_event_stop(
     tag: Int32,
     max_events_per_unit: Int32,
 ) -> None:
-    """Record one event in compact format: single packed int64 store, no warp guard.
+    """Record one event in compact format to global memory; 1x ``STG.E.EF.64`` per event.
+
+    Pick this when total kernel slowdown matters most and you do not want to
+    plumb a smem ``MemRange`` through your ``SharedStorage``. Per-event STGs
+    overlap with surrounding compute, but each event pays full L2/HBM cost.
+    For the same workload, :func:`compact_event_stop_smem` records ~30-50 ns
+    less observer overhead per event (at the cost of an end-of-kernel flush).
+
 
     Pair with :func:`read_globaltimer_lo32` for the start timestamp. The
     packed record layout is::
@@ -183,7 +188,15 @@ def compact_event_stop_smem(
     start_ts32: Int32,
     tag: Int32,
 ) -> None:
-    """Record one event into a per-CTA smem buffer; single STS, no warp guard.
+    """Record one event into per-CTA smem; 1x ``STS.64`` per event, lowest observer cost.
+
+    Pick this when the recorded timestamps will drive optimization decisions:
+    the per-event hot-path cost is the smallest of any format (one shared-mem
+    store, no global address math), so recorded ``dur_ns`` for inner regions
+    is ~30-50 ns smaller than :func:`compact_event_stop` for the same logical
+    work. The cost is paid once at kernel exit via
+    :func:`compact_flush_smem_to_gmem`, which doesn't pollute the timestamps.
+
 
     Same packed layout as :func:`compact_event_stop` (``tag | dur24 | ts32``)
     but writes to shared memory instead of global. Pair with
@@ -262,9 +275,7 @@ def _env_flag(name: str, default: bool = True) -> bool:
 # so toggling the env var and re-staging the kernel removes all profiling code.
 ENABLE_PROFILING: bool = _env_flag("TNUGGETS_ENABLE_PROFILING", default=True)
 # Use cutlass.const_expr so the branch is compile-time in staged kernels.
-# If const_expr is missing in the installed cutlass, fall back to plain bool.
-ENABLE_PROFILING_CONST = getattr(cutlass, "const_expr", lambda x: x)(ENABLE_PROFILING)
-_PROFILE_DISABLED_PRINTED = False
+ENABLE_PROFILING_CONST = cutlass.const_expr(ENABLE_PROFILING)
 
 
 @dsl_user_op
@@ -420,19 +431,10 @@ def static_stop(
         max_events_per_unit: Maximum events per unit (determines slice size).
         bounds_check: Forwarded to :func:`static_start`.
     """
+    should_record = True
     if cutlass.const_expr(bounds_check):
-        if event_idx < max_events_per_unit:
-            end_ns = read_globaltimer()
-            base_ptr = buf.iterator.toint()
-            slice_size = Int64(1 + 4 * max_events_per_unit)
-            base_offset = Int64(unit_id) * slice_size + Int64(1 + 4 * event_idx)
-            byte_offset = base_offset * Int64(8)
-            dur_ns = end_ns - start_ns
-            _store_i64(base_ptr + byte_offset, start_ns)
-            _store_i64(base_ptr + byte_offset + Int64(8), dur_ns)
-            _store_i64(base_ptr + byte_offset + Int64(16), Int64(tag))
-            _store_i64(base_ptr + byte_offset + Int64(24), Int64(tid))
-    else:
+        should_record = event_idx < max_events_per_unit
+    if should_record:
         end_ns = read_globaltimer()
         base_ptr = buf.iterator.toint()
         slice_size = Int64(1 + 4 * max_events_per_unit)
@@ -443,32 +445,6 @@ def static_stop(
         _store_i64(base_ptr + byte_offset + Int64(8), dur_ns)
         _store_i64(base_ptr + byte_offset + Int64(16), Int64(tag))
         _store_i64(base_ptr + byte_offset + Int64(24), Int64(tid))
-
-
-@cute.jit
-def static_flush(
-    buf: cute.Tensor,
-    unit_id: Int32,
-    count: Int32,
-    max_events_per_unit: Int32,
-) -> None:
-    """Write the final event count for a unit (DEPRECATED).
-
-    Note: This function is deprecated. The decode_events function now scans
-    all slots, so explicit flushing is no longer required.
-
-    Args:
-        buf: Profile buffer tensor (int64).
-        unit_id: Which profiling unit this is.
-        count: Number of events recorded by this unit.
-        max_events_per_unit: Maximum events per unit (determines slice size).
-    """
-    base_ptr = buf.iterator.toint()
-
-    slice_size = Int64(1 + 4 * max_events_per_unit)
-    byte_offset = Int64(unit_id) * slice_size * Int64(8)
-
-    _store_i64(base_ptr + byte_offset, Int64(count))
 
 
 @cute.jit
@@ -583,35 +559,6 @@ def warp_stop(
         )
 
 
-@cute.jit
-def warp_flush(
-    buf: cute.Tensor,
-    unit_id: Int32,
-    count: Int32,
-    max_events_per_unit: Int32,
-    target_warp: Int32,
-) -> None:
-    """Flush event count, but only for lane 0 of the specified warp.
-
-    This is a convenience wrapper around static_flush that automatically
-    guards the call so only one thread per block/unit executes it.
-
-    Call this at the end of the kernel to record how many events were logged.
-
-    Args:
-        buf: Profile buffer tensor (int64).
-        unit_id: Which profiling unit this is.
-        count: Number of events recorded by this unit.
-        max_events_per_unit: Maximum events per unit (determines slice size).
-        target_warp: Which warp should flush (0, 1, 2, ...).
-    """
-    warp_idx = cute.arch.warp_idx()
-    lane_idx = cute.arch.lane_idx()
-
-    if warp_idx == target_warp and lane_idx == 0:
-        static_flush(buf, unit_id, count, max_events_per_unit)
-
-
 class _ProfileRegionContext:
     """DSL-level context manager for profiling regions in CUTE kernels.
 
@@ -720,11 +667,7 @@ def profile_region(
     Returns:
         Context manager for use with ``with``.
     """
-    if not cutlass.const_expr(bool(ENABLE_PROFILING_CONST)):
-        global _PROFILE_DISABLED_PRINTED
-        if not _PROFILE_DISABLED_PRINTED:
-            print("profiling disabled: TNUGGETS_ENABLE_PROFILING=0, profile_region is no-op")
-            _PROFILE_DISABLED_PRINTED = True
+    if not cutlass.const_expr(ENABLE_PROFILING_CONST):
         return _NoOpProfileRegion()
 
     if target_warp is None:

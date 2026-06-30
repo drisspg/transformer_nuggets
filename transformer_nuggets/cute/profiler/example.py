@@ -19,6 +19,7 @@ import cutlass.cute as cute
 from cutlass import Int32
 from cutlass.cute.runtime import from_dlpack
 
+from transformer_nuggets import DATA_DIR
 from transformer_nuggets.cute.base import CuteOp
 from transformer_nuggets.cute.profiler.host import profile_session
 from transformer_nuggets.cute.profiler.ops import profile_region, region_start, region_end
@@ -63,8 +64,7 @@ class ProfiledKernelAtomic(CuteOp):
                 with profile_region(prof_buf, max_events_per_unit, TAG_COMPUTE, prof_tid):
                     with profile_region(prof_buf, max_events_per_unit, TAG_STORE, prof_tid):
                         if global_idx < cute.size(output):
-                            val = output[global_idx]
-                            output[global_idx] = val + 1
+                            output[global_idx] = output[global_idx] + 1
 
     @cute.jit()
     def __call__(
@@ -130,8 +130,7 @@ class ProfiledKernelStatic(CuteOp):
                         event_idx=Int32(2) + i * Int32(3),
                     ):
                         if global_idx < cute.size(output):
-                            val = output[global_idx]
-                            output[global_idx] = val + 1
+                            output[global_idx] = output[global_idx] + 1
 
     @cute.jit()
     def __call__(
@@ -158,9 +157,7 @@ def run_atomic_mode():
     device = torch.device("cuda")
     output = torch.zeros(256, dtype=torch.float32, device=device)
 
-    import transformer_nuggets
-
-    trace_path = transformer_nuggets.DATA_DIR / "profiler_atomic_trace.pftrace"
+    trace_path = DATA_DIR / "profiler_atomic_trace.pftrace"
 
     with profile_session(
         max_events_per_unit=3 * NUM_ITERATIONS + 2,
@@ -191,9 +188,7 @@ def run_static_mode():
     device = torch.device("cuda")
     output = torch.zeros(256, dtype=torch.float32, device=device)
 
-    import transformer_nuggets
-
-    trace_path = transformer_nuggets.DATA_DIR / "profiler_static_trace.pftrace"
+    trace_path = DATA_DIR / "profiler_static_trace.pftrace"
 
     with profile_session(
         max_events_per_unit=3 * NUM_ITERATIONS + 2,
@@ -246,8 +241,7 @@ class ProfiledKernelToken(CuteOp):
         for i in cutlass.range(self.num_iterations):
             compute_tok = region_start(prof_buf, prof_tid, max_events_per_unit)
             if global_idx < cute.size(output):
-                val = output[global_idx]
-                output[global_idx] = val + 1
+                output[global_idx] = output[global_idx] + 1
             region_end(prof_buf, TAG_COMPUTE, compute_tok, max_events_per_unit)
         region_end(prof_buf, TAG_ITERATION, outer_tok, max_events_per_unit)
 
@@ -276,9 +270,7 @@ def run_token_mode():
     device = torch.device("cuda")
     output = torch.zeros(256, dtype=torch.float32, device=device)
 
-    import transformer_nuggets
-
-    trace_path = transformer_nuggets.DATA_DIR / "profiler_token_trace.pftrace"
+    trace_path = DATA_DIR / "profiler_token_trace.pftrace"
 
     with profile_session(
         max_events_per_unit=2 * NUM_ITERATIONS + 2,

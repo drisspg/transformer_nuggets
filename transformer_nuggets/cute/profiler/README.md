@@ -79,6 +79,32 @@ region_end(prof_buf, TAG_OUTER, outer, max_events)
 
 This is the closest analogue to NVIDIA IKET's `iket.range_start` / `iket.range_end` SSA-token pairing in `cutlass.cute.experimental.iket`. The shape is similar but the mechanism is different: IKET emits MLIR ops and lowers via the proprietary `iket` dialect, while this profiler emits inline PTX (`%globaltimer`, `st.global.cs.u64`) directly.
 
+## Record formats: legacy 4xi64 vs compact 1xi64 (gmem / smem)
+
+Three on-wire record formats are available, in addition to the three pairing modes above:
+
+| Format | Per-event device cost | Bytes/event | Where stored | When to use |
+|---|---|---|---|---|
+| **Legacy 4xi64** (`profile_region` / `region_start` / `region_end`) | 2x `CS2R` (64-bit timer) + 4x `STG.E.EF.64` + address math | 32 B global | Per-event STG to global | Default; matches the original API |
+| **Compact 1xi64 gmem** (`compact_event_stop` + `compact_anchor_init`) | 2x `CS2R.32` (32-bit timer) + 1x `STG.E.EF.64` (packed) + address math | 8 B global | Per-event STG to global | Smaller buffer, smaller decode work, lower L2 pressure |
+| **Compact 1xi64 smem** (`compact_event_stop_smem` + `compact_anchor_init_smem` + `compact_flush_smem_to_gmem`) | 2x `CS2R.32` + 1x `STS.64` + bit-pack | 8 B in smem; cooperative flush to gmem at kernel exit | Per-event STS, one cooperative flush at end | Lowest per-event observer cost; recommended when timestamps will drive optimization decisions |
+
+Format is the per-event SHAPE; pairing (atomic vs static vs token) is independent. Today only the legacy 4xi64 path has the `with profile_region(...)` context-manager wrapper; the compact paths use direct `read_globaltimer_lo32()` + `compact_event_stop*()` calls, which is also the right shape for deeply-nested call sites (see `raw_event_stop` for the analogous legacy primitive).
+
+### When to pick smem
+
+We benchmarked compact-gmem vs compact-smem on a Blackwell GEMM (`agent_space/bench_*.py`). Headline finding:
+
+- **Total kernel time is a wash.** The smem path saves per-event STGs but pays the same number of STGs in a single end-of-kernel cooperative flush; for the GEMM we tested, that flush couldn't overlap with anything.
+- **Per-event observer cost is ~30-50 ns lower in smem mode.** The recorded `dur_ns` for inner regions (e.g. `k_tile`, `mma_wait`) is consistently ~64 ns shorter than in compact-gmem for the same logical work — i.e. the timestamps better reflect real kernel behavior because measurement is less invasive.
+
+Decision rule:
+- **Pick smem** when the timestamps you record will be used to make optimization decisions (per-region duration is your signal). The flush cost is paid once at kernel exit and doesn't pollute the timestamps.
+- **Pick compact-gmem** when total kernel slowdown matters most (e.g. you're profiling something that already runs under other tooling), or when you don't want to plumb a smem `MemRange` through your `SharedStorage`.
+- **Pick legacy** when you want the convenient `with profile_region(...)` context-manager API and care about backwards compatibility.
+
+The smem path requires the caller to add a `cute.struct.MemRange[Int64, 1 + max_events_per_unit]` field to their `SharedStorage` and pass a `Tensor` view (`storage.prof_smem.get_tensor(cute.make_layout((1 + N,)))`) to the device ops. See `agent_space/bench_profile_overhead.py:GEMMCompactSmem` for a full working example.
+
 ## API
 
 ### Host (`host.py`)
@@ -94,13 +120,26 @@ This is the closest analogue to NVIDIA IKET's `iket.range_start` / `iket.range_e
 
 ### Device (`ops.py`)
 
+Legacy 4xi64 format (default; `profile_session(compact=False, ...)`):
+
 | Function | Description |
 |----------|-------------|
 | `profile_region(buf, max_events, tag, unit_id, target_warp=None, event_idx=None, tid=None)` | Context-manager API |
-| `region_start(buf, unit_id, max_events, target_warp=None, event_idx=None) -> RegionToken` | Open a region, return a pairing token |
-| `region_end(buf, tag, token, max_events_per_unit, tid=None)` | Close a region using its token |
+| `region_start(buf, unit_id, max_events, ...) -> RegionToken` / `region_end(buf, tag, token, ...)` | Token-based start/end pairing |
+| `raw_event_stop(buf, unit_id, event_idx, start_ns, tag, tid, max_events)` | No-warp-guard stop for deeply nested call sites |
 | `warp_start/warp_stop(...)` | Low-level start/stop (lane 0 of target_warp) |
 | `warp_atomic_alloc(...)` | Allocate event index atomically |
+
+Compact 1xi64 format (`profile_session(compact=True, ...)`):
+
+| Function | Description |
+|----------|-------------|
+| `read_globaltimer_lo32()` | 32-bit timer read (1x `CS2R.32`); pair with `compact_event_stop*` |
+| `compact_anchor_init(buf, unit_id, max_events)` | Write 64-bit anchor to gmem slot 0 |
+| `compact_event_stop(buf, unit_id, event_idx, start_ts32, tag, max_events)` | 1x `STG.E.EF.64` packed-record store |
+| `compact_anchor_init_smem(smem_buf)` | Write 64-bit anchor to smem slot 0 |
+| `compact_event_stop_smem(smem_buf, event_idx, start_ts32, tag)` | 1x `STS.64` packed-record store |
+| `compact_flush_smem_to_gmem(smem_buf, gmem_buf, unit_id, max_events)` | Cooperative copy at kernel exit |
 
 ## Trace Formats
 

@@ -3,9 +3,8 @@
 This package provides utilities for profiling code regions *inside* GPU kernels,
 generating native Perfetto TrackEvent traces viewable in Perfetto (https://ui.perfetto.dev/).
 
-Two modes are supported:
-- Atomic mode: No event_idx needed, indices allocated via atomics (simple)
-- Static mode: Explicit event_idx, no atomics (maximum performance)
+See README.md for the full list of recording modes (atomic / static / token /
+compact gmem / compact smem) and a guide on which to pick.
 
 Quick Start:
     from transformer_nuggets.cute.profiler import profile_session, profile_region

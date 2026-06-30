@@ -49,10 +49,8 @@ from transformer_nuggets.utils.perfetto import write_perfetto_trace
 try:
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
-
-    HAS_CUTE = True
 except ImportError:
-    HAS_CUTE = False
+    pass
 
 
 __all__ = [
@@ -282,6 +280,12 @@ def decode_events(
     return _decode_events_legacy(buf, tag_table, tid_base)
 
 
+def _tag_name_or_unknown(tag_table: TagTable, tag_id: int) -> str:
+    if 0 <= tag_id < len(tag_table):
+        return tag_table.name(tag_id)
+    return f"unknown_{tag_id}"
+
+
 def _decode_events_legacy(buf: ProfileBuf, tag_table: TagTable, tid_base: int) -> list[Event]:
     cpu_buf = buf.tensor.cpu().numpy()
     slice_size = buf.slice_size
@@ -300,15 +304,12 @@ def _decode_events_legacy(buf: ProfileBuf, tag_table: TagTable, tid_base: int) -
             if start_ns == 0 and dur_ns == 0:
                 continue
 
-            tag_name = (
-                tag_table.name(tag_id) if 0 <= tag_id < len(tag_table) else f"unknown_{tag_id}"
-            )
             events.append(
                 Event(
                     start_ns=start_ns,
                     dur_ns=dur_ns,
                     tag_id=tag_id,
-                    tag_name=tag_name,
+                    tag_name=_tag_name_or_unknown(tag_table, tag_id),
                     tid=tid + tid_base,
                     unit_id=unit_id,
                 )
@@ -358,22 +359,19 @@ def _decode_events_compact(buf: ProfileBuf, tag_table: TagTable, tid_base: int) 
     wrap = (ts_lo < anchor_lo.unsqueeze(1)).to(torch.int64) << 32
     start_ns = anchor_hi.unsqueeze(1) + wrap + ts_lo
 
-    unit_idx, _ = torch.nonzero(valid, as_tuple=True)
     starts = start_ns[valid].tolist()
     durs = dur_ns[valid].tolist()
     tags = tag_ids[valid].tolist()
-    units = unit_idx.tolist()
+    units = torch.nonzero(valid, as_tuple=True)[0].tolist()
 
-    n_tags = len(tag_table)
     events = []
     for s, d, t, u in zip(starts, durs, tags, units):
-        tag_name = tag_table.name(t) if 0 <= t < n_tags else f"unknown_{t}"
         events.append(
             Event(
                 start_ns=s,
                 dur_ns=d,
                 tag_id=t,
-                tag_name=tag_name,
+                tag_name=_tag_name_or_unknown(tag_table, t),
                 tid=u + tid_base,
                 unit_id=u,
             )

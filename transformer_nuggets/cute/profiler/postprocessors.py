@@ -8,6 +8,8 @@ Quick start:
 
 from __future__ import annotations
 
+import re
+
 from transformer_nuggets.cute.profiler.host import Event, PostProcessContext
 
 
@@ -78,15 +80,9 @@ def strip_tid_suffix(events: list[Event], ctx: PostProcessContext) -> list[Event
     Returns:
         Events with cleaned tag_names.
     """
-    import re
-
     for e in events:
         tid_str = str(e.tid)
-        patterns = [
-            rf"_0*{tid_str}$",
-            rf"(?<=[a-zA-Z])0*{tid_str}$",
-        ]
-        for pattern in patterns:
+        for pattern in (rf"_0*{tid_str}$", rf"(?<=[a-zA-Z])0*{tid_str}$"):
             new_name = re.sub(pattern, "", e.tag_name)
             if new_name != e.tag_name:
                 e.tag_name = new_name
@@ -164,12 +160,9 @@ def filter_by_tag(
     """
 
     def _filter(events: list[Event], ctx: PostProcessContext) -> list[Event]:
-        keep_ids = set()
+        keep_ids = set(tag_ids or ())
         if tag_names is not None:
-            for name in tag_names:
-                keep_ids.add(ctx.tag_table.id(name))
-        if tag_ids is not None:
-            keep_ids.update(tag_ids)
+            keep_ids.update(ctx.tag_table.id(name) for name in tag_names)
         return [e for e in events if e.tag_id in keep_ids]
 
     return _filter
@@ -237,7 +230,7 @@ def rename_processes(name_map: dict[int, str]):
     return _rename
 
 
-def rename_threads(name_map: dict[tuple[int, int], str] | dict[int, str]):
+def rename_threads(name_map: dict[tuple[int, int] | int, str]):
     """Create a trace post-processor that renames threads.
 
     Use with post_process_trace to customize thread names in Perfetto.
