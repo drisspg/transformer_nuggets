@@ -330,7 +330,23 @@ def _decode_events_compact(buf: ProfileBuf, tag_table: TagTable, tid_base: int) 
     anchors = grid[:, 0]
     records = grid[:, 1:]
 
-    valid = (records != 0) & (anchors != 0).unsqueeze(1)
+    # CTAs in the same launch start within microseconds, so all real anchors
+    # should agree to within a small window. An anchor diverging from the
+    # median by >1s almost certainly means a caller event_idx overflowed and
+    # clobbered the next unit's anchor slot.
+    valid_anchor = anchors != 0
+    if valid_anchor.any():
+        median = anchors[valid_anchor].median()
+        suspect = valid_anchor & ((anchors - median).abs() > 1_000_000_000)
+        if suspect.any():
+            bad = suspect.nonzero(as_tuple=True)[0].tolist()
+            raise RuntimeError(
+                f"Compact-mode anchors for units {bad} diverge from the median by >1s; "
+                "likely an event_idx >= max_events_per_unit overflow clobbered the next "
+                "unit's anchor. Bump max_events_per_unit or fix caller slot allocation."
+            )
+
+    valid = (records != 0) & valid_anchor.unsqueeze(1)
     if not valid.any():
         return []
 
