@@ -30,6 +30,7 @@ Low-level usage (manual guards):
 """
 
 import os
+from typing import NamedTuple
 
 import cutlass
 import cutlass.cute as cute
@@ -46,9 +47,60 @@ __all__ = [
     "warp_start",
     "warp_stop",
     "profile_region",
+    "RegionToken",
+    "region_start",
+    "region_end",
+    "raw_event_stop",
     "ENABLE_PROFILING",
     "ENABLE_PROFILING_CONST",
 ]
+
+
+@cute.jit
+def raw_event_stop(
+    buf: cute.Tensor,
+    unit_id: Int32,
+    event_idx: Int32,
+    start_ns: Int64,
+    tag: Int32,
+    tid: Int32,
+    max_events_per_unit: Int32,
+) -> None:
+    """Read the end timer and store an event record without a warp guard.
+
+    Pair with :func:`read_globaltimer` for the start timestamp. Only lane 0 of
+    the calling warp performs the stores; the caller is responsible for any
+    outer warp election. The inner ``if lane_idx == 0:`` yields no value, so
+    this primitive can be used in deeply nested control flow where
+    :func:`profile_region` would trigger ``cf.br`` lowering failures.
+    """
+    lane_idx = cute.arch.lane_idx()
+    end_ns = read_globaltimer()
+    if lane_idx == 0:
+        base_ptr = buf.iterator.toint()
+        slice_size = Int64(1 + 4 * max_events_per_unit)
+        base_offset = Int64(unit_id) * slice_size + Int64(1 + 4 * event_idx)
+        byte_offset = base_offset * Int64(8)
+        dur_ns = end_ns - start_ns
+        _store_i64(base_ptr + byte_offset, start_ns)
+        _store_i64(base_ptr + byte_offset + Int64(8), dur_ns)
+        _store_i64(base_ptr + byte_offset + Int64(16), Int64(tag))
+        _store_i64(base_ptr + byte_offset + Int64(24), Int64(tid))
+
+
+class RegionToken(NamedTuple):
+    """Pairing token returned by :func:`region_start` and consumed by :func:`region_end`.
+
+    Captures everything :func:`region_end` needs to close the region (slot
+    index, start timestamp, unit id, target warp), so callers cannot mismatch
+    those fields between start and end. Implemented as ``NamedTuple`` so the
+    DSL can thread it through ``scf.for`` as a loop-carried value.
+    """
+
+    unit_id: Int32
+    event_idx: Int32
+    start_ns: Int64
+    target_warp: Int32
 
 
 def _env_flag(name: str, default: bool = True) -> bool:
@@ -138,6 +190,7 @@ def static_start(
     unit_id: Int32,
     event_idx: Int32,
     max_events_per_unit: Int32,
+    bounds_check: cutlass.Constexpr = True,
 ) -> Int64:
     """Read start timestamp for an event within a unit's static buffer slice.
 
@@ -149,14 +202,23 @@ def static_start(
         unit_id: Which profiling unit this is (e.g., block index, warp index).
         event_idx: Event index within this unit (0, 1, 2, ... tracked in registers).
         max_events_per_unit: Maximum events per unit (determines slice size).
+        bounds_check: Compile-time flag. When ``True`` (default), gate the timer
+            read on ``event_idx < max_events_per_unit``. Setting ``False`` drops
+            the inner ``scf.if`` and is required when calling from deeply nested
+            control flow (e.g. inside ``if warp_idx == 0: for ...:`` in a
+            warp-specialized kernel) where the extra conditional has been seen
+            to trip ``cf.br`` lowering or LLVM dominance verification.
 
     Returns:
-        Int64: Start timestamp (0 when event_idx >= max_events_per_unit).
+        Int64: Start timestamp (0 when ``bounds_check`` is True and the slot
+        is out of range).
     """
-    start_ns = Int64(0)
-    if event_idx < max_events_per_unit:
-        start_ns = read_globaltimer()
-    return start_ns
+    if cutlass.const_expr(bounds_check):
+        start_ns = Int64(0)
+        if event_idx < max_events_per_unit:
+            start_ns = read_globaltimer()
+        return start_ns
+    return read_globaltimer()
 
 
 @cute.jit
@@ -168,6 +230,7 @@ def static_stop(
     tag: Int32,
     tid: Int32,
     max_events_per_unit: Int32,
+    bounds_check: cutlass.Constexpr = True,
 ) -> None:
     """Stop profiling an event, recording duration, tag, and tid.
 
@@ -182,18 +245,27 @@ def static_stop(
         tag: Tag ID for this event (from TagTable on host).
         tid: Thread/block identifier for Perfetto visualization.
         max_events_per_unit: Maximum events per unit (determines slice size).
+        bounds_check: Forwarded to :func:`static_start`.
     """
-    if event_idx < max_events_per_unit:
+    if cutlass.const_expr(bounds_check):
+        if event_idx < max_events_per_unit:
+            end_ns = read_globaltimer()
+            base_ptr = buf.iterator.toint()
+            slice_size = Int64(1 + 4 * max_events_per_unit)
+            base_offset = Int64(unit_id) * slice_size + Int64(1 + 4 * event_idx)
+            byte_offset = base_offset * Int64(8)
+            dur_ns = end_ns - start_ns
+            _store_i64(base_ptr + byte_offset, start_ns)
+            _store_i64(base_ptr + byte_offset + Int64(8), dur_ns)
+            _store_i64(base_ptr + byte_offset + Int64(16), Int64(tag))
+            _store_i64(base_ptr + byte_offset + Int64(24), Int64(tid))
+    else:
         end_ns = read_globaltimer()
-
         base_ptr = buf.iterator.toint()
-
         slice_size = Int64(1 + 4 * max_events_per_unit)
         base_offset = Int64(unit_id) * slice_size + Int64(1 + 4 * event_idx)
         byte_offset = base_offset * Int64(8)
-
         dur_ns = end_ns - start_ns
-
         _store_i64(base_ptr + byte_offset, start_ns)
         _store_i64(base_ptr + byte_offset + Int64(8), dur_ns)
         _store_i64(base_ptr + byte_offset + Int64(16), Int64(tag))
@@ -267,31 +339,33 @@ def warp_start(
     event_idx: Int32,
     max_events_per_unit: Int32,
     target_warp: Int32,
+    bounds_check: cutlass.Constexpr = True,
 ) -> Int64:
     """Start profiling, but only for lane 0 of the specified warp.
 
-    This is a convenience wrapper around static_start that automatically
-    guards the call so only one thread per block/unit executes it.
-
-    For simple per-block profiling, use target_warp=Int32(0).
-    For warp-specialized kernels, use the appropriate warp index.
+    Convenience wrapper around :func:`static_start` that adds a
+    ``warp_idx == target_warp and lane_idx == 0`` guard so only one thread
+    records the event.
 
     Args:
         buf: Profile buffer tensor (int64).
-        unit_id: Which profiling unit this is (e.g., block index, or bidx * NUM_WARPS + warp_idx).
-        event_idx: Event index within this unit (0, 1, 2, ... tracked in registers).
-        max_events_per_unit: Maximum events per unit (determines slice size).
-        target_warp: Which warp should profile (0, 1, 2, ...).
+        unit_id: Which profiling unit this is.
+        event_idx: Event index within this unit.
+        max_events_per_unit: Maximum events per unit.
+        target_warp: Which warp should profile.
+        bounds_check: Forwarded to :func:`static_start`.
 
     Returns:
-        Int64: Start timestamp for this event (0 for non-participating lanes).
+        Int64: Start timestamp (0 for non-participating lanes).
     """
     warp_idx = cute.arch.warp_idx()
     lane_idx = cute.arch.lane_idx()
 
     start_ns = Int64(0)
     if warp_idx == target_warp and lane_idx == 0:
-        start_ns = static_start(buf, unit_id, event_idx, max_events_per_unit)
+        start_ns = static_start(
+            buf, unit_id, event_idx, max_events_per_unit, bounds_check=bounds_check
+        )
     return start_ns
 
 
@@ -305,27 +379,35 @@ def warp_stop(
     tid: Int32,
     max_events_per_unit: Int32,
     target_warp: Int32,
+    bounds_check: cutlass.Constexpr = True,
 ) -> None:
     """Stop profiling, but only for lane 0 of the specified warp.
 
-    This is a convenience wrapper around static_stop that automatically
-    guards the call so only one thread per block/unit executes it.
-
     Args:
         buf: Profile buffer tensor (int64).
-        unit_id: Which profiling unit this is (must match warp_start).
-        event_idx: Event index within this unit (must match warp_start).
-        start_ns: Start timestamp returned by warp_start.
-        tag: Tag ID for this event (from TagTable on host).
-        tid: Thread/block identifier for Perfetto visualization.
-        max_events_per_unit: Maximum events per unit (determines slice size).
-        target_warp: Which warp should profile (must match warp_start).
+        unit_id: Which profiling unit this is.
+        event_idx: Event index within this unit.
+        start_ns: Start timestamp returned by :func:`warp_start`.
+        tag: Tag ID for this event.
+        tid: Per-event tid.
+        max_events_per_unit: Maximum events per unit.
+        target_warp: Which warp should profile.
+        bounds_check: Forwarded to :func:`static_stop`.
     """
     warp_idx = cute.arch.warp_idx()
     lane_idx = cute.arch.lane_idx()
 
     if warp_idx == target_warp and lane_idx == 0:
-        static_stop(buf, unit_id, event_idx, start_ns, tag, tid, max_events_per_unit)
+        static_stop(
+            buf,
+            unit_id,
+            event_idx,
+            start_ns,
+            tag,
+            tid,
+            max_events_per_unit,
+            bounds_check=bounds_check,
+        )
 
 
 @cute.jit
@@ -360,25 +442,25 @@ def warp_flush(
 class _ProfileRegionContext:
     """DSL-level context manager for profiling regions in CUTE kernels.
 
-    This works at IR generation time, not runtime. When you use:
-        with profile_region(prof_buf, max_events, tag, unit_id):
-            compute_something()
-
-    The __enter__ generates warp_start IR, __exit__ generates warp_stop IR.
-
-    Two modes:
-    - Atomic mode (event_idx=None): Allocates event index at runtime via atomic.
-    - Static mode (event_idx provided): Uses the given index, no atomics.
+    Generated at IR-staging time: ``__enter__`` emits the warp_start IR,
+    ``__exit__`` emits the warp_stop IR. Pairing is structural (Python
+    ``with``), so there is no way to start without ending. ``event_idx=None``
+    selects atomic slot allocation; a caller-supplied ``event_idx`` selects
+    static (no-atomic) allocation.
     """
 
-    def __init__(self, buf, max_events_per_unit, tag, unit_id, target_warp, event_idx):
+    def __init__(
+        self, buf, max_events_per_unit, tag, unit_id, tid, target_warp, event_idx, bounds_check
+    ):
         self._buf = buf
         self._max_events_per_unit = max_events_per_unit
         self._tag = tag
         self._unit_id = unit_id
+        self._tid = tid
         self._target_warp = target_warp
         self._event_idx = event_idx
         self._use_atomic = event_idx is None
+        self._bounds_check = bounds_check
 
     def __enter__(self):
         if cutlass.const_expr(self._use_atomic):
@@ -392,6 +474,7 @@ class _ProfileRegionContext:
             self._event_idx,
             self._max_events_per_unit,
             self._target_warp,
+            bounds_check=self._bounds_check,
         )
         return self
 
@@ -402,9 +485,10 @@ class _ProfileRegionContext:
             self._event_idx,
             self._start_ns,
             self._tag,
-            self._unit_id,
+            self._tid,
             self._max_events_per_unit,
             self._target_warp,
+            bounds_check=self._bounds_check,
         )
         return False
 
@@ -419,45 +503,49 @@ class _NoOpProfileRegion:
         return False
 
 
-def profile_region(buf, max_events_per_unit, tag, unit_id, target_warp=None, event_idx=None):
-    """Create a context manager for profiling a code region in CUTE DSL kernels.
+def profile_region(
+    buf,
+    max_events_per_unit,
+    tag,
+    unit_id,
+    target_warp=None,
+    event_idx=None,
+    tid=None,
+    bounds_check=True,
+):
+    """Context manager that profiles a code region in a CUTE DSL kernel.
 
-    This enables clean `with` statement syntax inside @cute.kernel functions.
-
-    **Atomic mode (recommended for simplicity)**:
-
-    When event_idx is omitted, event indices are allocated atomically at runtime.
-    No manual index tracking or flushing needed:
+    Atomic mode (default, ``event_idx=None``)::
 
         for i in cutlass.range(4):
-            with profile_region(prof_buf, max_events, TAG_COMPUTE):
+            with profile_region(prof_buf, max_events, TAG_COMPUTE, bidx):
                 compute_something()
-            with profile_region(prof_buf, max_events, TAG_STORE):
-                store_something()
-        # Done! No flush needed.
 
-    **Static mode (for maximum performance)**:
-
-    When event_idx is provided, no atomics are used. Use runtime expressions
-    with the loop variable to get unique indices:
+    Static mode (``event_idx`` provided, no atomics)::
 
         for i in cutlass.range(4):
             with profile_region(..., event_idx=Int32(0) + i * Int32(2)):
                 ...
-            with profile_region(..., event_idx=Int32(1) + i * Int32(2)):
-                ...
-        # No flush needed.
+
+    See :func:`region_start`/:func:`region_end` for explicit token pairing
+    across Python scopes or loop iterations.
 
     Args:
-        buf: Profile buffer tensor (cute.Tensor).
-        max_events_per_unit: Maximum events per unit (Int32).
-        tag: Tag ID for this region (Int32).
-        unit_id: Which profiling unit (buffer slice) to use (Int32). Defaults to bidx.
-        target_warp: Which warp should profile (Int32). Defaults to Int32(0).
-        event_idx: Event index (Int32). If None, uses atomic allocation.
+        buf: Profile buffer tensor.
+        max_events_per_unit: Slots reserved per unit (Int32).
+        tag: Tag ID for the region (Int32).
+        unit_id: Profiling unit (buffer slice) to write to (Int32).
+        target_warp: Which warp records the event. Defaults to ``Int32(0)``.
+        event_idx: Optional explicit slot index. ``None`` enables atomic mode.
+        tid: Per-event ``tid`` written into the slot and surfaced as the
+            Perfetto thread id. Defaults to ``unit_id`` for backward
+            compatibility with the single-warp case. For warp-specialized
+            kernels pass ``cute.arch.warp_idx()`` (or any per-warp value) so
+            each warp gets its own Perfetto lane.
+        bounds_check: Forwarded to :func:`static_start`/:func:`static_stop`.
 
     Returns:
-        Context manager for use with `with` statement.
+        Context manager for use with ``with``.
     """
     if not cutlass.const_expr(bool(ENABLE_PROFILING_CONST)):
         global _PROFILE_DISABLED_PRINTED
@@ -468,5 +556,76 @@ def profile_region(buf, max_events_per_unit, tag, unit_id, target_warp=None, eve
 
     if target_warp is None:
         target_warp = Int32(0)
+    if tid is None:
+        tid = unit_id
 
-    return _ProfileRegionContext(buf, max_events_per_unit, tag, unit_id, target_warp, event_idx)
+    return _ProfileRegionContext(
+        buf, max_events_per_unit, tag, unit_id, tid, target_warp, event_idx, bounds_check
+    )
+
+
+def region_start(
+    buf: cute.Tensor,
+    unit_id: Int32,
+    max_events_per_unit: Int32,
+    target_warp: Int32 | None = None,
+    event_idx: Int32 | None = None,
+) -> RegionToken:
+    """Open a region and return a :class:`RegionToken` for explicit pairing.
+
+    Use this when ``with profile_region(...)`` does not fit, e.g. when a region
+    spans two Python scopes or needs to be loop-carried across
+    ``cutlass.range`` iterations.
+
+    Args:
+        buf: Profile buffer tensor.
+        unit_id: Profiling unit (buffer slice) to write to.
+        max_events_per_unit: Slots reserved per unit.
+        target_warp: Which warp records the event. Defaults to ``Int32(0)``.
+        event_idx: Optional explicit slot index. ``None`` enables atomic
+            allocation via :func:`warp_atomic_alloc`.
+
+    Returns:
+        Token to pass to :func:`region_end`.
+    """
+    if target_warp is None:
+        target_warp = Int32(0)
+    if event_idx is None:
+        event_idx = warp_atomic_alloc(buf, unit_id, max_events_per_unit, target_warp)
+    start_ns = warp_start(buf, unit_id, event_idx, max_events_per_unit, target_warp)
+    return RegionToken(
+        unit_id=unit_id, event_idx=event_idx, start_ns=start_ns, target_warp=target_warp
+    )
+
+
+def region_end(
+    buf: cute.Tensor,
+    tag: Int32,
+    token: RegionToken,
+    max_events_per_unit: Int32,
+    tid: Int32 | None = None,
+) -> None:
+    """Close a region opened by :func:`region_start`.
+
+    Slot index, start timestamp, unit id, and target warp all come from
+    ``token``, so the start/end pair can't drift apart on those fields.
+
+    Args:
+        buf: Profile buffer tensor.
+        tag: Tag ID for the region.
+        token: Token returned by :func:`region_start`.
+        max_events_per_unit: Slots reserved per unit.
+        tid: Per-event ``tid``. Defaults to the token's ``unit_id``.
+    """
+    if tid is None:
+        tid = token.unit_id
+    warp_stop(
+        buf,
+        token.unit_id,
+        token.event_idx,
+        token.start_ns,
+        tag,
+        tid,
+        max_events_per_unit,
+        token.target_warp,
+    )

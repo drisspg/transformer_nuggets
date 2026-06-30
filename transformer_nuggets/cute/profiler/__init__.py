@@ -47,6 +47,10 @@ from transformer_nuggets.cute.profiler.ops import (
     warp_start,
     warp_stop,
     profile_region,
+    region_start,
+    region_end,
+    RegionToken,
+    raw_event_stop,
 )
 
 from transformer_nuggets.cute.profiler.postprocessors import (
@@ -78,6 +82,10 @@ __all__ = [
     "warp_start",
     "warp_stop",
     "profile_region",
+    "region_start",
+    "region_end",
+    "RegionToken",
+    "raw_event_stop",
     # Post-processors
     "group_by_unit",
     "group_by_tag",

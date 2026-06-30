@@ -25,20 +25,20 @@ with profile_session(
     my_kernel(output, prof.tensor, prof.max_events_per_unit)
 ```
 
-## Two Modes
+## Three Modes
 
-### Atomic Mode (simple)
+### Atomic mode (default)
 
 Omit `event_idx` and indices are allocated via atomics at runtime:
 
 ```python
-with profile_region(prof_buf, max_events, TAG, tid):
+with profile_region(prof_buf, max_events, TAG, unit_id):
     do_work()
 ```
 
 Works in loops without manual bookkeeping. The tradeoff: **nested regions cause timing skew**. The inner region's atomic runs while the outer region's timer is still running, inflating the outer duration.
 
-### Manual Mode (accurate for nesting)
+### Static mode (accurate for nesting)
 
 Pass an explicit `event_idx` to avoid atomics entirely:
 
@@ -60,6 +60,25 @@ for i in cutlass.range(4):
 
 You set `max_events_per_unit` to something larger than you need; the decoder scans all slots and skips empty ones.
 
+### Token mode (explicit pairing across scopes)
+
+`with profile_region(...)` already pairs start and end structurally, but it can't bridge two Python scopes or open in iteration `i` and close in `i+1`. For those cases, use `region_start` / `region_end` and pass the returned `RegionToken` explicitly:
+
+```python
+from transformer_nuggets.cute.profiler import region_start, region_end, RegionToken
+
+outer = region_start(prof_buf, unit_id, max_events)
+for i in cutlass.range(N):
+    inner = region_start(prof_buf, unit_id, max_events)
+    do_work(i)
+    region_end(prof_buf, TAG_INNER, inner, max_events)
+region_end(prof_buf, TAG_OUTER, outer, max_events)
+```
+
+`RegionToken` captures `(unit_id, event_idx, start_ns, target_warp)`, so `region_end` only needs the token plus the tag, and the start/end pair can't drift on those fields. It's a `NamedTuple`, so the DSL can thread it through `cutlass.range` as a loop-carried value if you need to keep a region open across iterations.
+
+This is the closest analogue to NVIDIA IKET's `iket.range_start` / `iket.range_end` SSA-token pairing in `cutlass.cute.experimental.iket`. The shape is similar but the mechanism is different: IKET emits MLIR ops and lowers via the proprietary `iket` dialect, while this profiler emits inline PTX (`%globaltimer`, `st.global.cs.u64`) directly.
+
 ## API
 
 ### Host (`host.py`)
@@ -77,7 +96,9 @@ You set `max_events_per_unit` to something larger than you need; the decoder sca
 
 | Function | Description |
 |----------|-------------|
-| `profile_region(buf, max_events, tag, tid, event_idx=None)` | Context manager |
+| `profile_region(buf, max_events, tag, unit_id, target_warp=None, event_idx=None, tid=None)` | Context-manager API |
+| `region_start(buf, unit_id, max_events, target_warp=None, event_idx=None) -> RegionToken` | Open a region, return a pairing token |
+| `region_end(buf, tag, token, max_events_per_unit, tid=None)` | Close a region using its token |
 | `warp_start/warp_stop(...)` | Low-level start/stop (lane 0 of target_warp) |
 | `warp_atomic_alloc(...)` | Allocate event index atomically |
 

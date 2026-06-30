@@ -1,8 +1,10 @@
 """Example demonstrating NVIDIA intra-kernel profiling with CUTE DSL.
 
-This example shows BOTH profiling modes:
-1. Atomic mode: No event_idx needed, indices allocated via atomics (simple)
-2. Static mode: Explicit event_idx via runtime expressions (no atomics)
+This example shows THREE profiling shapes:
+1. Atomic mode (recommended default): ``with profile_region(...)``, no event_idx.
+2. Static mode: ``with profile_region(..., event_idx=...)`` for zero atomics.
+3. Token mode: ``region_start(...) -> token`` / ``region_end(..., token)`` for
+   explicit pairing across Python scopes or loop iterations.
 
 Run with:
     python -m transformer_nuggets.cute.profiler.example
@@ -19,7 +21,7 @@ from cutlass.cute.runtime import from_dlpack
 
 from transformer_nuggets.cute.base import CuteOp
 from transformer_nuggets.cute.profiler.host import profile_session
-from transformer_nuggets.cute.profiler.ops import profile_region
+from transformer_nuggets.cute.profiler.ops import profile_region, region_start, region_end
 from transformer_nuggets.cute.profiler.postprocessors import group_by_unit
 
 
@@ -214,10 +216,94 @@ def run_static_mode():
         print("✗ Output verification failed!")
 
 
+class ProfiledKernelToken(CuteOp):
+    """Kernel using TOKEN mode: ``region_start`` returns a token consumed by ``region_end``.
+
+    The token carries (event_idx, start_ns); pairing is data-flow, not scope.
+    Use this when a region naturally spans a loop iteration boundary or two
+    Python scopes that ``with`` can't bridge cleanly.
+    """
+
+    def __init__(self, num_iterations: int = 4):
+        super().__init__()
+        self.num_iterations = num_iterations
+
+    @cute.kernel
+    def kernel(
+        self,
+        output: cute.Tensor,
+        prof_buf: cute.Tensor,
+        max_events_per_unit: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        bdim, _, _ = cute.arch.block_dim()
+
+        prof_tid = bidx
+        global_idx = bidx * bdim + tidx
+
+        outer_tok = region_start(prof_buf, prof_tid, max_events_per_unit)
+        for i in cutlass.range(self.num_iterations):
+            compute_tok = region_start(prof_buf, prof_tid, max_events_per_unit)
+            if global_idx < cute.size(output):
+                val = output[global_idx]
+                output[global_idx] = val + 1
+            region_end(prof_buf, TAG_COMPUTE, compute_tok, max_events_per_unit)
+        region_end(prof_buf, TAG_ITERATION, outer_tok, max_events_per_unit)
+
+    @cute.jit()
+    def __call__(
+        self,
+        output: cute.Tensor,
+        prof_buf: cute.Tensor,
+        max_events_per_unit: cutlass.Int32,
+    ):
+        self.kernel(output, prof_buf, max_events_per_unit).launch(
+            grid=(NUM_BLOCKS, 1, 1),
+            block=(THREADS_PER_BLOCK, 1, 1),
+        )
+
+    def interface(self, output: torch.Tensor, prof_buf: torch.Tensor, max_events: int):
+        self.__call__(from_dlpack(output), from_dlpack(prof_buf), Int32(max_events))
+
+
+def run_token_mode():
+    """Run the token mode example."""
+    print("\n" + "=" * 60)
+    print("TOKEN MODE: region_start returns a token, region_end consumes it")
+    print("=" * 60)
+
+    device = torch.device("cuda")
+    output = torch.zeros(256, dtype=torch.float32, device=device)
+
+    import transformer_nuggets
+
+    trace_path = transformer_nuggets.DATA_DIR / "profiler_token_trace.pftrace"
+
+    with profile_session(
+        max_events_per_unit=2 * NUM_ITERATIONS + 2,
+        num_units=(NUM_BLOCKS, "Block"),
+        tag_names=["iteration", "compute", "store"],
+        trace_path=str(trace_path),
+        device=device,
+    ) as (prof, tag_table):
+        print(f"Tags: {tag_table.names}")
+        kernel = ProfiledKernelToken(num_iterations=NUM_ITERATIONS)
+        kernel.interface(output, prof.tensor, prof.max_events_per_unit)
+
+    print(f"Trace: {trace_path}")
+
+    expected = torch.full_like(output, float(NUM_ITERATIONS))
+    if torch.allclose(output, expected):
+        print("✓ Output verification passed!")
+    else:
+        print("✗ Output verification failed!")
+
+
 def main():
     print("=" * 60)
     print("NVIDIA Intra-Kernel Profiling Example")
-    print("Demonstrating BOTH atomic and static modes")
+    print("Demonstrating atomic, static, and token modes")
     print("=" * 60)
 
     if not torch.cuda.is_available():
@@ -226,6 +312,7 @@ def main():
 
     run_atomic_mode()
     run_static_mode()
+    run_token_mode()
 
     print("\n" + "=" * 60)
     print("Done! View traces at https://ui.perfetto.dev/")
