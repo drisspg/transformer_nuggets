@@ -9,6 +9,8 @@ from typing import Annotated
 
 import typer
 
+from transformer_nuggets.utils.track_event import write_track_event_trace
+
 app = typer.Typer(help="Merge per-rank Chrome/Perfetto traces into one file.")
 
 
@@ -31,6 +33,12 @@ def merge_traces(
     labels: list[str] | None = None,
     align_timestamps: bool = False,
 ) -> None:
+    """Merge Chrome JSON traces into one multi-process trace.
+
+    Output format follows the ``output_path`` suffix: ``.pftrace`` writes a native
+    Perfetto TrackEvent protobuf, anything else writes Chrome JSON (gzipped for
+    ``.gz``).
+    """
     merged_events: list[dict] = []
 
     for idx, path in enumerate(input_paths):
@@ -62,8 +70,11 @@ def merge_traces(
                 ev["id"] = ev["id"] + idx * (1 << 32)
             merged_events.append(ev)
 
-    with _open_trace(output_path, "w") as f:
-        json.dump({"traceEvents": merged_events}, f, indent=0)
+    if output_path.endswith(".pftrace"):
+        write_track_event_trace(output_path, {"traceEvents": merged_events})
+    else:
+        with _open_trace(output_path, "w") as f:
+            json.dump({"traceEvents": merged_events}, f, indent=0)
 
 
 @app.command()
@@ -71,9 +82,14 @@ def main(
     traces: Annotated[
         list[Path], typer.Argument(help="Input trace files, one per rank, in rank order.")
     ],
-    output: Annotated[Path, typer.Option("-o", "--output", help="Output path.")] = Path(
-        "merged_trace.json.gz"
-    ),
+    output: Annotated[
+        Path,
+        typer.Option(
+            "-o",
+            "--output",
+            help="Output path (.pftrace for native Perfetto, .json/.json.gz for Chrome JSON).",
+        ),
+    ] = Path("merged_trace.json.gz"),
     label: Annotated[
         list[str] | None,
         typer.Option("-l", "--label", help="Label for each trace (repeat for each file)."),

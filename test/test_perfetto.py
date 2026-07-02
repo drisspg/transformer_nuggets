@@ -330,3 +330,34 @@ def test_track_event_conversion_keeps_back_to_back_slices_separate():
 
     assert all(not stack for stack in open_stacks.values())
     assert rendered == {"a": (10_000, 20_000), "b": (20_000, 30_000)}
+
+
+def test_merge_traces_writes_native_pftrace(tmp_path):
+    from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import Trace
+
+    from transformer_nuggets.utils.merge_traces import merge_traces
+
+    inputs = []
+    for idx in range(2):
+        path = tmp_path / f"rank{idx}.json"
+        events = [{"ph": "X", "name": f"op{idx}", "pid": 7, "tid": 3, "ts": 100 + idx, "dur": 5}]
+        path.write_text(json.dumps({"traceEvents": events}))
+        inputs.append(str(path))
+
+    output = tmp_path / "merged.pftrace"
+    merge_traces(inputs, str(output), labels=["impl a", "impl b"], align_timestamps=True)
+
+    trace = Trace()
+    trace.ParseFromString(output.read_bytes())
+    process_names = {
+        p.track_descriptor.process.process_name
+        for p in trace.packet
+        if p.HasField("track_descriptor") and p.track_descriptor.HasField("process")
+    }
+    assert {"impl a", "impl b"} <= process_names
+    slice_names = {
+        p.track_event.name
+        for p in trace.packet
+        if p.HasField("track_event") and p.track_event.name
+    }
+    assert {"op0", "op1"} <= slice_names
