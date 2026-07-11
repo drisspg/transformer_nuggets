@@ -13,6 +13,12 @@ from transformer_nuggets.cute.utils import visualize_tv_layout
 from transformer_nuggets.cute import profiler
 
 
+_MXFP8_TMA_EXPORTS = {
+    "Mxfp8TmaGemv",
+    "get_mxfp8_tma_gemv",
+    "mxfp8_tma_gemv",
+}
+
 _SYMMETRIC_MEMORY_EXPORTS = {
     "compile_symmetric_memory_all_reduce",
     "init_torchrun_process_group",
@@ -23,6 +29,10 @@ _SYMMETRIC_MEMORY_EXPORTS = {
 
 
 def __getattr__(name):
+    if name in _MXFP8_TMA_EXPORTS:
+        from transformer_nuggets.cute import mxfp8_tma
+
+        return getattr(mxfp8_tma, name)
     if name in _SYMMETRIC_MEMORY_EXPORTS:
         from transformer_nuggets.cute import symmetric_memory
 
