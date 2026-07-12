@@ -36,11 +36,12 @@ def dequantize_mxfp8(value: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return value.float() * expanded_scale
 
 
+@pytest.mark.parametrize("num_compute_warps", [1, 2, 4])
 @pytest.mark.parametrize(
     ("k", "block_n", "num_stages"),
     [(2048, 4, 2), (4096, 8, 3)],
 )
-def test_mxfp8_tma_gemv_matches_reference(k, block_n, num_stages):
+def test_mxfp8_tma_gemv_matches_reference(k, block_n, num_stages, num_compute_warps):
     """Match independently dequantized float32 matmul."""
     torch.manual_seed(k)
     q_input, input_scale = quantize_mxfp8(torch.randn((1, k), dtype=torch.bfloat16, device="cuda"))
@@ -60,6 +61,7 @@ def test_mxfp8_tma_gemv_matches_reference(k, block_n, num_stages):
         block_n=block_n,
         num_stages=num_stages,
         output=output,
+        num_compute_warps=num_compute_warps,
     )
     torch.cuda.synchronize()
 
@@ -67,7 +69,8 @@ def test_mxfp8_tma_gemv_matches_reference(k, block_n, num_stages):
     torch.testing.assert_close(actual, expected, atol=1.0, rtol=0.05)
 
 
-def test_mxfp8_tma_gemv_cuda_graph_replay():
+@pytest.mark.parametrize("num_compute_warps", [1, 2, 4])
+def test_mxfp8_tma_gemv_cuda_graph_replay(num_compute_warps):
     """Replay into caller-owned output without hidden allocation or copies."""
     k = 2048
     q_input, input_scale = quantize_mxfp8(torch.randn((1, k), dtype=torch.bfloat16, device="cuda"))
@@ -82,6 +85,7 @@ def test_mxfp8_tma_gemv_cuda_graph_replay():
         weight_scale,
         block_n=4,
         output=output,
+        num_compute_warps=num_compute_warps,
     )
     graph = torch.cuda.CUDAGraph()
 
@@ -93,6 +97,7 @@ def test_mxfp8_tma_gemv_cuda_graph_replay():
             weight_scale,
             block_n=4,
             output=output,
+            num_compute_warps=num_compute_warps,
         )
     graph.replay()
     torch.cuda.synchronize()
@@ -110,7 +115,13 @@ def test_mxfp8_tma_gemv_profiles_labeled_regions():
     weight, weight_scale = quantize_mxfp8(
         torch.randn((128, k), dtype=torch.bfloat16, device="cuda")
     )
-    op = get_mxfp8_tma_gemv(128, k, 4, enable_profiling=True)
+    op = get_mxfp8_tma_gemv(
+        128,
+        k,
+        4,
+        enable_profiling=True,
+        num_compute_warps=4,
+    )
 
     with profile_session(
         max_events_per_unit=op.max_profile_events_per_cta,
@@ -168,6 +179,8 @@ def test_mxfp8_tma_cli_writes_pftrace(tmp_path):
             "--k",
             "2048",
             "--block-n",
+            "4",
+            "--num-compute-warps",
             "4",
             "--output",
             str(trace_path),

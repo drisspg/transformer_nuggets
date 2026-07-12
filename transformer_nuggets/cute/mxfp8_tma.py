@@ -70,6 +70,7 @@ class Mxfp8TmaGemv(CuteOp):
         block_n: int,
         num_stages: int,
         enable_profiling: bool = False,
+        num_compute_warps: int = 1,
     ):
         super().__init__()
         m = 1
@@ -82,6 +83,8 @@ class Mxfp8TmaGemv(CuteOp):
             )
         if num_stages not in (2, 3):
             raise ValueError("num_stages must be 2 or 3")
+        if num_compute_warps not in (1, 2, 4) or block_n % num_compute_warps != 0:
+            raise ValueError("num_compute_warps must be 1, 2, or 4 and divide block_n")
         if sf_k < num_stages * 32:
             raise ValueError("TMA staging requires at least one K tile per stage")
         self.m = m
@@ -92,6 +95,8 @@ class Mxfp8TmaGemv(CuteOp):
         self.tile_k_u32 = 256
         self.num_k_tiles = sf_k // 32
         self.enable_profiling = enable_profiling
+        self.num_compute_warps = num_compute_warps
+        self.rows_per_warp = block_n // num_compute_warps
         self.max_profile_events_per_cta = 2 + 3 * self.num_k_tiles
         self.num_profile_units = n // block_n
 
@@ -166,7 +171,9 @@ class Mxfp8TmaGemv(CuteOp):
         producer, consumer = pipeline.PipelineTmaAsync.create(
             num_stages=self.num_stages,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.m),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, self.num_compute_warps
+            ),
             tx_count=(self.block_n + self.m) * self.tile_k_u32 * 4,
             barrier_storage=barriers,
             tidx=lane,
@@ -218,7 +225,7 @@ class Mxfp8TmaGemv(CuteOp):
                 )
                 stage.commit()
 
-        acc = [cutlass.Float32(0.0) for _ in range(self.block_n)]
+        acc = [cutlass.Float32(0.0) for _ in range(self.rows_per_warp)]
         for k_tile in cutlass.range_constexpr(self.num_k_tiles):
             if warp == TMA_PRODUCER_WARP and k_tile < self.num_k_tiles - 1:
                 with profile_region(
@@ -269,7 +276,7 @@ class Mxfp8TmaGemv(CuteOp):
                 cute.copy(
                     smem_atom,
                     cute.make_tensor(
-                        sX.iterator + cute.assume(sX.layout((warp, col_a, full.index)), divby=4),
+                        sX.iterator + cute.assume(sX.layout((0, col_a, full.index)), divby=4),
                         chunk_layout,
                     ),
                     cute.make_tensor(x_frag.iterator, chunk_layout),
@@ -277,7 +284,7 @@ class Mxfp8TmaGemv(CuteOp):
                 cute.copy(
                     smem_atom,
                     cute.make_tensor(
-                        sX.iterator + cute.assume(sX.layout((warp, col_b, full.index)), divby=4),
+                        sX.iterator + cute.assume(sX.layout((0, col_b, full.index)), divby=4),
                         chunk_layout,
                     ),
                     cute.make_tensor(x_frag.iterator + 4, chunk_layout),
@@ -291,12 +298,13 @@ class Mxfp8TmaGemv(CuteOp):
                 input_scale = cute.make_rmem_tensor(1, cutlass.Uint8)
                 cute.copy(
                     input_scale_atom,
-                    cute.make_tensor(mSFX.iterator + mSFX.layout((warp, scale_k)), scale_layout),
+                    cute.make_tensor(mSFX.iterator + mSFX.layout((0, scale_k)), scale_layout),
                     input_scale,
                 )
                 sx = input_scale[0]
 
-                for row in cutlass.range_constexpr(self.block_n):
+                for local_row in cutlass.range_constexpr(self.rows_per_warp):
+                    row = warp * self.rows_per_warp + local_row
                     w_frag = cute.make_rmem_tensor((1, 8), cutlass.Uint32)
                     cute.copy(
                         smem_atom,
@@ -334,7 +342,7 @@ class Mxfp8TmaGemv(CuteOp):
                     product = (x_values * w_values).reduce(
                         cute.ReductionOp.ADD, cutlass.Float32(0.0), (None, 1)
                     )
-                    acc[row] += (product[0] + product[1]) * combined_e8m0_to_f32(
+                    acc[local_row] += (product[0] + product[1]) * combined_e8m0_to_f32(
                         sx, weight_scale[0]
                     )
                 cute.arch.fence_view_async_shared()
@@ -352,11 +360,12 @@ class Mxfp8TmaGemv(CuteOp):
         ):
             if warp == TMA_PRODUCER_WARP:
                 producer.tail()
-            for row in cutlass.range_constexpr(self.block_n):
-                acc[row] = cute.arch.warp_reduction(acc[row], operator.add)
+            for local_row in cutlass.range_constexpr(self.rows_per_warp):
+                acc[local_row] = cute.arch.warp_reduction(acc[local_row], operator.add)
             if lane == 0:
-                for row in cutlass.range_constexpr(self.block_n):
-                    mO[warp, n0 + row] = acc[row].to(cutlass.BFloat16)
+                for local_row in cutlass.range_constexpr(self.rows_per_warp):
+                    row = warp * self.rows_per_warp + local_row
+                    mO[0, n0 + row] = acc[local_row].to(cutlass.BFloat16)
 
     @cute.jit
     def __call__(
@@ -399,7 +408,7 @@ class Mxfp8TmaGemv(CuteOp):
             _name_prefix=name,
         ).launch(
             grid=[self.n // self.block_n, 1, 1],
-            block=[self.m * 32, 1, 1],
+            block=[self.num_compute_warps * 32, 1, 1],
             stream=stream,
         )
 
@@ -407,7 +416,7 @@ class Mxfp8TmaGemv(CuteOp):
         """Return the static kernel specialization key."""
         return (
             f"{self.n}_{self.sf_k}_{self.block_n}_{self.num_stages}"
-            f"_profile={self.enable_profiling}"
+            f"_cw={self.num_compute_warps}_profile={self.enable_profiling}"
         )
 
     def get_name(self) -> str:
@@ -415,7 +424,8 @@ class Mxfp8TmaGemv(CuteOp):
         profile_suffix = "_profiled" if self.enable_profiling else ""
         return (
             f"mxfp8_tma_gemv_n{self.n}_k{self.sf_k * 32}"
-            f"_bn{self.block_n}_s{self.num_stages}{profile_suffix}"
+            f"_bn{self.block_n}_s{self.num_stages}_cw{self.num_compute_warps}"
+            f"{profile_suffix}"
         )
 
     def interface(
@@ -536,9 +546,17 @@ def get_mxfp8_tma_gemv(
     block_n: int,
     num_stages: int = 2,
     enable_profiling: bool = False,
+    num_compute_warps: int = 1,
 ) -> Mxfp8TmaGemv:
     """Return a cached MXFP8 TMA GEMV specialization."""
-    return Mxfp8TmaGemv(n, k, block_n, num_stages, enable_profiling)
+    return Mxfp8TmaGemv(
+        n,
+        k,
+        block_n,
+        num_stages,
+        enable_profiling,
+        num_compute_warps,
+    )
 
 
 def mxfp8_tma_gemv(
@@ -552,6 +570,7 @@ def mxfp8_tma_gemv(
     output: torch.Tensor | None = None,
     enable_profiling: bool = False,
     profile_buffer: torch.Tensor | None = None,
+    num_compute_warps: int = 1,
 ) -> torch.Tensor:
     """Compute raw-layout MXFP8 GEMV on prequantized inputs.
 
@@ -565,6 +584,7 @@ def mxfp8_tma_gemv(
         output: Optional caller-owned contiguous ``[1, N]`` BF16 output.
         enable_profiling: Compile a separate specialization with labeled region timing.
         profile_buffer: Buffer from ``profile_session`` for the profiled specialization.
+        num_compute_warps: Consumer warps sharing each CTA's output-row tile.
 
     Returns:
         The provided or newly allocated output tensor.
@@ -577,6 +597,7 @@ def mxfp8_tma_gemv(
         block_n,
         num_stages,
         enable_profiling,
+        num_compute_warps,
     ).interface(
         q_input,
         weight,
@@ -606,6 +627,7 @@ def profile_mxfp8_tma(
     k: int = 8192,
     block_n: int = 4,
     num_stages: int = 2,
+    num_compute_warps: int = 1,
     output: Path = Path("mxfp8_tma.pftrace"),
     seed: int = 0,
     warmups: int = 1,
@@ -631,6 +653,7 @@ def profile_mxfp8_tma(
         block_n,
         num_stages,
         enable_profiling=True,
+        num_compute_warps=num_compute_warps,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
 
