@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import operator
+from enum import IntEnum
 from functools import cache
 from pathlib import Path
 from typing import Annotated
@@ -23,7 +24,12 @@ from transformer_nuggets.cute.profiler.ops import profile_region
 from transformer_nuggets.cute.utils import fake_stream, make_fake_compact_tensor
 
 
-TMA_PRODUCER_WARP = 0
+class WarpRole(IntEnum):
+    """Static warp roles within an MXFP8 TMA CTA."""
+
+    TMA_PRODUCER = 0
+
+
 TAG_TMA_PROLOGUE = 0
 TAG_TMA_REFILL = 1
 TAG_TMA_WAIT = 2
@@ -113,6 +119,183 @@ class Mxfp8TmaGemv(CuteOp):
             (self.block_n, self.tile_k_u32, self.num_stages), order=(1, 0, 2)
         )
 
+    @cute.jit
+    def tma_producer_load_stage(
+        self,
+        producer: pipeline.PipelineProducer,
+        tma_atom_w: cute.CopyAtom,
+        tWgW: cute.Tensor,
+        tWsW: cute.Tensor,
+        tma_atom_x: cute.CopyAtom,
+        tXgX: cute.Tensor,
+        tXsX: cute.Tensor,
+    ) -> pipeline.PipelineProducer:
+        """Acquire one pipeline stage and issue its weight and input TMA loads."""
+        stage = producer.acquire_and_advance()
+        cute.copy(
+            tma_atom_w,
+            tWgW[(None, stage.count)],
+            tWsW[(None, stage.index)],
+            tma_bar_ptr=stage.barrier,
+        )
+        cute.copy(
+            tma_atom_x,
+            tXgX[(None, stage.count)],
+            tXsX[(None, stage.index)],
+            tma_bar_ptr=stage.barrier,
+        )
+        stage.commit()
+        return producer
+
+    @cute.jit
+    def compute_warp_consume_stage(
+        self,
+        consumer: pipeline.PipelineConsumer,
+        accumulators: list,
+        k_tile: cutlass.Constexpr,
+        lane: cutlass.Int32,
+        owned_row_start: cutlass.Int32,
+        n0: cutlass.Int32,
+        pid_n: cutlass.Int32,
+        sX: cute.Tensor,
+        sW: cute.Tensor,
+        mSFX: cute.Tensor,
+        mSFW: cute.Tensor,
+        smem_atom: cute.CopyAtom,
+        input_scale_atom: cute.CopyAtom,
+        weight_scale_atom: cute.CopyAtom,
+        chunk_layout: cute.Layout,
+        scale_layout: cute.Layout,
+        prof_buf: cute.Tensor | None,
+        max_profile_events: cutlass.Int32,
+        enable_profiling: cutlass.Constexpr,
+    ) -> tuple[pipeline.PipelineConsumer, list]:
+        """Wait for one stage and accumulate the rows owned by this compute warp."""
+        with profile_region(
+            prof_buf,
+            max_profile_events,
+            cutlass.Int32(TAG_TMA_WAIT),
+            pid_n,
+            event_idx=cutlass.Int32(2 + 3 * k_tile),
+            bounds_check=False,
+            enabled=enable_profiling,
+        ):
+            full = consumer.wait_and_advance()
+
+        with profile_region(
+            prof_buf,
+            max_profile_events,
+            cutlass.Int32(TAG_TILE_COMPUTE),
+            pid_n,
+            event_idx=cutlass.Int32(3 + 3 * k_tile),
+            bounds_check=False,
+            enabled=enable_profiling,
+        ):
+            # Each lane owns u32s [8*lane, 8*lane+8) (one 32-value scale block) as
+            # two 16-byte LDS.128 chunks. Loading them low-first for lanes 0-3 and
+            # high-first for lanes 4-7 of each octet spreads every load across all
+            # 32 banks, removing the 2x shared-load bank conflict.
+            col_a = cute.assume(lane * 8 + (lane & 4), divby=4)
+            col_b = cute.assume(lane * 8 + ((lane ^ 4) & 4), divby=4)
+            scale_k = lane + k_tile * 32
+            x_frag = cute.make_rmem_tensor((1, 8), cutlass.Uint32)
+            cute.copy(
+                smem_atom,
+                cute.make_tensor(
+                    sX.iterator + cute.assume(sX.layout((0, col_a, full.index)), divby=4),
+                    chunk_layout,
+                ),
+                cute.make_tensor(x_frag.iterator, chunk_layout),
+            )
+            cute.copy(
+                smem_atom,
+                cute.make_tensor(
+                    sX.iterator + cute.assume(sX.layout((0, col_b, full.index)), divby=4),
+                    chunk_layout,
+                ),
+                cute.make_tensor(x_frag.iterator + 4, chunk_layout),
+            )
+            x_values = (
+                cute.recast_tensor(x_frag, cutlass.Float8E4M3FN)
+                .load()
+                .to(cutlass.Float32)
+                .reshape((2, 16))
+            )
+            input_scale = cute.make_rmem_tensor(1, cutlass.Uint8)
+            cute.copy(
+                input_scale_atom,
+                cute.make_tensor(mSFX.iterator + mSFX.layout((0, scale_k)), scale_layout),
+                input_scale,
+            )
+            sx = input_scale[0]
+
+            for local_row in cutlass.range_constexpr(self.rows_per_warp):
+                cta_row = owned_row_start + local_row
+                global_row = n0 + cta_row
+                w_frag = cute.make_rmem_tensor((1, 8), cutlass.Uint32)
+                cute.copy(
+                    smem_atom,
+                    cute.make_tensor(
+                        sW.iterator
+                        + cute.assume(sW.layout((cta_row, col_a, full.index)), divby=4),
+                        chunk_layout,
+                    ),
+                    cute.make_tensor(w_frag.iterator, chunk_layout),
+                )
+                cute.copy(
+                    smem_atom,
+                    cute.make_tensor(
+                        sW.iterator
+                        + cute.assume(sW.layout((cta_row, col_b, full.index)), divby=4),
+                        chunk_layout,
+                    ),
+                    cute.make_tensor(w_frag.iterator + 4, chunk_layout),
+                )
+                w_values = (
+                    cute.recast_tensor(w_frag, cutlass.Float8E4M3FN)
+                    .load()
+                    .to(cutlass.Float32)
+                    .reshape((2, 16))
+                )
+                weight_scale = cute.make_rmem_tensor(1, cutlass.Uint8)
+                cute.copy(
+                    weight_scale_atom,
+                    cute.make_tensor(
+                        mSFW.iterator + mSFW.layout((global_row, scale_k)),
+                        scale_layout,
+                    ),
+                    weight_scale,
+                )
+                product = (x_values * w_values).reduce(
+                    cute.ReductionOp.ADD, cutlass.Float32(0.0), (None, 1)
+                )
+                accumulators[local_row] += (product[0] + product[1]) * combined_e8m0_to_f32(
+                    sx, weight_scale[0]
+                )
+            cute.arch.fence_view_async_shared()
+            cute.arch.sync_warp()
+            full.release()
+        return consumer, accumulators
+
+    @cute.jit
+    def compute_warp_store_output(
+        self,
+        accumulators: list,
+        lane: cutlass.Int32,
+        owned_row_start: cutlass.Int32,
+        n0: cutlass.Int32,
+        mO: cute.Tensor,
+    ) -> None:
+        """Reduce and store the output rows owned by this compute warp."""
+        for local_row in cutlass.range_constexpr(self.rows_per_warp):
+            accumulators[local_row] = cute.arch.warp_reduction(
+                accumulators[local_row], operator.add
+            )
+        if lane == 0:
+            for local_row in cutlass.range_constexpr(self.rows_per_warp):
+                cta_row = owned_row_start + local_row
+                mO[0, n0 + cta_row] = accumulators[local_row].to(cutlass.BFloat16)
+
     @cute.kernel
     def kernel(
         self,
@@ -126,22 +309,17 @@ class Mxfp8TmaGemv(CuteOp):
         prof_buf: cute.Tensor | None,
         enable_profiling: cutlass.Constexpr,
     ):
-        """Overlap TMA production with typed FP8 conversion and accumulation."""
+        """Assign rows to compute warps and interleave TMA production with consumption."""
         tidx, _, _ = cute.arch.thread_idx()
         pid_n, _, _ = cute.arch.block_idx()
         warp = cute.arch.make_warp_uniform(tidx // 32)
         lane = tidx % 32
         n0 = pid_n * self.block_n
+        owned_row_start = warp * self.rows_per_warp
         max_profile_events = cutlass.Int32(self.max_profile_events_per_cta)
         if cutlass.const_expr(enable_profiling):
             assert prof_buf is not None
         chunk_layout = cute.make_ordered_layout((1, 4), order=(1, 0))
-        # Each lane owns u32s [8*lane, 8*lane+8) (one 32-value scale block) as
-        # two 16-byte LDS.128 chunks. Loading them low-first for lanes 0-3 and
-        # high-first for lanes 4-7 of each octet spreads every load across all
-        # 32 banks, removing the 2x shared-load bank conflict.
-        col_a = cute.assume(lane * 8 + (lane & 4), divby=4)
-        col_b = cute.assume(lane * 8 + ((lane ^ 4) & 4), divby=4)
         scale_layout = cute.make_layout(1)
         smem_atom = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
@@ -166,7 +344,7 @@ class Mxfp8TmaGemv(CuteOp):
         sX = smem.allocate_tensor(cutlass.Uint32, self.x_smem_layout(), byte_alignment=128)
         sW = smem.allocate_tensor(cutlass.Uint32, self.w_smem_layout(), byte_alignment=128)
 
-        if warp == TMA_PRODUCER_WARP:
+        if warp == WarpRole.TMA_PRODUCER:
             cpasync.prefetch_descriptor(tma_atom_w)
             cpasync.prefetch_descriptor(tma_atom_x)
         producer, consumer = pipeline.PipelineTmaAsync.create(
@@ -210,25 +388,20 @@ class Mxfp8TmaGemv(CuteOp):
             bounds_check=False,
             enabled=enable_profiling,
         ):
-            if warp == TMA_PRODUCER_WARP:
-                stage = producer.acquire_and_advance()
-                cute.copy(
+            if warp == WarpRole.TMA_PRODUCER:
+                producer = self.tma_producer_load_stage(
+                    producer,
                     tma_atom_w,
-                    tWgW[(None, stage.count)],
-                    tWsW[(None, stage.index)],
-                    tma_bar_ptr=stage.barrier,
-                )
-                cute.copy(
+                    tWgW,
+                    tWsW,
                     tma_atom_x,
-                    tXgX[(None, stage.count)],
-                    tXsX[(None, stage.index)],
-                    tma_bar_ptr=stage.barrier,
+                    tXgX,
+                    tXsX,
                 )
-                stage.commit()
 
-        acc = [cutlass.Float32(0.0) for _ in range(self.rows_per_warp)]
+        accumulators = [cutlass.Float32(0.0) for _ in range(self.rows_per_warp)]
         for k_tile in cutlass.range_constexpr(self.num_k_tiles):
-            if warp == TMA_PRODUCER_WARP and k_tile < self.num_k_tiles - 1:
+            if warp == WarpRole.TMA_PRODUCER and k_tile < self.num_k_tiles - 1:
                 with profile_region(
                     prof_buf,
                     max_profile_events,
@@ -238,117 +411,37 @@ class Mxfp8TmaGemv(CuteOp):
                     bounds_check=False,
                     enabled=enable_profiling,
                 ):
-                    stage = producer.acquire_and_advance()
-                    cute.copy(
+                    producer = self.tma_producer_load_stage(
+                        producer,
                         tma_atom_w,
-                        tWgW[(None, stage.count)],
-                        tWsW[(None, stage.index)],
-                        tma_bar_ptr=stage.barrier,
-                    )
-                    cute.copy(
+                        tWgW,
+                        tWsW,
                         tma_atom_x,
-                        tXgX[(None, stage.count)],
-                        tXsX[(None, stage.index)],
-                        tma_bar_ptr=stage.barrier,
+                        tXgX,
+                        tXsX,
                     )
-                    stage.commit()
 
-            with profile_region(
+            consumer, accumulators = self.compute_warp_consume_stage(
+                consumer,
+                accumulators,
+                k_tile,
+                lane,
+                owned_row_start,
+                n0,
+                pid_n,
+                sX,
+                sW,
+                mSFX,
+                mSFW,
+                smem_atom,
+                input_scale_atom,
+                weight_scale_atom,
+                chunk_layout,
+                scale_layout,
                 prof_buf,
                 max_profile_events,
-                cutlass.Int32(TAG_TMA_WAIT),
-                pid_n,
-                event_idx=cutlass.Int32(2 + 3 * k_tile),
-                bounds_check=False,
-                enabled=enable_profiling,
-            ):
-                full = consumer.wait_and_advance()
-            with profile_region(
-                prof_buf,
-                max_profile_events,
-                cutlass.Int32(TAG_TILE_COMPUTE),
-                pid_n,
-                event_idx=cutlass.Int32(3 + 3 * k_tile),
-                bounds_check=False,
-                enabled=enable_profiling,
-            ):
-                scale_k = lane + k_tile * 32
-                x_frag = cute.make_rmem_tensor((1, 8), cutlass.Uint32)
-                cute.copy(
-                    smem_atom,
-                    cute.make_tensor(
-                        sX.iterator + cute.assume(sX.layout((0, col_a, full.index)), divby=4),
-                        chunk_layout,
-                    ),
-                    cute.make_tensor(x_frag.iterator, chunk_layout),
-                )
-                cute.copy(
-                    smem_atom,
-                    cute.make_tensor(
-                        sX.iterator + cute.assume(sX.layout((0, col_b, full.index)), divby=4),
-                        chunk_layout,
-                    ),
-                    cute.make_tensor(x_frag.iterator + 4, chunk_layout),
-                )
-                x_values = (
-                    cute.recast_tensor(x_frag, cutlass.Float8E4M3FN)
-                    .load()
-                    .to(cutlass.Float32)
-                    .reshape((2, 16))
-                )
-                input_scale = cute.make_rmem_tensor(1, cutlass.Uint8)
-                cute.copy(
-                    input_scale_atom,
-                    cute.make_tensor(mSFX.iterator + mSFX.layout((0, scale_k)), scale_layout),
-                    input_scale,
-                )
-                sx = input_scale[0]
-
-                for local_row in cutlass.range_constexpr(self.rows_per_warp):
-                    row = warp * self.rows_per_warp + local_row
-                    w_frag = cute.make_rmem_tensor((1, 8), cutlass.Uint32)
-                    cute.copy(
-                        smem_atom,
-                        cute.make_tensor(
-                            sW.iterator
-                            + cute.assume(sW.layout((row, col_a, full.index)), divby=4),
-                            chunk_layout,
-                        ),
-                        cute.make_tensor(w_frag.iterator, chunk_layout),
-                    )
-                    cute.copy(
-                        smem_atom,
-                        cute.make_tensor(
-                            sW.iterator
-                            + cute.assume(sW.layout((row, col_b, full.index)), divby=4),
-                            chunk_layout,
-                        ),
-                        cute.make_tensor(w_frag.iterator + 4, chunk_layout),
-                    )
-                    w_values = (
-                        cute.recast_tensor(w_frag, cutlass.Float8E4M3FN)
-                        .load()
-                        .to(cutlass.Float32)
-                        .reshape((2, 16))
-                    )
-                    weight_scale = cute.make_rmem_tensor(1, cutlass.Uint8)
-                    cute.copy(
-                        weight_scale_atom,
-                        cute.make_tensor(
-                            mSFW.iterator + mSFW.layout((n0 + row, scale_k)),
-                            scale_layout,
-                        ),
-                        weight_scale,
-                    )
-                    product = (x_values * w_values).reduce(
-                        cute.ReductionOp.ADD, cutlass.Float32(0.0), (None, 1)
-                    )
-                    acc[local_row] += (product[0] + product[1]) * combined_e8m0_to_f32(
-                        sx, weight_scale[0]
-                    )
-                cute.arch.fence_view_async_shared()
-                cute.arch.sync_warp()
-                full.release()
+                enable_profiling,
+            )
 
         with profile_region(
             prof_buf,
@@ -359,14 +452,9 @@ class Mxfp8TmaGemv(CuteOp):
             bounds_check=False,
             enabled=enable_profiling,
         ):
-            if warp == TMA_PRODUCER_WARP:
+            if warp == WarpRole.TMA_PRODUCER:
                 producer.tail()
-            for local_row in cutlass.range_constexpr(self.rows_per_warp):
-                acc[local_row] = cute.arch.warp_reduction(acc[local_row], operator.add)
-            if lane == 0:
-                for local_row in cutlass.range_constexpr(self.rows_per_warp):
-                    row = warp * self.rows_per_warp + local_row
-                    mO[0, n0 + row] = acc[local_row].to(cutlass.BFloat16)
+            self.compute_warp_store_output(accumulators, lane, owned_row_start, n0, mO)
 
     @cute.jit
     def __call__(
