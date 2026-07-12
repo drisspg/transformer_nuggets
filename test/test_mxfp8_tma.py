@@ -13,6 +13,7 @@ try:
         MXFP8_TMA_PROFILE_TAGS,
         get_mxfp8_tma_gemv,
         mxfp8_tma_gemv,
+        select_mxfp8_tma_compute_warps,
     )
     from transformer_nuggets.cute.mxfp8_tma import app
     from transformer_nuggets.cute.profiler import profile_session
@@ -28,6 +29,16 @@ def quantize_mxfp8(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     scale = torch.exp2(exponent).unsqueeze(-1)
     quantized = (blocks / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
     return quantized.reshape_as(value), (exponent + 127).to(torch.uint8)
+
+
+@pytest.mark.parametrize(
+    ("k", "block_n", "expected_sm100"),
+    [(8192, 4, 1), (8192, 8, 2), (8192, 16, 4), (4096, 4, 2), (4096, 8, 4)],
+)
+def test_select_mxfp8_tma_compute_warps(k, block_n, expected_sm100):
+    """Bake in the measured B200 rows-per-warp crossover."""
+    expected = expected_sm100 if torch.cuda.get_device_capability() == (10, 0) else 1
+    assert select_mxfp8_tma_compute_warps(k, block_n) == expected
 
 
 def dequantize_mxfp8(value: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:

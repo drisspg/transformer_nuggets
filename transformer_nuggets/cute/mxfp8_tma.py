@@ -5,6 +5,7 @@ from __future__ import annotations
 import operator
 from functools import cache
 from pathlib import Path
+from typing import Annotated
 
 import torch
 import typer
@@ -559,6 +560,24 @@ def get_mxfp8_tma_gemv(
     )
 
 
+def select_mxfp8_tma_compute_warps(
+    k: int,
+    block_n: int,
+    device: torch.device | str | int | None = None,
+) -> int:
+    """Select the B200-tuned consumer-warp count for a CTA row tile."""
+    if torch.cuda.get_device_capability(device) != (10, 0):
+        return 1
+    target_rows_per_warp = 4 if k >= 8192 else 2
+    for num_compute_warps in (4, 2, 1):
+        if (
+            block_n % num_compute_warps == 0
+            and block_n // num_compute_warps >= target_rows_per_warp
+        ):
+            return num_compute_warps
+    return 1
+
+
 def mxfp8_tma_gemv(
     q_input: torch.Tensor,
     weight: torch.Tensor,
@@ -570,7 +589,7 @@ def mxfp8_tma_gemv(
     output: torch.Tensor | None = None,
     enable_profiling: bool = False,
     profile_buffer: torch.Tensor | None = None,
-    num_compute_warps: int = 1,
+    num_compute_warps: int | None = None,
 ) -> torch.Tensor:
     """Compute raw-layout MXFP8 GEMV on prequantized inputs.
 
@@ -584,13 +603,18 @@ def mxfp8_tma_gemv(
         output: Optional caller-owned contiguous ``[1, N]`` BF16 output.
         enable_profiling: Compile a separate specialization with labeled region timing.
         profile_buffer: Buffer from ``profile_session`` for the profiled specialization.
-        num_compute_warps: Consumer warps sharing each CTA's output-row tile.
+        num_compute_warps: Consumer warps sharing each CTA's output-row tile. ``None``
+            selects the B200-tuned value and remains one warp on other architectures.
 
     Returns:
         The provided or newly allocated output tensor.
     """
     if q_input.ndim != 2 or weight.ndim != 2:
         raise ValueError("q_input and weight must be rank-2 tensors")
+    if num_compute_warps is None:
+        num_compute_warps = select_mxfp8_tma_compute_warps(
+            q_input.shape[1], block_n, q_input.device
+        )
     return get_mxfp8_tma_gemv(
         weight.shape[0],
         q_input.shape[1],
@@ -627,7 +651,10 @@ def profile_mxfp8_tma(
     k: int = 8192,
     block_n: int = 4,
     num_stages: int = 2,
-    num_compute_warps: int = 1,
+    num_compute_warps: Annotated[
+        int | None,
+        typer.Option(help="Compute warps per CTA; defaults to the architecture-tuned value."),
+    ] = None,
     output: Path = Path("mxfp8_tma.pftrace"),
     seed: int = 0,
     warmups: int = 1,
@@ -647,6 +674,8 @@ def profile_mxfp8_tma(
     weight, weight_scale = quantize_mxfp8_tensor(
         torch.randn((n, k), dtype=torch.bfloat16, device=torch_device)
     )
+    if num_compute_warps is None:
+        num_compute_warps = select_mxfp8_tma_compute_warps(k, block_n, torch_device)
     op = get_mxfp8_tma_gemv(
         n,
         k,

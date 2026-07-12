@@ -18,6 +18,7 @@ _MXFP8_TMA_EXPORTS = {
     "Mxfp8TmaGemv",
     "get_mxfp8_tma_gemv",
     "mxfp8_tma_gemv",
+    "select_mxfp8_tma_compute_warps",
 }
 
 _SYMMETRIC_MEMORY_EXPORTS = {
