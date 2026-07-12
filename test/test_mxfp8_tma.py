@@ -1,5 +1,6 @@
 import pytest
 import torch
+from typer.testing import CliRunner
 
 
 if not torch.cuda.is_available():
@@ -13,6 +14,7 @@ try:
         get_mxfp8_tma_gemv,
         mxfp8_tma_gemv,
     )
+    from transformer_nuggets.cute.mxfp8_tma import app
     from transformer_nuggets.cute.profiler import profile_session
     from transformer_nuggets.cute.profiler.host import decode_events
 except ImportError:
@@ -153,6 +155,27 @@ def test_mxfp8_tma_gemv_combines_cancelling_scales(input_byte, weight_byte):
     torch.cuda.synchronize()
 
     torch.testing.assert_close(actual, torch.full_like(actual, k), rtol=0, atol=0)
+
+
+def test_mxfp8_tma_cli_writes_pftrace(tmp_path):
+    """Run the module CLI and write a nonempty native Perfetto trace."""
+    trace_path = tmp_path / "mxfp8_tma.pftrace"
+    result = CliRunner().invoke(
+        app,
+        [
+            "--n",
+            "128",
+            "--k",
+            "2048",
+            "--block-n",
+            "4",
+            "--output",
+            str(trace_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert trace_path.stat().st_size > 0
 
 
 def test_mxfp8_tma_gemv_preserves_nan_scale():

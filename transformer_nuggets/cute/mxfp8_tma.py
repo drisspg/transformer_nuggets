@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import operator
 from functools import cache
+from pathlib import Path
 
 import torch
+import typer
 
 import cutlass
 import cutlass.cute as cute
@@ -15,6 +17,7 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from transformer_nuggets.cute.base import CuteOp
 from transformer_nuggets.cute.cache import compile_tvm_ffi_and_cache
+from transformer_nuggets.cute.profiler import group_by_unit, profile_session
 from transformer_nuggets.cute.profiler.ops import profile_region
 from transformer_nuggets.cute.utils import fake_stream, make_fake_compact_tensor
 
@@ -582,3 +585,86 @@ def mxfp8_tma_gemv(
         output,
         profile_buffer,
     )
+
+
+def quantize_mxfp8_tensor(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Create E4M3 values and raw E8M0 block scales for profiling inputs."""
+    blocks = value.float().reshape(value.shape[0], -1, 32)
+    max_abs = blocks.abs().amax(dim=-1).clamp_min(torch.finfo(torch.float32).tiny)
+    exponent = torch.ceil(torch.log2(max_abs / 448.0)).clamp(-126, 127)
+    scale = torch.exp2(exponent).unsqueeze(-1)
+    quantized = (blocks / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+    return quantized.reshape_as(value), (exponent + 127).to(torch.uint8)
+
+
+app = typer.Typer(help="Run the MXFP8 TMA GEMV with labeled intra-kernel profiling.")
+
+
+@app.command()
+def profile_mxfp8_tma(
+    n: int = 4096,
+    k: int = 8192,
+    block_n: int = 4,
+    num_stages: int = 2,
+    output: Path = Path("mxfp8_tma.pftrace"),
+    seed: int = 0,
+    warmups: int = 1,
+    device: str = "cuda",
+) -> None:
+    """Generate a Perfetto trace for one warm MXFP8 TMA GEMV launch."""
+    torch_device = torch.device(device)
+    if torch_device.type != "cuda" or not torch.cuda.is_available():
+        raise typer.BadParameter("device must name an available CUDA device")
+    if warmups < 0:
+        raise typer.BadParameter("warmups must be non-negative")
+
+    torch.manual_seed(seed)
+    q_input, input_scale = quantize_mxfp8_tensor(
+        torch.randn((1, k), dtype=torch.bfloat16, device=torch_device)
+    )
+    weight, weight_scale = quantize_mxfp8_tensor(
+        torch.randn((n, k), dtype=torch.bfloat16, device=torch_device)
+    )
+    op = get_mxfp8_tma_gemv(
+        n,
+        k,
+        block_n,
+        num_stages,
+        enable_profiling=True,
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    with profile_session(
+        max_events_per_unit=op.max_profile_events_per_cta,
+        num_units=(op.num_profile_units, "CTA"),
+        tag_names=list(op.profile_tags),
+        trace_path=str(output),
+        device=torch_device,
+        post_process_events=group_by_unit,
+    ) as (prof, _):
+        result = torch.empty((1, n), dtype=torch.bfloat16, device=torch_device)
+        for _ in range(warmups):
+            op.interface(
+                q_input,
+                weight,
+                input_scale,
+                weight_scale,
+                output=result,
+                profile_buffer=prof.tensor,
+            )
+        torch.cuda.synchronize(torch_device)
+        prof.tensor.zero_()
+        op.interface(
+            q_input,
+            weight,
+            input_scale,
+            weight_scale,
+            output=result,
+            profile_buffer=prof.tensor,
+        )
+
+    typer.echo(f"Wrote {output.resolve()}")
+
+
+if __name__ == "__main__":
+    app()
