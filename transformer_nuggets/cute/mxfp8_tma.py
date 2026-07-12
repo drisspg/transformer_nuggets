@@ -30,18 +30,17 @@ class WarpRole(IntEnum):
     TMA_PRODUCER = 0
 
 
-TAG_TMA_PROLOGUE = 0
-TAG_TMA_REFILL = 1
-TAG_TMA_WAIT = 2
-TAG_TILE_COMPUTE = 3
-TAG_EPILOGUE = 4
-MXFP8_TMA_PROFILE_TAGS = (
-    "tma_prologue",
-    "tma_refill",
-    "tma_wait",
-    "tile_compute",
-    "epilogue",
-)
+class ProfileTag(IntEnum):
+    """Labeled regions emitted by the MXFP8 TMA profiler."""
+
+    TMA_PROLOGUE = 0
+    TMA_REFILL = 1
+    TMA_WAIT = 2
+    TILE_COMPUTE = 3
+    EPILOGUE = 4
+
+
+MXFP8_TMA_PROFILE_TAGS = tuple(tag.name.lower() for tag in ProfileTag)
 
 
 @cute.jit
@@ -119,6 +118,25 @@ class Mxfp8TmaGemv(CuteOp):
             (self.block_n, self.tile_k_u32, self.num_stages), order=(1, 0, 2)
         )
 
+    def profile_scope(
+        self,
+        prof_buf: cute.Tensor | None,
+        tag: ProfileTag,
+        pid_n: cutlass.Int32,
+        event_idx,
+        enable_profiling: cutlass.Constexpr,
+    ):
+        """Build a static-slot profiling context for one CTA region."""
+        return profile_region(
+            prof_buf,
+            cutlass.Int32(self.max_profile_events_per_cta),
+            cutlass.Int32(tag),
+            pid_n,
+            event_idx=cutlass.Int32(event_idx),
+            bounds_check=False,
+            enabled=enable_profiling,
+        )
+
     @cute.jit
     def tma_producer_load_stage(
         self,
@@ -167,29 +185,24 @@ class Mxfp8TmaGemv(CuteOp):
         chunk_layout: cute.Layout,
         scale_layout: cute.Layout,
         prof_buf: cute.Tensor | None,
-        max_profile_events: cutlass.Int32,
         enable_profiling: cutlass.Constexpr,
     ) -> tuple[pipeline.PipelineConsumer, list]:
         """Wait for one stage and accumulate the rows owned by this compute warp."""
-        with profile_region(
+        with self.profile_scope(
             prof_buf,
-            max_profile_events,
-            cutlass.Int32(TAG_TMA_WAIT),
+            ProfileTag.TMA_WAIT,
             pid_n,
-            event_idx=cutlass.Int32(2 + 3 * k_tile),
-            bounds_check=False,
-            enabled=enable_profiling,
+            2 + 3 * k_tile,
+            enable_profiling,
         ):
             full = consumer.wait_and_advance()
 
-        with profile_region(
+        with self.profile_scope(
             prof_buf,
-            max_profile_events,
-            cutlass.Int32(TAG_TILE_COMPUTE),
+            ProfileTag.TILE_COMPUTE,
             pid_n,
-            event_idx=cutlass.Int32(3 + 3 * k_tile),
-            bounds_check=False,
-            enabled=enable_profiling,
+            3 + 3 * k_tile,
+            enable_profiling,
         ):
             # Each lane owns u32s [8*lane, 8*lane+8) (one 32-value scale block) as
             # two 16-byte LDS.128 chunks. Loading them low-first for lanes 0-3 and
@@ -316,7 +329,6 @@ class Mxfp8TmaGemv(CuteOp):
         lane = tidx % 32
         n0 = pid_n * self.block_n
         owned_row_start = warp * self.rows_per_warp
-        max_profile_events = cutlass.Int32(self.max_profile_events_per_cta)
         if cutlass.const_expr(enable_profiling):
             assert prof_buf is not None
         chunk_layout = cute.make_ordered_layout((1, 4), order=(1, 0))
@@ -379,14 +391,12 @@ class Mxfp8TmaGemv(CuteOp):
             cute.group_modes(gX, 0, 2),
         )
 
-        with profile_region(
+        with self.profile_scope(
             prof_buf,
-            max_profile_events,
-            cutlass.Int32(TAG_TMA_PROLOGUE),
+            ProfileTag.TMA_PROLOGUE,
             pid_n,
-            event_idx=cutlass.Int32(0),
-            bounds_check=False,
-            enabled=enable_profiling,
+            0,
+            enable_profiling,
         ):
             if warp == WarpRole.TMA_PRODUCER:
                 producer = self.tma_producer_load_stage(
@@ -402,14 +412,12 @@ class Mxfp8TmaGemv(CuteOp):
         accumulators = [cutlass.Float32(0.0) for _ in range(self.rows_per_warp)]
         for k_tile in cutlass.range_constexpr(self.num_k_tiles):
             if warp == WarpRole.TMA_PRODUCER and k_tile < self.num_k_tiles - 1:
-                with profile_region(
+                with self.profile_scope(
                     prof_buf,
-                    max_profile_events,
-                    cutlass.Int32(TAG_TMA_REFILL),
+                    ProfileTag.TMA_REFILL,
                     pid_n,
-                    event_idx=cutlass.Int32(1 + 3 * k_tile),
-                    bounds_check=False,
-                    enabled=enable_profiling,
+                    1 + 3 * k_tile,
+                    enable_profiling,
                 ):
                     producer = self.tma_producer_load_stage(
                         producer,
@@ -439,18 +447,15 @@ class Mxfp8TmaGemv(CuteOp):
                 chunk_layout,
                 scale_layout,
                 prof_buf,
-                max_profile_events,
                 enable_profiling,
             )
 
-        with profile_region(
+        with self.profile_scope(
             prof_buf,
-            max_profile_events,
-            cutlass.Int32(TAG_EPILOGUE),
+            ProfileTag.EPILOGUE,
             pid_n,
-            event_idx=cutlass.Int32(1 + 3 * self.num_k_tiles),
-            bounds_check=False,
-            enabled=enable_profiling,
+            1 + 3 * self.num_k_tiles,
+            enable_profiling,
         ):
             if warp == WarpRole.TMA_PRODUCER:
                 producer.tail()

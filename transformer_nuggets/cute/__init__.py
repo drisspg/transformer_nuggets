@@ -16,6 +16,7 @@ from transformer_nuggets.cute import profiler
 _MXFP8_TMA_EXPORTS = {
     "MXFP8_TMA_PROFILE_TAGS",
     "Mxfp8TmaGemv",
+    "ProfileTag",
     "get_mxfp8_tma_gemv",
     "mxfp8_tma_gemv",
     "select_mxfp8_tma_compute_warps",
