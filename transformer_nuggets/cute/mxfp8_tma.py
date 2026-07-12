@@ -740,9 +740,9 @@ app = typer.Typer(help="Run the MXFP8 TMA GEMV with labeled intra-kernel profili
 
 @app.command()
 def profile_mxfp8_tma(
-    n: int = 4096,
-    k: int = 8192,
-    block_n: int = 4,
+    n: int = 14336,
+    k: int = 4096,
+    block_n: int = 8,
     num_stages: int = 2,
     num_compute_warps: Annotated[
         int | None,
@@ -753,7 +753,7 @@ def profile_mxfp8_tma(
     warmups: int = 1,
     device: str = "cuda",
 ) -> None:
-    """Generate a Perfetto trace for one warm MXFP8 TMA GEMV launch."""
+    """Profile a Llama 3.1 8B-sized MLP gate/up projection by default."""
     torch_device = torch.device(device)
     if torch_device.type != "cuda" or not torch.cuda.is_available():
         raise typer.BadParameter("device must name an available CUDA device")
