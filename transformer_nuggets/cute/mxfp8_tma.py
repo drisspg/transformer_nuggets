@@ -15,10 +15,23 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from transformer_nuggets.cute.base import CuteOp
 from transformer_nuggets.cute.cache import compile_tvm_ffi_and_cache
+from transformer_nuggets.cute.profiler.ops import profile_region
 from transformer_nuggets.cute.utils import fake_stream, make_fake_compact_tensor
 
 
 TMA_PRODUCER_WARP = 0
+TAG_TMA_PROLOGUE = 0
+TAG_TMA_REFILL = 1
+TAG_TMA_WAIT = 2
+TAG_TILE_COMPUTE = 3
+TAG_EPILOGUE = 4
+MXFP8_TMA_PROFILE_TAGS = (
+    "tma_prologue",
+    "tma_refill",
+    "tma_wait",
+    "tile_compute",
+    "epilogue",
+)
 
 
 @cute.jit
@@ -39,9 +52,22 @@ def combined_e8m0_to_f32(a, b):
 
 
 class Mxfp8TmaGemv(CuteOp):
-    """Compute a raw-layout MXFP8 GEMV with one consumer warp."""
+    """Compute raw-layout MXFP8 GEMV with optional compile-time region profiling.
 
-    def __init__(self, n: int, k: int, block_n: int, num_stages: int):
+    ``enable_profiling=False`` emits no timer or profile-buffer instructions. A profiled
+    specialization records statically indexed regions named by :attr:`profile_tags`.
+    """
+
+    profile_tags = MXFP8_TMA_PROFILE_TAGS
+
+    def __init__(
+        self,
+        n: int,
+        k: int,
+        block_n: int,
+        num_stages: int,
+        enable_profiling: bool = False,
+    ):
         super().__init__()
         m = 1
         if k % 1024 != 0:
@@ -62,6 +88,9 @@ class Mxfp8TmaGemv(CuteOp):
         self.num_stages = num_stages
         self.tile_k_u32 = 256
         self.num_k_tiles = sf_k // 32
+        self.enable_profiling = enable_profiling
+        self.max_profile_events_per_cta = 2 + 3 * self.num_k_tiles
+        self.num_profile_units = n // block_n
 
     def x_smem_layout(self):
         """Return the staged layout for M 1024-byte input tiles."""
@@ -85,6 +114,8 @@ class Mxfp8TmaGemv(CuteOp):
         mSFW: cute.Tensor,
         mSFX: cute.Tensor,
         mO: cute.Tensor,
+        prof_buf: cute.Tensor | None,
+        enable_profiling: cutlass.Constexpr,
     ):
         """Overlap TMA production with typed FP8 conversion and accumulation."""
         tidx, _, _ = cute.arch.thread_idx()
@@ -92,13 +123,16 @@ class Mxfp8TmaGemv(CuteOp):
         warp = cute.arch.make_warp_uniform(tidx // 32)
         lane = tidx % 32
         n0 = pid_n * self.block_n
+        max_profile_events = cutlass.Int32(self.max_profile_events_per_cta)
+        if cutlass.const_expr(enable_profiling):
+            assert prof_buf is not None
         chunk_layout = cute.make_ordered_layout((1, 4), order=(1, 0))
         # Each lane owns u32s [8*lane, 8*lane+8) (one 32-value scale block) as
         # two 16-byte LDS.128 chunks. Loading them low-first for lanes 0-3 and
         # high-first for lanes 4-7 of each octet spreads every load across all
         # 32 banks, removing the 2x shared-load bank conflict.
-        col_a = cute.assume(lane * 8 + (lane >> 2) % 2 * 4, divby=4)
-        col_b = cute.assume(lane * 8 + ((lane >> 2) + 1) % 2 * 4, divby=4)
+        col_a = cute.assume(lane * 8 + (lane & 4), divby=4)
+        col_b = cute.assume(lane * 8 + ((lane ^ 4) & 4), divby=4)
         scale_layout = cute.make_layout(1)
         smem_atom = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
@@ -156,25 +190,16 @@ class Mxfp8TmaGemv(CuteOp):
             cute.group_modes(gX, 0, 2),
         )
 
-        if warp == TMA_PRODUCER_WARP:
-            stage = producer.acquire_and_advance()
-            cute.copy(
-                tma_atom_w,
-                tWgW[(None, stage.count)],
-                tWsW[(None, stage.index)],
-                tma_bar_ptr=stage.barrier,
-            )
-            cute.copy(
-                tma_atom_x,
-                tXgX[(None, stage.count)],
-                tXsX[(None, stage.index)],
-                tma_bar_ptr=stage.barrier,
-            )
-            stage.commit()
-
-        acc = [cutlass.Float32(0.0) for _ in range(self.block_n)]
-        for k_tile in cutlass.range_constexpr(self.num_k_tiles):
-            if warp == TMA_PRODUCER_WARP and k_tile < self.num_k_tiles - 1:
+        with profile_region(
+            prof_buf,
+            max_profile_events,
+            cutlass.Int32(TAG_TMA_PROLOGUE),
+            pid_n,
+            event_idx=cutlass.Int32(0),
+            bounds_check=False,
+            enabled=enable_profiling,
+        ):
+            if warp == TMA_PRODUCER_WARP:
                 stage = producer.acquire_and_advance()
                 cute.copy(
                     tma_atom_w,
@@ -190,87 +215,145 @@ class Mxfp8TmaGemv(CuteOp):
                 )
                 stage.commit()
 
-            full = consumer.wait_and_advance()
-            scale_k = lane + k_tile * 32
-            x_frag = cute.make_rmem_tensor((1, 8), cutlass.Uint32)
-            cute.copy(
-                smem_atom,
-                cute.make_tensor(
-                    sX.iterator + cute.assume(sX.layout((warp, col_a, full.index)), divby=4),
-                    chunk_layout,
-                ),
-                cute.make_tensor(x_frag.iterator, chunk_layout),
-            )
-            cute.copy(
-                smem_atom,
-                cute.make_tensor(
-                    sX.iterator + cute.assume(sX.layout((warp, col_b, full.index)), divby=4),
-                    chunk_layout,
-                ),
-                cute.make_tensor(x_frag.iterator + 4, chunk_layout),
-            )
-            x_values = (
-                cute.recast_tensor(x_frag, cutlass.Float8E4M3FN)
-                .load()
-                .to(cutlass.Float32)
-                .reshape((2, 16))
-            )
-            input_scale = cute.make_rmem_tensor(1, cutlass.Uint8)
-            cute.copy(
-                input_scale_atom,
-                cute.make_tensor(mSFX.iterator + mSFX.layout((warp, scale_k)), scale_layout),
-                input_scale,
-            )
-            sx = input_scale[0]
+        acc = [cutlass.Float32(0.0) for _ in range(self.block_n)]
+        for k_tile in cutlass.range_constexpr(self.num_k_tiles):
+            if warp == TMA_PRODUCER_WARP and k_tile < self.num_k_tiles - 1:
+                with profile_region(
+                    prof_buf,
+                    max_profile_events,
+                    cutlass.Int32(TAG_TMA_REFILL),
+                    pid_n,
+                    event_idx=cutlass.Int32(1 + 3 * k_tile),
+                    bounds_check=False,
+                    enabled=enable_profiling,
+                ):
+                    stage = producer.acquire_and_advance()
+                    cute.copy(
+                        tma_atom_w,
+                        tWgW[(None, stage.count)],
+                        tWsW[(None, stage.index)],
+                        tma_bar_ptr=stage.barrier,
+                    )
+                    cute.copy(
+                        tma_atom_x,
+                        tXgX[(None, stage.count)],
+                        tXsX[(None, stage.index)],
+                        tma_bar_ptr=stage.barrier,
+                    )
+                    stage.commit()
 
-            for row in cutlass.range_constexpr(self.block_n):
-                w_frag = cute.make_rmem_tensor((1, 8), cutlass.Uint32)
+            with profile_region(
+                prof_buf,
+                max_profile_events,
+                cutlass.Int32(TAG_TMA_WAIT),
+                pid_n,
+                event_idx=cutlass.Int32(2 + 3 * k_tile),
+                bounds_check=False,
+                enabled=enable_profiling,
+            ):
+                full = consumer.wait_and_advance()
+            with profile_region(
+                prof_buf,
+                max_profile_events,
+                cutlass.Int32(TAG_TILE_COMPUTE),
+                pid_n,
+                event_idx=cutlass.Int32(3 + 3 * k_tile),
+                bounds_check=False,
+                enabled=enable_profiling,
+            ):
+                scale_k = lane + k_tile * 32
+                x_frag = cute.make_rmem_tensor((1, 8), cutlass.Uint32)
                 cute.copy(
                     smem_atom,
                     cute.make_tensor(
-                        sW.iterator + cute.assume(sW.layout((row, col_a, full.index)), divby=4),
+                        sX.iterator + cute.assume(sX.layout((warp, col_a, full.index)), divby=4),
                         chunk_layout,
                     ),
-                    cute.make_tensor(w_frag.iterator, chunk_layout),
+                    cute.make_tensor(x_frag.iterator, chunk_layout),
                 )
                 cute.copy(
                     smem_atom,
                     cute.make_tensor(
-                        sW.iterator + cute.assume(sW.layout((row, col_b, full.index)), divby=4),
+                        sX.iterator + cute.assume(sX.layout((warp, col_b, full.index)), divby=4),
                         chunk_layout,
                     ),
-                    cute.make_tensor(w_frag.iterator + 4, chunk_layout),
+                    cute.make_tensor(x_frag.iterator + 4, chunk_layout),
                 )
-                w_values = (
-                    cute.recast_tensor(w_frag, cutlass.Float8E4M3FN)
+                x_values = (
+                    cute.recast_tensor(x_frag, cutlass.Float8E4M3FN)
                     .load()
                     .to(cutlass.Float32)
                     .reshape((2, 16))
                 )
-                weight_scale = cute.make_rmem_tensor(1, cutlass.Uint8)
+                input_scale = cute.make_rmem_tensor(1, cutlass.Uint8)
                 cute.copy(
-                    weight_scale_atom,
-                    cute.make_tensor(
-                        mSFW.iterator + mSFW.layout((n0 + row, scale_k)),
-                        scale_layout,
-                    ),
-                    weight_scale,
+                    input_scale_atom,
+                    cute.make_tensor(mSFX.iterator + mSFX.layout((warp, scale_k)), scale_layout),
+                    input_scale,
                 )
-                product = (x_values * w_values).reduce(
-                    cute.ReductionOp.ADD, cutlass.Float32(0.0), (None, 1)
-                )
-                acc[row] += (product[0] + product[1]) * combined_e8m0_to_f32(sx, weight_scale[0])
-            cute.arch.fence_view_async_shared()
-            cute.arch.sync_warp()
-            full.release()
+                sx = input_scale[0]
 
-        if warp == TMA_PRODUCER_WARP:
-            producer.tail()
-        for row in cutlass.range_constexpr(self.block_n):
-            acc[row] = cute.arch.warp_reduction(acc[row], operator.add)
-        if lane == 0:
+                for row in cutlass.range_constexpr(self.block_n):
+                    w_frag = cute.make_rmem_tensor((1, 8), cutlass.Uint32)
+                    cute.copy(
+                        smem_atom,
+                        cute.make_tensor(
+                            sW.iterator
+                            + cute.assume(sW.layout((row, col_a, full.index)), divby=4),
+                            chunk_layout,
+                        ),
+                        cute.make_tensor(w_frag.iterator, chunk_layout),
+                    )
+                    cute.copy(
+                        smem_atom,
+                        cute.make_tensor(
+                            sW.iterator
+                            + cute.assume(sW.layout((row, col_b, full.index)), divby=4),
+                            chunk_layout,
+                        ),
+                        cute.make_tensor(w_frag.iterator + 4, chunk_layout),
+                    )
+                    w_values = (
+                        cute.recast_tensor(w_frag, cutlass.Float8E4M3FN)
+                        .load()
+                        .to(cutlass.Float32)
+                        .reshape((2, 16))
+                    )
+                    weight_scale = cute.make_rmem_tensor(1, cutlass.Uint8)
+                    cute.copy(
+                        weight_scale_atom,
+                        cute.make_tensor(
+                            mSFW.iterator + mSFW.layout((n0 + row, scale_k)),
+                            scale_layout,
+                        ),
+                        weight_scale,
+                    )
+                    product = (x_values * w_values).reduce(
+                        cute.ReductionOp.ADD, cutlass.Float32(0.0), (None, 1)
+                    )
+                    acc[row] += (product[0] + product[1]) * combined_e8m0_to_f32(
+                        sx, weight_scale[0]
+                    )
+                cute.arch.fence_view_async_shared()
+                cute.arch.sync_warp()
+                full.release()
+
+        with profile_region(
+            prof_buf,
+            max_profile_events,
+            cutlass.Int32(TAG_EPILOGUE),
+            pid_n,
+            event_idx=cutlass.Int32(1 + 3 * self.num_k_tiles),
+            bounds_check=False,
+            enabled=enable_profiling,
+        ):
+            if warp == TMA_PRODUCER_WARP:
+                producer.tail()
             for row in cutlass.range_constexpr(self.block_n):
-                mO[warp, n0 + row] = acc[row].to(cutlass.BFloat16)
+                acc[row] = cute.arch.warp_reduction(acc[row], operator.add)
+            if lane == 0:
+                for row in cutlass.range_constexpr(self.block_n):
+                    mO[warp, n0 + row] = acc[row].to(cutlass.BFloat16)
 
     @cute.jit
     def __call__(
@@ -280,6 +363,7 @@ class Mxfp8TmaGemv(CuteOp):
         mSFW: cute.Tensor,
         mSFX: cute.Tensor,
         mO: cute.Tensor,
+        prof_buf: cute.Tensor | None,
         stream: cuda.CUstream,
     ):
         """Construct TMA descriptors and launch the kernel."""
@@ -298,7 +382,7 @@ class Mxfp8TmaGemv(CuteOp):
             cute.select(self.x_smem_layout(), mode=[0, 1]),
             (self.m, self.tile_k_u32),
         )
-        name = f"mxfp8_gemm_tma_m{self.m}_bn{self.block_n}_s{self.num_stages}"
+        name = self.get_name()
         self.kernel(
             tma_atom_w,
             tma_tensor_w,
@@ -307,6 +391,8 @@ class Mxfp8TmaGemv(CuteOp):
             mSFW,
             mSFX,
             mO,
+            prof_buf,
+            self.enable_profiling,
             _name_prefix=name,
         ).launch(
             grid=[self.n // self.block_n, 1, 1],
@@ -316,11 +402,18 @@ class Mxfp8TmaGemv(CuteOp):
 
     def get_key(self) -> str:
         """Return the static kernel specialization key."""
-        return f"{self.n}_{self.sf_k}_{self.block_n}_{self.num_stages}"
+        return (
+            f"{self.n}_{self.sf_k}_{self.block_n}_{self.num_stages}"
+            f"_profile={self.enable_profiling}"
+        )
 
     def get_name(self) -> str:
         """Return the compiled kernel name."""
-        return f"mxfp8_tma_gemv_n{self.n}_k{self.sf_k * 32}_bn{self.block_n}_s{self.num_stages}"
+        profile_suffix = "_profiled" if self.enable_profiling else ""
+        return (
+            f"mxfp8_tma_gemv_n{self.n}_k{self.sf_k * 32}"
+            f"_bn{self.block_n}_s{self.num_stages}{profile_suffix}"
+        )
 
     def interface(
         self,
@@ -329,6 +422,7 @@ class Mxfp8TmaGemv(CuteOp):
         input_scale: torch.Tensor,
         weight_scale: torch.Tensor,
         output: torch.Tensor | None = None,
+        profile_buffer: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Launch raw-layout MXFP8 GEMV into a contiguous BF16 output.
 
@@ -338,6 +432,7 @@ class Mxfp8TmaGemv(CuteOp):
             input_scale: Raw ``[1, K / 32]`` E8M0 scale storage.
             weight_scale: Raw ``[N, K / 32]`` E8M0 scale storage.
             output: Optional contiguous ``[1, N]`` BF16 output tensor.
+            profile_buffer: Legacy profiler buffer for a profiling-enabled specialization.
 
         Returns:
             The provided or newly allocated output tensor.
@@ -386,6 +481,28 @@ class Mxfp8TmaGemv(CuteOp):
         ):
             raise ValueError("output must be a contiguous [1, N] BF16 tensor on the input device")
 
+        expected_profile_numel = self.num_profile_units * (1 + 4 * self.max_profile_events_per_cta)
+        if self.enable_profiling:
+            if profile_buffer is None:
+                raise ValueError("profile_buffer is required when enable_profiling=True")
+            if (
+                profile_buffer.dtype != torch.int64
+                or profile_buffer.device != q_input.device
+                or not profile_buffer.is_contiguous()
+                or profile_buffer.numel() < expected_profile_numel
+            ):
+                raise ValueError(
+                    "profile_buffer must be a contiguous CUDA int64 tensor with "
+                    f"at least {expected_profile_numel} elements"
+                )
+        elif profile_buffer is not None:
+            raise ValueError("profile_buffer requires an enable_profiling=True specialization")
+
+        fake_profile_buffer = (
+            make_fake_compact_tensor(cutlass.Int64, (expected_profile_numel,))
+            if self.enable_profiling
+            else None
+        )
         compiled = compile_tvm_ffi_and_cache(
             self,
             self.get_name(),
@@ -394,6 +511,7 @@ class Mxfp8TmaGemv(CuteOp):
             make_fake_compact_tensor(cutlass.Uint8, (self.n, self.sf_k)),
             make_fake_compact_tensor(cutlass.Uint8, (1, self.sf_k)),
             make_fake_compact_tensor(cutlass.BFloat16, (1, self.n)),
+            fake_profile_buffer,
             fake_stream(),
             _name_prefix=self.get_name(),
         )
@@ -403,6 +521,7 @@ class Mxfp8TmaGemv(CuteOp):
             weight_scale.view(torch.uint8),
             input_scale.view(torch.uint8),
             output,
+            profile_buffer,
         )
         return output
 
@@ -413,9 +532,10 @@ def get_mxfp8_tma_gemv(
     k: int,
     block_n: int,
     num_stages: int = 2,
+    enable_profiling: bool = False,
 ) -> Mxfp8TmaGemv:
     """Return a cached MXFP8 TMA GEMV specialization."""
-    return Mxfp8TmaGemv(n, k, block_n, num_stages)
+    return Mxfp8TmaGemv(n, k, block_n, num_stages, enable_profiling)
 
 
 def mxfp8_tma_gemv(
@@ -427,14 +547,38 @@ def mxfp8_tma_gemv(
     block_n: int,
     num_stages: int = 2,
     output: torch.Tensor | None = None,
+    enable_profiling: bool = False,
+    profile_buffer: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Compute a raw-layout MXFP8 GEMV on prequantized inputs."""
+    """Compute raw-layout MXFP8 GEMV on prequantized inputs.
+
+    Args:
+        q_input: Contiguous ``[1, K]`` FP8 E4M3 input.
+        weight: Contiguous ``[N, K]`` FP8 E4M3 weight.
+        input_scale: Raw ``[1, K / 32]`` E8M0 scale storage.
+        weight_scale: Raw ``[N, K / 32]`` E8M0 scale storage.
+        block_n: Output rows computed by each CTA.
+        num_stages: Number of shared-memory TMA pipeline stages.
+        output: Optional caller-owned contiguous ``[1, N]`` BF16 output.
+        enable_profiling: Compile a separate specialization with labeled region timing.
+        profile_buffer: Buffer from ``profile_session`` for the profiled specialization.
+
+    Returns:
+        The provided or newly allocated output tensor.
+    """
     if q_input.ndim != 2 or weight.ndim != 2:
         raise ValueError("q_input and weight must be rank-2 tensors")
-    return get_mxfp8_tma_gemv(weight.shape[0], q_input.shape[1], block_n, num_stages).interface(
+    return get_mxfp8_tma_gemv(
+        weight.shape[0],
+        q_input.shape[1],
+        block_n,
+        num_stages,
+        enable_profiling,
+    ).interface(
         q_input,
         weight,
         input_scale,
         weight_scale,
         output,
+        profile_buffer,
     )

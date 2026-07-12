@@ -632,6 +632,7 @@ def profile_region(
     event_idx=None,
     tid=None,
     bounds_check=True,
+    enabled=True,
 ):
     """Context manager that profiles a code region in a CUTE DSL kernel.
 
@@ -663,11 +664,12 @@ def profile_region(
             kernels pass ``cute.arch.warp_idx()`` (or any per-warp value) so
             each warp gets its own Perfetto lane.
         bounds_check: Forwarded to :func:`static_start`/:func:`static_stop`.
+        enabled: Compile-time switch. When false, the region emits no profiling code.
 
     Returns:
         Context manager for use with ``with``.
     """
-    if not cutlass.const_expr(ENABLE_PROFILING_CONST):
+    if not cutlass.const_expr(enabled) or not cutlass.const_expr(ENABLE_PROFILING_CONST):
         return _NoOpProfileRegion()
 
     if target_warp is None:

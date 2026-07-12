@@ -8,7 +8,13 @@ if torch.cuda.get_device_capability() not in {(10, 0), (10, 3)}:
     pytest.skip("MXFP8 TMA GEMV requires SM100 or SM103", allow_module_level=True)
 
 try:
-    from transformer_nuggets.cute import mxfp8_tma_gemv
+    from transformer_nuggets.cute import (
+        MXFP8_TMA_PROFILE_TAGS,
+        get_mxfp8_tma_gemv,
+        mxfp8_tma_gemv,
+    )
+    from transformer_nuggets.cute.profiler import profile_session
+    from transformer_nuggets.cute.profiler.host import decode_events
 except ImportError:
     pytest.skip("CuTe DSL not available", allow_module_level=True)
 
@@ -95,13 +101,47 @@ def test_mxfp8_tma_gemv_cuda_graph_replay():
     torch.testing.assert_close(output, expected, atol=1.0, rtol=0.05)
 
 
-def test_mxfp8_tma_gemv_combines_cancelling_scales():
+def test_mxfp8_tma_gemv_profiles_labeled_regions():
+    """Record each compile-time-enabled region with static event slots."""
+    k = 2048
+    q_input, input_scale = quantize_mxfp8(torch.randn((1, k), dtype=torch.bfloat16, device="cuda"))
+    weight, weight_scale = quantize_mxfp8(
+        torch.randn((128, k), dtype=torch.bfloat16, device="cuda")
+    )
+    op = get_mxfp8_tma_gemv(128, k, 4, enable_profiling=True)
+
+    with profile_session(
+        max_events_per_unit=op.max_profile_events_per_cta,
+        num_units=(op.num_profile_units, "CTA"),
+        tag_names=list(MXFP8_TMA_PROFILE_TAGS),
+        device=q_input.device,
+    ) as (prof, tags):
+        actual = op.interface(
+            q_input,
+            weight,
+            input_scale,
+            weight_scale,
+            profile_buffer=prof.tensor,
+        )
+
+    expected = (
+        dequantize_mxfp8(q_input, input_scale) @ dequantize_mxfp8(weight, weight_scale).T
+    ).bfloat16()
+    torch.testing.assert_close(actual, expected, atol=1.0, rtol=0.05)
+    events = decode_events(prof, tags)
+    assert len(events) == op.num_profile_units * (3 * op.num_k_tiles + 1)
+    assert {event.tag_name for event in events} == set(MXFP8_TMA_PROFILE_TAGS)
+    assert {event.unit_id for event in events} == set(range(op.num_profile_units))
+
+
+@pytest.mark.parametrize(("input_byte", "weight_byte"), [(254, 0), (0, 254)])
+def test_mxfp8_tma_gemv_combines_cancelling_scales(input_byte, weight_byte):
     """Avoid an infinite intermediate when E8M0 scale exponents cancel."""
     k = 2048
     q_input = torch.ones((1, k), dtype=torch.float8_e4m3fn, device="cuda")
     weight = torch.ones((128, k), dtype=torch.float8_e4m3fn, device="cuda")
-    input_scale = torch.full((1, k // 32), 254, dtype=torch.uint8, device="cuda")
-    weight_scale = torch.zeros((128, k // 32), dtype=torch.uint8, device="cuda")
+    input_scale = torch.full((1, k // 32), input_byte, dtype=torch.uint8, device="cuda")
+    weight_scale = torch.full((128, k // 32), weight_byte, dtype=torch.uint8, device="cuda")
 
     actual = mxfp8_tma_gemv(
         q_input,
