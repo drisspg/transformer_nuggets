@@ -14,6 +14,8 @@ from transformer_nuggets.cute import profiler
 
 
 _MXFP8_TMA_EXPORTS = {
+    "DEFAULT_PERSISTENT_CTAS_PER_SM",
+    "GridScheduler",
     "MXFP8_TMA_PROFILE_TAGS",
     "Mxfp8TmaGemv",
     "ProfileTag",

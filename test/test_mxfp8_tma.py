@@ -10,6 +10,7 @@ if torch.cuda.get_device_capability() not in {(10, 0), (10, 3)}:
 
 try:
     from transformer_nuggets.cute import (
+        GridScheduler,
         MXFP8_TMA_PROFILE_TAGS,
         get_mxfp8_tma_gemv,
         mxfp8_tma_gemv,
@@ -80,6 +81,49 @@ def test_mxfp8_tma_gemv_matches_reference(k, block_n, num_stages, num_compute_wa
     torch.testing.assert_close(actual, expected, atol=1.0, rtol=0.05)
 
 
+def test_mxfp8_tma_gemv_persistent_grid_matches_reference():
+    """Reuse a bounded physical CTA grid across all logical output tiles."""
+    k = 2048
+    q_input, input_scale = quantize_mxfp8(torch.randn((1, k), dtype=torch.bfloat16, device="cuda"))
+    weight, weight_scale = quantize_mxfp8(
+        torch.randn((128, k), dtype=torch.bfloat16, device="cuda")
+    )
+
+    output = torch.empty((1, 128), dtype=torch.bfloat16, device="cuda")
+    actual = mxfp8_tma_gemv(
+        q_input,
+        weight,
+        input_scale,
+        weight_scale,
+        block_n=4,
+        output=output,
+        num_compute_warps=4,
+        grid_scheduler=GridScheduler.PERSISTENT,
+        num_persistent_ctas=3,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        mxfp8_tma_gemv(
+            q_input,
+            weight,
+            input_scale,
+            weight_scale,
+            block_n=4,
+            output=output,
+            num_compute_warps=4,
+            grid_scheduler=GridScheduler.PERSISTENT,
+            num_persistent_ctas=3,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert actual is output
+    expected = (
+        dequantize_mxfp8(q_input, input_scale) @ dequantize_mxfp8(weight, weight_scale).T
+    ).bfloat16()
+    torch.testing.assert_close(actual, expected, atol=1.0, rtol=0.05)
+
+
 @pytest.mark.parametrize("num_compute_warps", [1, 2, 4])
 def test_mxfp8_tma_gemv_cuda_graph_replay(num_compute_warps):
     """Replay into caller-owned output without hidden allocation or copies."""
@@ -119,7 +163,11 @@ def test_mxfp8_tma_gemv_cuda_graph_replay(num_compute_warps):
     torch.testing.assert_close(output, expected, atol=1.0, rtol=0.05)
 
 
-def test_mxfp8_tma_gemv_profiles_labeled_regions():
+@pytest.mark.parametrize(
+    ("grid_scheduler", "num_persistent_ctas"),
+    [(GridScheduler.STATIC, None), (GridScheduler.PERSISTENT, 3)],
+)
+def test_mxfp8_tma_gemv_profiles_labeled_regions(grid_scheduler, num_persistent_ctas):
     """Record each compile-time-enabled region with static event slots."""
     k = 2048
     q_input, input_scale = quantize_mxfp8(torch.randn((1, k), dtype=torch.bfloat16, device="cuda"))
@@ -132,6 +180,8 @@ def test_mxfp8_tma_gemv_profiles_labeled_regions():
         4,
         enable_profiling=True,
         num_compute_warps=4,
+        grid_scheduler=grid_scheduler,
+        num_persistent_ctas=num_persistent_ctas,
     )
 
     with profile_session(
@@ -193,6 +243,10 @@ def test_mxfp8_tma_cli_writes_pftrace(tmp_path):
             "4",
             "--num-compute-warps",
             "4",
+            "--grid-scheduler",
+            "persistent",
+            "--num-persistent-ctas",
+            "3",
             "--output",
             str(trace_path),
         ],

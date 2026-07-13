@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import operator
-from enum import IntEnum
+from enum import Enum, IntEnum
 from functools import cache
 from pathlib import Path
 from typing import Annotated
@@ -24,6 +24,13 @@ from transformer_nuggets.cute.profiler.ops import profile_region
 from transformer_nuggets.cute.utils import fake_stream, make_fake_compact_tensor
 
 
+class GridScheduler(str, Enum):
+    """Map logical output tiles onto the launched CTA grid."""
+
+    STATIC = "static"
+    PERSISTENT = "persistent"
+
+
 class WarpRole(IntEnum):
     """Static warp roles within an MXFP8 TMA CTA."""
 
@@ -41,6 +48,7 @@ class ProfileTag(IntEnum):
 
 
 MXFP8_TMA_PROFILE_TAGS = tuple(tag.name.lower() for tag in ProfileTag)
+DEFAULT_PERSISTENT_CTAS_PER_SM = 8
 
 
 @cute.jit
@@ -77,6 +85,8 @@ class Mxfp8TmaGemv(CuteOp):
         num_stages: int,
         enable_profiling: bool = False,
         num_compute_warps: int = 1,
+        grid_scheduler: GridScheduler = GridScheduler.STATIC,
+        num_persistent_ctas: int | None = None,
     ):
         super().__init__()
         m = 1
@@ -103,8 +113,26 @@ class Mxfp8TmaGemv(CuteOp):
         self.enable_profiling = enable_profiling
         self.num_compute_warps = num_compute_warps
         self.rows_per_warp = block_n // num_compute_warps
+        self.num_tiles = n // block_n
+        self.grid_scheduler = GridScheduler(grid_scheduler)
+        if self.grid_scheduler is GridScheduler.PERSISTENT:
+            if num_persistent_ctas is None or num_persistent_ctas <= 0:
+                raise ValueError(
+                    "num_persistent_ctas must be positive for the persistent scheduler"
+                )
+            max_grid_ctas = min(self.num_tiles, num_persistent_ctas)
+            self.grid_ctas = next(
+                grid_ctas
+                for grid_ctas in range(max_grid_ctas, 0, -1)
+                if self.num_tiles % grid_ctas == 0
+            )
+        else:
+            if num_persistent_ctas is not None:
+                raise ValueError("num_persistent_ctas is only valid with the persistent scheduler")
+            self.grid_ctas = self.num_tiles
+        self.tiles_per_cta = self.num_tiles // self.grid_ctas
         self.max_profile_events_per_cta = 2 + 3 * self.num_k_tiles
-        self.num_profile_units = n // block_n
+        self.num_profile_units = self.num_tiles
 
     def x_smem_layout(self):
         """Return the staged layout for M 1024-byte input tiles."""
@@ -322,12 +350,11 @@ class Mxfp8TmaGemv(CuteOp):
         prof_buf: cute.Tensor | None,
         enable_profiling: cutlass.Constexpr,
     ):
-        """Assign rows to compute warps and interleave TMA production with consumption."""
+        """Schedule logical N tiles across static or persistent CTA grids."""
         tidx, _, _ = cute.arch.thread_idx()
-        pid_n, _, _ = cute.arch.block_idx()
+        physical_cta, _, _ = cute.arch.block_idx()
         warp = cute.arch.make_warp_uniform(tidx // 32)
         lane = tidx % 32
-        n0 = pid_n * self.block_n
         owned_row_start = warp * self.rows_per_warp
         if cutlass.const_expr(enable_profiling):
             assert prof_buf is not None
@@ -369,20 +396,7 @@ class Mxfp8TmaGemv(CuteOp):
             barrier_storage=barriers,
             tidx=lane,
         ).make_participants()
-
-        gW = cute.local_tile(
-            mW_u32,
-            (self.block_n, self.tile_k_u32),
-            (pid_n, None),
-        )
         gX = cute.local_tile(mX_u32, (self.m, self.tile_k_u32), (0, None))
-        tWsW, tWgW = cpasync.tma_partition(
-            tma_atom_w,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sW, 0, 2),
-            cute.group_modes(gW, 0, 2),
-        )
         tXsX, tXgX = cpasync.tma_partition(
             tma_atom_x,
             0,
@@ -391,34 +405,32 @@ class Mxfp8TmaGemv(CuteOp):
             cute.group_modes(gX, 0, 2),
         )
 
-        with self.profile_scope(
-            prof_buf,
-            ProfileTag.TMA_PROLOGUE,
-            pid_n,
-            0,
-            enable_profiling,
-        ):
-            if warp == WarpRole.TMA_PRODUCER:
-                producer = self.tma_producer_load_stage(
-                    producer,
-                    tma_atom_w,
-                    tWgW,
-                    tWsW,
-                    tma_atom_x,
-                    tXgX,
-                    tXsX,
-                )
+        for tile_round in cutlass.range(self.tiles_per_cta, unroll=1):
+            producer.reset()
+            consumer.reset()
+            pid_n = physical_cta + tile_round * self.grid_ctas
+            n0 = pid_n * self.block_n
+            gW = cute.local_tile(
+                mW_u32,
+                (self.block_n, self.tile_k_u32),
+                (pid_n, None),
+            )
+            tWsW, tWgW = cpasync.tma_partition(
+                tma_atom_w,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sW, 0, 2),
+                cute.group_modes(gW, 0, 2),
+            )
 
-        accumulators = [cutlass.Float32(0.0) for _ in range(self.rows_per_warp)]
-        for k_tile in cutlass.range_constexpr(self.num_k_tiles):
-            if warp == WarpRole.TMA_PRODUCER and k_tile < self.num_k_tiles - 1:
-                with self.profile_scope(
-                    prof_buf,
-                    ProfileTag.TMA_REFILL,
-                    pid_n,
-                    1 + 3 * k_tile,
-                    enable_profiling,
-                ):
+            with self.profile_scope(
+                prof_buf,
+                ProfileTag.TMA_PROLOGUE,
+                pid_n,
+                0,
+                enable_profiling,
+            ):
+                if warp == WarpRole.TMA_PRODUCER:
                     producer = self.tma_producer_load_stage(
                         producer,
                         tma_atom_w,
@@ -429,37 +441,58 @@ class Mxfp8TmaGemv(CuteOp):
                         tXsX,
                     )
 
-            consumer, accumulators = self.compute_warp_consume_stage(
-                consumer,
-                accumulators,
-                k_tile,
-                lane,
-                owned_row_start,
-                n0,
-                pid_n,
-                sX,
-                sW,
-                mSFX,
-                mSFW,
-                smem_atom,
-                input_scale_atom,
-                weight_scale_atom,
-                chunk_layout,
-                scale_layout,
-                prof_buf,
-                enable_profiling,
-            )
+            accumulators = [cutlass.Float32(0.0) for _ in range(self.rows_per_warp)]
+            for k_tile in cutlass.range_constexpr(self.num_k_tiles):
+                if warp == WarpRole.TMA_PRODUCER and k_tile < self.num_k_tiles - 1:
+                    with self.profile_scope(
+                        prof_buf,
+                        ProfileTag.TMA_REFILL,
+                        pid_n,
+                        1 + 3 * k_tile,
+                        enable_profiling,
+                    ):
+                        producer = self.tma_producer_load_stage(
+                            producer,
+                            tma_atom_w,
+                            tWgW,
+                            tWsW,
+                            tma_atom_x,
+                            tXgX,
+                            tXsX,
+                        )
 
-        with self.profile_scope(
-            prof_buf,
-            ProfileTag.EPILOGUE,
-            pid_n,
-            1 + 3 * self.num_k_tiles,
-            enable_profiling,
-        ):
-            if warp == WarpRole.TMA_PRODUCER:
-                producer.tail()
-            self.compute_warp_store_output(accumulators, lane, owned_row_start, n0, mO)
+                consumer, accumulators = self.compute_warp_consume_stage(
+                    consumer,
+                    accumulators,
+                    k_tile,
+                    lane,
+                    owned_row_start,
+                    n0,
+                    pid_n,
+                    sX,
+                    sW,
+                    mSFX,
+                    mSFW,
+                    smem_atom,
+                    input_scale_atom,
+                    weight_scale_atom,
+                    chunk_layout,
+                    scale_layout,
+                    prof_buf,
+                    enable_profiling,
+                )
+
+            with self.profile_scope(
+                prof_buf,
+                ProfileTag.EPILOGUE,
+                pid_n,
+                1 + 3 * self.num_k_tiles,
+                enable_profiling,
+            ):
+                self.compute_warp_store_output(accumulators, lane, owned_row_start, n0, mO)
+
+        if warp == WarpRole.TMA_PRODUCER:
+            producer.tail()
 
     @cute.jit
     def __call__(
@@ -501,7 +534,7 @@ class Mxfp8TmaGemv(CuteOp):
             self.enable_profiling,
             _name_prefix=name,
         ).launch(
-            grid=[self.n // self.block_n, 1, 1],
+            grid=[self.grid_ctas, 1, 1],
             block=[self.num_compute_warps * 32, 1, 1],
             stream=stream,
         )
@@ -510,7 +543,8 @@ class Mxfp8TmaGemv(CuteOp):
         """Return the static kernel specialization key."""
         return (
             f"{self.n}_{self.sf_k}_{self.block_n}_{self.num_stages}"
-            f"_cw={self.num_compute_warps}_profile={self.enable_profiling}"
+            f"_cw={self.num_compute_warps}_scheduler={self.grid_scheduler.value}"
+            f"_grid={self.grid_ctas}_profile={self.enable_profiling}"
         )
 
     def get_name(self) -> str:
@@ -519,7 +553,7 @@ class Mxfp8TmaGemv(CuteOp):
         return (
             f"mxfp8_tma_gemv_n{self.n}_k{self.sf_k * 32}"
             f"_bn{self.block_n}_s{self.num_stages}_cw{self.num_compute_warps}"
-            f"{profile_suffix}"
+            f"_{self.grid_scheduler.value}_grid{self.grid_ctas}{profile_suffix}"
         )
 
     def interface(
@@ -641,6 +675,8 @@ def get_mxfp8_tma_gemv(
     num_stages: int = 2,
     enable_profiling: bool = False,
     num_compute_warps: int = 1,
+    grid_scheduler: GridScheduler = GridScheduler.STATIC,
+    num_persistent_ctas: int | None = None,
 ) -> Mxfp8TmaGemv:
     """Return a cached MXFP8 TMA GEMV specialization."""
     return Mxfp8TmaGemv(
@@ -650,6 +686,8 @@ def get_mxfp8_tma_gemv(
         num_stages,
         enable_profiling,
         num_compute_warps,
+        grid_scheduler,
+        num_persistent_ctas,
     )
 
 
@@ -683,6 +721,8 @@ def mxfp8_tma_gemv(
     enable_profiling: bool = False,
     profile_buffer: torch.Tensor | None = None,
     num_compute_warps: int | None = None,
+    grid_scheduler: GridScheduler = GridScheduler.STATIC,
+    num_persistent_ctas: int | None = None,
 ) -> torch.Tensor:
     """Compute raw-layout MXFP8 GEMV on prequantized inputs.
 
@@ -698,6 +738,10 @@ def mxfp8_tma_gemv(
         profile_buffer: Buffer from ``profile_session`` for the profiled specialization.
         num_compute_warps: Consumer warps sharing each CTA's output-row tile. ``None``
             selects the B200-tuned value and remains one warp on other architectures.
+        grid_scheduler: Launch one CTA per output tile or reuse a persistent CTA grid.
+        num_persistent_ctas: Maximum physical CTA count for the persistent scheduler.
+            ``None`` requests eight CTAs per SM; the launch rounds down to a divisor
+            of the logical tile count so every physical CTA executes equal work.
 
     Returns:
         The provided or newly allocated output tensor.
@@ -708,6 +752,12 @@ def mxfp8_tma_gemv(
         num_compute_warps = select_mxfp8_tma_compute_warps(
             q_input.shape[1], block_n, q_input.device
         )
+    grid_scheduler = GridScheduler(grid_scheduler)
+    if grid_scheduler is GridScheduler.PERSISTENT and num_persistent_ctas is None:
+        num_persistent_ctas = (
+            DEFAULT_PERSISTENT_CTAS_PER_SM
+            * torch.cuda.get_device_properties(q_input.device).multi_processor_count
+        )
     return get_mxfp8_tma_gemv(
         weight.shape[0],
         q_input.shape[1],
@@ -715,6 +765,8 @@ def mxfp8_tma_gemv(
         num_stages,
         enable_profiling,
         num_compute_warps,
+        grid_scheduler,
+        num_persistent_ctas,
     ).interface(
         q_input,
         weight,
@@ -748,6 +800,11 @@ def profile_mxfp8_tma(
         int | None,
         typer.Option(help="Compute warps per CTA; defaults to the architecture-tuned value."),
     ] = None,
+    grid_scheduler: GridScheduler = GridScheduler.STATIC,
+    num_persistent_ctas: Annotated[
+        int | None,
+        typer.Option(help="Maximum persistent CTA count; defaults to eight CTAs per SM."),
+    ] = None,
     output: Path = Path("mxfp8_tma.pftrace"),
     seed: int = 0,
     warmups: int = 1,
@@ -769,6 +826,11 @@ def profile_mxfp8_tma(
     )
     if num_compute_warps is None:
         num_compute_warps = select_mxfp8_tma_compute_warps(k, block_n, torch_device)
+    if grid_scheduler is GridScheduler.PERSISTENT and num_persistent_ctas is None:
+        num_persistent_ctas = (
+            DEFAULT_PERSISTENT_CTAS_PER_SM
+            * torch.cuda.get_device_properties(torch_device).multi_processor_count
+        )
     op = get_mxfp8_tma_gemv(
         n,
         k,
@@ -776,6 +838,8 @@ def profile_mxfp8_tma(
         num_stages,
         enable_profiling=True,
         num_compute_warps=num_compute_warps,
+        grid_scheduler=grid_scheduler,
+        num_persistent_ctas=num_persistent_ctas,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
 
