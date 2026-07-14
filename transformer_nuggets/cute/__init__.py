@@ -13,15 +13,27 @@ from transformer_nuggets.cute.utils import visualize_tv_layout
 from transformer_nuggets.cute import profiler
 
 
-_MXFP8_TMA_EXPORTS = {
+_BLOCKSCALED_TMA_EXPORTS = {
     "DEFAULT_PERSISTENT_CTAS_PER_SM",
     "GridScheduler",
+    "ProfileTag",
+}
+
+_MXFP8_TMA_EXPORTS = {
     "MXFP8_TMA_PROFILE_TAGS",
     "Mxfp8TmaGemv",
-    "ProfileTag",
     "get_mxfp8_tma_gemv",
     "mxfp8_tma_gemv",
     "select_mxfp8_tma_compute_warps",
+}
+
+_NVFP4_TMA_EXPORTS = {
+    "NVFP4_TMA_PROFILE_TAGS",
+    "Nvfp4TmaGemv",
+    "get_nvfp4_tma_gemv",
+    "nvfp4_tma_gemv",
+    "nvfp4_tma_scaled_mm",
+    "select_nvfp4_tma_compute_warps",
 }
 
 _SYMMETRIC_MEMORY_EXPORTS = {
@@ -34,10 +46,18 @@ _SYMMETRIC_MEMORY_EXPORTS = {
 
 
 def __getattr__(name):
+    if name in _BLOCKSCALED_TMA_EXPORTS:
+        from transformer_nuggets.cute import blockscaled_tma
+
+        return getattr(blockscaled_tma, name)
     if name in _MXFP8_TMA_EXPORTS:
         from transformer_nuggets.cute import mxfp8_tma
 
         return getattr(mxfp8_tma, name)
+    if name in _NVFP4_TMA_EXPORTS:
+        from transformer_nuggets.cute import nvfp4_tma
+
+        return getattr(nvfp4_tma, name)
     if name in _SYMMETRIC_MEMORY_EXPORTS:
         from transformer_nuggets.cute import symmetric_memory
 
