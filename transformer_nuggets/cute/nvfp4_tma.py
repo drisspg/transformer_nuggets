@@ -286,7 +286,7 @@ def nvfp4_tma_scaled_mm(
     scale_a: torch.Tensor,
     scale_b: torch.Tensor,
     *,
-    block_n: int,
+    block_n: int | None = None,
     global_scale_a: torch.Tensor | None = None,
     global_scale_b: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
@@ -317,12 +317,38 @@ def nvfp4_tma_scaled_mm(
     )
 
 
-def select_nvfp4_tma_compute_warps(block_n: int) -> int:
-    """Select the largest warp count that preserves at least two rows per warp."""
+def select_nvfp4_tma_compute_warps(
+    k: int,
+    block_n: int,
+    device: torch.device | str | int | None = None,
+) -> int:
+    """Select the B200-tuned NVFP4 compute-warp count."""
+    if torch.cuda.get_device_capability(device) != (10, 0):
+        return 1
+    target_rows_per_warp = 1 if k >= 12288 else 2
     for num_compute_warps in (4, 2, 1):
-        if block_n % num_compute_warps == 0 and block_n // num_compute_warps >= 2:
+        if (
+            block_n % num_compute_warps == 0
+            and block_n // num_compute_warps >= target_rows_per_warp
+        ):
             return num_compute_warps
     return 1
+
+
+def select_nvfp4_tma_config(
+    n: int,
+    k: int,
+    device: torch.device | str | int | None = None,
+) -> tuple[int, int, int]:
+    """Select the B200-tuned block, stage, and compute-warp configuration."""
+    if torch.cuda.get_device_capability(device) != (10, 0):
+        block_n = next(candidate for candidate in (8, 4, 2, 1) if n % candidate == 0)
+        return block_n, 2, 1
+    preferred_block_n = 4 if k >= 12288 else 16 if n >= 12288 else 8
+    block_n = next(
+        candidate for candidate in (preferred_block_n, 8, 4, 2, 1) if n % candidate == 0
+    )
+    return block_n, 2, select_nvfp4_tma_compute_warps(k, block_n, device)
 
 
 def nvfp4_tma_gemv(
@@ -331,7 +357,7 @@ def nvfp4_tma_gemv(
     input_scale: torch.Tensor,
     weight_scale: torch.Tensor,
     *,
-    block_n: int,
+    block_n: int | None = None,
     num_stages: int = 2,
     input_global_scale: torch.Tensor | None = None,
     weight_global_scale: torch.Tensor | None = None,
@@ -346,8 +372,16 @@ def nvfp4_tma_gemv(
     if q_input.ndim != 2 or weight.ndim != 2:
         raise ValueError("q_input and weight must be rank-2 tensors")
     k = q_input.shape[1] * 2
-    if num_compute_warps is None:
-        num_compute_warps = select_nvfp4_tma_compute_warps(block_n)
+    if block_n is None:
+        block_n, num_stages, selected_compute_warps = select_nvfp4_tma_config(
+            weight.shape[0],
+            k,
+            q_input.device,
+        )
+        if num_compute_warps is None:
+            num_compute_warps = selected_compute_warps
+    elif num_compute_warps is None:
+        num_compute_warps = select_nvfp4_tma_compute_warps(k, block_n, q_input.device)
     grid_scheduler = GridScheduler(grid_scheduler)
     if grid_scheduler is GridScheduler.PERSISTENT and num_persistent_ctas is None:
         num_persistent_ctas = (

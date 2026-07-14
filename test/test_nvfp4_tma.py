@@ -17,6 +17,7 @@ try:
         nvfp4_tma_gemv,
         nvfp4_tma_scaled_mm,
         select_nvfp4_tma_compute_warps,
+        select_nvfp4_tma_config,
     )
     from transformer_nuggets.cute.profiler import profile_session
     from transformer_nuggets.cute.profiler.host import decode_events
@@ -30,10 +31,27 @@ FP4_VALUES = torch.tensor(
 )
 
 
-@pytest.mark.parametrize(("block_n", "expected"), [(4, 2), (8, 4), (16, 4)])
-def test_select_nvfp4_tma_compute_warps(block_n, expected):
-    """Preserve at least two output rows per compute warp."""
-    assert select_nvfp4_tma_compute_warps(block_n) == expected
+@pytest.mark.parametrize(
+    ("k", "block_n", "expected"),
+    [(8192, 4, 2), (8192, 8, 4), (8192, 16, 4), (14336, 4, 4)],
+)
+def test_select_nvfp4_tma_compute_warps(k, block_n, expected):
+    """Use one row per warp only for the measured very-long-K regime."""
+    assert select_nvfp4_tma_compute_warps(k, block_n) == expected
+
+
+@pytest.mark.parametrize(
+    ("n", "k", "expected"),
+    [
+        (4608, 8192, (8, 2, 4)),
+        (8192, 2048, (8, 2, 4)),
+        (14336, 4096, (16, 2, 4)),
+        (4096, 14336, (4, 2, 4)),
+    ],
+)
+def test_select_nvfp4_tma_config(n, k, expected):
+    """Bake in the measured B200 shape families."""
+    assert select_nvfp4_tma_config(n, k) == expected
 
 
 def pack_fp4(codes: torch.Tensor) -> torch.Tensor:
@@ -116,6 +134,14 @@ def test_nvfp4_tma_matches_reference(num_compute_warps):
         block_n=4,
         num_compute_warps=num_compute_warps,
     )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, atol=2.0, rtol=0.05)
+
+
+def test_nvfp4_tma_uses_tuned_default_config():
+    """Run the architecture-tuned block and warp selection when unspecified."""
+    q_input, weight, input_scale, weight_scale, expected, _ = make_case(128, 2048)
+    actual = nvfp4_tma_gemv(q_input, weight, input_scale, weight_scale)
     torch.cuda.synchronize()
     torch.testing.assert_close(actual, expected, atol=2.0, rtol=0.05)
 
