@@ -74,6 +74,7 @@ class BlockscaledTmaGemv(CuteOp):
         grid_scheduler: GridScheduler = GridScheduler.STATIC,
         num_persistent_ctas: int | None = None,
         use_global_scales: bool = False,
+        split_k: int = 1,
     ):
         super().__init__()
         physical_k_bytes = k // values_per_byte
@@ -95,10 +96,15 @@ class BlockscaledTmaGemv(CuteOp):
         self.sf_k = k // scale_block_size
         self.block_n = block_n
         self.num_stages = num_stages
+        self.num_prologue_stages = 1
         self.tile_k_u32 = tile_k_u32
         self.num_k_tiles = physical_k_bytes // (self.tile_k_u32 * 4)
-        if self.num_k_tiles < num_stages:
-            raise ValueError("TMA staging requires at least one K tile per stage")
+        if split_k <= 0 or self.num_k_tiles % split_k != 0:
+            raise ValueError("split_k must be positive and divide the number of K tiles")
+        self.split_k = split_k
+        self.k_tiles_per_split = self.num_k_tiles // split_k
+        if self.k_tiles_per_split < num_stages:
+            raise ValueError("each K split must contain at least one tile per TMA stage")
         logical_values_per_tile = self.tile_k_u32 * 4 * values_per_byte
         self.words_per_lane = tile_k_u32 // 32
         logical_values_per_lane = logical_values_per_tile // 32
@@ -116,6 +122,10 @@ class BlockscaledTmaGemv(CuteOp):
         self.rows_per_warp = block_n // num_compute_warps
         self.num_tiles = n // block_n
         self.grid_scheduler = GridScheduler(grid_scheduler)
+        if self.split_k > 1 and self.grid_scheduler is not GridScheduler.STATIC:
+            raise ValueError("split-K requires the static grid scheduler")
+        if self.split_k > 1 and self.enable_profiling:
+            raise ValueError("split-K profiling is not supported")
         if self.grid_scheduler is GridScheduler.PERSISTENT:
             if num_persistent_ctas is None or num_persistent_ctas <= 0:
                 raise ValueError(
@@ -130,9 +140,9 @@ class BlockscaledTmaGemv(CuteOp):
         else:
             if num_persistent_ctas is not None:
                 raise ValueError("num_persistent_ctas is only valid with the persistent scheduler")
-            self.grid_ctas = self.num_tiles
-        self.tiles_per_cta = self.num_tiles // self.grid_ctas
-        self.max_profile_events_per_cta = 2 + 3 * self.num_k_tiles
+            self.grid_ctas = self.num_tiles * self.split_k
+        self.tiles_per_cta = 1 if self.split_k > 1 else self.num_tiles // self.grid_ctas
+        self.max_profile_events_per_cta = 2 + 3 * self.k_tiles_per_split
         self.num_profile_units = self.num_tiles
 
     @cute.jit
@@ -184,18 +194,19 @@ class BlockscaledTmaGemv(CuteOp):
         tma_atom_x: cute.CopyAtom,
         tXgX: cute.Tensor,
         tXsX: cute.Tensor,
+        k_tile_base: cutlass.Int32,
     ) -> pipeline.PipelineProducer:
         """Acquire one pipeline stage and issue its weight and input TMA loads."""
         stage = producer.acquire_and_advance()
         cute.copy(
             tma_atom_w,
-            tWgW[(None, stage.count)],
+            tWgW[(None, k_tile_base + stage.count)],
             tWsW[(None, stage.index)],
             tma_bar_ptr=stage.barrier,
         )
         cute.copy(
             tma_atom_x,
-            tXgX[(None, stage.count)],
+            tXgX[(None, k_tile_base + stage.count)],
             tXsX[(None, stage.index)],
             tma_bar_ptr=stage.barrier,
         )
@@ -224,7 +235,7 @@ class BlockscaledTmaGemv(CuteOp):
         self,
         scale_tensor: cute.Tensor,
         row_start,
-        k_tile: cutlass.Constexpr,
+        k_tile,
         lane: cutlass.Int32,
         scale_atom: cute.CopyAtom,
         scale_layout: cute.Layout,
@@ -349,7 +360,8 @@ class BlockscaledTmaGemv(CuteOp):
         self,
         consumer: pipeline.PipelineConsumer,
         accumulators: list,
-        k_tile: cutlass.Constexpr,
+        k_tile,
+        profile_k_tile: cutlass.Constexpr,
         lane: cutlass.Int32,
         owned_row_start: cutlass.Int32,
         n0: cutlass.Int32,
@@ -372,7 +384,7 @@ class BlockscaledTmaGemv(CuteOp):
             prof_buf,
             ProfileTag.TMA_WAIT,
             pid_n,
-            2 + 3 * k_tile,
+            2 + 3 * profile_k_tile,
             enable_profiling,
         ):
             input_scales = self.load_scale_values(
@@ -396,7 +408,7 @@ class BlockscaledTmaGemv(CuteOp):
             prof_buf,
             ProfileTag.TILE_COMPUTE,
             pid_n,
-            3 + 3 * k_tile,
+            3 + 3 * profile_k_tile,
             enable_profiling,
         ):
             x_values = self.load_lane_values(
@@ -447,6 +459,7 @@ class BlockscaledTmaGemv(CuteOp):
         lane: cutlass.Int32,
         owned_row_start: cutlass.Int32,
         n0: cutlass.Int32,
+        output_row: cutlass.Int32,
         mGFW: cute.Tensor | None,
         mGFX: cute.Tensor | None,
         mO: cute.Tensor,
@@ -458,12 +471,16 @@ class BlockscaledTmaGemv(CuteOp):
             )
         if lane == 0:
             output_scale = cutlass.Float32(1.0)
-            if cutlass.const_expr(self.use_global_scales):
+            if cutlass.const_expr(self.split_k == 1 and self.use_global_scales):
                 assert mGFX is not None and mGFW is not None
                 output_scale = mGFX[0] * mGFW[0]
             for local_row in cutlass.range_constexpr(self.rows_per_warp):
                 cta_row = owned_row_start + local_row
-                mO[0, n0 + cta_row] = (accumulators[local_row] * output_scale).to(cutlass.BFloat16)
+                if cutlass.const_expr(self.split_k == 1):
+                    result = accumulators[local_row] * output_scale
+                    mO[0, n0 + cta_row] = result.to(cutlass.BFloat16)
+                else:
+                    mO[output_row, n0 + cta_row] = accumulators[local_row]
 
     @cute.kernel
     def kernel(
@@ -483,6 +500,13 @@ class BlockscaledTmaGemv(CuteOp):
         """Schedule logical N tiles across static or persistent CTA grids."""
         tidx, _, _ = cute.arch.thread_idx()
         physical_cta, _, _ = cute.arch.block_idx()
+        if cutlass.const_expr(self.split_k > 1):
+            split_idx = physical_cta // self.num_tiles
+            scheduler_cta = physical_cta % self.num_tiles
+        else:
+            split_idx = cutlass.Int32(0)
+            scheduler_cta = physical_cta
+        k_tile_base = split_idx * self.k_tiles_per_split
         warp = cute.arch.make_warp_uniform(tidx // 32)
         lane = tidx % 32
         owned_row_start = warp * self.rows_per_warp
@@ -534,11 +558,10 @@ class BlockscaledTmaGemv(CuteOp):
             cute.group_modes(sX, 0, 2),
             cute.group_modes(gX, 0, 2),
         )
-
         for tile_round in cutlass.range(self.tiles_per_cta, unroll=1):
             producer.reset()
             consumer.reset()
-            pid_n = physical_cta + tile_round * self.grid_ctas
+            pid_n = scheduler_cta + tile_round * self.grid_ctas
             n0 = pid_n * self.block_n
             gW = cute.local_tile(
                 mW_u32,
@@ -552,7 +575,6 @@ class BlockscaledTmaGemv(CuteOp):
                 cute.group_modes(sW, 0, 2),
                 cute.group_modes(gW, 0, 2),
             )
-
             with self.profile_scope(
                 prof_buf,
                 ProfileTag.TMA_PROLOGUE,
@@ -561,24 +583,33 @@ class BlockscaledTmaGemv(CuteOp):
                 enable_profiling,
             ):
                 if warp == WarpRole.TMA_PRODUCER:
-                    producer = self.tma_producer_load_stage(
-                        producer,
-                        tma_atom_w,
-                        tWgW,
-                        tWsW,
-                        tma_atom_x,
-                        tXgX,
-                        tXsX,
-                    )
+                    for prefetch_stage in cutlass.range_constexpr(self.num_prologue_stages):
+                        producer = self.tma_producer_load_stage(
+                            producer,
+                            tma_atom_w,
+                            tWgW,
+                            tWsW,
+                            tma_atom_x,
+                            tXgX,
+                            tXsX,
+                            k_tile_base,
+                        )
 
             accumulators = [cutlass.Float32(0.0) for _ in range(self.rows_per_warp)]
-            for k_tile in cutlass.range_constexpr(self.num_k_tiles):
-                if warp == WarpRole.TMA_PRODUCER and k_tile < self.num_k_tiles - 1:
+            for local_k_tile in cutlass.range_constexpr(self.k_tiles_per_split):
+                if cutlass.const_expr(self.split_k > 1):
+                    k_tile = k_tile_base + local_k_tile
+                else:
+                    k_tile = local_k_tile
+                if (
+                    warp == WarpRole.TMA_PRODUCER
+                    and local_k_tile + self.num_prologue_stages < self.k_tiles_per_split
+                ):
                     with self.profile_scope(
                         prof_buf,
                         ProfileTag.TMA_REFILL,
                         pid_n,
-                        1 + 3 * k_tile,
+                        1 + 3 * local_k_tile,
                         enable_profiling,
                     ):
                         producer = self.tma_producer_load_stage(
@@ -589,12 +620,14 @@ class BlockscaledTmaGemv(CuteOp):
                             tma_atom_x,
                             tXgX,
                             tXsX,
+                            k_tile_base,
                         )
 
                 consumer, accumulators = self.compute_warp_consume_stage(
                     consumer,
                     accumulators,
                     k_tile,
+                    local_k_tile,
                     lane,
                     owned_row_start,
                     n0,
@@ -616,7 +649,7 @@ class BlockscaledTmaGemv(CuteOp):
                 prof_buf,
                 ProfileTag.EPILOGUE,
                 pid_n,
-                1 + 3 * self.num_k_tiles,
+                1 + 3 * self.k_tiles_per_split,
                 enable_profiling,
             ):
                 self.compute_warp_store_output(
@@ -624,6 +657,7 @@ class BlockscaledTmaGemv(CuteOp):
                     lane,
                     owned_row_start,
                     n0,
+                    split_idx,
                     mGFW,
                     mGFX,
                     mO,
@@ -631,6 +665,27 @@ class BlockscaledTmaGemv(CuteOp):
 
         if warp == WarpRole.TMA_PRODUCER:
             producer.tail()
+
+    @cute.kernel
+    def reduce_split_k(
+        self,
+        partial_output: cute.Tensor,
+        output: cute.Tensor,
+        mGFW: cute.Tensor | None,
+        mGFX: cute.Tensor | None,
+    ):
+        """Reduce FP32 K partitions, apply global scales, and convert to BF16."""
+        tidx, _, _ = cute.arch.thread_idx()
+        block, _, _ = cute.arch.block_idx()
+        column = block * 256 + tidx
+        if column < self.n:
+            result = cutlass.Float32(0.0)
+            for split in cutlass.range_constexpr(self.split_k):
+                result += partial_output[split, column]
+            if cutlass.const_expr(self.use_global_scales):
+                assert mGFX is not None and mGFW is not None
+                result *= mGFX[0] * mGFW[0]
+            output[0, column] = result.to(cutlass.BFloat16)
 
     @cute.jit
     def __call__(
@@ -642,6 +697,7 @@ class BlockscaledTmaGemv(CuteOp):
         mGFW: cute.Tensor | None,
         mGFX: cute.Tensor | None,
         mO: cute.Tensor,
+        mFinal: cute.Tensor | None,
         prof_buf: cute.Tensor | None,
         stream: cuda.CUstream,
     ):
@@ -680,6 +736,19 @@ class BlockscaledTmaGemv(CuteOp):
             block=[self.num_compute_warps * 32, 1, 1],
             stream=stream,
         )
+        if cutlass.const_expr(self.split_k > 1):
+            assert mFinal is not None
+            self.reduce_split_k(
+                mO,
+                mFinal,
+                mGFW,
+                mGFX,
+                _name_prefix=f"{name}_reduce",
+            ).launch(
+                grid=[(self.n + 255) // 256, 1, 1],
+                block=[256, 1, 1],
+                stream=stream,
+            )
 
     def get_key(self) -> str:
         """Return the static kernel specialization key."""
@@ -687,7 +756,7 @@ class BlockscaledTmaGemv(CuteOp):
             f"{self.format_name}_{self.n}_{self.k}_{self.block_n}_{self.num_stages}"
             f"_cw={self.num_compute_warps}_scheduler={self.grid_scheduler.value}"
             f"_grid={self.grid_ctas}_global={self.use_global_scales}"
-            f"_profile={self.enable_profiling}"
+            f"_split_k={self.split_k}_profile={self.enable_profiling}"
         )
 
     def get_name(self) -> str:
@@ -698,5 +767,5 @@ class BlockscaledTmaGemv(CuteOp):
             f"{self.format_name}_tma_gemv_n{self.n}_k{self.k}"
             f"_bn{self.block_n}_s{self.num_stages}_cw{self.num_compute_warps}"
             f"_{self.grid_scheduler.value}_grid{self.grid_ctas}"
-            f"{global_suffix}{profile_suffix}"
+            f"_splitk{self.split_k}{global_suffix}{profile_suffix}"
         )

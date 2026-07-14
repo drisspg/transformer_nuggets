@@ -121,6 +121,7 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
         grid_scheduler: GridScheduler = GridScheduler.STATIC,
         num_persistent_ctas: int | None = None,
         use_global_scales: bool = False,
+        split_k: int = 1,
     ):
         super().__init__(
             n,
@@ -141,24 +142,18 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
             grid_scheduler=grid_scheduler,
             num_persistent_ctas=num_persistent_ctas,
             use_global_scales=use_global_scales,
+            split_k=split_k,
         )
-        self.use_streaming_decode = self.num_k_tiles <= 4 or self.num_k_tiles >= 16
+        self.num_prologue_stages = self.num_stages - 1
 
     @cute.jit
     def decode_lane_values(self, raw_values: cute.Tensor):
-        """Decode 32 packed E2M1 values into register-resident FP16 groups."""
-        if cutlass.const_expr(self.use_streaming_decode):
-            return (
-                decode_e2m1x8_words(raw_values[0, 0]),
-                decode_e2m1x8_words(raw_values[0, 1]),
-                decode_e2m1x8_words(raw_values[0, 2]),
-                decode_e2m1x8_words(raw_values[0, 3]),
-            )
+        """Decode 32 packed E2M1 values into register-resident FP16x2 words."""
         return (
-            cute.recast_tensor(raw_values, cutlass.Float4E2M1FN)
-            .load()
-            .to(cutlass.Float16)
-            .reshape((16, 2))
+            decode_e2m1x8_words(raw_values[0, 0]),
+            decode_e2m1x8_words(raw_values[0, 1]),
+            decode_e2m1x8_words(raw_values[0, 2]),
+            decode_e2m1x8_words(raw_values[0, 3]),
         )
 
     @cute.jit
@@ -171,10 +166,8 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
         smem_atom: cute.CopyAtom,
         chunk_layout: cute.Layout,
     ):
-        """Keep selected packed weights raw until each immediate dot reduction."""
-        if cutlass.const_expr(self.use_streaming_decode):
-            return self.load_lane_words(smem, row, lane, stage, smem_atom, chunk_layout)
-        return self.load_lane_values(smem, row, lane, stage, smem_atom, chunk_layout)
+        """Keep packed weights raw until each immediate dot reduction."""
+        return self.load_lane_words(smem, row, lane, stage, smem_atom, chunk_layout)
 
     @cute.jit
     def load_scale_values(
@@ -209,7 +202,7 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
         self,
         scale_tensor: cute.Tensor,
         row_start,
-        k_tile: cutlass.Constexpr,
+        k_tile,
         lane: cutlass.Int32,
         scale_atom: cute.CopyAtom,
         scale_layout: cute.Layout,
@@ -278,36 +271,20 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
         weight_scales,
     ):
         """Accumulate two independently scaled 16-value E2M1 blocks."""
-        if cutlass.const_expr(self.use_streaming_decode):
-            partials = tuple(
-                dot_e2m1x8(
-                    x_values[word][0],
-                    x_values[word][1],
-                    x_values[word][2],
-                    x_values[word][3],
-                    w_values[0, word],
-                )
-                for word in range(4)
+        partials = tuple(
+            dot_e2m1x8(
+                x_values[word][0],
+                x_values[word][1],
+                x_values[word][2],
+                x_values[word][3],
+                w_values[0, word],
             )
-            products = (
-                partials[0] + partials[1],
-                partials[2] + partials[3],
-            )
-        else:
-            products = (
-                (x_values * w_values)
-                .reshape((2, 8, 2))
-                .reduce(
-                    cute.ReductionOp.ADD,
-                    cutlass.Float16(0.0),
-                    (1, None, None),
-                )
-            )
-            products = products.to(cutlass.Float32).reduce(
-                cute.ReductionOp.ADD,
-                cutlass.Float32(0.0),
-                (1, None),
-            )
+            for word in range(4)
+        )
+        products = (
+            partials[0] + partials[1],
+            partials[2] + partials[3],
+        )
         for scale_idx in cutlass.range_constexpr(2):
             accumulator += products[scale_idx] * input_scales[scale_idx] * weight_scales[scale_idx]
         return accumulator
@@ -322,6 +299,7 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
         weight_global_scale: torch.Tensor | None = None,
         output: torch.Tensor | None = None,
         profile_buffer: torch.Tensor | None = None,
+        partial_output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Launch packed NVFP4 GEMV into a contiguous BF16 output."""
         expected_shapes = {
@@ -388,6 +366,21 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
             or not output.is_contiguous()
         ):
             raise ValueError("output must be a contiguous [1, N] BF16 tensor on the input device")
+        if self.split_k == 1:
+            if partial_output is not None:
+                raise ValueError("partial_output requires split_k greater than one")
+            kernel_output = output
+        else:
+            if partial_output is None:
+                raise ValueError("partial_output is required when split_k is greater than one")
+            if (
+                partial_output.shape != (self.split_k, self.n)
+                or partial_output.dtype != torch.float32
+                or partial_output.device != q_input.device
+                or not partial_output.is_contiguous()
+            ):
+                raise ValueError("partial_output must be contiguous split_k-by-N CUDA float32")
+            kernel_output = partial_output
 
         expected_profile_numel = self.num_profile_units * (1 + 4 * self.max_profile_events_per_cta)
         if self.enable_profiling:
@@ -429,7 +422,12 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
             ),
             fake_global_scale,
             fake_global_scale,
-            make_fake_compact_tensor(cutlass.BFloat16, (1, self.n)),
+            make_fake_compact_tensor(
+                cutlass.BFloat16 if self.split_k == 1 else cutlass.Float32,
+                (1, self.n) if self.split_k == 1 else (self.split_k, self.n),
+                assumed_align=16 if self.split_k == 1 else 4,
+            ),
+            make_fake_compact_tensor(cutlass.BFloat16, (1, self.n)) if self.split_k > 1 else None,
             fake_profile_buffer,
             fake_stream(),
             _name_prefix=self.get_name(),
@@ -441,7 +439,8 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
             input_scale.view(torch.uint8),
             weight_global_scale,
             input_global_scale,
-            output,
+            kernel_output,
+            output if self.split_k > 1 else None,
             profile_buffer,
         )
         return output
@@ -458,6 +457,7 @@ def get_nvfp4_tma_gemv(
     grid_scheduler: GridScheduler = GridScheduler.STATIC,
     num_persistent_ctas: int | None = None,
     use_global_scales: bool = False,
+    split_k: int = 1,
 ) -> Nvfp4TmaGemv:
     """Return a cached NVFP4 TMA GEMV specialization."""
     return Nvfp4TmaGemv(
@@ -470,6 +470,7 @@ def get_nvfp4_tma_gemv(
         grid_scheduler,
         num_persistent_ctas,
         use_global_scales,
+        split_k,
     )
 
 
@@ -483,12 +484,34 @@ def nvfp4_tma_scaled_mm(
     global_scale_a: torch.Tensor | None = None,
     global_scale_b: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
+    partial_output: torch.Tensor | None = None,
+    split_k: int = 1,
     num_stages: int = 2,
     num_compute_warps: int | None = None,
     grid_scheduler: GridScheduler = GridScheduler.STATIC,
     num_persistent_ctas: int | None = None,
 ) -> torch.Tensor:
-    """Run the M=1 subset using F.scaled_mm's transposed-B convention."""
+    """Run the M=1 subset using F.scaled_mm's transposed-B convention.
+
+    Args:
+        mat_a: Contiguous packed FP4 input with logical shape ``[1, K]``.
+        mat_b: Metadata transpose of contiguous packed ``[N, K]`` weight storage.
+        scale_a: Swizzled E4M3 input block scales.
+        scale_b: Swizzled E4M3 weight block scales.
+        block_n: Output rows per CTA, or ``None`` for architecture tuning.
+        global_scale_a: Optional tensorwise FP32 input scale.
+        global_scale_b: Optional tensorwise FP32 weight scale.
+        output: Optional caller-owned contiguous ``[1, N]`` BF16 output.
+        partial_output: Caller-owned ``[split_k, N]`` FP32 workspace for split-K.
+        split_k: Number of parallel K partitions. Values above one require a static grid.
+        num_stages: Number of TMA pipeline stages.
+        num_compute_warps: Consumer warps per CTA, or ``None`` for architecture tuning.
+        grid_scheduler: Static or persistent N-tile scheduling.
+        num_persistent_ctas: Maximum physical CTA count for persistent scheduling.
+
+    Returns:
+        The provided or newly allocated BF16 output.
+    """
     if mat_b.ndim != 2:
         raise ValueError("mat_b must be rank-2")
     weight = mat_b.t()
@@ -504,6 +527,8 @@ def nvfp4_tma_scaled_mm(
         input_global_scale=global_scale_a,
         weight_global_scale=global_scale_b,
         output=output,
+        partial_output=partial_output,
+        split_k=split_k,
         num_compute_warps=num_compute_warps,
         grid_scheduler=grid_scheduler,
         num_persistent_ctas=num_persistent_ctas,
@@ -541,7 +566,33 @@ def select_nvfp4_tma_config(
     block_n = next(
         candidate for candidate in (preferred_block_n, 8, 4, 2, 1) if n % candidate == 0
     )
-    return block_n, 2, select_nvfp4_tma_compute_warps(k, block_n, device)
+    num_compute_warps = select_nvfp4_tma_compute_warps(k, block_n, device)
+    if k >= 16384 and block_n == 8 and num_compute_warps == 4:
+        num_tiles = n // block_n
+        num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+        s2_waves = (num_tiles + 12 * num_sms - 1) // (12 * num_sms)
+        s3_waves = (num_tiles + 10 * num_sms - 1) // (10 * num_sms)
+        num_stages = 2 if s2_waves < s3_waves else 3
+    else:
+        num_stages = 3 if k >= 14336 and n >= 8192 else 2
+    return block_n, num_stages, num_compute_warps
+
+
+def select_nvfp4_tma_split_k(
+    n: int,
+    k: int,
+    device: torch.device | str | int | None = None,
+) -> int:
+    """Select a small split-K only when the N grid cannot fill the B200."""
+    if torch.cuda.get_device_capability(device) != (10, 0):
+        return 1
+    if k % 4096:
+        return 1
+    if n <= 1024 and k >= 16384:
+        return 4
+    if n <= 2048 and k >= 24576:
+        return 4
+    return 1
 
 
 def nvfp4_tma_gemv(
@@ -555,13 +606,37 @@ def nvfp4_tma_gemv(
     input_global_scale: torch.Tensor | None = None,
     weight_global_scale: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
+    partial_output: torch.Tensor | None = None,
+    split_k: int = 1,
     enable_profiling: bool = False,
     profile_buffer: torch.Tensor | None = None,
     num_compute_warps: int | None = None,
     grid_scheduler: GridScheduler = GridScheduler.STATIC,
     num_persistent_ctas: int | None = None,
 ) -> torch.Tensor:
-    """Compute M=1 NVFP4 GEMV with optional tensorwise decode scales."""
+    """Compute M=1 NVFP4 GEMV with optional tensorwise scales and split-K.
+
+    Args:
+        q_input: Contiguous packed FP4 input with logical shape ``[1, K]``.
+        weight: Contiguous packed FP4 weight with logical shape ``[N, K]``.
+        input_scale: Canonically swizzled E4M3 input block scales.
+        weight_scale: Canonically swizzled E4M3 weight block scales.
+        block_n: Output rows per CTA, or ``None`` for architecture tuning.
+        num_stages: Number of TMA pipeline stages.
+        input_global_scale: Optional tensorwise FP32 input scale.
+        weight_global_scale: Optional tensorwise FP32 weight scale.
+        output: Optional caller-owned contiguous ``[1, N]`` BF16 output.
+        partial_output: Caller-owned ``[split_k, N]`` FP32 workspace for split-K.
+        split_k: Number of parallel K partitions. Values above one require a static grid.
+        enable_profiling: Compile static intra-kernel profiling regions.
+        profile_buffer: Profiling buffer required by profiled specializations.
+        num_compute_warps: Consumer warps per CTA, or ``None`` for architecture tuning.
+        grid_scheduler: Static or persistent N-tile scheduling.
+        num_persistent_ctas: Maximum physical CTA count for persistent scheduling.
+
+    Returns:
+        The provided or newly allocated BF16 output.
+    """
     if q_input.ndim != 2 or weight.ndim != 2:
         raise ValueError("q_input and weight must be rank-2 tensors")
     k = q_input.shape[1] * 2
@@ -592,6 +667,7 @@ def nvfp4_tma_gemv(
         grid_scheduler,
         num_persistent_ctas,
         use_global_scales,
+        split_k,
     ).interface(
         q_input,
         weight,
@@ -601,4 +677,5 @@ def nvfp4_tma_gemv(
         weight_global_scale,
         output,
         profile_buffer,
+        partial_output,
     )

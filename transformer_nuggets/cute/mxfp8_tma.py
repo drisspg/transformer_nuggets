@@ -121,7 +121,7 @@ class Mxfp8TmaGemv(BlockscaledTmaGemv):
         self,
         scale_tensor: cute.Tensor,
         row_start,
-        k_tile: cutlass.Constexpr,
+        k_tile,
         lane: cutlass.Int32,
         scale_atom: cute.CopyAtom,
         scale_layout: cute.Layout,
@@ -320,6 +320,7 @@ class Mxfp8TmaGemv(BlockscaledTmaGemv):
             None,
             None,
             make_fake_compact_tensor(cutlass.BFloat16, (1, self.n)),
+            None,
             fake_profile_buffer,
             fake_stream(),
             _name_prefix=self.get_name(),
@@ -332,6 +333,7 @@ class Mxfp8TmaGemv(BlockscaledTmaGemv):
             None,
             None,
             output,
+            None,
             profile_buffer,
         )
         return output

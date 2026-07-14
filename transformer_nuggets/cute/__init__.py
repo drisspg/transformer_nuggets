@@ -37,6 +37,7 @@ _NVFP4_TMA_EXPORTS = {
     "nvfp4_tma_scaled_mm",
     "select_nvfp4_tma_compute_warps",
     "select_nvfp4_tma_config",
+    "select_nvfp4_tma_split_k",
 }
 
 _SYMMETRIC_MEMORY_EXPORTS = {

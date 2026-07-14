@@ -18,6 +18,7 @@ try:
         nvfp4_tma_scaled_mm,
         select_nvfp4_tma_compute_warps,
         select_nvfp4_tma_config,
+        select_nvfp4_tma_split_k,
     )
     from transformer_nuggets.cute.profiler import profile_session
     from transformer_nuggets.cute.profiler.host import decode_events
@@ -47,11 +48,34 @@ def test_select_nvfp4_tma_compute_warps(k, block_n, expected):
         (8192, 2048, (8, 2, 4)),
         (14336, 4096, (16, 2, 4)),
         (4096, 14336, (8, 2, 4)),
+        (8192, 14336, (8, 3, 4)),
+        (8192, 28672, (8, 3, 4)),
+        (12288, 16384, (8, 2, 4)),
+        (14336, 16384, (8, 3, 4)),
+        (24576, 24576, (8, 2, 4)),
+        (32768, 32768, (8, 3, 4)),
     ],
 )
 def test_select_nvfp4_tma_config(n, k, expected):
     """Bake in the measured B200 shape families."""
     assert select_nvfp4_tma_config(n, k) == expected
+
+
+@pytest.mark.parametrize(
+    ("n", "k", "expected"),
+    [
+        (1024, 16384, 4),
+        (1024, 17408, 1),
+        (2048, 16384, 1),
+        (2048, 24576, 4),
+        (4096, 32768, 1),
+    ],
+)
+def test_select_nvfp4_tma_split_k(n, k, expected):
+    """Use split-K only for measured underfilled long-K grids."""
+    if torch.cuda.get_device_capability() != (10, 0):
+        expected = 1
+    assert select_nvfp4_tma_split_k(n, k) == expected
 
 
 def pack_fp4(codes: torch.Tensor) -> torch.Tensor:
@@ -176,9 +200,10 @@ def test_nvfp4_tma_fp16_partial_reduction_preserves_extreme_values():
     torch.testing.assert_close(actual, expected, atol=2.0, rtol=0.01)
 
 
-def test_nvfp4_tma_long_k_streaming_decode_matches_reference_bitwise():
-    """Preserve the exact BF16 result across the long-K decode crossover."""
-    q_input, weight, input_scale, weight_scale, expected, _ = make_case(128, 16384)
+@pytest.mark.parametrize("k", [8192, 16384])
+def test_nvfp4_tma_streaming_decode_matches_reference_bitwise(k):
+    """Preserve the exact BF16 result across middle- and long-K streaming decode."""
+    q_input, weight, input_scale, weight_scale, expected, _ = make_case(128, k)
     actual = nvfp4_tma_gemv(
         q_input,
         weight,
@@ -282,6 +307,95 @@ def test_nvfp4_tma_matches_scaled_mm_global_scale_contract():
     )
     torch.cuda.synchronize()
     torch.testing.assert_close(actual, expected, atol=2.0, rtol=0.05)
+
+
+def test_nvfp4_tma_split_k_requires_partial_output():
+    """Require caller-owned FP32 workspace for allocation-free split-K replay."""
+    q_input, weight, input_scale, weight_scale, _, _ = make_case(128, 8192)
+    with pytest.raises(ValueError, match="partial_output is required"):
+        nvfp4_tma_gemv(
+            q_input,
+            weight,
+            input_scale,
+            weight_scale,
+            block_n=8,
+            num_compute_warps=4,
+            split_k=2,
+        )
+
+
+def test_nvfp4_tma_split_k_applies_global_scales_after_reduction():
+    """Apply tensorwise scales after cancelling FP32 K partitions."""
+    n, k, split_k = 8, 4096, 2
+    input_codes = torch.full((1, k), 7, dtype=torch.uint8, device="cuda")
+    weight_codes = torch.full((n, k), 7, dtype=torch.uint8, device="cuda")
+    weight_codes[:, k // 2 :] = 15
+    scales = torch.full((1, k // 16), 448.0, device="cuda").to(torch.float8_e4m3fn)
+    weight_scales = scales.expand(n, -1).contiguous()
+    global_scale = torch.tensor([1e30], dtype=torch.float32, device="cuda")
+    output = torch.empty((1, n), dtype=torch.bfloat16, device="cuda")
+    partial_output = torch.empty((split_k, n), dtype=torch.float32, device="cuda")
+    nvfp4_tma_gemv(
+        pack_fp4(input_codes),
+        pack_fp4(weight_codes),
+        swizzle_scales(scales),
+        swizzle_scales(weight_scales),
+        block_n=8,
+        num_compute_warps=4,
+        split_k=split_k,
+        input_global_scale=global_scale,
+        weight_global_scale=torch.ones_like(global_scale),
+        output=output,
+        partial_output=partial_output,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, torch.zeros_like(output), atol=0, rtol=0)
+
+
+def test_nvfp4_tma_split_k_accepts_scalar_aligned_workspace():
+    """Accept contiguous FP32 workspaces without imposing vector alignment."""
+    n, k, split_k = 128, 8192, 2
+    q_input, weight, input_scale, weight_scale, expected, _ = make_case(n, k)
+    storage = torch.empty(split_k * n + 1, dtype=torch.float32, device="cuda")
+    partial_output = storage[1:].view(split_k, n)
+    output = torch.empty_like(expected)
+    nvfp4_tma_gemv(
+        q_input,
+        weight,
+        input_scale,
+        weight_scale,
+        block_n=8,
+        num_compute_warps=4,
+        split_k=split_k,
+        output=output,
+        partial_output=partial_output,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, expected, atol=2.0, rtol=0.05)
+
+
+@pytest.mark.parametrize(("k", "split_k", "num_stages"), [(8192, 2, 2), (16384, 4, 3)])
+def test_nvfp4_tma_split_k_cuda_graph(k, split_k, num_stages):
+    """Reduce parallel K partitions in FP32 before the final BF16 conversion."""
+    n = 128
+    q_input, weight, input_scale, weight_scale, expected, _ = make_case(n, k)
+    output = torch.empty_like(expected)
+    partial_output = torch.empty((split_k, n), dtype=torch.float32, device="cuda")
+    kwargs = {
+        "block_n": 8,
+        "num_compute_warps": 4,
+        "num_stages": num_stages,
+        "split_k": split_k,
+        "output": output,
+        "partial_output": partial_output,
+    }
+    nvfp4_tma_gemv(q_input, weight, input_scale, weight_scale, **kwargs)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        nvfp4_tma_gemv(q_input, weight, input_scale, weight_scale, **kwargs)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, expected, atol=2.0, rtol=0.05)
 
 
 def test_nvfp4_tma_persistent_cuda_graph():
