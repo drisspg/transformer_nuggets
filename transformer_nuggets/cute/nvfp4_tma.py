@@ -4,6 +4,9 @@ from functools import cache
 
 import cutlass
 import cutlass.cute as cute
+from cutlass._mlir import ir
+from cutlass._mlir.dialects import llvm, vector
+from cutlass.cutlass_dsl import T, dsl_user_op
 import torch
 
 from transformer_nuggets.cute.blockscaled_tma import (
@@ -17,6 +20,46 @@ from transformer_nuggets.cute.utils import fake_stream, make_fake_compact_tensor
 
 
 NVFP4_TMA_PROFILE_TAGS = BLOCKSCALED_TMA_PROFILE_TAGS
+
+
+@dsl_user_op
+def decode_e2m1x8(
+    packed: cutlass.Uint32,
+    *,
+    loc: ir.Location | None = None,
+    ip: ir.InsertionPoint | None = None,
+) -> cute.TensorSSA:
+    """Decode one packed E2M1 word with the native four-instruction conversion."""
+    converted = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [packed.ir_value(loc=loc, ip=ip)],
+        """{
+            .reg .b8 b0, b1, b2, b3;
+            mov.b32 {b0, b1, b2, b3}, $4;
+            cvt.rn.f16x2.e2m1x2 $0, b0;
+            cvt.rn.f16x2.e2m1x2 $1, b1;
+            cvt.rn.f16x2.e2m1x2 $2, b2;
+            cvt.rn.f16x2.e2m1x2 $3, b3;
+        }""",
+        "=r,=r,=r,=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+    converted_words = vector.from_elements(
+        ir.VectorType.get([4], T.i32(), loc=loc),
+        [llvm.extractvalue(T.i32(), converted, [word], loc=loc, ip=ip) for word in range(4)],
+        loc=loc,
+        ip=ip,
+    )
+    converted_values = llvm.bitcast(
+        ir.VectorType.get([8], cutlass.Float16.mlir_type, loc=loc),
+        converted_words,
+        loc=loc,
+        ip=ip,
+    )
+    return cute.TensorSSA(converted_values, (8,), cutlass.Float16, loc=loc, ip=ip)
 
 
 class Nvfp4TmaGemv(BlockscaledTmaGemv):
@@ -59,7 +102,14 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
 
     @cute.jit
     def decode_lane_values(self, raw_values: cute.Tensor):
-        """Decode 32 packed E2M1 values into two 16-value groups."""
+        """Decode 32 packed E2M1 values into register-resident FP16 groups."""
+        if cutlass.const_expr(self.k <= 4096):
+            return (
+                decode_e2m1x8(raw_values[0, 0]),
+                decode_e2m1x8(raw_values[0, 1]),
+                decode_e2m1x8(raw_values[0, 2]),
+                decode_e2m1x8(raw_values[0, 3]),
+            )
         return (
             cute.recast_tensor(raw_values, cutlass.Float4E2M1FN)
             .load()
@@ -169,21 +219,38 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
         weight_scales,
     ):
         """Accumulate two independently scaled 16-value E2M1 blocks."""
-        fp16_reduction_width = 8 if self.k <= 4096 else 2
-        products = (
-            (x_values * w_values)
-            .reshape((fp16_reduction_width, 16 // fp16_reduction_width, 2))
-            .reduce(
-                cute.ReductionOp.ADD,
-                cutlass.Float16(0.0),
-                (1, None, None),
+        if cutlass.const_expr(self.k <= 4096):
+            partial0 = (x_values[0] * w_values[0]).reduce(
+                cute.ReductionOp.ADD, cutlass.Float16(0.0), 0
             )
-        )
-        products = products.to(cutlass.Float32).reduce(
-            cute.ReductionOp.ADD,
-            cutlass.Float32(0.0),
-            (1, None),
-        )
+            partial1 = (x_values[1] * w_values[1]).reduce(
+                cute.ReductionOp.ADD, cutlass.Float16(0.0), 0
+            )
+            partial2 = (x_values[2] * w_values[2]).reduce(
+                cute.ReductionOp.ADD, cutlass.Float16(0.0), 0
+            )
+            partial3 = (x_values[3] * w_values[3]).reduce(
+                cute.ReductionOp.ADD, cutlass.Float16(0.0), 0
+            )
+            products = (
+                cutlass.Float32(partial0) + cutlass.Float32(partial1),
+                cutlass.Float32(partial2) + cutlass.Float32(partial3),
+            )
+        else:
+            products = (
+                (x_values * w_values)
+                .reshape((2, 8, 2))
+                .reduce(
+                    cute.ReductionOp.ADD,
+                    cutlass.Float16(0.0),
+                    (1, None, None),
+                )
+            )
+            products = products.to(cutlass.Float32).reduce(
+                cute.ReductionOp.ADD,
+                cutlass.Float32(0.0),
+                (1, None),
+            )
         for scale_idx in cutlass.range_constexpr(2):
             accumulator += products[scale_idx] * input_scales[scale_idx] * weight_scales[scale_idx]
         return accumulator
