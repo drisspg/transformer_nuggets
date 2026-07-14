@@ -154,8 +154,8 @@ def test_nvfp4_tma_scale_layout_and_paired_loads(block_n, num_compute_warps):
     torch.testing.assert_close(actual, expected, atol=2.0, rtol=0.05)
 
 
-def test_nvfp4_tma_pairwise_fp16_reduction_preserves_extreme_values():
-    """Keep the exact FP16 pairwise range before accumulating partials in FP32."""
+def test_nvfp4_tma_fp16_partial_reduction_preserves_extreme_values():
+    """Keep exact FP16 partial sums before accumulating them in FP32."""
     n, k = 128, 2048
     input_codes = torch.full((1, k), 7, dtype=torch.uint8, device="cuda")
     weight_codes = torch.full((n, k), 7, dtype=torch.uint8, device="cuda")

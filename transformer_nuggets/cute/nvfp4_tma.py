@@ -169,9 +169,10 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
         weight_scales,
     ):
         """Accumulate two independently scaled 16-value E2M1 blocks."""
+        fp16_reduction_width = 8 if self.k <= 4096 else 2
         products = (
             (x_values * w_values)
-            .reshape((2, 8, 2))
+            .reshape((fp16_reduction_width, 16 // fp16_reduction_width, 2))
             .reduce(
                 cute.ReductionOp.ADD,
                 cutlass.Float16(0.0),
