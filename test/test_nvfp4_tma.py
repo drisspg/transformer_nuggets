@@ -46,7 +46,7 @@ def test_select_nvfp4_tma_compute_warps(k, block_n, expected):
         (4608, 8192, (8, 2, 4)),
         (8192, 2048, (8, 2, 4)),
         (14336, 4096, (16, 2, 4)),
-        (4096, 14336, (4, 2, 4)),
+        (4096, 14336, (8, 2, 4)),
     ],
 )
 def test_select_nvfp4_tma_config(n, k, expected):
@@ -132,6 +132,22 @@ def test_nvfp4_tma_matches_reference(num_compute_warps):
         input_scale,
         weight_scale,
         block_n=4,
+        num_compute_warps=num_compute_warps,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, atol=2.0, rtol=0.05)
+
+
+@pytest.mark.parametrize(("block_n", "num_compute_warps"), [(8, 4), (6, 2)])
+def test_nvfp4_tma_scale_layout_and_paired_loads(block_n, num_compute_warps):
+    """Match random scales across blocked-layout boundaries and odd row ownership."""
+    q_input, weight, input_scale, weight_scale, expected, _ = make_case(264, 2048)
+    actual = nvfp4_tma_gemv(
+        q_input,
+        weight,
+        input_scale,
+        weight_scale,
+        block_n=block_n,
         num_compute_warps=num_compute_warps,
     )
     torch.cuda.synchronize()

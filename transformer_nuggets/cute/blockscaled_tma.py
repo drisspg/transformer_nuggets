@@ -60,6 +60,7 @@ class BlockscaledTmaGemv(CuteOp):
         scale_block_size: int,
         tile_k_u32: int,
         scale_copy_bits: int,
+        weight_scale_copy_bits: int | None = None,
         enable_profiling: bool = False,
         num_compute_warps: int = 1,
         grid_scheduler: GridScheduler = GridScheduler.STATIC,
@@ -100,6 +101,7 @@ class BlockscaledTmaGemv(CuteOp):
         self.scale_blocks_per_lane = logical_values_per_lane // scale_block_size
         self.scale_blocks_per_tile = logical_values_per_tile // scale_block_size
         self.scale_copy_bits = scale_copy_bits
+        self.weight_scale_copy_bits = weight_scale_copy_bits or scale_copy_bits
         self.use_global_scales = use_global_scales
         self.enable_profiling = enable_profiling
         self.num_compute_warps = num_compute_warps
@@ -200,6 +202,40 @@ class BlockscaledTmaGemv(CuteOp):
     ):
         """Load the format-specific block scales for one lane."""
         raise NotImplementedError
+
+    @cute.jit
+    def prepare_weight_scale_values(
+        self,
+        scale_tensor: cute.Tensor,
+        row_start,
+        k_tile: cutlass.Constexpr,
+        lane: cutlass.Int32,
+        scale_atom: cute.CopyAtom,
+        scale_layout: cute.Layout,
+    ):
+        """Optionally preload format-specific weight scales shared across row accumulation."""
+        return None
+
+    @cute.jit
+    def load_prepared_weight_scale_values(
+        self,
+        prepared_scales,
+        scale_tensor: cute.Tensor,
+        row,
+        scale_k,
+        local_row: cutlass.Constexpr,
+        lane: cutlass.Int32,
+        scale_atom: cute.CopyAtom,
+        scale_layout: cute.Layout,
+    ):
+        """Load one row's scales directly when the format has no prepared representation."""
+        return self.load_scale_values(
+            scale_tensor,
+            row,
+            scale_k,
+            scale_atom,
+            scale_layout,
+        )
 
     @cute.jit
     def accumulate_scaled_products(
@@ -319,6 +355,14 @@ class BlockscaledTmaGemv(CuteOp):
                 input_scale_atom,
                 scale_layout,
             )
+            prepared_weight_scales = self.prepare_weight_scale_values(
+                mSFW,
+                n0 + owned_row_start,
+                k_tile,
+                lane,
+                weight_scale_atom,
+                scale_layout,
+            )
             for local_row in cutlass.range_constexpr(self.rows_per_warp):
                 cta_row = owned_row_start + local_row
                 global_row = n0 + cta_row
@@ -330,10 +374,13 @@ class BlockscaledTmaGemv(CuteOp):
                     smem_atom,
                     chunk_layout,
                 )
-                weight_scales = self.load_scale_values(
+                weight_scales = self.load_prepared_weight_scale_values(
+                    prepared_weight_scales,
                     mSFW,
                     global_row,
                     scale_k,
+                    local_row,
+                    lane,
                     weight_scale_atom,
                     scale_layout,
                 )
@@ -413,7 +460,7 @@ class BlockscaledTmaGemv(CuteOp):
         weight_scale_atom = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             cutlass.Uint8,
-            num_bits_per_copy=self.scale_copy_bits,
+            num_bits_per_copy=self.weight_scale_copy_bits,
             l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.EVICT_FIRST,
         )
 

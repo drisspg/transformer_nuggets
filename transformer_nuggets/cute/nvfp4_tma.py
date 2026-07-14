@@ -4,6 +4,7 @@ from functools import cache
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.utils.blockscaled_layout as blockscaled_utils
 import torch
 
 from transformer_nuggets.cute.blockscaled_tma import (
@@ -17,16 +18,6 @@ from transformer_nuggets.cute.utils import fake_stream, make_fake_compact_tensor
 
 
 NVFP4_TMA_PROFILE_TAGS = BLOCKSCALED_TMA_PROFILE_TAGS
-
-
-@cute.jit
-def blocked_scale_offset(row, col, col_blocks: cutlass.Constexpr):
-    """Map a logical scale coordinate to SWIZZLE_32_4_4 storage."""
-    row_block = row // 128
-    row_in_block = row % 128
-    return (
-        (((row_block * col_blocks + col // 4) * 32 + row_in_block % 32) * 4) + row_in_block // 32
-    ) * 4 + col % 4
 
 
 class Nvfp4TmaGemv(BlockscaledTmaGemv):
@@ -55,6 +46,11 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
             scale_block_size=16,
             tile_k_u32=128,
             scale_copy_bits=16,
+            weight_scale_copy_bits=(
+                32
+                if block_n // num_compute_warps >= 2 and (block_n // num_compute_warps) % 2 == 0
+                else 16
+            ),
             enable_profiling=enable_profiling,
             num_compute_warps=num_compute_warps,
             grid_scheduler=grid_scheduler,
@@ -73,6 +69,14 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
         )
 
     @cute.jit
+    def blocked_scale_layout(self):
+        """Map logical matrix coordinates onto canonical blocked scale storage."""
+        return blockscaled_utils.tile_atom_to_shape_SF(
+            (((self.n + 127) // 128) * 128, self.k, 1),
+            16,
+        )
+
+    @cute.jit
     def load_scale_values(
         self,
         scale_tensor: cute.Tensor,
@@ -88,7 +92,7 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
             cute.make_tensor(
                 scale_tensor.iterator.align(min_align=2)
                 + cute.assume(
-                    blocked_scale_offset(row, scale_k, self.sf_k // 4),
+                    self.blocked_scale_layout()((row, scale_k * 16, 0)),
                     divby=2,
                 ),
                 cute.make_layout(2),
@@ -98,6 +102,70 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
         return (
             scales[0].bitcast(cutlass.Float8E4M3FN).to(cutlass.Float32),
             scales[1].bitcast(cutlass.Float8E4M3FN).to(cutlass.Float32),
+        )
+
+    @cute.jit
+    def prepare_weight_scale_values(
+        self,
+        scale_tensor: cute.Tensor,
+        row_start,
+        k_tile: cutlass.Constexpr,
+        lane: cutlass.Int32,
+        scale_atom: cute.CopyAtom,
+        scale_layout: cute.Layout,
+    ):
+        """Load two rows of four-column scale groups per warp instruction."""
+        if cutlass.const_expr(self.rows_per_warp < 2 or self.rows_per_warp % 2 != 0):
+            return None
+        packed_row_pairs = []
+        for row_pair in cutlass.range_constexpr(self.rows_per_warp // 2):
+            scales = cute.make_rmem_tensor(4, cutlass.Uint8)
+            row = row_start + row_pair * 2 + lane // 16
+            col = k_tile * self.scale_blocks_per_tile + (lane % 16) * 4
+            cute.copy(
+                scale_atom,
+                cute.make_tensor(
+                    scale_tensor.iterator.align(min_align=4)
+                    + cute.assume(
+                        self.blocked_scale_layout()((row, col * 16, 0)),
+                        divby=4,
+                    ),
+                    cute.make_layout(4),
+                ),
+                scales,
+            )
+            packed_row_pairs.append(cute.recast_tensor(scales, cutlass.Uint32).load()[0])
+        return packed_row_pairs
+
+    @cute.jit
+    def load_prepared_weight_scale_values(
+        self,
+        prepared_scales,
+        scale_tensor: cute.Tensor,
+        row,
+        scale_k,
+        local_row: cutlass.Constexpr,
+        lane: cutlass.Int32,
+        scale_atom: cute.CopyAtom,
+        scale_layout: cute.Layout,
+    ):
+        """Shuffle one packed four-scale group to its two consuming lanes."""
+        if cutlass.const_expr(self.rows_per_warp < 2 or self.rows_per_warp % 2 != 0):
+            return self.load_scale_values(
+                scale_tensor,
+                row,
+                scale_k,
+                scale_atom,
+                scale_layout,
+            )
+        packed = cute.arch.shuffle_sync_op(
+            prepared_scales[local_row // 2],
+            (local_row % 2) * 16 + lane // 2,
+        )
+        scales = packed >> cutlass.Uint32((lane & 1) * 16)
+        return (
+            cutlass.Uint8(scales & 0xFF).bitcast(cutlass.Float8E4M3FN).to(cutlass.Float32),
+            cutlass.Uint8((scales >> 8) & 0xFF).bitcast(cutlass.Float8E4M3FN).to(cutlass.Float32),
         )
 
     @cute.jit
@@ -353,7 +421,7 @@ def select_nvfp4_tma_config(
     if torch.cuda.get_device_capability(device) != (10, 0):
         block_n = next(candidate for candidate in (8, 4, 2, 1) if n % candidate == 0)
         return block_n, 2, 1
-    preferred_block_n = 4 if k >= 12288 else 16 if n >= 12288 else 8
+    preferred_block_n = 16 if n >= 12288 and k < 12288 else 8
     block_n = next(
         candidate for candidate in (preferred_block_n, 8, 4, 2, 1) if n % candidate == 0
     )
