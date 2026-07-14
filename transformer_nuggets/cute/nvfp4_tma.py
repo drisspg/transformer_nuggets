@@ -122,6 +122,7 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
         num_persistent_ctas: int | None = None,
         use_global_scales: bool = False,
         split_k: int = 1,
+        stage_weight_scales: bool = False,
     ):
         super().__init__(
             n,
@@ -144,7 +145,52 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
             use_global_scales=use_global_scales,
             split_k=split_k,
         )
+        if stage_weight_scales and block_n != 8:
+            raise ValueError("staged weight scales require block_n=8")
         self.num_prologue_stages = self.num_stages - 1
+        self.stage_weight_scales = stage_weight_scales
+
+    def weight_scale_tma_tile(self):
+        """Load four physical row groups for eight logical output rows."""
+        return (16, 8, self.scale_blocks_per_tile // 4, 1)
+
+    def weight_scale_gmem_layout(self):
+        """Expose SWIZZLE_32_4_4 storage as its compact physical rank-four tensor."""
+        return cute.make_layout(
+            (16, 32, self.sf_k // 4, (self.n + 127) // 128),
+        )
+
+    def weight_scale_smem_layout(self):
+        """Compact one legal TMA scale subset per pipeline stage, K groups innermost."""
+        return cute.make_ordered_layout(
+            (16, 8, self.scale_blocks_per_tile // 4, 1, self.num_stages),
+            order=(0, 2, 1, 3, 4),
+        )
+
+    @cute.jit
+    def weight_scale_tile_coord(self, n0):
+        """Select one eight-row subset from a physical 128-row scale atom."""
+        return 0, (n0 % 32) // 8, None, n0 // 128
+
+    @cute.jit
+    def weight_scale_consumer_view(self, sSFW: cute.Tensor, n0):
+        """Slice this tile's staged row group as a logical (row, scale_k, stage) tensor.
+
+        The staged tile fuses ``(inner4, row_group4)`` in its first mode; offsetting the
+        iterator by the tile's row group leaves a nested ``(inner, k_group)`` scale mode
+        whose flat coordinate is exactly ``scale_k``.
+        """
+        return cute.make_tensor(
+            sSFW.iterator + cute.assume(((n0 % 128) // 32) * 4, divby=4),
+            cute.make_layout(
+                (8, (4, self.scale_blocks_per_tile // 4), self.num_stages),
+                stride=(
+                    sSFW.layout.stride[1],
+                    (1, sSFW.layout.stride[2]),
+                    sSFW.layout.stride[4],
+                ),
+            ),
+        )
 
     @cute.jit
     def decode_lane_values(self, raw_values: cute.Tensor):
@@ -195,6 +241,93 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
         return (
             scales[0].bitcast(cutlass.Float8E4M3FN).to(cutlass.Float32),
             scales[1].bitcast(cutlass.Float8E4M3FN).to(cutlass.Float32),
+        )
+
+    @cute.jit
+    def load_staged_weight_scale_values(
+        self,
+        scale_view: cute.Tensor,
+        row,
+        scale_k,
+        stage,
+        scale_atom: cute.CopyAtom,
+    ):
+        """Load two contiguous E4M3 scales from the staged row-group view."""
+        scales = cute.make_rmem_tensor(2, cutlass.Uint8)
+        cute.copy(
+            scale_atom,
+            cute.make_tensor(
+                scale_view.iterator
+                + cute.assume(scale_view.layout((row, scale_k, stage)), divby=2),
+                cute.make_layout(2),
+            ),
+            scales,
+        )
+        return (
+            scales[0].bitcast(cutlass.Float8E4M3FN).to(cutlass.Float32),
+            scales[1].bitcast(cutlass.Float8E4M3FN).to(cutlass.Float32),
+        )
+
+    @cute.jit
+    def prepare_staged_weight_scale_values(
+        self,
+        scale_view: cute.Tensor,
+        row_start,
+        lane: cutlass.Int32,
+        stage,
+        scale_atom: cute.CopyAtom,
+    ):
+        """Load staged four-scale groups for pairs of output rows."""
+        if cutlass.const_expr(self.rows_per_warp < 2 or self.rows_per_warp % 2 != 0):
+            return None
+        packed_row_pairs = []
+        for row_pair in cutlass.range_constexpr(self.rows_per_warp // 2):
+            scales = cute.make_rmem_tensor(4, cutlass.Uint8)
+            row = row_start + row_pair * 2 + lane // 16
+            cute.copy(
+                scale_atom,
+                cute.make_tensor(
+                    scale_view.iterator
+                    + cute.assume(
+                        scale_view.layout((row, (0, lane % 16), stage)),
+                        divby=4,
+                    ),
+                    cute.make_layout(4),
+                ),
+                scales,
+            )
+            packed_row_pairs.append(cute.recast_tensor(scales, cutlass.Uint32).load()[0])
+        return packed_row_pairs
+
+    @cute.jit
+    def load_prepared_staged_weight_scale_values(
+        self,
+        prepared_scales,
+        scale_view: cute.Tensor,
+        row,
+        scale_k,
+        local_row: cutlass.Constexpr,
+        lane: cutlass.Int32,
+        stage,
+        scale_atom: cute.CopyAtom,
+    ):
+        """Shuffle staged four-scale groups to their consuming lanes."""
+        if cutlass.const_expr(self.rows_per_warp < 2 or self.rows_per_warp % 2 != 0):
+            return self.load_staged_weight_scale_values(
+                scale_view,
+                row,
+                scale_k,
+                stage,
+                scale_atom,
+            )
+        packed = cute.arch.shuffle_sync_op(
+            prepared_scales[local_row // 2],
+            (local_row % 2) * 16 + lane // 2,
+        )
+        scales = packed >> cutlass.Uint32((lane & 1) * 16)
+        return (
+            cutlass.Uint8(scales & 0xFF).bitcast(cutlass.Float8E4M3FN).to(cutlass.Float32),
+            cutlass.Uint8((scales >> 8) & 0xFF).bitcast(cutlass.Float8E4M3FN).to(cutlass.Float32),
         )
 
     @cute.jit
@@ -458,6 +591,7 @@ def get_nvfp4_tma_gemv(
     num_persistent_ctas: int | None = None,
     use_global_scales: bool = False,
     split_k: int = 1,
+    stage_weight_scales: bool = False,
 ) -> Nvfp4TmaGemv:
     """Return a cached NVFP4 TMA GEMV specialization."""
     return Nvfp4TmaGemv(
@@ -471,6 +605,7 @@ def get_nvfp4_tma_gemv(
         num_persistent_ctas,
         use_global_scales,
         split_k,
+        stage_weight_scales,
     )
 
 
@@ -486,6 +621,7 @@ def nvfp4_tma_scaled_mm(
     output: torch.Tensor | None = None,
     partial_output: torch.Tensor | None = None,
     split_k: int = 1,
+    stage_weight_scales: bool | None = None,
     num_stages: int = 2,
     num_compute_warps: int | None = None,
     grid_scheduler: GridScheduler = GridScheduler.STATIC,
@@ -504,6 +640,7 @@ def nvfp4_tma_scaled_mm(
         output: Optional caller-owned contiguous ``[1, N]`` BF16 output.
         partial_output: Caller-owned ``[split_k, N]`` FP32 workspace for split-K.
         split_k: Number of parallel K partitions. Values above one require a static grid.
+        stage_weight_scales: Stage physical weight-scale subsets with TMA, or auto-select.
         num_stages: Number of TMA pipeline stages.
         num_compute_warps: Consumer warps per CTA, or ``None`` for architecture tuning.
         grid_scheduler: Static or persistent N-tile scheduling.
@@ -529,6 +666,7 @@ def nvfp4_tma_scaled_mm(
         output=output,
         partial_output=partial_output,
         split_k=split_k,
+        stage_weight_scales=stage_weight_scales,
         num_compute_warps=num_compute_warps,
         grid_scheduler=grid_scheduler,
         num_persistent_ctas=num_persistent_ctas,
@@ -562,7 +700,8 @@ def select_nvfp4_tma_config(
     if torch.cuda.get_device_capability(device) != (10, 0):
         block_n = next(candidate for candidate in (8, 4, 2, 1) if n % candidate == 0)
         return block_n, 2, 1
-    preferred_block_n = 16 if n >= 12288 and k < 12288 else 8
+    use_compact_scale_tile = n >= 16384 and 6144 <= k <= 8192
+    preferred_block_n = 16 if n >= 12288 and k < 12288 and not use_compact_scale_tile else 8
     block_n = next(
         candidate for candidate in (preferred_block_n, 8, 4, 2, 1) if n % candidate == 0
     )
@@ -595,6 +734,27 @@ def select_nvfp4_tma_split_k(
     return 1
 
 
+def select_nvfp4_tma_stage_weight_scales(
+    n: int,
+    k: int,
+    block_n: int,
+    num_compute_warps: int,
+    grid_scheduler: GridScheduler,
+    split_k: int,
+    device: torch.device | str | int | None = None,
+) -> bool:
+    """Stage weight scales in the measured B200 large-N middle-K configuration."""
+    return (
+        torch.cuda.get_device_capability(device) == (10, 0)
+        and block_n == 8
+        and num_compute_warps == 4
+        and GridScheduler(grid_scheduler) is GridScheduler.STATIC
+        and split_k == 1
+        and n >= 16384
+        and 6144 <= k <= 8192
+    )
+
+
 def nvfp4_tma_gemv(
     q_input: torch.Tensor,
     weight: torch.Tensor,
@@ -608,6 +768,7 @@ def nvfp4_tma_gemv(
     output: torch.Tensor | None = None,
     partial_output: torch.Tensor | None = None,
     split_k: int = 1,
+    stage_weight_scales: bool | None = None,
     enable_profiling: bool = False,
     profile_buffer: torch.Tensor | None = None,
     num_compute_warps: int | None = None,
@@ -628,6 +789,7 @@ def nvfp4_tma_gemv(
         output: Optional caller-owned contiguous ``[1, N]`` BF16 output.
         partial_output: Caller-owned ``[split_k, N]`` FP32 workspace for split-K.
         split_k: Number of parallel K partitions. Values above one require a static grid.
+        stage_weight_scales: Stage physical weight-scale subsets with TMA, or auto-select.
         enable_profiling: Compile static intra-kernel profiling regions.
         profile_buffer: Profiling buffer required by profiled specializations.
         num_compute_warps: Consumer warps per CTA, or ``None`` for architecture tuning.
@@ -651,6 +813,16 @@ def nvfp4_tma_gemv(
     elif num_compute_warps is None:
         num_compute_warps = select_nvfp4_tma_compute_warps(k, block_n, q_input.device)
     grid_scheduler = GridScheduler(grid_scheduler)
+    if stage_weight_scales is None:
+        stage_weight_scales = select_nvfp4_tma_stage_weight_scales(
+            weight.shape[0],
+            k,
+            block_n,
+            num_compute_warps,
+            grid_scheduler,
+            split_k,
+            q_input.device,
+        )
     if grid_scheduler is GridScheduler.PERSISTENT and num_persistent_ctas is None:
         num_persistent_ctas = (
             DEFAULT_PERSISTENT_CTAS_PER_SM
@@ -668,6 +840,7 @@ def nvfp4_tma_gemv(
         num_persistent_ctas,
         use_global_scales,
         split_k,
+        stage_weight_scales,
     ).interface(
         q_input,
         weight,

@@ -144,6 +144,7 @@ class BlockscaledTmaGemv(CuteOp):
         self.tiles_per_cta = 1 if self.split_k > 1 else self.num_tiles // self.grid_ctas
         self.max_profile_events_per_cta = 2 + 3 * self.k_tiles_per_split
         self.num_profile_units = self.num_tiles
+        self.stage_weight_scales = False
 
     @cute.jit
     def make_blocked_scale_layout(self, scale_vector_size: cutlass.Constexpr):
@@ -164,6 +165,28 @@ class BlockscaledTmaGemv(CuteOp):
         return cute.make_ordered_layout(
             (self.block_n, self.tile_k_u32, self.num_stages), order=(1, 0, 2)
         )
+
+    def weight_scale_tma_tile(self):
+        """Return the format-specific physical weight-scale TMA tile."""
+        raise NotImplementedError
+
+    def weight_scale_gmem_layout(self):
+        """Return the format-specific physical weight-scale global layout."""
+        raise NotImplementedError
+
+    def weight_scale_smem_layout(self):
+        """Return the format-specific staged weight-scale shared layout."""
+        raise NotImplementedError
+
+    @cute.jit
+    def weight_scale_tile_coord(self, n0):
+        """Map an output-row tile to its physical scale-tensor coordinate."""
+        raise NotImplementedError
+
+    @cute.jit
+    def weight_scale_consumer_view(self, sSFW: cute.Tensor, n0):
+        """Rewrap a staged scale tile as a logical (row, scale_k, stage) tensor."""
+        raise NotImplementedError
 
     def profile_scope(
         self,
@@ -194,6 +217,9 @@ class BlockscaledTmaGemv(CuteOp):
         tma_atom_x: cute.CopyAtom,
         tXgX: cute.Tensor,
         tXsX: cute.Tensor,
+        tma_atom_sfw: cute.CopyAtom | None,
+        tSFWgSFW: cute.Tensor | None,
+        tSFWsSFW: cute.Tensor | None,
         k_tile_base: cutlass.Int32,
     ) -> pipeline.PipelineProducer:
         """Acquire one pipeline stage and issue its weight and input TMA loads."""
@@ -210,6 +236,14 @@ class BlockscaledTmaGemv(CuteOp):
             tXsX[(None, stage.index)],
             tma_bar_ptr=stage.barrier,
         )
+        if cutlass.const_expr(self.stage_weight_scales):
+            assert tma_atom_sfw is not None and tSFWgSFW is not None and tSFWsSFW is not None
+            cute.copy(
+                tma_atom_sfw,
+                tSFWgSFW[(None, k_tile_base + stage.count)],
+                tSFWsSFW[(None, stage.index)],
+                tma_bar_ptr=stage.barrier,
+            )
         stage.commit()
         return producer
 
@@ -228,6 +262,33 @@ class BlockscaledTmaGemv(CuteOp):
         scale_layout: cute.Layout,
     ):
         """Load the format-specific block scales for one lane."""
+        raise NotImplementedError
+
+    @cute.jit
+    def prepare_staged_weight_scale_values(
+        self,
+        scale_view: cute.Tensor,
+        row_start,
+        lane: cutlass.Int32,
+        stage,
+        scale_atom: cute.CopyAtom,
+    ):
+        """Optionally prepare weight scales from a staged row-group view."""
+        return None
+
+    @cute.jit
+    def load_prepared_staged_weight_scale_values(
+        self,
+        prepared_scales,
+        scale_view: cute.Tensor,
+        row,
+        scale_k,
+        local_row: cutlass.Constexpr,
+        lane: cutlass.Int32,
+        stage,
+        scale_atom: cute.CopyAtom,
+    ):
+        """Load one row's scales from a staged row-group view."""
         raise NotImplementedError
 
     @cute.jit
@@ -368,6 +429,7 @@ class BlockscaledTmaGemv(CuteOp):
         pid_n: cutlass.Int32,
         sX: cute.Tensor,
         sW: cute.Tensor,
+        sSFW_view: cute.Tensor | None,
         mSFX: cute.Tensor,
         mSFW: cute.Tensor,
         smem_atom: cute.CopyAtom,
@@ -394,15 +456,25 @@ class BlockscaledTmaGemv(CuteOp):
                 input_scale_atom,
                 scale_layout,
             )
-            prepared_weight_scales = self.prepare_weight_scale_values(
-                mSFW,
-                n0 + owned_row_start,
-                k_tile,
-                lane,
-                weight_scale_atom,
-                scale_layout,
-            )
+            if cutlass.const_expr(not self.stage_weight_scales):
+                prepared_weight_scales = self.prepare_weight_scale_values(
+                    mSFW,
+                    n0 + owned_row_start,
+                    k_tile,
+                    lane,
+                    weight_scale_atom,
+                    scale_layout,
+                )
             full = consumer.wait_and_advance()
+            if cutlass.const_expr(self.stage_weight_scales):
+                assert sSFW_view is not None
+                prepared_weight_scales = self.prepare_staged_weight_scale_values(
+                    sSFW_view,
+                    owned_row_start,
+                    lane,
+                    full.index,
+                    weight_scale_atom,
+                )
 
         with self.profile_scope(
             prof_buf,
@@ -430,16 +502,29 @@ class BlockscaledTmaGemv(CuteOp):
                     smem_atom,
                     chunk_layout,
                 )
-                weight_scales = self.load_prepared_weight_scale_values(
-                    prepared_weight_scales,
-                    mSFW,
-                    global_row,
-                    scale_k,
-                    local_row,
-                    lane,
-                    weight_scale_atom,
-                    scale_layout,
-                )
+                if cutlass.const_expr(self.stage_weight_scales):
+                    assert sSFW_view is not None
+                    weight_scales = self.load_prepared_staged_weight_scale_values(
+                        prepared_weight_scales,
+                        sSFW_view,
+                        cta_row,
+                        lane * self.scale_blocks_per_lane,
+                        local_row,
+                        lane,
+                        full.index,
+                        weight_scale_atom,
+                    )
+                else:
+                    weight_scales = self.load_prepared_weight_scale_values(
+                        prepared_weight_scales,
+                        mSFW,
+                        global_row,
+                        scale_k,
+                        local_row,
+                        lane,
+                        weight_scale_atom,
+                        scale_layout,
+                    )
                 accumulators[local_row] = self.accumulate_scaled_products(
                     accumulators[local_row],
                     x_values,
@@ -491,6 +576,8 @@ class BlockscaledTmaGemv(CuteOp):
         mX_u32: cute.Tensor,
         mSFW: cute.Tensor,
         mSFX: cute.Tensor,
+        tma_atom_sfw: cute.CopyAtom | None,
+        mSFW_tma: cute.Tensor | None,
         mGFW: cute.Tensor | None,
         mGFX: cute.Tensor | None,
         mO: cute.Tensor,
@@ -536,17 +623,36 @@ class BlockscaledTmaGemv(CuteOp):
         barriers = smem.allocate_array(cutlass.Int64, self.num_stages * 2, byte_alignment=8)
         sX = smem.allocate_tensor(cutlass.Uint32, self.x_smem_layout(), byte_alignment=128)
         sW = smem.allocate_tensor(cutlass.Uint32, self.w_smem_layout(), byte_alignment=128)
+        if cutlass.const_expr(self.stage_weight_scales):
+            sSFW = smem.allocate_tensor(
+                cutlass.Uint8,
+                self.weight_scale_smem_layout(),
+                byte_alignment=128,
+            )
+        else:
+            sSFW = None
 
         if warp == WarpRole.TMA_PRODUCER:
             cpasync.prefetch_descriptor(tma_atom_w)
             cpasync.prefetch_descriptor(tma_atom_x)
+            if cutlass.const_expr(self.stage_weight_scales):
+                assert tma_atom_sfw is not None
+                cpasync.prefetch_descriptor(tma_atom_sfw)
         producer, consumer = pipeline.PipelineTmaAsync.create(
             num_stages=self.num_stages,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             consumer_group=pipeline.CooperativeGroup(
                 pipeline.Agent.Thread, self.num_compute_warps
             ),
-            tx_count=(self.block_n + self.m) * self.tile_k_u32 * 4,
+            tx_count=(self.block_n + self.m) * self.tile_k_u32 * 4
+            + (
+                cute.size_in_bytes(
+                    cutlass.Uint8,
+                    cute.select(self.weight_scale_smem_layout(), mode=[0, 1, 2, 3]),
+                )
+                if self.stage_weight_scales
+                else 0
+            ),
             barrier_storage=barriers,
             tidx=lane,
         ).make_participants()
@@ -575,6 +681,25 @@ class BlockscaledTmaGemv(CuteOp):
                 cute.group_modes(sW, 0, 2),
                 cute.group_modes(gW, 0, 2),
             )
+            if cutlass.const_expr(self.stage_weight_scales):
+                assert tma_atom_sfw is not None and mSFW_tma is not None and sSFW is not None
+                gSFW = cute.local_tile(
+                    mSFW_tma,
+                    self.weight_scale_tma_tile(),
+                    self.weight_scale_tile_coord(n0),
+                )
+                tSFWsSFW, tSFWgSFW = cpasync.tma_partition(
+                    tma_atom_sfw,
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(sSFW, 0, 4),
+                    cute.group_modes(gSFW, 0, 4),
+                )
+                sSFW_view = self.weight_scale_consumer_view(sSFW, n0)
+            else:
+                tSFWsSFW = None
+                tSFWgSFW = None
+                sSFW_view = None
             with self.profile_scope(
                 prof_buf,
                 ProfileTag.TMA_PROLOGUE,
@@ -592,6 +717,9 @@ class BlockscaledTmaGemv(CuteOp):
                             tma_atom_x,
                             tXgX,
                             tXsX,
+                            tma_atom_sfw,
+                            tSFWgSFW,
+                            tSFWsSFW,
                             k_tile_base,
                         )
 
@@ -620,6 +748,9 @@ class BlockscaledTmaGemv(CuteOp):
                             tma_atom_x,
                             tXgX,
                             tXsX,
+                            tma_atom_sfw,
+                            tSFWgSFW,
+                            tSFWsSFW,
                             k_tile_base,
                         )
 
@@ -634,6 +765,7 @@ class BlockscaledTmaGemv(CuteOp):
                     pid_n,
                     sX,
                     sW,
+                    sSFW_view,
                     mSFX,
                     mSFW,
                     smem_atom,
@@ -717,6 +849,20 @@ class BlockscaledTmaGemv(CuteOp):
             cute.select(self.x_smem_layout(), mode=[0, 1]),
             (self.m, self.tile_k_u32),
         )
+        if cutlass.const_expr(self.stage_weight_scales):
+            physical_weight_scales = cute.make_tensor(
+                mSFW.iterator,
+                self.weight_scale_gmem_layout(),
+            )
+            tma_atom_sfw, tma_tensor_sfw = cpasync.make_tiled_tma_atom(
+                tma_op,
+                physical_weight_scales,
+                cute.select(self.weight_scale_smem_layout(), mode=[0, 1, 2, 3]),
+                self.weight_scale_tma_tile(),
+            )
+        else:
+            tma_atom_sfw = None
+            tma_tensor_sfw = None
         name = self.get_name()
         self.kernel(
             tma_atom_w,
@@ -725,6 +871,8 @@ class BlockscaledTmaGemv(CuteOp):
             tma_tensor_x,
             mSFW,
             mSFX,
+            tma_atom_sfw,
+            tma_tensor_sfw,
             mGFW,
             mGFX,
             mO,
@@ -756,16 +904,18 @@ class BlockscaledTmaGemv(CuteOp):
             f"{self.format_name}_{self.n}_{self.k}_{self.block_n}_{self.num_stages}"
             f"_cw={self.num_compute_warps}_scheduler={self.grid_scheduler.value}"
             f"_grid={self.grid_ctas}_global={self.use_global_scales}"
-            f"_split_k={self.split_k}_profile={self.enable_profiling}"
+            f"_split_k={self.split_k}_stage_sf={self.stage_weight_scales}"
+            f"_profile={self.enable_profiling}"
         )
 
     def get_name(self) -> str:
         """Return the compiled kernel name."""
         profile_suffix = "_profiled" if self.enable_profiling else ""
         global_suffix = "_global" if self.use_global_scales else ""
+        scale_stage_suffix = "_stage_sf" if self.stage_weight_scales else ""
         return (
             f"{self.format_name}_tma_gemv_n{self.n}_k{self.k}"
             f"_bn{self.block_n}_s{self.num_stages}_cw{self.num_compute_warps}"
             f"_{self.grid_scheduler.value}_grid{self.grid_ctas}"
-            f"_splitk{self.split_k}{global_suffix}{profile_suffix}"
+            f"_splitk{self.split_k}{global_suffix}{scale_stage_suffix}{profile_suffix}"
         )

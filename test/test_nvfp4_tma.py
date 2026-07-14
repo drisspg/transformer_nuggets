@@ -19,6 +19,7 @@ try:
         select_nvfp4_tma_compute_warps,
         select_nvfp4_tma_config,
         select_nvfp4_tma_split_k,
+        select_nvfp4_tma_stage_weight_scales,
     )
     from transformer_nuggets.cute.profiler import profile_session
     from transformer_nuggets.cute.profiler.host import decode_events
@@ -54,6 +55,7 @@ def test_select_nvfp4_tma_compute_warps(k, block_n, expected):
         (14336, 16384, (8, 3, 4)),
         (24576, 24576, (8, 2, 4)),
         (32768, 32768, (8, 3, 4)),
+        (16384, 8192, (8, 2, 4)),
     ],
 )
 def test_select_nvfp4_tma_config(n, k, expected):
@@ -76,6 +78,38 @@ def test_select_nvfp4_tma_split_k(n, k, expected):
     if torch.cuda.get_device_capability() != (10, 0):
         expected = 1
     assert select_nvfp4_tma_split_k(n, k) == expected
+
+
+@pytest.mark.parametrize(
+    ("n", "k", "block_n", "num_compute_warps", "grid_scheduler", "split_k", "expected"),
+    [
+        (16384, 6144, 8, 4, GridScheduler.STATIC, 1, True),
+        (32768, 8192, 8, 4, GridScheduler.STATIC, 1, True),
+        (14336, 8192, 8, 4, GridScheduler.STATIC, 1, False),
+        (16384, 12288, 8, 4, GridScheduler.STATIC, 1, False),
+        (16384, 8192, 16, 4, GridScheduler.STATIC, 1, False),
+        (16384, 8192, 8, 2, GridScheduler.STATIC, 1, False),
+        (16384, 8192, 8, 4, GridScheduler.PERSISTENT, 1, False),
+        (16384, 8192, 8, 4, GridScheduler.STATIC, 2, False),
+    ],
+)
+def test_select_nvfp4_tma_stage_weight_scales(
+    n, k, block_n, num_compute_warps, grid_scheduler, split_k, expected
+):
+    """Stage physical scale subsets only in the measured B200 regime."""
+    if torch.cuda.get_device_capability() != (10, 0):
+        expected = False
+    assert (
+        select_nvfp4_tma_stage_weight_scales(
+            n,
+            k,
+            block_n,
+            num_compute_warps,
+            grid_scheduler,
+            split_k,
+        )
+        is expected
+    )
 
 
 def pack_fp4(codes: torch.Tensor) -> torch.Tensor:
@@ -176,6 +210,23 @@ def test_nvfp4_tma_scale_layout_and_paired_loads(block_n, num_compute_warps):
     )
     torch.cuda.synchronize()
     torch.testing.assert_close(actual, expected, atol=2.0, rtol=0.05)
+
+
+def test_nvfp4_tma_compact_scale_tma_matches_blocked_layout():
+    """Match exact scales across physical 128-row atoms with compact TMA staging."""
+    q_input, weight, input_scale, weight_scale, expected, _ = make_case(264, 6144)
+    actual = nvfp4_tma_gemv(
+        q_input,
+        weight,
+        input_scale,
+        weight_scale,
+        block_n=8,
+        num_stages=3,
+        num_compute_warps=4,
+        stage_weight_scales=True,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 def test_nvfp4_tma_fp16_partial_reduction_preserves_extreme_values():
@@ -374,8 +425,11 @@ def test_nvfp4_tma_split_k_accepts_scalar_aligned_workspace():
     torch.testing.assert_close(output, expected, atol=2.0, rtol=0.05)
 
 
-@pytest.mark.parametrize(("k", "split_k", "num_stages"), [(8192, 2, 2), (16384, 4, 3)])
-def test_nvfp4_tma_split_k_cuda_graph(k, split_k, num_stages):
+@pytest.mark.parametrize(
+    ("k", "split_k", "num_stages", "stage_weight_scales"),
+    [(8192, 2, 2, True), (16384, 4, 3, False)],
+)
+def test_nvfp4_tma_split_k_cuda_graph(k, split_k, num_stages, stage_weight_scales):
     """Reduce parallel K partitions in FP32 before the final BF16 conversion."""
     n = 128
     q_input, weight, input_scale, weight_scale, expected, _ = make_case(n, k)
@@ -386,6 +440,7 @@ def test_nvfp4_tma_split_k_cuda_graph(k, split_k, num_stages):
         "num_compute_warps": 4,
         "num_stages": num_stages,
         "split_k": split_k,
+        "stage_weight_scales": stage_weight_scales,
         "output": output,
         "partial_output": partial_output,
     }
@@ -396,6 +451,24 @@ def test_nvfp4_tma_split_k_cuda_graph(k, split_k, num_stages):
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(output, expected, atol=2.0, rtol=0.05)
+
+
+def test_nvfp4_tma_compact_scale_tma_persistent_reuse():
+    """Reuse compact scale stages across persistent output tiles."""
+    q_input, weight, input_scale, weight_scale, expected, _ = make_case(256, 2048)
+    actual = nvfp4_tma_gemv(
+        q_input,
+        weight,
+        input_scale,
+        weight_scale,
+        block_n=8,
+        num_compute_warps=4,
+        grid_scheduler=GridScheduler.PERSISTENT,
+        num_persistent_ctas=4,
+        stage_weight_scales=True,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, atol=2.0, rtol=0.05)
 
 
 def test_nvfp4_tma_persistent_cuda_graph():

@@ -38,6 +38,7 @@ _NVFP4_TMA_EXPORTS = {
     "select_nvfp4_tma_compute_warps",
     "select_nvfp4_tma_config",
     "select_nvfp4_tma_split_k",
+    "select_nvfp4_tma_stage_weight_scales",
 }
 
 _SYMMETRIC_MEMORY_EXPORTS = {

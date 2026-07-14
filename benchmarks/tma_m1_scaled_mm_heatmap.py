@@ -21,6 +21,7 @@ from transformer_nuggets.cute import (
     select_mxfp8_tma_compute_warps,
     select_nvfp4_tma_config,
     select_nvfp4_tma_split_k,
+    select_nvfp4_tma_stage_weight_scales,
 )
 from transformer_nuggets.utils.benchmark import benchmark_cuda_function_in_microseconds
 
@@ -35,6 +36,7 @@ class KernelConfig:
     num_compute_warps: int
     grid_scheduler: GridScheduler
     split_k: int = 1
+    stage_weight_scales: bool = False
 
 
 @dataclass(frozen=True)
@@ -50,6 +52,7 @@ class BenchmarkResult:
     num_compute_warps: int | None
     grid_scheduler: str
     split_k: int
+    stage_weight_scales: bool
 
 
 def parse_sizes(value: str, dimension: str, multiple: int) -> list[int]:
@@ -168,12 +171,22 @@ def select_nvfp4_config(n: int, k: int, device: torch.device) -> KernelConfig:
     elif n >= 12288 and k == 12288:
         block_n, num_compute_warps = 16, 4
     split_k = select_nvfp4_tma_split_k(n, k, device)
+    stage_weight_scales = select_nvfp4_tma_stage_weight_scales(
+        n,
+        k,
+        block_n,
+        num_compute_warps,
+        GridScheduler.STATIC,
+        split_k,
+        device,
+    )
     return KernelConfig(
         block_n,
         num_stages,
         num_compute_warps,
         GridScheduler.STATIC,
         split_k,
+        stage_weight_scales,
     )
 
 
@@ -266,6 +279,7 @@ def run_mxfp8(n: int, k: int, rounds: int, iterations: int, seed: int) -> Benchm
         config.num_compute_warps,
         config.grid_scheduler.value,
         config.split_k,
+        config.stage_weight_scales,
     )
 
 
@@ -289,6 +303,7 @@ def run_nvfp4(n: int, k: int, rounds: int, iterations: int, seed: int) -> Benchm
         num_compute_warps=config.num_compute_warps,
         grid_scheduler=config.grid_scheduler,
         split_k=config.split_k,
+        stage_weight_scales=config.stage_weight_scales,
         output=output,
         partial_output=partial_output,
     )
@@ -308,6 +323,7 @@ def run_nvfp4(n: int, k: int, rounds: int, iterations: int, seed: int) -> Benchm
         config.num_compute_warps,
         config.grid_scheduler.value,
         config.split_k,
+        config.stage_weight_scales,
     )
 
 
