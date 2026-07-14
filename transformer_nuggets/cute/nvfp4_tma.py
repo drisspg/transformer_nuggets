@@ -5,7 +5,7 @@ from functools import cache
 import cutlass
 import cutlass.cute as cute
 from cutlass._mlir import ir
-from cutlass._mlir.dialects import llvm, vector
+from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 import torch
 
@@ -23,13 +23,13 @@ NVFP4_TMA_PROFILE_TAGS = BLOCKSCALED_TMA_PROFILE_TAGS
 
 
 @dsl_user_op
-def decode_e2m1x8(
+def decode_e2m1x8_words(
     packed: cutlass.Uint32,
     *,
     loc: ir.Location | None = None,
     ip: ir.InsertionPoint | None = None,
-) -> cute.TensorSSA:
-    """Decode one packed E2M1 word with the native four-instruction conversion."""
+) -> tuple[cutlass.Uint32, cutlass.Uint32, cutlass.Uint32, cutlass.Uint32]:
+    """Decode one packed E2M1 word into four FP16x2 registers."""
     converted = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
         [packed.ir_value(loc=loc, ip=ip)],
@@ -47,19 +47,62 @@ def decode_e2m1x8(
         loc=loc,
         ip=ip,
     )
-    converted_words = vector.from_elements(
-        ir.VectorType.get([4], T.i32(), loc=loc),
-        [llvm.extractvalue(T.i32(), converted, [word], loc=loc, ip=ip) for word in range(4)],
+    return tuple(
+        cutlass.Uint32(llvm.extractvalue(T.i32(), converted, [word], loc=loc, ip=ip))
+        for word in range(4)
+    )
+
+
+@dsl_user_op
+def dot_e2m1x8(
+    x0: cutlass.Uint32,
+    x1: cutlass.Uint32,
+    x2: cutlass.Uint32,
+    x3: cutlass.Uint32,
+    packed_weight: cutlass.Uint32,
+    *,
+    loc: ir.Location | None = None,
+    ip: ir.InsertionPoint | None = None,
+) -> cutlass.Float32:
+    """Decode one weight word and reduce its dot product with decoded input values."""
+    result = llvm.inline_asm(
+        T.f32(),
+        [
+            x0.ir_value(loc=loc, ip=ip),
+            x1.ir_value(loc=loc, ip=ip),
+            x2.ir_value(loc=loc, ip=ip),
+            x3.ir_value(loc=loc, ip=ip),
+            packed_weight.ir_value(loc=loc, ip=ip),
+        ],
+        """{
+            .reg .b8 b0, b1, b2, b3;
+            .reg .b32 w0, w1, w2, w3;
+            .reg .b32 p0, p1, p2, p3;
+            .reg .b16 lo, hi;
+            .reg .f16 total;
+            mov.b32 {b0, b1, b2, b3}, $5;
+            cvt.rn.f16x2.e2m1x2 w0, b0;
+            cvt.rn.f16x2.e2m1x2 w1, b1;
+            cvt.rn.f16x2.e2m1x2 w2, b2;
+            cvt.rn.f16x2.e2m1x2 w3, b3;
+            mul.rn.f16x2 p0, $1, w0;
+            mul.rn.f16x2 p1, $2, w1;
+            mul.rn.f16x2 p2, $3, w2;
+            mul.rn.f16x2 p3, $4, w3;
+            add.rn.f16x2 p0, p0, p1;
+            add.rn.f16x2 p2, p2, p3;
+            add.rn.f16x2 p0, p0, p2;
+            mov.b32 {lo, hi}, p0;
+            add.rn.f16 total, lo, hi;
+            cvt.f32.f16 $0, total;
+        }""",
+        "=f,r,r,r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
         loc=loc,
         ip=ip,
     )
-    converted_values = llvm.bitcast(
-        ir.VectorType.get([8], cutlass.Float16.mlir_type, loc=loc),
-        converted_words,
-        loc=loc,
-        ip=ip,
-    )
-    return cute.TensorSSA(converted_values, (8,), cutlass.Float16, loc=loc, ip=ip)
+    return cutlass.Float32(result)
 
 
 class Nvfp4TmaGemv(BlockscaledTmaGemv):
@@ -99,16 +142,17 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
             num_persistent_ctas=num_persistent_ctas,
             use_global_scales=use_global_scales,
         )
+        self.use_streaming_decode = self.num_k_tiles <= 4 or self.num_k_tiles >= 16
 
     @cute.jit
     def decode_lane_values(self, raw_values: cute.Tensor):
         """Decode 32 packed E2M1 values into register-resident FP16 groups."""
-        if cutlass.const_expr(self.k <= 4096):
+        if cutlass.const_expr(self.use_streaming_decode):
             return (
-                decode_e2m1x8(raw_values[0, 0]),
-                decode_e2m1x8(raw_values[0, 1]),
-                decode_e2m1x8(raw_values[0, 2]),
-                decode_e2m1x8(raw_values[0, 3]),
+                decode_e2m1x8_words(raw_values[0, 0]),
+                decode_e2m1x8_words(raw_values[0, 1]),
+                decode_e2m1x8_words(raw_values[0, 2]),
+                decode_e2m1x8_words(raw_values[0, 3]),
             )
         return (
             cute.recast_tensor(raw_values, cutlass.Float4E2M1FN)
@@ -116,6 +160,21 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
             .to(cutlass.Float16)
             .reshape((16, 2))
         )
+
+    @cute.jit
+    def load_weight_lane_values(
+        self,
+        smem: cute.Tensor,
+        row,
+        lane: cutlass.Int32,
+        stage,
+        smem_atom: cute.CopyAtom,
+        chunk_layout: cute.Layout,
+    ):
+        """Keep selected packed weights raw until each immediate dot reduction."""
+        if cutlass.const_expr(self.use_streaming_decode):
+            return self.load_lane_words(smem, row, lane, stage, smem_atom, chunk_layout)
+        return self.load_lane_values(smem, row, lane, stage, smem_atom, chunk_layout)
 
     @cute.jit
     def load_scale_values(
@@ -219,22 +278,20 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
         weight_scales,
     ):
         """Accumulate two independently scaled 16-value E2M1 blocks."""
-        if cutlass.const_expr(self.k <= 4096):
-            partial0 = (x_values[0] * w_values[0]).reduce(
-                cute.ReductionOp.ADD, cutlass.Float16(0.0), 0
-            )
-            partial1 = (x_values[1] * w_values[1]).reduce(
-                cute.ReductionOp.ADD, cutlass.Float16(0.0), 0
-            )
-            partial2 = (x_values[2] * w_values[2]).reduce(
-                cute.ReductionOp.ADD, cutlass.Float16(0.0), 0
-            )
-            partial3 = (x_values[3] * w_values[3]).reduce(
-                cute.ReductionOp.ADD, cutlass.Float16(0.0), 0
+        if cutlass.const_expr(self.use_streaming_decode):
+            partials = tuple(
+                dot_e2m1x8(
+                    x_values[word][0],
+                    x_values[word][1],
+                    x_values[word][2],
+                    x_values[word][3],
+                    w_values[0, word],
+                )
+                for word in range(4)
             )
             products = (
-                cutlass.Float32(partial0) + cutlass.Float32(partial1),
-                cutlass.Float32(partial2) + cutlass.Float32(partial3),
+                partials[0] + partials[1],
+                partials[2] + partials[3],
             )
         else:
             products = (

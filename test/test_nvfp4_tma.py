@@ -176,6 +176,21 @@ def test_nvfp4_tma_fp16_partial_reduction_preserves_extreme_values():
     torch.testing.assert_close(actual, expected, atol=2.0, rtol=0.01)
 
 
+def test_nvfp4_tma_long_k_streaming_decode_matches_reference_bitwise():
+    """Preserve the exact BF16 result across the long-K decode crossover."""
+    q_input, weight, input_scale, weight_scale, expected, _ = make_case(128, 16384)
+    actual = nvfp4_tma_gemv(
+        q_input,
+        weight,
+        input_scale,
+        weight_scale,
+        block_n=8,
+        num_compute_warps=4,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 def test_nvfp4_tma_uses_tuned_default_config():
     """Run the architecture-tuned block and warp selection when unspecified."""
     q_input, weight, input_scale, weight_scale, expected, _ = make_case(128, 2048)

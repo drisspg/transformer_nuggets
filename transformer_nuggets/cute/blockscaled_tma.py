@@ -266,7 +266,7 @@ class BlockscaledTmaGemv(CuteOp):
         raise NotImplementedError
 
     @cute.jit
-    def load_lane_values(
+    def load_lane_words(
         self,
         smem: cute.Tensor,
         row,
@@ -275,7 +275,7 @@ class BlockscaledTmaGemv(CuteOp):
         smem_atom: cute.CopyAtom,
         chunk_layout: cute.Layout,
     ):
-        """Load one lane's 128-bit chunks and decode their packed values."""
+        """Load one lane's packed 128-bit chunks into registers."""
         raw_values = cute.make_rmem_tensor((1, self.words_per_lane), cutlass.Uint32)
         if cutlass.const_expr(self.words_per_lane == 4):
             col = cute.assume(lane * 4, divby=4)
@@ -314,7 +314,35 @@ class BlockscaledTmaGemv(CuteOp):
                     chunk_layout,
                 ),
             )
-        return self.decode_lane_values(raw_values)
+        return raw_values
+
+    @cute.jit
+    def load_lane_values(
+        self,
+        smem: cute.Tensor,
+        row,
+        lane: cutlass.Int32,
+        stage,
+        smem_atom: cute.CopyAtom,
+        chunk_layout: cute.Layout,
+    ):
+        """Load and decode one lane's packed values."""
+        return self.decode_lane_values(
+            self.load_lane_words(smem, row, lane, stage, smem_atom, chunk_layout)
+        )
+
+    @cute.jit
+    def load_weight_lane_values(
+        self,
+        smem: cute.Tensor,
+        row,
+        lane: cutlass.Int32,
+        stage,
+        smem_atom: cute.CopyAtom,
+        chunk_layout: cute.Layout,
+    ):
+        """Load weight values using the format's default decode path."""
+        return self.load_lane_values(smem, row, lane, stage, smem_atom, chunk_layout)
 
     @cute.jit
     def compute_warp_consume_stage(
@@ -382,7 +410,7 @@ class BlockscaledTmaGemv(CuteOp):
             for local_row in cutlass.range_constexpr(self.rows_per_warp):
                 cta_row = owned_row_start + local_row
                 global_row = n0 + cta_row
-                w_values = self.load_lane_values(
+                w_values = self.load_weight_lane_values(
                     sW,
                     cta_row,
                     lane,
