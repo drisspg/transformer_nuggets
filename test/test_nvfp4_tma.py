@@ -138,6 +138,28 @@ def test_nvfp4_tma_matches_reference(num_compute_warps):
     torch.testing.assert_close(actual, expected, atol=2.0, rtol=0.05)
 
 
+def test_nvfp4_tma_pairwise_fp16_reduction_preserves_extreme_values():
+    """Keep the exact FP16 pairwise range before accumulating partials in FP32."""
+    n, k = 128, 2048
+    input_codes = torch.full((1, k), 7, dtype=torch.uint8, device="cuda")
+    weight_codes = torch.full((n, k), 7, dtype=torch.uint8, device="cuda")
+    scale_values = torch.tensor([0.5, 1.0, 2.0, 448.0], device="cuda")
+    input_scale = scale_values[torch.arange(k // 16, device="cuda") % 4].reshape(1, -1)
+    weight_scale = scale_values[torch.arange(n * (k // 16), device="cuda") * 3 % 4].reshape(n, -1)
+    expected = (
+        (torch.full((1, k), 6.0, device="cuda") * input_scale.repeat_interleave(16, 1))
+        @ (torch.full((n, k), 6.0, device="cuda") * weight_scale.repeat_interleave(16, 1)).T
+    ).bfloat16()
+    actual = nvfp4_tma_gemv(
+        pack_fp4(input_codes),
+        pack_fp4(weight_codes),
+        swizzle_scales(input_scale.to(torch.float8_e4m3fn)),
+        swizzle_scales(weight_scale.to(torch.float8_e4m3fn)),
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, atol=2.0, rtol=0.01)
+
+
 def test_nvfp4_tma_uses_tuned_default_config():
     """Run the architecture-tuned block and warp selection when unspecified."""
     q_input, weight, input_scale, weight_scale, expected, _ = make_case(128, 2048)

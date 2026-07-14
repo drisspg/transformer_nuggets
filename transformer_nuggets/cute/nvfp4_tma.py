@@ -68,7 +68,7 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
         return (
             cute.recast_tensor(raw_values, cutlass.Float4E2M1FN)
             .load()
-            .to(cutlass.Float32)
+            .to(cutlass.Float16)
             .reshape((16, 2))
         )
 
@@ -110,7 +110,16 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
         weight_scales,
     ):
         """Accumulate two independently scaled 16-value E2M1 blocks."""
-        products = (x_values * w_values).reduce(
+        products = (
+            (x_values * w_values)
+            .reshape((2, 8, 2))
+            .reduce(
+                cute.ReductionOp.ADD,
+                cutlass.Float16(0.0),
+                (1, None, None),
+            )
+        )
+        products = products.to(cutlass.Float32).reduce(
             cute.ReductionOp.ADD,
             cutlass.Float32(0.0),
             (1, None),
