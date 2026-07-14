@@ -104,7 +104,7 @@ def test_mxfp8_tma_gemv_matches_reference(k, block_n, num_stages, num_compute_wa
     torch.testing.assert_close(actual, expected, atol=1.0, rtol=0.05)
 
 
-@pytest.mark.parametrize(("block_n", "num_compute_warps"), [(8, 4), (6, 2)])
+@pytest.mark.parametrize(("block_n", "num_compute_warps"), [(4, 4), (8, 4), (6, 2)])
 def test_mxfp8_tma_swizzled_scales_match_raw(block_n, num_compute_warps):
     """Read canonical blocked E8M0 scales across row-layout boundaries."""
     n, k = 264, 2048

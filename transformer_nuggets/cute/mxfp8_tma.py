@@ -126,11 +126,20 @@ class Mxfp8TmaGemv(BlockscaledTmaGemv):
         scale_atom: cute.CopyAtom,
         scale_layout: cute.Layout,
     ):
-        """Load up to four rows of blocked E8M0 scales per warp instruction."""
-        if cutlass.const_expr(
-            self.block_scale_layout is BlockScaleLayout.RAW or self.rows_per_warp == 1
-        ):
+        """Prefetch blocked scales before the matrix TMA wait."""
+        if cutlass.const_expr(self.block_scale_layout is BlockScaleLayout.RAW):
             return None
+        if cutlass.const_expr(self.rows_per_warp == 1):
+            scale_k = lane * self.scale_blocks_per_lane + k_tile * self.scale_blocks_per_tile
+            return [
+                self.load_scale_values(
+                    scale_tensor,
+                    row_start,
+                    scale_k,
+                    scale_atom,
+                    scale_layout,
+                )
+            ]
         packed_row_groups = []
         for row_group in cutlass.range_constexpr((self.rows_per_warp + 3) // 4):
             rows_in_group = min(4, self.rows_per_warp - row_group * 4)
@@ -165,10 +174,8 @@ class Mxfp8TmaGemv(BlockscaledTmaGemv):
         scale_atom: cute.CopyAtom,
         scale_layout: cute.Layout,
     ):
-        """Shuffle one packed four-scale group to its four consuming lanes."""
-        if cutlass.const_expr(
-            self.block_scale_layout is BlockScaleLayout.RAW or self.rows_per_warp == 1
-        ):
+        """Read a raw scale or consume a prefetched blocked scale."""
+        if cutlass.const_expr(self.block_scale_layout is BlockScaleLayout.RAW):
             return self.load_scale_values(
                 scale_tensor,
                 row,
@@ -176,6 +183,8 @@ class Mxfp8TmaGemv(BlockscaledTmaGemv):
                 scale_atom,
                 scale_layout,
             )
+        if cutlass.const_expr(self.rows_per_warp == 1):
+            return prepared_scales[0]
         packed = cute.arch.shuffle_sync_op(
             prepared_scales[local_row // 4],
             (local_row % 4) * 8 + lane // 4,
