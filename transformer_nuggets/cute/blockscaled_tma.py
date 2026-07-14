@@ -8,9 +8,17 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 from cuda.bindings import driver as cuda
 from cutlass.cute.nvgpu import cpasync, tcgen05
+import cutlass.utils.blockscaled_layout as blockscaled_utils
 
 from transformer_nuggets.cute.base import CuteOp
 from transformer_nuggets.cute.profiler.ops import profile_region
+
+
+class BlockScaleLayout(str, Enum):
+    """Describe caller-owned block-scale storage."""
+
+    RAW = "raw"
+    SWIZZLE_32_4_4 = "swizzle_32_4_4"
 
 
 class GridScheduler(str, Enum):
@@ -126,6 +134,14 @@ class BlockscaledTmaGemv(CuteOp):
         self.tiles_per_cta = self.num_tiles // self.grid_ctas
         self.max_profile_events_per_cta = 2 + 3 * self.num_k_tiles
         self.num_profile_units = self.num_tiles
+
+    @cute.jit
+    def make_blocked_scale_layout(self, scale_vector_size: cutlass.Constexpr):
+        """Map logical matrix coordinates onto canonical blocked scale storage."""
+        return blockscaled_utils.tile_atom_to_shape_SF(
+            (((self.n + 127) // 128) * 128, self.k, 1),
+            scale_vector_size,
+        )
 
     def x_smem_layout(self):
         """Return the staged layout for one physical input tile."""

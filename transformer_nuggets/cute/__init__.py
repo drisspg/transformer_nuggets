@@ -15,6 +15,7 @@ from transformer_nuggets.cute import profiler
 
 _BLOCKSCALED_TMA_EXPORTS = {
     "DEFAULT_PERSISTENT_CTAS_PER_SM",
+    "BlockScaleLayout",
     "GridScheduler",
     "ProfileTag",
 }
@@ -24,6 +25,7 @@ _MXFP8_TMA_EXPORTS = {
     "Mxfp8TmaGemv",
     "get_mxfp8_tma_gemv",
     "mxfp8_tma_gemv",
+    "mxfp8_tma_scaled_mm",
     "select_mxfp8_tma_compute_warps",
 }
 

@@ -10,10 +10,12 @@ if torch.cuda.get_device_capability() not in {(10, 0), (10, 3)}:
 
 try:
     from transformer_nuggets.cute import (
+        BlockScaleLayout,
         GridScheduler,
         MXFP8_TMA_PROFILE_TAGS,
         get_mxfp8_tma_gemv,
         mxfp8_tma_gemv,
+        mxfp8_tma_scaled_mm,
         select_mxfp8_tma_compute_warps,
     )
     from transformer_nuggets.cute.mxfp8_tma import app
@@ -40,6 +42,27 @@ def test_select_mxfp8_tma_compute_warps(k, block_n, expected_sm100):
     """Bake in the measured B200 rows-per-warp crossover."""
     expected = expected_sm100 if torch.cuda.get_device_capability() == (10, 0) else 1
     assert select_mxfp8_tma_compute_warps(k, block_n) == expected
+
+
+def swizzle_mxfp8_scales(scales: torch.Tensor) -> torch.Tensor:
+    """Convert natural E8M0 scales to canonical SWIZZLE_32_4_4 storage."""
+    rows, cols = scales.shape
+    padded_rows = ((rows + 127) // 128) * 128
+    padded_cols = ((cols + 3) // 4) * 4
+    padded = torch.zeros(
+        (padded_rows, padded_cols),
+        dtype=scales.dtype,
+        device=scales.device,
+    )
+    padded[:rows, :cols] = scales
+    return (
+        padded.view(padded_rows // 128, 128, padded_cols // 4, 4)
+        .permute(0, 2, 1, 3)
+        .reshape(-1, 4, 32, 4)
+        .transpose(1, 2)
+        .reshape(-1)
+        .contiguous()
+    )
 
 
 def dequantize_mxfp8(value: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -78,6 +101,65 @@ def test_mxfp8_tma_gemv_matches_reference(k, block_n, num_stages, num_compute_wa
     torch.cuda.synchronize()
 
     assert actual is output
+    torch.testing.assert_close(actual, expected, atol=1.0, rtol=0.05)
+
+
+@pytest.mark.parametrize(("block_n", "num_compute_warps"), [(8, 4), (6, 2)])
+def test_mxfp8_tma_swizzled_scales_match_raw(block_n, num_compute_warps):
+    """Read canonical blocked E8M0 scales across row-layout boundaries."""
+    n, k = 264, 2048
+    q_input, input_scale = quantize_mxfp8(torch.randn((1, k), dtype=torch.bfloat16, device="cuda"))
+    weight, weight_scale = quantize_mxfp8(torch.randn((n, k), dtype=torch.bfloat16, device="cuda"))
+    expected = mxfp8_tma_gemv(
+        q_input,
+        weight,
+        input_scale,
+        weight_scale,
+        block_n=block_n,
+        num_compute_warps=num_compute_warps,
+    )
+    actual = mxfp8_tma_gemv(
+        q_input,
+        weight,
+        swizzle_mxfp8_scales(input_scale),
+        swizzle_mxfp8_scales(weight_scale),
+        block_n=block_n,
+        num_compute_warps=num_compute_warps,
+        block_scale_layout=BlockScaleLayout.SWIZZLE_32_4_4,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, atol=1.0, rtol=0.05)
+
+
+def test_mxfp8_tma_scaled_mm_adapter_matches_scaled_mm():
+    """Match scaled_mm's blocked E8M0 scale and transposed-weight contract."""
+    from torch.nn.functional import ScalingType, SwizzleType, scaled_mm
+
+    n, k = 128, 2048
+    q_input, input_scale = quantize_mxfp8(torch.randn((1, k), dtype=torch.bfloat16, device="cuda"))
+    weight, weight_scale = quantize_mxfp8(torch.randn((n, k), dtype=torch.bfloat16, device="cuda"))
+    input_scale = swizzle_mxfp8_scales(input_scale).view(torch.float8_e8m0fnu)
+    weight_scale = swizzle_mxfp8_scales(weight_scale).view(torch.float8_e8m0fnu)
+    actual = mxfp8_tma_scaled_mm(
+        q_input,
+        weight.t(),
+        input_scale,
+        weight_scale,
+        block_n=8,
+        num_compute_warps=4,
+    )
+    expected = scaled_mm(
+        q_input,
+        weight.t(),
+        scale_a=[input_scale],
+        scale_recipe_a=[ScalingType.BlockWise1x32],
+        swizzle_a=[SwizzleType.SWIZZLE_32_4_4],
+        scale_b=[weight_scale],
+        scale_recipe_b=[ScalingType.BlockWise1x32],
+        swizzle_b=[SwizzleType.SWIZZLE_32_4_4],
+        output_dtype=torch.bfloat16,
+    )
+    torch.cuda.synchronize()
     torch.testing.assert_close(actual, expected, atol=1.0, rtol=0.05)
 
 

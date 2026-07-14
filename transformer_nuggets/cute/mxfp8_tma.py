@@ -12,6 +12,7 @@ import typer
 from transformer_nuggets.cute.blockscaled_tma import (
     BLOCKSCALED_TMA_PROFILE_TAGS,
     DEFAULT_PERSISTENT_CTAS_PER_SM,
+    BlockScaleLayout,
     BlockscaledTmaGemv,
     GridScheduler,
     ProfileTag as ProfileTag,
@@ -42,7 +43,7 @@ def combined_e8m0_to_f32(a, b):
 
 
 class Mxfp8TmaGemv(BlockscaledTmaGemv):
-    """Compute raw-layout MXFP8 GEMV with optional region profiling."""
+    """Compute MXFP8 GEMV from raw or canonical blocked E8M0 scales."""
 
     format_name = "mxfp8"
 
@@ -56,7 +57,10 @@ class Mxfp8TmaGemv(BlockscaledTmaGemv):
         num_compute_warps: int = 1,
         grid_scheduler: GridScheduler = GridScheduler.STATIC,
         num_persistent_ctas: int | None = None,
+        block_scale_layout: BlockScaleLayout = BlockScaleLayout.RAW,
     ):
+        self.block_scale_layout = BlockScaleLayout(block_scale_layout)
+        rows_per_warp = block_n // num_compute_warps
         super().__init__(
             n,
             k,
@@ -66,11 +70,19 @@ class Mxfp8TmaGemv(BlockscaledTmaGemv):
             scale_block_size=32,
             tile_k_u32=256,
             scale_copy_bits=8,
+            weight_scale_copy_bits=(
+                32
+                if self.block_scale_layout is BlockScaleLayout.SWIZZLE_32_4_4
+                and rows_per_warp >= 2
+                else 8
+            ),
             enable_profiling=enable_profiling,
             num_compute_warps=num_compute_warps,
             grid_scheduler=grid_scheduler,
             num_persistent_ctas=num_persistent_ctas,
         )
+        if self.block_scale_layout is BlockScaleLayout.SWIZZLE_32_4_4:
+            self.format_name = "mxfp8_swizzled"
 
     @cute.jit
     def decode_lane_values(self, raw_values: cute.Tensor):
@@ -91,17 +103,84 @@ class Mxfp8TmaGemv(BlockscaledTmaGemv):
         scale_atom: cute.CopyAtom,
         scale_layout: cute.Layout,
     ):
-        """Load one raw E8M0 scale byte."""
+        """Load one E8M0 scale byte from raw or blocked storage."""
         scale = cute.make_rmem_tensor(1, cutlass.Uint8)
+        if cutlass.const_expr(self.block_scale_layout is BlockScaleLayout.SWIZZLE_32_4_4):
+            offset = self.make_blocked_scale_layout(32)((row, scale_k * 32, 0))
+        else:
+            offset = scale_tensor.layout((row, scale_k))
         cute.copy(
             scale_atom,
-            cute.make_tensor(
-                scale_tensor.iterator + scale_tensor.layout((row, scale_k)),
-                scale_layout,
-            ),
+            cute.make_tensor(scale_tensor.iterator + offset, scale_layout),
             scale,
         )
         return scale[0]
+
+    @cute.jit
+    def prepare_weight_scale_values(
+        self,
+        scale_tensor: cute.Tensor,
+        row_start,
+        k_tile: cutlass.Constexpr,
+        lane: cutlass.Int32,
+        scale_atom: cute.CopyAtom,
+        scale_layout: cute.Layout,
+    ):
+        """Load up to four rows of blocked E8M0 scales per warp instruction."""
+        if cutlass.const_expr(
+            self.block_scale_layout is BlockScaleLayout.RAW or self.rows_per_warp == 1
+        ):
+            return None
+        packed_row_groups = []
+        for row_group in cutlass.range_constexpr((self.rows_per_warp + 3) // 4):
+            rows_in_group = min(4, self.rows_per_warp - row_group * 4)
+            lane_slot = lane % (rows_in_group * 8)
+            row = row_start + row_group * 4 + lane_slot // 8
+            col = k_tile * self.scale_blocks_per_tile + (lane_slot % 8) * 4
+            scales = cute.make_rmem_tensor(4, cutlass.Uint8)
+            cute.copy(
+                scale_atom,
+                cute.make_tensor(
+                    scale_tensor.iterator.align(min_align=4)
+                    + cute.assume(
+                        self.make_blocked_scale_layout(32)((row, col * 32, 0)),
+                        divby=4,
+                    ),
+                    cute.make_layout(4),
+                ),
+                scales,
+            )
+            packed_row_groups.append(cute.recast_tensor(scales, cutlass.Uint32).load()[0])
+        return packed_row_groups
+
+    @cute.jit
+    def load_prepared_weight_scale_values(
+        self,
+        prepared_scales,
+        scale_tensor: cute.Tensor,
+        row,
+        scale_k,
+        local_row: cutlass.Constexpr,
+        lane: cutlass.Int32,
+        scale_atom: cute.CopyAtom,
+        scale_layout: cute.Layout,
+    ):
+        """Shuffle one packed four-scale group to its four consuming lanes."""
+        if cutlass.const_expr(
+            self.block_scale_layout is BlockScaleLayout.RAW or self.rows_per_warp == 1
+        ):
+            return self.load_scale_values(
+                scale_tensor,
+                row,
+                scale_k,
+                scale_atom,
+                scale_layout,
+            )
+        packed = cute.arch.shuffle_sync_op(
+            prepared_scales[local_row // 4],
+            (local_row % 4) * 8 + lane // 4,
+        )
+        return cutlass.Uint8((packed >> cutlass.Uint32((lane & 3) * 8)) & 0xFF)
 
     @cute.jit
     def accumulate_scaled_products(
@@ -132,25 +211,42 @@ class Mxfp8TmaGemv(BlockscaledTmaGemv):
         output: torch.Tensor | None = None,
         profile_buffer: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Launch raw-layout MXFP8 GEMV into a contiguous BF16 output."""
+        """Launch MXFP8 GEMV from raw or blocked scales into contiguous BF16 output."""
         k = self.k
-        expected_shapes = {
-            "q_input": (1, k),
-            "weight": (self.n, k),
-            "input_scale": (1, self.sf_k),
-            "weight_scale": (self.n, self.sf_k),
-        }
-        tensors = {
-            "q_input": q_input,
-            "weight": weight,
-            "input_scale": input_scale,
-            "weight_scale": weight_scale,
-        }
-        for name, tensor in tensors.items():
-            if tensor.shape != expected_shapes[name]:
+        for name, tensor, expected_shape in (
+            ("q_input", q_input, (1, k)),
+            ("weight", weight, (self.n, k)),
+        ):
+            if tensor.shape != expected_shape:
                 raise ValueError(
-                    f"{name} must have shape {expected_shapes[name]}, got {tuple(tensor.shape)}"
+                    f"{name} must have shape {expected_shape}, got {tuple(tensor.shape)}"
                 )
+            if not tensor.is_cuda or not tensor.is_contiguous():
+                raise ValueError(f"{name} must be a contiguous CUDA tensor")
+
+        if self.block_scale_layout is BlockScaleLayout.RAW:
+            expected_scale_shapes = {
+                "input_scale": (1, self.sf_k),
+                "weight_scale": (self.n, self.sf_k),
+            }
+            for name, tensor in (("input_scale", input_scale), ("weight_scale", weight_scale)):
+                if tensor.shape != expected_scale_shapes[name]:
+                    raise ValueError(
+                        f"{name} must have shape {expected_scale_shapes[name]}, "
+                        f"got {tuple(tensor.shape)}"
+                    )
+        else:
+            padded_sf_k = ((self.sf_k + 3) // 4) * 4
+            expected_scale_numels = {
+                "input_scale": 128 * padded_sf_k,
+                "weight_scale": ((self.n + 127) // 128) * 128 * padded_sf_k,
+            }
+            for name, tensor in (("input_scale", input_scale), ("weight_scale", weight_scale)):
+                if tensor.numel() != expected_scale_numels[name]:
+                    raise ValueError(
+                        f"{name} must contain {expected_scale_numels[name]} swizzled elements"
+                    )
+        for name, tensor in (("input_scale", input_scale), ("weight_scale", weight_scale)):
             if not tensor.is_cuda or not tensor.is_contiguous():
                 raise ValueError(f"{name} must be a contiguous CUDA tensor")
         if q_input.dtype != torch.float8_e4m3fn or weight.dtype != torch.float8_e4m3fn:
@@ -195,13 +291,23 @@ class Mxfp8TmaGemv(BlockscaledTmaGemv):
             if self.enable_profiling
             else None
         )
+        weight_scale_shape = (
+            (self.n, self.sf_k)
+            if self.block_scale_layout is BlockScaleLayout.RAW
+            else (expected_scale_numels["weight_scale"],)
+        )
+        input_scale_shape = (
+            (1, self.sf_k)
+            if self.block_scale_layout is BlockScaleLayout.RAW
+            else (expected_scale_numels["input_scale"],)
+        )
         compiled = compile_tvm_ffi_and_cache(
             self,
             self.get_name(),
             make_fake_compact_tensor(cutlass.Float8E4M3FN, (self.n, k)),
             make_fake_compact_tensor(cutlass.Float8E4M3FN, (1, k)),
-            make_fake_compact_tensor(cutlass.Uint8, (self.n, self.sf_k)),
-            make_fake_compact_tensor(cutlass.Uint8, (1, self.sf_k)),
+            make_fake_compact_tensor(cutlass.Uint8, weight_scale_shape),
+            make_fake_compact_tensor(cutlass.Uint8, input_scale_shape),
             None,
             None,
             make_fake_compact_tensor(cutlass.BFloat16, (1, self.n)),
@@ -232,6 +338,7 @@ def get_mxfp8_tma_gemv(
     num_compute_warps: int = 1,
     grid_scheduler: GridScheduler = GridScheduler.STATIC,
     num_persistent_ctas: int | None = None,
+    block_scale_layout: BlockScaleLayout = BlockScaleLayout.RAW,
 ) -> Mxfp8TmaGemv:
     """Return a cached MXFP8 TMA GEMV specialization."""
     return Mxfp8TmaGemv(
@@ -243,6 +350,7 @@ def get_mxfp8_tma_gemv(
         num_compute_warps,
         grid_scheduler,
         num_persistent_ctas,
+        block_scale_layout,
     )
 
 
@@ -278,14 +386,15 @@ def mxfp8_tma_gemv(
     num_compute_warps: int | None = None,
     grid_scheduler: GridScheduler = GridScheduler.STATIC,
     num_persistent_ctas: int | None = None,
+    block_scale_layout: BlockScaleLayout = BlockScaleLayout.RAW,
 ) -> torch.Tensor:
-    """Compute raw-layout MXFP8 GEMV on prequantized inputs.
+    """Compute MXFP8 GEMV on prequantized inputs and caller-owned scales.
 
     Args:
         q_input: Contiguous ``[1, K]`` FP8 E4M3 input.
         weight: Contiguous ``[N, K]`` FP8 E4M3 weight.
-        input_scale: Raw ``[1, K / 32]`` E8M0 scale storage.
-        weight_scale: Raw ``[N, K / 32]`` E8M0 scale storage.
+        input_scale: Raw or ``SWIZZLE_32_4_4`` E8M0 input scales.
+        weight_scale: Raw or ``SWIZZLE_32_4_4`` E8M0 weight scales.
         block_n: Output rows computed by each CTA.
         num_stages: Number of shared-memory TMA pipeline stages.
         output: Optional caller-owned contiguous ``[1, N]`` BF16 output.
@@ -297,6 +406,7 @@ def mxfp8_tma_gemv(
         num_persistent_ctas: Maximum physical CTA count for the persistent scheduler.
             ``None`` requests eight CTAs per SM; the launch rounds down to a divisor
             of the logical tile count so every physical CTA executes equal work.
+        block_scale_layout: Caller-owned raw or blocked scale storage layout.
 
     Returns:
         The provided or newly allocated output tensor.
@@ -322,6 +432,7 @@ def mxfp8_tma_gemv(
         num_compute_warps,
         grid_scheduler,
         num_persistent_ctas,
+        block_scale_layout,
     ).interface(
         q_input,
         weight,
@@ -329,6 +440,40 @@ def mxfp8_tma_gemv(
         weight_scale,
         output,
         profile_buffer,
+    )
+
+
+def mxfp8_tma_scaled_mm(
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    *,
+    block_n: int,
+    output: torch.Tensor | None = None,
+    num_stages: int = 2,
+    num_compute_warps: int | None = None,
+    grid_scheduler: GridScheduler = GridScheduler.STATIC,
+    num_persistent_ctas: int | None = None,
+) -> torch.Tensor:
+    """Run the M=1 subset using scaled_mm's blocked-scale and transposed-B convention."""
+    if mat_b.ndim != 2:
+        raise ValueError("mat_b must be rank-2")
+    weight = mat_b.t()
+    if not weight.is_contiguous():
+        raise ValueError("mat_b must be a metadata transpose of contiguous [N, K] storage")
+    return mxfp8_tma_gemv(
+        mat_a,
+        weight,
+        scale_a,
+        scale_b,
+        block_n=block_n,
+        num_stages=num_stages,
+        output=output,
+        num_compute_warps=num_compute_warps,
+        grid_scheduler=grid_scheduler,
+        num_persistent_ctas=num_persistent_ctas,
+        block_scale_layout=BlockScaleLayout.SWIZZLE_32_4_4,
     )
 
 

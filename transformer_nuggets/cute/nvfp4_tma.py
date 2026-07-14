@@ -4,7 +4,6 @@ from functools import cache
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.utils.blockscaled_layout as blockscaled_utils
 import torch
 
 from transformer_nuggets.cute.blockscaled_tma import (
@@ -69,14 +68,6 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
         )
 
     @cute.jit
-    def blocked_scale_layout(self):
-        """Map logical matrix coordinates onto canonical blocked scale storage."""
-        return blockscaled_utils.tile_atom_to_shape_SF(
-            (((self.n + 127) // 128) * 128, self.k, 1),
-            16,
-        )
-
-    @cute.jit
     def load_scale_values(
         self,
         scale_tensor: cute.Tensor,
@@ -92,7 +83,7 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
             cute.make_tensor(
                 scale_tensor.iterator.align(min_align=2)
                 + cute.assume(
-                    self.blocked_scale_layout()((row, scale_k * 16, 0)),
+                    self.make_blocked_scale_layout(16)((row, scale_k * 16, 0)),
                     divby=2,
                 ),
                 cute.make_layout(2),
@@ -127,7 +118,7 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
                 cute.make_tensor(
                     scale_tensor.iterator.align(min_align=4)
                     + cute.assume(
-                        self.blocked_scale_layout()((row, col * 16, 0)),
+                        self.make_blocked_scale_layout(16)((row, col * 16, 0)),
                         divby=4,
                     ),
                     cute.make_layout(4),
