@@ -339,6 +339,7 @@ class BlockscaledTmaGemv(CuteOp):
         enable_profiling: cutlass.Constexpr,
     ) -> tuple[pipeline.PipelineConsumer, list]:
         """Wait for one stage and accumulate the rows owned by this compute warp."""
+        scale_k = lane * self.scale_blocks_per_lane + k_tile * self.scale_blocks_per_tile
         with self.profile_scope(
             prof_buf,
             ProfileTag.TMA_WAIT,
@@ -346,24 +347,6 @@ class BlockscaledTmaGemv(CuteOp):
             2 + 3 * k_tile,
             enable_profiling,
         ):
-            full = consumer.wait_and_advance()
-
-        with self.profile_scope(
-            prof_buf,
-            ProfileTag.TILE_COMPUTE,
-            pid_n,
-            3 + 3 * k_tile,
-            enable_profiling,
-        ):
-            scale_k = lane * self.scale_blocks_per_lane + k_tile * self.scale_blocks_per_tile
-            x_values = self.load_lane_values(
-                sX,
-                0,
-                lane,
-                full.index,
-                smem_atom,
-                chunk_layout,
-            )
             input_scales = self.load_scale_values(
                 mSFX,
                 0,
@@ -378,6 +361,23 @@ class BlockscaledTmaGemv(CuteOp):
                 lane,
                 weight_scale_atom,
                 scale_layout,
+            )
+            full = consumer.wait_and_advance()
+
+        with self.profile_scope(
+            prof_buf,
+            ProfileTag.TILE_COMPUTE,
+            pid_n,
+            3 + 3 * k_tile,
+            enable_profiling,
+        ):
+            x_values = self.load_lane_values(
+                sX,
+                0,
+                lane,
+                full.index,
+                smem_atom,
+                chunk_layout,
             )
             for local_row in cutlass.range_constexpr(self.rows_per_warp):
                 cta_row = owned_row_start + local_row
