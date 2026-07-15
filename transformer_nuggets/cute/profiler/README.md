@@ -89,7 +89,7 @@ Three on-wire record formats are available, in addition to the three pairing mod
 | **Compact 1xi64 gmem** (`compact_event_stop` + `compact_anchor_init`) | 2x `CS2R.32` (32-bit timer) + 1x `STG.E.EF.64` (packed) + address math | 8 B global | Per-event STG to global | Smaller buffer, smaller decode work, lower L2 pressure |
 | **Compact 1xi64 smem** (`compact_event_stop_smem` + `compact_anchor_init_smem` + `compact_flush_smem_to_gmem`) | 2x `CS2R.32` + 1x `STS.64` + bit-pack | 8 B in smem; cooperative flush to gmem at kernel exit | Per-event STS, one cooperative flush at end | Lowest per-event observer cost; recommended when timestamps will drive optimization decisions |
 
-Format is the per-event SHAPE; pairing (atomic vs static vs token) is independent. Today only the legacy 4xi64 path has the `with profile_region(...)` context-manager wrapper; the compact paths use direct `read_globaltimer_lo32()` + `compact_event_stop*()` calls, which is also the right shape for deeply-nested call sites (see `raw_event_stop` for the analogous legacy primitive).
+Format is the per-event SHAPE; pairing (atomic vs static vs token) is independent. The legacy path uses `with profile_region(...)`; compact static slots can use `with compact_profile_region(...)`, selecting shared-memory records with `smem=True`. Direct `read_globaltimer_lo32()` + `compact_event_stop*()` calls remain available for deeply nested call sites.
 
 ### When to pick smem
 
@@ -101,9 +101,9 @@ We benchmarked compact-gmem vs compact-smem on a Blackwell GEMM (`agent_space/be
 Decision rule:
 - **Pick smem** when the timestamps you record will be used to make optimization decisions (per-region duration is your signal). The flush cost is paid once at kernel exit and doesn't pollute the timestamps.
 - **Pick compact-gmem** when total kernel slowdown matters most (e.g. you're profiling something that already runs under other tooling), or when you don't want to plumb a smem `MemRange` through your `SharedStorage`.
-- **Pick legacy** when you want the convenient `with profile_region(...)` context-manager API and care about backwards compatibility.
+- **Pick legacy** when you need atomic slot allocation, per-event thread IDs, or backwards compatibility.
 
-The smem path requires the caller to add a `cute.struct.MemRange[Int64, 1 + max_events_per_unit]` field to their `SharedStorage` and pass a `Tensor` view (`storage.prof_smem.get_tensor(cute.make_layout((1 + N,)))`) to the device ops. See `agent_space/bench_profile_overhead.py:GEMMCompactSmem` for a full working example.
+The smem path requires a CTA-local `Int64` tensor with `1 + max_events_per_unit` slots, allocated through either `SmemAllocator.allocate_array` or a `cute.struct.MemRange`. See `agent_space/bench_profile_overhead.py:GEMMCompactSmem` for a full working example.
 
 ## API
 
@@ -139,7 +139,9 @@ Compact 1xi64 format (`profile_session(compact=True, ...)`):
 | `compact_event_stop(buf, unit_id, event_idx, start_ts32, tag, max_events)` | 1x `STG.E.EF.64` packed-record store |
 | `compact_anchor_init_smem(smem_buf)` | Write 64-bit anchor to smem slot 0 |
 | `compact_event_stop_smem(smem_buf, event_idx, start_ts32, tag)` | 1x `STS.64` packed-record store |
+| `compact_prepare_smem(smem_buf, max_events, record)` | Cooperatively clear and anchor a reusable smem slice |
 | `compact_flush_smem_to_gmem(smem_buf, gmem_buf, unit_id, max_events)` | Cooperative copy at kernel exit |
+| `compact_profile_region(..., event_idx, smem=False)` | Context-manager wrapper for compact static slots |
 
 ## Trace Formats
 

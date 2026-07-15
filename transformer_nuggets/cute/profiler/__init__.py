@@ -55,7 +55,9 @@ from transformer_nuggets.cute.profiler.ops import (
     compact_anchor_init,
     compact_event_stop_smem,
     compact_anchor_init_smem,
+    compact_prepare_smem,
     compact_flush_smem_to_gmem,
+    compact_profile_region,
 )
 
 from transformer_nuggets.cute.profiler.postprocessors import (
@@ -96,7 +98,9 @@ __all__ = [
     "compact_anchor_init",
     "compact_event_stop_smem",
     "compact_anchor_init_smem",
+    "compact_prepare_smem",
     "compact_flush_smem_to_gmem",
+    "compact_profile_region",
     # Post-processors
     "group_by_unit",
     "group_by_tag",

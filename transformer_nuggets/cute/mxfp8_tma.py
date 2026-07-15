@@ -278,7 +278,7 @@ class Mxfp8TmaGemv(BlockscaledTmaGemv):
         ):
             raise ValueError("output must be a contiguous [1, N] BF16 tensor on the input device")
 
-        expected_profile_numel = self.num_profile_units * (1 + 4 * self.max_profile_events_per_cta)
+        expected_profile_numel = self.num_profile_units * (1 + self.max_profile_events_per_cta)
         if self.enable_profiling:
             if profile_buffer is None:
                 raise ValueError("profile_buffer is required when enable_profiling=True")
@@ -286,11 +286,11 @@ class Mxfp8TmaGemv(BlockscaledTmaGemv):
                 profile_buffer.dtype != torch.int64
                 or profile_buffer.device != q_input.device
                 or not profile_buffer.is_contiguous()
-                or profile_buffer.numel() < expected_profile_numel
+                or profile_buffer.numel() != expected_profile_numel
             ):
                 raise ValueError(
-                    "profile_buffer must be a contiguous CUDA int64 tensor with "
-                    f"at least {expected_profile_numel} elements"
+                    "profile_buffer must be a compact contiguous CUDA int64 tensor with "
+                    f"exactly {expected_profile_numel} elements"
                 )
         elif profile_buffer is not None:
             raise ValueError("profile_buffer requires an enable_profiling=True specialization")
@@ -560,6 +560,7 @@ def profile_mxfp8_tma(
         tag_names=list(op.profile_tags),
         trace_path=str(output),
         device=torch_device,
+        compact=True,
         post_process_events=group_by_unit,
     ) as (prof, _):
         result = torch.empty((1, n), dtype=torch.bfloat16, device=torch_device)

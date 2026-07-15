@@ -265,12 +265,26 @@ def test_mxfp8_tma_gemv_profiles_labeled_regions(grid_scheduler, num_persistent_
         grid_scheduler=grid_scheduler,
         num_persistent_ctas=num_persistent_ctas,
     )
+    legacy_profile_buffer = torch.zeros(
+        op.num_profile_units * (1 + 4 * op.max_profile_events_per_cta),
+        dtype=torch.int64,
+        device=q_input.device,
+    )
+    with pytest.raises(ValueError, match="compact.*exactly"):
+        op.interface(
+            q_input,
+            weight,
+            input_scale,
+            weight_scale,
+            profile_buffer=legacy_profile_buffer,
+        )
 
     with profile_session(
         max_events_per_unit=op.max_profile_events_per_cta,
         num_units=(op.num_profile_units, "CTA"),
         tag_names=list(MXFP8_TMA_PROFILE_TAGS),
         device=q_input.device,
+        compact=True,
     ) as (prof, tags):
         actual = op.interface(
             q_input,
@@ -285,8 +299,12 @@ def test_mxfp8_tma_gemv_profiles_labeled_regions(grid_scheduler, num_persistent_
     ).bfloat16()
     torch.testing.assert_close(actual, expected, atol=1.0, rtol=0.05)
     events = decode_events(prof, tags)
-    assert len(events) == op.num_profile_units * (3 * op.num_k_tiles + 1)
-    assert {event.tag_name for event in events} == set(MXFP8_TMA_PROFILE_TAGS)
+    assert len(events) == op.num_profile_units * op.profile_events_per_cta
+    assert {event.tag_name for event in events} == set(MXFP8_TMA_PROFILE_TAGS) - {
+        "input_scale_acquire",
+        "input_scale_copy",
+        "input_scale_wait",
+    }
     assert {event.unit_id for event in events} == set(range(op.num_profile_units))
 
 

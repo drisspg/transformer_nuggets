@@ -123,6 +123,9 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
         use_global_scales: bool = False,
         split_k: int = 1,
         stage_weight_scales: bool = False,
+        profile_cta_stride: int = 1,
+        dedicated_producer_warp: bool = False,
+        prefetch_input_scales: bool = False,
     ):
         super().__init__(
             n,
@@ -144,6 +147,9 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
             num_persistent_ctas=num_persistent_ctas,
             use_global_scales=use_global_scales,
             split_k=split_k,
+            profile_cta_stride=profile_cta_stride,
+            dedicated_producer_warp=dedicated_producer_warp,
+            prefetch_input_scales=prefetch_input_scales,
         )
         if stage_weight_scales and block_n != 8:
             raise ValueError("staged weight scales require block_n=8")
@@ -241,6 +247,39 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
         return (
             scales[0].bitcast(cutlass.Float8E4M3FN).to(cutlass.Float32),
             scales[1].bitcast(cutlass.Float8E4M3FN).to(cutlass.Float32),
+        )
+
+    @cute.jit
+    def prefetch_input_scale_values(
+        self,
+        scale_tensor: cute.Tensor,
+        row,
+        scale_k,
+        scale_atom: cute.CopyAtom,
+        scale_layout: cute.Layout,
+    ):
+        """Load two E4M3 scale bytes without resolving them for arithmetic."""
+        scales = cute.make_rmem_tensor(2, cutlass.Uint8)
+        cute.copy(
+            scale_atom,
+            cute.make_tensor(
+                scale_tensor.iterator.align(min_align=2)
+                + cute.assume(
+                    self.make_blocked_scale_layout(16)((row, scale_k * 16, 0)),
+                    divby=2,
+                ),
+                cute.make_layout(2),
+            ),
+            scales,
+        )
+        return scales[0], scales[1]
+
+    @cute.jit
+    def decode_prefetched_input_scale_values(self, prefetched_scales):
+        """Convert two previously issued E4M3 scale bytes to FP32."""
+        return (
+            prefetched_scales[0].bitcast(cutlass.Float8E4M3FN).to(cutlass.Float32),
+            prefetched_scales[1].bitcast(cutlass.Float8E4M3FN).to(cutlass.Float32),
         )
 
     @cute.jit
@@ -515,7 +554,7 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
                 raise ValueError("partial_output must be contiguous split_k-by-N CUDA float32")
             kernel_output = partial_output
 
-        expected_profile_numel = self.num_profile_units * (1 + 4 * self.max_profile_events_per_cta)
+        expected_profile_numel = self.num_profile_units * (1 + self.max_profile_events_per_cta)
         if self.enable_profiling:
             if profile_buffer is None:
                 raise ValueError("profile_buffer is required when enable_profiling=True")
@@ -523,11 +562,11 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
                 profile_buffer.dtype != torch.int64
                 or profile_buffer.device != q_input.device
                 or not profile_buffer.is_contiguous()
-                or profile_buffer.numel() < expected_profile_numel
+                or profile_buffer.numel() != expected_profile_numel
             ):
                 raise ValueError(
-                    "profile_buffer must be a contiguous CUDA int64 tensor with "
-                    f"at least {expected_profile_numel} elements"
+                    "profile_buffer must be a compact contiguous CUDA int64 tensor with "
+                    f"exactly {expected_profile_numel} elements"
                 )
         elif profile_buffer is not None:
             raise ValueError("profile_buffer requires an enable_profiling=True specialization")
@@ -592,6 +631,9 @@ def get_nvfp4_tma_gemv(
     use_global_scales: bool = False,
     split_k: int = 1,
     stage_weight_scales: bool = False,
+    profile_cta_stride: int = 1,
+    dedicated_producer_warp: bool = False,
+    prefetch_input_scales: bool = False,
 ) -> Nvfp4TmaGemv:
     """Return a cached NVFP4 TMA GEMV specialization."""
     return Nvfp4TmaGemv(
@@ -606,6 +648,9 @@ def get_nvfp4_tma_gemv(
         use_global_scales,
         split_k,
         stage_weight_scales,
+        profile_cta_stride,
+        dedicated_producer_warp,
+        prefetch_input_scales,
     )
 
 
@@ -626,6 +671,8 @@ def nvfp4_tma_scaled_mm(
     num_compute_warps: int | None = None,
     grid_scheduler: GridScheduler = GridScheduler.STATIC,
     num_persistent_ctas: int | None = None,
+    dedicated_producer_warp: bool = False,
+    prefetch_input_scales: bool = False,
 ) -> torch.Tensor:
     """Run the M=1 subset using F.scaled_mm's transposed-B convention.
 
@@ -645,6 +692,8 @@ def nvfp4_tma_scaled_mm(
         num_compute_warps: Consumer warps per CTA, or ``None`` for architecture tuning.
         grid_scheduler: Static or persistent N-tile scheduling.
         num_persistent_ctas: Maximum physical CTA count for persistent scheduling.
+        dedicated_producer_warp: Reserve warp 0 for TMA production instead of compute.
+        prefetch_input_scales: Stage input scales through the dedicated producer warp.
 
     Returns:
         The provided or newly allocated BF16 output.
@@ -670,6 +719,8 @@ def nvfp4_tma_scaled_mm(
         num_compute_warps=num_compute_warps,
         grid_scheduler=grid_scheduler,
         num_persistent_ctas=num_persistent_ctas,
+        dedicated_producer_warp=dedicated_producer_warp,
+        prefetch_input_scales=prefetch_input_scales,
     )
 
 
@@ -771,6 +822,9 @@ def nvfp4_tma_gemv(
     stage_weight_scales: bool | None = None,
     enable_profiling: bool = False,
     profile_buffer: torch.Tensor | None = None,
+    profile_cta_stride: int = 1,
+    dedicated_producer_warp: bool = False,
+    prefetch_input_scales: bool = False,
     num_compute_warps: int | None = None,
     grid_scheduler: GridScheduler = GridScheduler.STATIC,
     num_persistent_ctas: int | None = None,
@@ -792,6 +846,9 @@ def nvfp4_tma_gemv(
         stage_weight_scales: Stage physical weight-scale subsets with TMA, or auto-select.
         enable_profiling: Compile static intra-kernel profiling regions.
         profile_buffer: Profiling buffer required by profiled specializations.
+        profile_cta_stride: Record one logical CTA out of each stride when profiling.
+        dedicated_producer_warp: Reserve warp 0 for TMA production instead of compute.
+        prefetch_input_scales: Stage input scales through the dedicated producer warp.
         num_compute_warps: Consumer warps per CTA, or ``None`` for architecture tuning.
         grid_scheduler: Static or persistent N-tile scheduling.
         num_persistent_ctas: Maximum physical CTA count for persistent scheduling.
@@ -841,6 +898,9 @@ def nvfp4_tma_gemv(
         use_global_scales,
         split_k,
         stage_weight_scales,
+        profile_cta_stride,
+        dedicated_producer_warp,
+        prefetch_input_scales,
     ).interface(
         q_input,
         weight,

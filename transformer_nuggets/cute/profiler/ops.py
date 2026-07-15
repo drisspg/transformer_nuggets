@@ -54,7 +54,9 @@ __all__ = [
     "compact_anchor_init",
     "compact_event_stop_smem",
     "compact_anchor_init_smem",
+    "compact_prepare_smem",
     "compact_flush_smem_to_gmem",
+    "compact_profile_region",
     "ENABLE_PROFILING",
     "ENABLE_PROFILING_CONST",
 ]
@@ -217,6 +219,26 @@ def compact_event_stop_smem(
         tag_u = Int64(tag) & Int64(0xFF)
         packed = ts_u | (dur_u << 32) | (tag_u << 56)
         smem_buf[Int32(1) + event_idx] = packed
+
+
+@cute.jit
+def compact_prepare_smem(
+    smem_buf: cute.Tensor,
+    max_events_per_unit: Int32,
+    record=True,
+) -> None:
+    """Clear and anchor a compact shared-memory profile slice."""
+    if record:
+        tidx, _, _ = cute.arch.thread_idx()
+        bdim, _, _ = cute.arch.block_dim()
+        slice_size = Int32(1) + max_events_per_unit
+        i = tidx
+        while i < slice_size:
+            smem_buf[i] = Int64(0)
+            i = i + bdim
+        cute.arch.barrier()
+        compact_anchor_init_smem(smem_buf)
+        cute.arch.barrier()
 
 
 @cute.jit
@@ -453,6 +475,7 @@ def warp_atomic_alloc(
     unit_id: Int32,
     max_events_per_unit: Int32,
     target_warp: Int32,
+    record=True,
 ) -> Int32:
     """Atomically allocate event index, guarded to lane 0 of target_warp.
 
@@ -472,12 +495,13 @@ def warp_atomic_alloc(
     lane_idx = cute.arch.lane_idx()
 
     event_idx = Int32(-1)
-    if warp_idx == target_warp and lane_idx == 0:
-        base_ptr = buf.iterator.toint()
-        slice_size = Int64(1 + 4 * max_events_per_unit)
-        counter_ptr = base_ptr + Int64(unit_id) * slice_size * Int64(8)
-        old_count = _atomic_add_i64_ptr(counter_ptr, Int64(1))
-        event_idx = Int32(old_count)
+    if record:
+        if warp_idx == target_warp and lane_idx == 0:
+            base_ptr = buf.iterator.toint()
+            slice_size = Int64(1 + 4 * max_events_per_unit)
+            counter_ptr = base_ptr + Int64(unit_id) * slice_size * Int64(8)
+            old_count = _atomic_add_i64_ptr(counter_ptr, Int64(1))
+            event_idx = Int32(old_count)
     return event_idx
 
 
@@ -489,6 +513,7 @@ def warp_start(
     max_events_per_unit: Int32,
     target_warp: Int32,
     bounds_check: cutlass.Constexpr = True,
+    record=True,
 ) -> Int64:
     """Start profiling, but only for lane 0 of the specified warp.
 
@@ -503,6 +528,7 @@ def warp_start(
         max_events_per_unit: Maximum events per unit.
         target_warp: Which warp should profile.
         bounds_check: Forwarded to :func:`static_start`.
+        record: Runtime predicate controlling whether the warp records.
 
     Returns:
         Int64: Start timestamp (0 for non-participating lanes).
@@ -511,10 +537,11 @@ def warp_start(
     lane_idx = cute.arch.lane_idx()
 
     start_ns = Int64(0)
-    if warp_idx == target_warp and lane_idx == 0:
-        start_ns = static_start(
-            buf, unit_id, event_idx, max_events_per_unit, bounds_check=bounds_check
-        )
+    if record:
+        if warp_idx == target_warp and lane_idx == 0:
+            start_ns = static_start(
+                buf, unit_id, event_idx, max_events_per_unit, bounds_check=bounds_check
+            )
     return start_ns
 
 
@@ -529,6 +556,7 @@ def warp_stop(
     max_events_per_unit: Int32,
     target_warp: Int32,
     bounds_check: cutlass.Constexpr = True,
+    record=True,
 ) -> None:
     """Stop profiling, but only for lane 0 of the specified warp.
 
@@ -542,21 +570,23 @@ def warp_stop(
         max_events_per_unit: Maximum events per unit.
         target_warp: Which warp should profile.
         bounds_check: Forwarded to :func:`static_stop`.
+        record: Runtime predicate controlling whether the warp records.
     """
     warp_idx = cute.arch.warp_idx()
     lane_idx = cute.arch.lane_idx()
 
-    if warp_idx == target_warp and lane_idx == 0:
-        static_stop(
-            buf,
-            unit_id,
-            event_idx,
-            start_ns,
-            tag,
-            tid,
-            max_events_per_unit,
-            bounds_check=bounds_check,
-        )
+    if record:
+        if warp_idx == target_warp and lane_idx == 0:
+            static_stop(
+                buf,
+                unit_id,
+                event_idx,
+                start_ns,
+                tag,
+                tid,
+                max_events_per_unit,
+                bounds_check=bounds_check,
+            )
 
 
 class _ProfileRegionContext:
@@ -570,7 +600,16 @@ class _ProfileRegionContext:
     """
 
     def __init__(
-        self, buf, max_events_per_unit, tag, unit_id, tid, target_warp, event_idx, bounds_check
+        self,
+        buf,
+        max_events_per_unit,
+        tag,
+        unit_id,
+        tid,
+        target_warp,
+        event_idx,
+        bounds_check,
+        record,
     ):
         self._buf = buf
         self._max_events_per_unit = max_events_per_unit
@@ -581,11 +620,16 @@ class _ProfileRegionContext:
         self._event_idx = event_idx
         self._use_atomic = event_idx is None
         self._bounds_check = bounds_check
+        self._record = record
 
     def __enter__(self):
         if cutlass.const_expr(self._use_atomic):
             self._event_idx = warp_atomic_alloc(
-                self._buf, self._unit_id, self._max_events_per_unit, self._target_warp
+                self._buf,
+                self._unit_id,
+                self._max_events_per_unit,
+                self._target_warp,
+                self._record,
             )
 
         self._start_ns = warp_start(
@@ -595,6 +639,7 @@ class _ProfileRegionContext:
             self._max_events_per_unit,
             self._target_warp,
             bounds_check=self._bounds_check,
+            record=self._record,
         )
         return self
 
@@ -609,6 +654,7 @@ class _ProfileRegionContext:
             self._max_events_per_unit,
             self._target_warp,
             bounds_check=self._bounds_check,
+            record=self._record,
         )
         return False
 
@@ -623,6 +669,134 @@ class _NoOpProfileRegion:
         return False
 
 
+@cute.jit
+def compact_warp_start(target_warp: Int32, record=True) -> Int32:
+    """Read a compact start timestamp from lane 0 of one warp."""
+    start_ts32 = Int32(0)
+    if record:
+        if cute.arch.warp_idx() == target_warp and cute.arch.lane_idx() == 0:
+            start_ts32 = read_globaltimer_lo32()
+    return start_ts32
+
+
+@cute.jit
+def compact_warp_stop_smem(
+    buf: cute.Tensor,
+    event_idx: Int32,
+    start_ts32: Int32,
+    tag: Int32,
+    target_warp: Int32,
+    record=True,
+) -> None:
+    """Close a compact shared-memory region from lane 0 of one warp."""
+    if record:
+        if cute.arch.warp_idx() == target_warp and cute.arch.lane_idx() == 0:
+            compact_event_stop_smem(buf, event_idx, start_ts32, tag)
+
+
+@cute.jit
+def compact_warp_stop_gmem(
+    buf: cute.Tensor,
+    unit_id: Int32,
+    event_idx: Int32,
+    start_ts32: Int32,
+    tag: Int32,
+    max_events_per_unit: Int32,
+    target_warp: Int32,
+    record=True,
+) -> None:
+    """Close a compact global-memory region from lane 0 of one warp."""
+    if record:
+        if cute.arch.warp_idx() == target_warp and cute.arch.lane_idx() == 0:
+            compact_event_stop(
+                buf,
+                unit_id,
+                event_idx,
+                start_ts32,
+                tag,
+                max_events_per_unit,
+            )
+
+
+class _CompactProfileRegionContext:
+    """DSL context manager for statically indexed compact profile records."""
+
+    def __init__(
+        self,
+        buf,
+        max_events_per_unit,
+        tag,
+        unit_id,
+        target_warp,
+        event_idx,
+        record,
+        smem,
+    ):
+        self._buf = buf
+        self._max_events_per_unit = max_events_per_unit
+        self._tag = tag
+        self._unit_id = unit_id
+        self._target_warp = target_warp
+        self._event_idx = event_idx
+        self._record = record
+        self._smem = smem
+
+    def __enter__(self):
+        self._start_ts32 = compact_warp_start(self._target_warp, self._record)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if cutlass.const_expr(self._smem):
+            compact_warp_stop_smem(
+                self._buf,
+                self._event_idx,
+                self._start_ts32,
+                self._tag,
+                self._target_warp,
+                self._record,
+            )
+        else:
+            compact_warp_stop_gmem(
+                self._buf,
+                self._unit_id,
+                self._event_idx,
+                self._start_ts32,
+                self._tag,
+                self._max_events_per_unit,
+                self._target_warp,
+                self._record,
+            )
+        return False
+
+
+def compact_profile_region(
+    buf,
+    max_events_per_unit,
+    tag,
+    unit_id,
+    event_idx,
+    target_warp=None,
+    enabled=True,
+    record=True,
+    smem=False,
+):
+    """Profile one static-slot region using the compact packed record format."""
+    if not cutlass.const_expr(enabled) or not cutlass.const_expr(ENABLE_PROFILING_CONST):
+        return _NoOpProfileRegion()
+    if target_warp is None:
+        target_warp = Int32(0)
+    return _CompactProfileRegionContext(
+        buf,
+        max_events_per_unit,
+        tag,
+        unit_id,
+        target_warp,
+        event_idx,
+        record,
+        smem,
+    )
+
+
 def profile_region(
     buf,
     max_events_per_unit,
@@ -633,6 +807,7 @@ def profile_region(
     tid=None,
     bounds_check=True,
     enabled=True,
+    record=True,
 ):
     """Context manager that profiles a code region in a CUTE DSL kernel.
 
@@ -665,6 +840,7 @@ def profile_region(
             each warp gets its own Perfetto lane.
         bounds_check: Forwarded to :func:`static_start`/:func:`static_stop`.
         enabled: Compile-time switch. When false, the region emits no profiling code.
+        record: Runtime predicate selecting whether this unit records the region.
 
     Returns:
         Context manager for use with ``with``.
@@ -678,7 +854,15 @@ def profile_region(
         tid = unit_id
 
     return _ProfileRegionContext(
-        buf, max_events_per_unit, tag, unit_id, tid, target_warp, event_idx, bounds_check
+        buf,
+        max_events_per_unit,
+        tag,
+        unit_id,
+        tid,
+        target_warp,
+        event_idx,
+        bounds_check,
+        record,
     )
 
 

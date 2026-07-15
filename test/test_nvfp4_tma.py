@@ -196,6 +196,46 @@ def test_nvfp4_tma_matches_reference(num_compute_warps):
     torch.testing.assert_close(actual, expected, atol=2.0, rtol=0.05)
 
 
+def test_nvfp4_tma_prefetch_input_scales_requires_dedicated_producer():
+    """Keep scale production off the consumer path by construction."""
+    q_input, weight, input_scale, weight_scale, _, _ = make_case(128, 4096)
+    with pytest.raises(ValueError, match="requires a dedicated producer warp"):
+        nvfp4_tma_gemv(
+            q_input,
+            weight,
+            input_scale,
+            weight_scale,
+            block_n=8,
+            num_stages=3,
+            num_compute_warps=4,
+            prefetch_input_scales=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("dedicated_producer_warp", "prefetch_input_scales"),
+    [(True, False), (True, True)],
+)
+def test_nvfp4_tma_prefetch_input_scales_matches_reference(
+    dedicated_producer_warp, prefetch_input_scales
+):
+    """Preserve NVFP4 output while independently producing and prefetching scales."""
+    q_input, weight, input_scale, weight_scale, expected, _ = make_case(128, 4096)
+    actual = nvfp4_tma_gemv(
+        q_input,
+        weight,
+        input_scale,
+        weight_scale,
+        block_n=8,
+        num_stages=3,
+        num_compute_warps=4,
+        dedicated_producer_warp=dedicated_producer_warp,
+        prefetch_input_scales=prefetch_input_scales,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, atol=2.0, rtol=0.05)
+
+
 @pytest.mark.parametrize(("block_n", "num_compute_warps"), [(8, 4), (6, 2)])
 def test_nvfp4_tma_scale_layout_and_paired_loads(block_n, num_compute_warps):
     """Match random scales across blocked-layout boundaries and odd row ownership."""
@@ -309,11 +349,25 @@ def test_nvfp4_tma_profiles_common_pipeline_regions():
         enable_profiling=True,
         num_compute_warps=4,
     )
+    legacy_profile_buffer = torch.zeros(
+        op.num_profile_units * (1 + 4 * op.max_profile_events_per_cta),
+        dtype=torch.int64,
+        device="cuda",
+    )
+    with pytest.raises(ValueError, match="compact.*exactly"):
+        op.interface(
+            q_input,
+            weight,
+            input_scale,
+            weight_scale,
+            profile_buffer=legacy_profile_buffer,
+        )
     with profile_session(
         max_events_per_unit=op.max_profile_events_per_cta,
         num_units=(op.num_profile_units, "CTA"),
         tag_names=list(NVFP4_TMA_PROFILE_TAGS),
         device="cuda",
+        compact=True,
     ) as (prof, tags):
         actual = op.interface(
             q_input,
@@ -324,11 +378,87 @@ def test_nvfp4_tma_profiles_common_pipeline_regions():
         )
     torch.testing.assert_close(actual, expected, atol=2.0, rtol=0.05)
     events = decode_events(prof, tags)
-    assert len(events) == op.num_profile_units * (3 * op.num_k_tiles + 1)
-    assert {event.tag_name for event in events} == set(NVFP4_TMA_PROFILE_TAGS)
+    assert len(events) == op.num_profile_units * op.profile_events_per_cta
+    assert {event.tag_name for event in events} == set(NVFP4_TMA_PROFILE_TAGS) - {
+        "input_scale_acquire",
+        "input_scale_copy",
+        "input_scale_wait",
+    }
 
 
-def test_nvfp4_tma_matches_scaled_mm_global_scale_contract():
+def test_nvfp4_tma_profiles_sampled_ctas():
+    """Record a deterministic CTA subset without changing the launched grid."""
+    q_input, weight, input_scale, weight_scale, expected, _ = make_case(128, 4096)
+    op = get_nvfp4_tma_gemv(
+        128,
+        4096,
+        4,
+        enable_profiling=True,
+        num_compute_warps=4,
+        profile_cta_stride=4,
+    )
+    with profile_session(
+        max_events_per_unit=op.max_profile_events_per_cta,
+        num_units=(op.num_profile_units, "CTA"),
+        tag_names=list(NVFP4_TMA_PROFILE_TAGS),
+        device="cuda",
+        compact=True,
+    ) as (prof, tags):
+        actual = op.interface(
+            q_input,
+            weight,
+            input_scale,
+            weight_scale,
+            profile_buffer=prof.tensor,
+        )
+    torch.testing.assert_close(actual, expected, atol=2.0, rtol=0.05)
+    events = decode_events(prof, tags)
+    assert len(events) == op.num_profile_units * op.profile_events_per_cta
+    assert {event.unit_id for event in events} == set(range(op.num_profile_units))
+
+
+def test_nvfp4_tma_profiles_dedicated_persistent_tiles():
+    """Profile sampled persistent tiles with dedicated matrix and scale production."""
+    q_input, weight, input_scale, weight_scale, expected, _ = make_case(256, 4096)
+    op = get_nvfp4_tma_gemv(
+        256,
+        4096,
+        8,
+        enable_profiling=True,
+        num_compute_warps=4,
+        grid_scheduler=GridScheduler.PERSISTENT,
+        num_persistent_ctas=4,
+        profile_cta_stride=2,
+        dedicated_producer_warp=True,
+        prefetch_input_scales=True,
+    )
+    with profile_session(
+        max_events_per_unit=op.max_profile_events_per_cta,
+        num_units=(op.num_profile_units, "CTA"),
+        tag_names=list(NVFP4_TMA_PROFILE_TAGS),
+        device="cuda",
+        compact=True,
+    ) as (prof, tags):
+        actual = op.interface(
+            q_input,
+            weight,
+            input_scale,
+            weight_scale,
+            profile_buffer=prof.tensor,
+        )
+    torch.testing.assert_close(actual, expected, atol=2.0, rtol=0.05)
+    events = decode_events(prof, tags)
+    assert len(events) == op.num_profile_units * op.profile_events_per_cta
+    assert {event.unit_id for event in events} == set(range(op.num_profile_units))
+
+
+@pytest.mark.parametrize(
+    ("dedicated_producer_warp", "prefetch_input_scales"),
+    [(False, False), (True, True)],
+)
+def test_nvfp4_tma_matches_scaled_mm_global_scale_contract(
+    dedicated_producer_warp, prefetch_input_scales
+):
     """Match F.scaled_mm blockwise and tensorwise NVFP4 scaling semantics."""
     from torch.nn.functional import ScalingType, SwizzleType, scaled_mm
 
@@ -344,6 +474,8 @@ def test_nvfp4_tma_matches_scaled_mm_global_scale_contract():
         global_scale_a=input_global_scale,
         global_scale_b=weight_global_scale,
         num_compute_warps=4,
+        dedicated_producer_warp=dedicated_producer_warp,
+        prefetch_input_scales=prefetch_input_scales,
     )
     expected = scaled_mm(
         q_input,
@@ -466,6 +598,26 @@ def test_nvfp4_tma_compact_scale_tma_persistent_reuse():
         grid_scheduler=GridScheduler.PERSISTENT,
         num_persistent_ctas=4,
         stage_weight_scales=True,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, atol=2.0, rtol=0.05)
+
+
+@pytest.mark.parametrize("prefetch_input_scales", [False, True])
+def test_nvfp4_tma_dedicated_producer_persistent_reuse(prefetch_input_scales):
+    """Keep producer and consumer pipeline phases aligned across persistent tiles."""
+    q_input, weight, input_scale, weight_scale, expected, _ = make_case(256, 4096)
+    actual = nvfp4_tma_gemv(
+        q_input,
+        weight,
+        input_scale,
+        weight_scale,
+        block_n=8,
+        num_compute_warps=4,
+        grid_scheduler=GridScheduler.PERSISTENT,
+        num_persistent_ctas=4,
+        dedicated_producer_warp=True,
+        prefetch_input_scales=prefetch_input_scales,
     )
     torch.cuda.synchronize()
     torch.testing.assert_close(actual, expected, atol=2.0, rtol=0.05)
