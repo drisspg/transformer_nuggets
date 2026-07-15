@@ -64,7 +64,7 @@ def dot_e2m1x8(
     loc: ir.Location | None = None,
     ip: ir.InsertionPoint | None = None,
 ) -> cutlass.Float32:
-    """Decode one weight word and reduce its dot product with decoded input values."""
+    """Fuse exact E2M1 products into the existing pairwise FP16 reduction tree."""
     result = llvm.inline_asm(
         T.f32(),
         [
@@ -77,7 +77,7 @@ def dot_e2m1x8(
         """{
             .reg .b8 b0, b1, b2, b3;
             .reg .b32 w0, w1, w2, w3;
-            .reg .b32 p0, p1, p2, p3;
+            .reg .b32 p0, p2;
             .reg .b16 lo, hi;
             .reg .f16 total;
             mov.b32 {b0, b1, b2, b3}, $5;
@@ -86,11 +86,9 @@ def dot_e2m1x8(
             cvt.rn.f16x2.e2m1x2 w2, b2;
             cvt.rn.f16x2.e2m1x2 w3, b3;
             mul.rn.f16x2 p0, $1, w0;
-            mul.rn.f16x2 p1, $2, w1;
+            fma.rn.f16x2 p0, $2, w1, p0;
             mul.rn.f16x2 p2, $3, w2;
-            mul.rn.f16x2 p3, $4, w3;
-            add.rn.f16x2 p0, p0, p1;
-            add.rn.f16x2 p2, p2, p3;
+            fma.rn.f16x2 p2, $4, w3, p2;
             add.rn.f16x2 p0, p0, p2;
             mov.b32 {lo, hi}, p0;
             add.rn.f16 total, lo, hi;
