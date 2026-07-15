@@ -155,6 +155,13 @@ class Nvfp4TmaGemv(BlockscaledTmaGemv):
             raise ValueError("staged weight scales require block_n=8")
         self.num_prologue_stages = self.num_stages - 1
         self.stage_weight_scales = stage_weight_scales
+        if (
+            not dedicated_producer_warp
+            and self.grid_scheduler is GridScheduler.STATIC
+            and split_k == 1
+            and k >= 44032
+        ):
+            self.use_runtime_k_loop = True
 
     def weight_scale_tma_tile(self):
         """Load four physical row groups for eight logical output rows."""

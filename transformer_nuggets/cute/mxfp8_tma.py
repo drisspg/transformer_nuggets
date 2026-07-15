@@ -83,6 +83,12 @@ class Mxfp8TmaGemv(BlockscaledTmaGemv):
         )
         if self.block_scale_layout is BlockScaleLayout.SWIZZLE_32_4_4:
             self.format_name = "mxfp8_swizzled"
+            if (
+                self.grid_scheduler is GridScheduler.STATIC
+                and num_compute_warps == 2
+                and k >= 24576
+            ):
+                self.use_runtime_k_loop = True
 
     @cute.jit
     def decode_lane_values(self, raw_values: cute.Tensor):

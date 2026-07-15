@@ -18,7 +18,7 @@ try:
         mxfp8_tma_scaled_mm,
         select_mxfp8_tma_compute_warps,
     )
-    from transformer_nuggets.cute.mxfp8_tma import app
+    from transformer_nuggets.cute.mxfp8_tma import Mxfp8TmaGemv, app
     from transformer_nuggets.cute.profiler import profile_session
     from transformer_nuggets.cute.profiler.host import decode_events
 except ImportError:
@@ -42,6 +42,28 @@ def test_select_mxfp8_tma_compute_warps(k, block_n, expected_sm100):
     """Bake in the measured B200 rows-per-warp crossover."""
     expected = expected_sm100 if torch.cuda.get_device_capability() == (10, 0) else 1
     assert select_mxfp8_tma_compute_warps(k, block_n) == expected
+
+
+@pytest.mark.parametrize(
+    ("k", "num_compute_warps", "block_scale_layout", "expected"),
+    [
+        (20480, 2, BlockScaleLayout.SWIZZLE_32_4_4, False),
+        (24576, 2, BlockScaleLayout.SWIZZLE_32_4_4, True),
+        (24576, 4, BlockScaleLayout.SWIZZLE_32_4_4, False),
+        (24576, 2, BlockScaleLayout.RAW, False),
+    ],
+)
+def test_mxfp8_tma_selects_runtime_k_loop(k, num_compute_warps, block_scale_layout, expected):
+    """Compact only the measured long-K blocked-scale specialization."""
+    op = Mxfp8TmaGemv(
+        128,
+        k,
+        4,
+        3,
+        num_compute_warps=num_compute_warps,
+        block_scale_layout=block_scale_layout,
+    )
+    assert op.use_runtime_k_loop is expected
 
 
 def swizzle_mxfp8_scales(scales: torch.Tensor) -> torch.Tensor:
@@ -69,6 +91,24 @@ def dequantize_mxfp8(value: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Dequantize raw MXFP8 storage to float32."""
     expanded_scale = scale.view(torch.float8_e8m0fnu).float().repeat_interleave(32, dim=1)
     return value.float() * expanded_scale
+
+
+def test_mxfp8_tma_runtime_k_loop_matches_fully_unrolled():
+    """Preserve exact MXFP8 accumulation order with the compact loop."""
+    n, k = 128, 4096
+    q_input, input_scale = quantize_mxfp8(torch.randn((1, k), dtype=torch.bfloat16, device="cuda"))
+    weight, weight_scale = quantize_mxfp8(torch.randn((n, k), dtype=torch.bfloat16, device="cuda"))
+    input_scale = swizzle_mxfp8_scales(input_scale)
+    weight_scale = swizzle_mxfp8_scales(weight_scale)
+    args = (n, k, 4, 3, False, 2, GridScheduler.STATIC, None, BlockScaleLayout.SWIZZLE_32_4_4)
+    fully_unrolled = Mxfp8TmaGemv(*args)
+    runtime_loop = Mxfp8TmaGemv(*args)
+    runtime_loop.format_name = "mxfp8_test_runtime_loop"
+    runtime_loop.use_runtime_k_loop = True
+    expected = fully_unrolled.interface(q_input, weight, input_scale, weight_scale)
+    actual = runtime_loop.interface(q_input, weight, input_scale, weight_scale)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("num_compute_warps", [1, 2, 4])

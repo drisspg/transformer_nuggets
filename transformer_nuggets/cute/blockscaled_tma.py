@@ -139,6 +139,7 @@ class BlockscaledTmaGemv(CuteOp):
         self.profile_cta_stride = profile_cta_stride
         self.dedicated_producer_warp = dedicated_producer_warp
         self.prefetch_input_scales = prefetch_input_scales
+        self.use_runtime_k_loop = False
         self.num_compute_warps = num_compute_warps
         self.rows_per_warp = block_n // num_compute_warps
         self.num_tiles = n // block_n
@@ -519,7 +520,7 @@ class BlockscaledTmaGemv(CuteOp):
         scale_consumer: pipeline.PipelineConsumer | None,
         accumulators: list,
         k_tile,
-        profile_k_tile: cutlass.Constexpr,
+        profile_k_tile,
         lane: cutlass.Int32,
         owned_row_start: cutlass.Int32,
         n0: cutlass.Int32,
@@ -690,6 +691,101 @@ class BlockscaledTmaGemv(CuteOp):
                 if lane == 0:
                     scale_full.release()
         return consumer, accumulators
+
+    @cute.jit
+    def dual_role_k_step(
+        self,
+        producer,
+        consumer,
+        accumulators,
+        local_k_tile,
+        warp,
+        lane,
+        owned_row_start,
+        n0,
+        pid_n,
+        k_tile_base,
+        tma_args,
+        compute_args,
+    ):
+        """Refill and consume one K tile in the dual-role warp schedule."""
+        (
+            tma_atom_w,
+            tWgW,
+            tWsW,
+            tma_atom_x,
+            tXgX,
+            tXsX,
+            tma_atom_sfw,
+            tSFWgSFW,
+            tSFWsSFW,
+        ) = tma_args
+        (
+            sX,
+            sW,
+            sSFW_view,
+            mSFX,
+            mSFW,
+            smem_atom,
+            input_scale_atom,
+            weight_scale_atom,
+            chunk_layout,
+            scale_layout,
+            prof_buf,
+            enable_profiling,
+            profile_warp,
+        ) = compute_args
+        k_tile = k_tile_base + local_k_tile if self.split_k > 1 else local_k_tile
+        if (
+            warp == WarpRole.TMA_PRODUCER
+            and local_k_tile + self.num_prologue_stages < self.k_tiles_per_split
+        ):
+            with self.profile_scope(
+                prof_buf,
+                ProfileTag.TMA_REFILL,
+                pid_n,
+                1 + 8 * local_k_tile,
+                enable_profiling,
+            ):
+                producer = self.tma_producer_load_stage(
+                    producer,
+                    tma_atom_w,
+                    tWgW,
+                    tWsW,
+                    tma_atom_x,
+                    tXgX,
+                    tXsX,
+                    tma_atom_sfw,
+                    tSFWgSFW,
+                    tSFWsSFW,
+                    k_tile_base,
+                )
+        consumer, accumulators = self.compute_warp_consume_stage(
+            consumer,
+            None,
+            accumulators,
+            k_tile,
+            local_k_tile,
+            lane,
+            owned_row_start,
+            n0,
+            pid_n,
+            sX,
+            sW,
+            None,
+            sSFW_view,
+            mSFX,
+            mSFW,
+            smem_atom,
+            input_scale_atom,
+            weight_scale_atom,
+            chunk_layout,
+            scale_layout,
+            prof_buf,
+            enable_profiling,
+            profile_warp,
+        )
+        return producer, consumer, accumulators
 
     @cute.jit
     def compute_warp_store_output(
@@ -1143,62 +1239,64 @@ class BlockscaledTmaGemv(CuteOp):
                             )
 
                 accumulators = [cutlass.Float32(0.0) for _ in range(self.rows_per_warp)]
-                for local_k_tile in cutlass.range_constexpr(self.k_tiles_per_split):
-                    if cutlass.const_expr(self.split_k > 1):
-                        k_tile = k_tile_base + local_k_tile
-                    else:
-                        k_tile = local_k_tile
-                    if (
-                        warp == WarpRole.TMA_PRODUCER
-                        and local_k_tile + self.num_prologue_stages < self.k_tiles_per_split
-                    ):
-                        with self.profile_scope(
-                            prof_buf,
-                            ProfileTag.TMA_REFILL,
+                tma_args = (
+                    tma_atom_w,
+                    tWgW,
+                    tWsW,
+                    tma_atom_x,
+                    tXgX,
+                    tXsX,
+                    tma_atom_sfw,
+                    tSFWgSFW,
+                    tSFWsSFW,
+                )
+                compute_args = (
+                    sX,
+                    sW,
+                    sSFW_view,
+                    mSFX,
+                    mSFW,
+                    smem_atom,
+                    input_scale_atom,
+                    weight_scale_atom,
+                    chunk_layout,
+                    scale_layout,
+                    prof_buf,
+                    enable_profiling,
+                    profile_warp,
+                )
+                if cutlass.const_expr(self.use_runtime_k_loop):
+                    for local_k_tile in cutlass.range(self.k_tiles_per_split, unroll=1):
+                        producer, consumer, accumulators = self.dual_role_k_step(
+                            producer,
+                            consumer,
+                            accumulators,
+                            local_k_tile,
+                            warp,
+                            lane,
+                            owned_row_start,
+                            n0,
                             pid_n,
-                            1 + 8 * local_k_tile,
-                            enable_profiling,
-                        ):
-                            producer = self.tma_producer_load_stage(
-                                producer,
-                                tma_atom_w,
-                                tWgW,
-                                tWsW,
-                                tma_atom_x,
-                                tXgX,
-                                tXsX,
-                                tma_atom_sfw,
-                                tSFWgSFW,
-                                tSFWsSFW,
-                                k_tile_base,
-                            )
-
-                    consumer, accumulators = self.compute_warp_consume_stage(
-                        consumer,
-                        None,
-                        accumulators,
-                        k_tile,
-                        local_k_tile,
-                        lane,
-                        owned_row_start,
-                        n0,
-                        pid_n,
-                        sX,
-                        sW,
-                        None,
-                        sSFW_view,
-                        mSFX,
-                        mSFW,
-                        smem_atom,
-                        input_scale_atom,
-                        weight_scale_atom,
-                        chunk_layout,
-                        scale_layout,
-                        prof_buf,
-                        enable_profiling,
-                        profile_warp,
-                    )
-
+                            k_tile_base,
+                            tma_args,
+                            compute_args,
+                        )
+                else:
+                    for local_k_tile in cutlass.range_constexpr(self.k_tiles_per_split):
+                        producer, consumer, accumulators = self.dual_role_k_step(
+                            producer,
+                            consumer,
+                            accumulators,
+                            local_k_tile,
+                            warp,
+                            lane,
+                            owned_row_start,
+                            n0,
+                            pid_n,
+                            k_tile_base,
+                            tma_args,
+                            compute_args,
+                        )
                 with self.profile_scope(
                     prof_buf,
                     ProfileTag.EPILOGUE,

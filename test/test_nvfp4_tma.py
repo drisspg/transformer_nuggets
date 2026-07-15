@@ -21,6 +21,7 @@ try:
         select_nvfp4_tma_split_k,
         select_nvfp4_tma_stage_weight_scales,
     )
+    from transformer_nuggets.cute.nvfp4_tma import Nvfp4TmaGemv
     from transformer_nuggets.cute.profiler import profile_session
     from transformer_nuggets.cute.profiler.host import decode_events
 except ImportError:
@@ -112,6 +113,43 @@ def test_select_nvfp4_tma_stage_weight_scales(
     )
 
 
+@pytest.mark.parametrize(
+    (
+        "k",
+        "enable_profiling",
+        "dedicated_producer_warp",
+        "split_k",
+        "grid_scheduler",
+        "expected",
+    ),
+    [
+        (43008, False, False, 1, GridScheduler.STATIC, False),
+        (44032, False, False, 1, GridScheduler.STATIC, True),
+        (44032, True, False, 1, GridScheduler.STATIC, True),
+        (44032, False, True, 1, GridScheduler.STATIC, False),
+        (45056, False, False, 2, GridScheduler.STATIC, False),
+        (44032, False, False, 1, GridScheduler.PERSISTENT, False),
+    ],
+)
+def test_nvfp4_tma_selects_runtime_k_loop(
+    k, enable_profiling, dedicated_producer_warp, split_k, grid_scheduler, expected
+):
+    """Use the compact runtime loop only beyond the measured instruction-cache cliff."""
+    op = get_nvfp4_tma_gemv(
+        128,
+        k,
+        8,
+        3,
+        enable_profiling=enable_profiling,
+        num_compute_warps=4,
+        split_k=split_k,
+        grid_scheduler=grid_scheduler,
+        num_persistent_ctas=4 if grid_scheduler is GridScheduler.PERSISTENT else None,
+        dedicated_producer_warp=dedicated_producer_warp,
+    )
+    assert op.use_runtime_k_loop is expected
+
+
 def pack_fp4(codes: torch.Tensor) -> torch.Tensor:
     """Pack low-nibble-first E2M1 codes into the PyTorch FP4 shell dtype."""
     packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
@@ -178,6 +216,20 @@ def make_case(n: int, k: int):
         expected_fp32.bfloat16(),
         expected_fp32,
     )
+
+
+def test_nvfp4_tma_runtime_k_loop_matches_fully_unrolled():
+    """Preserve exact accumulation order when compacting the K loop."""
+    q_input, weight, input_scale, weight_scale, _, _ = make_case(128, 4096)
+    args = (128, 4096, 8, 3, False, 4, GridScheduler.STATIC)
+    fully_unrolled = Nvfp4TmaGemv(*args)
+    runtime_loop = Nvfp4TmaGemv(*args)
+    runtime_loop.format_name = "nvfp4_test_runtime_loop"
+    runtime_loop.use_runtime_k_loop = True
+    expected = fully_unrolled.interface(q_input, weight, input_scale, weight_scale)
+    actual = runtime_loop.interface(q_input, weight, input_scale, weight_scale)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("num_compute_warps", [1, 2, 4])
@@ -339,16 +391,14 @@ def test_nvfp4_tma_applies_global_scales_in_epilogue():
     )
 
 
-def test_nvfp4_tma_profiles_common_pipeline_regions():
-    """Use the shared block-scaled pipeline's static profiling slots."""
+@pytest.mark.parametrize("use_runtime_k_loop", [False, True])
+def test_nvfp4_tma_profiles_common_pipeline_regions(use_runtime_k_loop):
+    """Use compact profiling slots with static and runtime K loops."""
     q_input, weight, input_scale, weight_scale, expected, _ = make_case(128, 4096)
-    op = get_nvfp4_tma_gemv(
-        128,
-        4096,
-        4,
-        enable_profiling=True,
-        num_compute_warps=4,
-    )
+    op = Nvfp4TmaGemv(128, 4096, 4, 2, True, 4)
+    op.use_runtime_k_loop = use_runtime_k_loop
+    if use_runtime_k_loop:
+        op.format_name = "nvfp4_test_profiled_runtime_loop"
     legacy_profile_buffer = torch.zeros(
         op.num_profile_units * (1 + 4 * op.max_profile_events_per_cta),
         dtype=torch.int64,
