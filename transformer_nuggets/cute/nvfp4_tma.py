@@ -757,12 +757,19 @@ def select_nvfp4_tma_config(
         block_n = next(candidate for candidate in (8, 4, 2, 1) if n % candidate == 0)
         return block_n, 2, 1
     use_compact_scale_tile = n >= 16384 and 6144 <= k <= 8192
-    preferred_block_n = 16 if n >= 12288 and k < 12288 and not use_compact_scale_tile else 8
+    use_wide_middle_k_tile = 10240 <= n <= 18432 and 16384 <= k <= 24576
+    preferred_block_n = (
+        16
+        if (n >= 12288 and k < 12288 and not use_compact_scale_tile) or use_wide_middle_k_tile
+        else 8
+    )
     block_n = next(
         candidate for candidate in (preferred_block_n, 8, 4, 2, 1) if n % candidate == 0
     )
     num_compute_warps = select_nvfp4_tma_compute_warps(k, block_n, device)
-    if k >= 16384 and block_n == 8 and num_compute_warps == 4:
+    if use_wide_middle_k_tile and block_n == 16:
+        num_stages = 2
+    elif k >= 16384 and block_n == 8 and num_compute_warps == 4:
         num_tiles = n // block_n
         num_sms = torch.cuda.get_device_properties(device).multi_processor_count
         s2_waves = (num_tiles + 12 * num_sms - 1) // (12 * num_sms)
