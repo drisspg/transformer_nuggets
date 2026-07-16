@@ -208,18 +208,23 @@ def scaled_mm_mxfp8(
 
 
 def scaled_mm_nvfp4(
-    mat_a: torch.Tensor, mat_b: torch.Tensor, scale_a: torch.Tensor, scale_b: torch.Tensor
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    global_scale_a: torch.Tensor,
+    global_scale_b: torch.Tensor,
 ):
-    """Run the cuBLASLt NVFP4 block-scaled GEMV baseline."""
+    """Run the cuBLASLt NVFP4 block- and tensor-scaled GEMV baseline."""
     return scaled_mm(
         mat_a,
         mat_b,
-        scale_a=[scale_a],
-        scale_recipe_a=[ScalingType.BlockWise1x16],
-        swizzle_a=[SwizzleType.SWIZZLE_32_4_4],
-        scale_b=[scale_b],
-        scale_recipe_b=[ScalingType.BlockWise1x16],
-        swizzle_b=[SwizzleType.SWIZZLE_32_4_4],
+        scale_a=[scale_a, global_scale_a],
+        scale_recipe_a=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
+        swizzle_a=[SwizzleType.SWIZZLE_32_4_4, SwizzleType.NO_SWIZZLE],
+        scale_b=[scale_b, global_scale_b],
+        scale_recipe_b=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
+        swizzle_b=[SwizzleType.SWIZZLE_32_4_4, SwizzleType.NO_SWIZZLE],
         output_dtype=torch.bfloat16,
     )
 
@@ -286,6 +291,8 @@ def run_mxfp8(n: int, k: int, rounds: int, iterations: int, seed: int) -> Benchm
 def run_nvfp4(n: int, k: int, rounds: int, iterations: int, seed: int) -> BenchmarkResult:
     """Benchmark the NVFP4 TMA specialization against the matching scaled_mm contract."""
     mat_a, mat_b, scale_a, scale_b = make_nvfp4_case(n, k, seed)
+    global_scale_a = torch.tensor([1.5], dtype=torch.float32, device="cuda")
+    global_scale_b = torch.tensor([0.75], dtype=torch.float32, device="cuda")
     config = select_nvfp4_config(n, k, mat_a.device)
     output = torch.empty((1, n), dtype=torch.bfloat16, device="cuda")
     partial_output = (
@@ -304,10 +311,19 @@ def run_nvfp4(n: int, k: int, rounds: int, iterations: int, seed: int) -> Benchm
         grid_scheduler=config.grid_scheduler,
         split_k=config.split_k,
         stage_weight_scales=config.stage_weight_scales,
+        global_scale_a=global_scale_a,
+        global_scale_b=global_scale_b,
         output=output,
         partial_output=partial_output,
     )
-    baseline = lambda: scaled_mm_nvfp4(mat_a, mat_b, scale_a, scale_b)
+    baseline = lambda: scaled_mm_nvfp4(
+        mat_a,
+        mat_b,
+        scale_a,
+        scale_b,
+        global_scale_a,
+        global_scale_b,
+    )
     torch.testing.assert_close(tma(), baseline(), atol=2.0, rtol=0.05)
     torch.cuda.synchronize()
     tma_us, scaled_mm_us = median_interleaved_latency(tma, baseline, rounds, iterations)

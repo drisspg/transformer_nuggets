@@ -11,60 +11,35 @@ from transformer_nuggets.cute.base import CuteOp
 from transformer_nuggets.cute.element_wise import ElementwiseOp, elementwise_op
 from transformer_nuggets.cute.utils import visualize_tv_layout
 from transformer_nuggets.cute import profiler
-
-
-_BLOCKSCALED_TMA_EXPORTS = {
-    "DEFAULT_PERSISTENT_CTAS_PER_SM",
-    "BlockScaleLayout",
-    "GridScheduler",
-    "ProfileTag",
-}
-
-_MXFP8_TMA_EXPORTS = {
-    "MXFP8_TMA_PROFILE_TAGS",
-    "Mxfp8TmaGemv",
-    "get_mxfp8_tma_gemv",
-    "mxfp8_tma_gemv",
-    "mxfp8_tma_scaled_mm",
-    "select_mxfp8_tma_compute_warps",
-}
-
-_NVFP4_TMA_EXPORTS = {
-    "NVFP4_TMA_PROFILE_TAGS",
-    "Nvfp4TmaGemv",
-    "get_nvfp4_tma_gemv",
-    "nvfp4_tma_gemv",
-    "nvfp4_tma_scaled_mm",
-    "select_nvfp4_tma_compute_warps",
-    "select_nvfp4_tma_config",
-    "select_nvfp4_tma_split_k",
-    "select_nvfp4_tma_stage_weight_scales",
-}
-
-_SYMMETRIC_MEMORY_EXPORTS = {
-    "compile_symmetric_memory_all_reduce",
-    "init_torchrun_process_group",
-    "run_symmetric_memory_all_reduce_example",
-    "symmetric_memory_all_reduce",
-    "symmetric_memory_peer_tensors",
-}
-
-
-def __getattr__(name):
-    if name in _BLOCKSCALED_TMA_EXPORTS:
-        from transformer_nuggets.cute import blockscaled_tma
-
-        return getattr(blockscaled_tma, name)
-    if name in _MXFP8_TMA_EXPORTS:
-        from transformer_nuggets.cute import mxfp8_tma
-
-        return getattr(mxfp8_tma, name)
-    if name in _NVFP4_TMA_EXPORTS:
-        from transformer_nuggets.cute import nvfp4_tma
-
-        return getattr(nvfp4_tma, name)
-    if name in _SYMMETRIC_MEMORY_EXPORTS:
-        from transformer_nuggets.cute import symmetric_memory
-
-        return getattr(symmetric_memory, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+from transformer_nuggets.cute.blockscaled_tma import (
+    DEFAULT_PERSISTENT_CTAS_PER_SM,
+    BlockScaleLayout,
+    GridScheduler,
+    ProfileTag,
+)
+from transformer_nuggets.cute.mxfp8_tma import (
+    MXFP8_TMA_PROFILE_TAGS,
+    Mxfp8TmaGemv,
+    get_mxfp8_tma_gemv,
+    mxfp8_tma_gemv,
+    mxfp8_tma_scaled_mm,
+    select_mxfp8_tma_compute_warps,
+)
+from transformer_nuggets.cute.nvfp4_tma import (
+    NVFP4_TMA_PROFILE_TAGS,
+    Nvfp4TmaGemv,
+    get_nvfp4_tma_gemv,
+    nvfp4_tma_gemv,
+    nvfp4_tma_scaled_mm,
+    select_nvfp4_tma_compute_warps,
+    select_nvfp4_tma_config,
+    select_nvfp4_tma_split_k,
+    select_nvfp4_tma_stage_weight_scales,
+)
+from transformer_nuggets.cute.symmetric_memory import (
+    compile_symmetric_memory_all_reduce,
+    init_torchrun_process_group,
+    run_symmetric_memory_all_reduce_example,
+    symmetric_memory_all_reduce,
+    symmetric_memory_peer_tensors,
+)
