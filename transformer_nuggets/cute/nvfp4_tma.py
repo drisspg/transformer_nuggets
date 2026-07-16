@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from functools import cache
+from pathlib import Path
+from typing import Annotated
+
+import torch
+import typer
 
 import cutlass
 import cutlass.cute as cute
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
-import torch
 
 from transformer_nuggets.cute.blockscaled_tma import (
     BLOCKSCALED_TMA_PROFILE_TAGS,
@@ -16,6 +20,14 @@ from transformer_nuggets.cute.blockscaled_tma import (
     GridScheduler,
 )
 from transformer_nuggets.cute.cache import compile_tvm_ffi_and_cache
+from transformer_nuggets.cute.profiler import (
+    compose,
+    group_by_unit,
+    profile_session,
+    rename_processes,
+    rename_threads,
+)
+from transformer_nuggets.cute.profiler.host import Event, PostProcessContext
 from transformer_nuggets.cute.utils import fake_stream, make_fake_compact_tensor
 
 
@@ -924,3 +936,180 @@ def nvfp4_tma_gemv(
         profile_buffer,
         partial_output,
     )
+
+
+def pack_nvfp4_codes(codes: torch.Tensor) -> torch.Tensor:
+    """Pack low-nibble-first E2M1 codes into PyTorch's FP4 shell dtype."""
+    return (codes[:, 0::2] | (codes[:, 1::2] << 4)).contiguous().view(torch.float4_e2m1fn_x2)
+
+
+def swizzle_nvfp4_scales(scales: torch.Tensor) -> torch.Tensor:
+    """Convert natural row-major block scales to SWIZZLE_32_4_4 storage."""
+    rows, cols = scales.shape
+    padded_rows = ((rows + 127) // 128) * 128
+    padded_cols = ((cols + 3) // 4) * 4
+    padded = torch.zeros(
+        (padded_rows, padded_cols),
+        dtype=scales.dtype,
+        device=scales.device,
+    )
+    padded[:rows, :cols] = scales
+    return (
+        padded.view(padded_rows // 128, 128, padded_cols // 4, 4)
+        .permute(0, 2, 1, 3)
+        .reshape(-1, 4, 32, 4)
+        .transpose(1, 2)
+        .reshape(-1)
+        .contiguous()
+    )
+
+
+def make_nvfp4_profile_inputs(
+    n: int,
+    k: int,
+    seed: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Create packed NVFP4 operands and nonuniform swizzled block scales."""
+    generator = torch.Generator(device=device).manual_seed(seed)
+    q_input = pack_nvfp4_codes(
+        torch.randint(0, 16, (1, k), device=device, dtype=torch.uint8, generator=generator)
+    )
+    weight = pack_nvfp4_codes(
+        torch.randint(0, 16, (n, k), device=device, dtype=torch.uint8, generator=generator)
+    )
+    scale_choices = torch.tensor([0.5, 1.0, 2.0, 3.0], device=device)
+    input_scale = scale_choices[
+        torch.randint(0, 4, (1, k // 16), device=device, generator=generator)
+    ].to(torch.float8_e4m3fn)
+    weight_scale = scale_choices[
+        torch.randint(0, 4, (n, k // 16), device=device, generator=generator)
+    ].to(torch.float8_e4m3fn)
+    return (
+        q_input,
+        weight,
+        swizzle_nvfp4_scales(input_scale),
+        swizzle_nvfp4_scales(weight_scale),
+    )
+
+
+def group_persistent_cta_zero(events: list[Event], ctx: PostProcessContext) -> list[Event]:
+    """Merge sampled persistent rounds onto physical CTA 0's semantic warp tracks."""
+    producer_tags = {
+        "tma_prologue",
+        "tma_refill",
+        "input_scale_acquire",
+        "input_scale_copy",
+    }
+    for event in events:
+        event.pid = 0
+        event.tid = 0 if event.tag_name in producer_tags else 1
+        event.extra_args = {
+            "persistent_tile_round": event.unit_id,
+            "physical_cta": 0,
+        }
+    return events
+
+
+app = typer.Typer(help="Run the NVFP4 TMA GEMV with labeled intra-kernel profiling.")
+
+
+@app.command()
+def profile_nvfp4_tma(
+    n: int = 32768,
+    k: int = 32768,
+    block_n: int = 8,
+    num_stages: int = 3,
+    num_compute_warps: int = 4,
+    grid_scheduler: GridScheduler = GridScheduler.PERSISTENT,
+    num_persistent_ctas: Annotated[
+        int | None,
+        typer.Option(help="Persistent CTA count; defaults to four CTAs per SM."),
+    ] = None,
+    dedicated_producer_warp: bool = True,
+    prefetch_input_scales: bool = True,
+    trace_cta_zero_only: bool = True,
+    output: Path = Path("nvfp4_tma.pftrace"),
+    seed: int = 0,
+    warmups: int = 1,
+    device: str = "cuda",
+) -> None:
+    """Profile the long-K persistent CTA-0 experiment by default."""
+    torch_device = torch.device(device)
+    if torch_device.type != "cuda" or not torch.cuda.is_available():
+        raise typer.BadParameter("device must name an available CUDA device")
+    if warmups < 0:
+        raise typer.BadParameter("warmups must be non-negative")
+
+    if grid_scheduler is GridScheduler.PERSISTENT and num_persistent_ctas is None:
+        num_persistent_ctas = (
+            4 * torch.cuda.get_device_properties(torch_device).multi_processor_count
+        )
+    num_tiles = n // block_n
+    grid_ctas = (
+        num_tiles
+        if grid_scheduler is GridScheduler.STATIC
+        else min(num_tiles, num_persistent_ctas or num_tiles)
+    )
+    profile_cta_stride = grid_ctas if trace_cta_zero_only else 1
+    q_input, weight, input_scale, weight_scale = make_nvfp4_profile_inputs(
+        n, k, seed, torch_device
+    )
+    op = get_nvfp4_tma_gemv(
+        n,
+        k,
+        block_n,
+        num_stages,
+        enable_profiling=True,
+        num_compute_warps=num_compute_warps,
+        grid_scheduler=grid_scheduler,
+        num_persistent_ctas=num_persistent_ctas,
+        profile_cta_stride=profile_cta_stride,
+        dedicated_producer_warp=dedicated_producer_warp,
+        prefetch_input_scales=prefetch_input_scales,
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    with profile_session(
+        max_events_per_unit=op.max_profile_events_per_cta,
+        num_units=(op.num_profile_units, "Persistent CTA"),
+        tag_names=list(op.profile_tags),
+        trace_path=str(output),
+        device=torch_device,
+        compact=True,
+        post_process_events=group_persistent_cta_zero if trace_cta_zero_only else group_by_unit,
+        post_process_trace=(
+            compose(
+                rename_processes({0: "Physical CTA 0"}),
+                rename_threads({0: "Load warp", 1: "Compute warp"}),
+            )
+            if trace_cta_zero_only
+            else None
+        ),
+    ) as (prof, _):
+        result = torch.empty((1, n), dtype=torch.bfloat16, device=torch_device)
+        for _ in range(warmups):
+            op.interface(
+                q_input,
+                weight,
+                input_scale,
+                weight_scale,
+                output=result,
+                profile_buffer=prof.tensor,
+            )
+        torch.cuda.synchronize(torch_device)
+        prof.tensor.zero_()
+        op.interface(
+            q_input,
+            weight,
+            input_scale,
+            weight_scale,
+            output=result,
+            profile_buffer=prof.tensor,
+        )
+
+    typer.echo(f"Wrote {output.resolve()}")
+
+
+if __name__ == "__main__":
+    app()

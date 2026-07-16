@@ -1,5 +1,6 @@
 import pytest
 import torch
+from typer.testing import CliRunner
 
 
 if not torch.cuda.is_available():
@@ -21,7 +22,7 @@ try:
         select_nvfp4_tma_split_k,
         select_nvfp4_tma_stage_weight_scales,
     )
-    from transformer_nuggets.cute.nvfp4_tma import Nvfp4TmaGemv
+    from transformer_nuggets.cute.nvfp4_tma import Nvfp4TmaGemv, app
     from transformer_nuggets.cute.profiler import profile_session
     from transformer_nuggets.cute.profiler.host import decode_events
 except ImportError:
@@ -676,6 +677,33 @@ def test_nvfp4_tma_dedicated_producer_persistent_reuse(prefetch_input_scales):
     )
     torch.cuda.synchronize()
     torch.testing.assert_close(actual, expected, atol=2.0, rtol=0.05)
+
+
+def test_nvfp4_tma_cli_writes_persistent_cta_zero_trace(tmp_path):
+    """Run the module CLI and write a nonempty persistent CTA-0 Perfetto trace."""
+    trace_path = tmp_path / "nvfp4_tma.pftrace"
+    result = CliRunner().invoke(
+        app,
+        [
+            "--n",
+            "128",
+            "--k",
+            "2048",
+            "--block-n",
+            "4",
+            "--num-stages",
+            "2",
+            "--num-compute-warps",
+            "4",
+            "--num-persistent-ctas",
+            "3",
+            "--output",
+            str(trace_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert trace_path.stat().st_size > 0
 
 
 def test_nvfp4_tma_persistent_cuda_graph():
