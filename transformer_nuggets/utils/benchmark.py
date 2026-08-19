@@ -1,23 +1,24 @@
 import ctypes
 import ctypes.util
+import functools
+import gzip
 import inspect
+import json
 import logging
 import os
 import random
 import statistics
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
-from collections.abc import Callable, Sequence
 
 import torch
-import torch.utils.benchmark as benchmark
 from torch._inductor.utils import do_bench_using_profiling
-import functools
-
 from torch.cuda._memory_viz import profile_plot  # type: ignore
-from torch.profiler import profile, ProfilerActivity, record_function, schedule
+from torch.profiler import ProfilerActivity, profile, record_function, schedule
+from torch.utils import benchmark
 
 from transformer_nuggets.utils.perfetto import (
     perfetto_trace_path,
@@ -171,6 +172,58 @@ class ProfileConfig:
     fix_overlapping_events: bool = True
     overlap_track_pattern: str | None = "stream.*"
     trace_format: Literal["chrome_json", "track_event"] = "track_event"
+
+
+DEFAULT_CUPTI_MONITOR_PM_METRICS = (
+    "sm__cycles_active.avg.pct_of_peak_sustained_elapsed",
+    "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed",
+)
+
+
+@dataclass(frozen=True)
+class CuptiMonitorConfig:
+    """Options for PyTorch's experimental CUPTI monitor profiler backend.
+
+    Construct the profiler before CUDA Graph capture when ``graph_dependencies`` or
+    ``event_node_ids`` is enabled so the monitor can observe graph instantiation. To enable
+    CUPTI hardware-event sampling, call ``torch.profiler._cupti.monitor.enable_hes_early()``
+    before importing transformer-nuggets or creating any CUDA context.
+    """
+
+    environment_counters: bool = True
+    pm_metrics: tuple[str, ...] = DEFAULT_CUPTI_MONITOR_PM_METRICS
+    graph_dependencies: bool = True
+    event_node_ids: bool = True
+    cuda_sync_events: bool = False
+    pftrace_compression_level: int = 1
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.pftrace_compression_level <= 9:
+            raise ValueError("pftrace_compression_level must be between 0 and 9")
+
+    def custom_profiler_config(self) -> dict[str, object]:
+        """Build the JSON-compatible PyTorch custom profiler configuration."""
+        return {
+            "backend": "cupti_monitor",
+            "enable_environment_counters": self.environment_counters,
+            "enable_pm_sampling": bool(self.pm_metrics),
+            "pm_metrics": list(self.pm_metrics),
+            "enable_graph_dependencies": self.graph_dependencies,
+            "enable_event_node_ids": self.event_node_ids,
+            "enable_cuda_sync_events": self.cuda_sync_events,
+            "pftrace_compression_level": self.pftrace_compression_level,
+        }
+
+
+def supported_cupti_monitor_metrics(*, with_sub_metrics: bool = False) -> frozenset[str]:
+    """Return PM-sampling metrics supported by the current CUDA device."""
+    try:
+        from torch.profiler._cupti.pm_sampling import supported_metrics
+    except ImportError as exc:
+        raise ImportError(
+            "CUPTI metric discovery requires the transformer-nuggets[cupti-monitor] extra"
+        ) from exc
+    return supported_metrics(with_sub_metrics=with_sub_metrics)
 
 
 @dataclass(frozen=True)
@@ -530,6 +583,54 @@ def _write_profiler_trace(
         export_path.unlink(missing_ok=True)
 
 
+def _cupti_monitor_experimental_config(
+    config: CuptiMonitorConfig,
+) -> torch._C._profiler._ExperimentalConfig:
+    """Prepare PyTorch's experimental CUPTI monitor before profiler construction."""
+    try:
+        import cupti  # noqa: F401
+    except ImportError as exc:
+        raise ImportError(
+            "The CUPTI monitor backend requires cupti-python. Install the "
+            "transformer-nuggets[cupti-monitor] extra or cupti-python directly."
+        ) from exc
+
+    return torch._C._profiler._ExperimentalConfig(
+        custom_profiler_config=json.dumps(config.custom_profiler_config())
+    )
+
+
+def _write_cupti_monitor_trace(
+    prof: torch.profiler.profile,
+    trace_path: Path,
+    *,
+    trace_format: Literal["chrome_json", "track_event"],
+) -> None:
+    """Export a monitor trace while hiding its unconditional ``.gz`` suffix."""
+    export_path = trace_path.with_name(f"{trace_path.name}.monitor-export")
+    monitor_path = Path(f"{export_path}.gz")
+    export_path.unlink(missing_ok=True)
+    monitor_path.unlink(missing_ok=True)
+    prof.export_chrome_trace(str(export_path))
+
+    generated_path = export_path if export_path.exists() else monitor_path
+    if not generated_path.exists():
+        raise FileNotFoundError(
+            f"CUPTI monitor export produced neither {export_path} nor {monitor_path}"
+        )
+
+    trace_path.unlink(missing_ok=True)
+    if trace_format == "track_event" or trace_path.suffix == ".gz":
+        generated_path.replace(trace_path)
+        return
+
+    try:
+        with gzip.open(generated_path, "rb") as source, trace_path.open("wb") as destination:
+            destination.write(source.read())
+    finally:
+        generated_path.unlink(missing_ok=True)
+
+
 def profile_function(
     config: ProfileConfig, func: Callable, *args, **kwargs
 ) -> torch.profiler.profile:
@@ -793,7 +894,7 @@ def attach_oom_observer(
             curr_trace_name = f"memory_snapshots_rank_{rank}_snapshot.html"
             current_trace_name = trace_dir / Path(curr_trace_name)
 
-            logging.info("Saving allocated state during OOM")
+            logger.info("Saving allocated state during OOM")
             snapshot = torch.cuda.memory._snapshot()
 
             match viz:
@@ -808,9 +909,9 @@ def attach_oom_observer(
 
             with open(current_trace_name, "w") as f:
                 f.write(html)
-            logging.info(f"Wrote memory snapshot to {current_trace_name}")
-        except Exception as e:
-            logging.error(f"Failed to save memory snapshot: {e}")
+            logger.info("Wrote memory snapshot to %s", current_trace_name)
+        except Exception:
+            logger.exception("Failed to save memory snapshot")
 
     torch._C._cuda_attach_out_of_memory_observer(oom_observer)  # type: ignore
     torch.cuda.memory._record_memory_history(max_entries=max_entries, stacks="all")
@@ -834,7 +935,6 @@ def _ranked_trace_path(path: Path, rank: int) -> Path:
     return path.with_name(f"{path.stem}_rank_{rank}{path.suffix}")
 
 
-@contextmanager
 def profiler(
     path: Path | str,
     record_shapes: bool = True,
@@ -845,60 +945,71 @@ def profiler(
     overlap_track_pattern: str | None = "stream.*",
     gzip_trace: bool = False,
     trace_format: Literal["chrome_json", "track_event"] = "track_event",
+    backend: Literal["kineto", "cupti_monitor"] = "kineto",
+    cupti_monitor_config: CuptiMonitorConfig | None = None,
 ):
-    """Thin wrapper around torch.profiler
+    """Create a torch profiler context and save its trace when the context exits.
 
     Args:
-        path: The path to save the trace file to
-        record_shapes: Record shapes of tensors
-        profile_memory: Profile memory usage
-        with_stack: Record stack traces - Blows up memory
-        warmup: If greater than 0 then it will warmup record before recording
-        fix_overlapping_events: Postprocess overlapping duration slices into
-            sibling lanes so Perfetto does not hide overlapped events.
-        overlap_track_pattern: Regex for tracks to postprocess. Defaults to CUDA
+        path: The path to save the trace file to.
+        record_shapes: Record shapes of tensors.
+        profile_memory: Profile memory usage.
+        with_stack: Record stack traces. This can substantially increase memory use.
+        warmup: Number of scheduled warmup steps before recording.
+        fix_overlapping_events: Postprocess Kineto duration slices into sibling lanes so
+            Perfetto does not hide overlaps. The CUPTI monitor's native exporter owns its
+            lane layout and does not use this postprocessor.
+        overlap_track_pattern: Regex for Kineto tracks to postprocess. Defaults to CUDA
             stream tracks; pass ``None`` to process every track.
         gzip_trace: Write ``.json.gz`` instead of ``.json`` for Chrome JSON traces.
         trace_format: ``"track_event"`` writes native Perfetto ``.pftrace`` output;
             ``"chrome_json"`` writes Chrome JSON/JSON.GZ output.
+        backend: Profiler backend. ``"kineto"`` preserves the standard PyTorch profiler;
+            ``"cupti_monitor"`` enables counters, CUDA Graph dependencies, kernel
+            annotations, and native Perfetto export.
+        cupti_monitor_config: Advanced CUPTI monitor overrides. Passing this also selects
+            the monitor backend. Construct the profiler before CUDA Graph capture when
+            recording graph dependencies, then enter it around replay.
 
     Usage:
     ```
         with profiler(Path("trace.pftrace")):
-            # code to profile
+            run_workload()
 
-        # With steps (e.g. in a training loop) this will record 7 iterations
-        with profiler(Path("trace.pftrace"), warmup=3) as p:
-            for i in range(10):
-                # Your code for this step (e.g. forward, backward, optimize)
+        with profiler(Path("monitor_trace.pftrace"), backend="cupti_monitor"):
+            run_workload()
 
-                # Call step() after each iteration
-                p.step()
+        monitor = profiler(Path("graph_trace.pftrace"), backend="cupti_monitor")
+        graph = capture_graph()
+        with monitor:
+            graph.replay()
     ```
     """
     from transformer_nuggets import init_logging
 
     init_logging()
+    if backend not in ("kineto", "cupti_monitor"):
+        raise ValueError(f"Unsupported profiler backend: {backend!r}")
+    if cupti_monitor_config is not None:
+        backend = "cupti_monitor"
+    monitor_config = CuptiMonitorConfig() if cupti_monitor_config is None else cupti_monitor_config
+    use_cupti_monitor = backend == "cupti_monitor"
+    if use_cupti_monitor and warmup:
+        raise ValueError("warmup schedules are not supported by the CUPTI monitor backend")
 
-    if not isinstance(path, Path):
-        path = Path(path)
-
-    rank = get_process_rank()
-
-    # Create path with suffix
+    path = Path(path)
     path = perfetto_trace_path(path, trace_format=trace_format, gzip_trace=gzip_trace)
-
-    # Add rank to filename if distributed
+    rank = get_process_rank()
     if rank is not None:
         path = _ranked_trace_path(path, rank)
-
-    # make parent dir if it doesn't exist
-    output_dir = path.parent
-    output_dir.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
 
     logger.info(f"💾 Trace file 📄 saved to: {bcolors.OKGREEN}{path}{bcolors.ENDC}")
 
     def trace_handler(prof) -> None:
+        if use_cupti_monitor:
+            _write_cupti_monitor_trace(prof, path, trace_format=trace_format)
+            return
         _write_profiler_trace(
             prof,
             path,
@@ -908,8 +1019,11 @@ def profiler(
             gzip_trace=gzip_trace,
         )
 
-    prof_sched = schedule(wait=0, warmup=warmup, active=int(1_000_000)) if warmup > 0 else None
-    profiler = torch.profiler.profile(
+    prof_sched = schedule(wait=0, warmup=warmup, active=1_000_000) if warmup > 0 else None
+    experimental_config = (
+        _cupti_monitor_experimental_config(monitor_config) if use_cupti_monitor else None
+    )
+    torch_profiler = torch.profiler.profile(
         activities=[
             torch.profiler.ProfilerActivity.CPU,
             torch.profiler.ProfilerActivity.CUDA,
@@ -919,10 +1033,15 @@ def profiler(
         profile_memory=profile_memory,
         with_stack=with_stack,
         schedule=prof_sched,
+        experimental_config=experimental_config,
     )
 
-    try:
-        profiler.start()
-        yield profiler
-    finally:
-        profiler.stop()
+    @contextmanager
+    def profile_context():
+        try:
+            torch_profiler.start()
+            yield torch_profiler
+        finally:
+            torch_profiler.stop()
+
+    return profile_context()
