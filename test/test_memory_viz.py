@@ -638,7 +638,8 @@ class TestGenerateHTML:
         assert 'id="controls-toggle"' in html
         assert 'id="panel-toggle"' in html
         assert 'id="chart-legend"' in html
-        assert "memory retained for replay" in html
+        assert "Multiple yellow lines mean memory was sampled multiple times" in html
+        assert "_snapshot()" in html
         assert "allocator event order" in html
         assert "setDetailPanelCollapsed(false);" in html
 
@@ -753,7 +754,7 @@ class TestGenerateComparisonHTML:
         assert '<div id="controls" class="collapsed">' in html
         assert '<div id="detail-panel" class="collapsed">' in html
         assert 'id="chart-legend"' in html
-        assert "memory retained for replay" in html
+        assert "Multiple yellow lines mean memory was sampled multiple times" in html
         assert "setDetailPanelCollapsed(false);" in html
         assert "const MAX_TS = Math.max(1, META.max_timestep);" in html
         assert "setReservedVisible" in html

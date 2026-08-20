@@ -935,7 +935,6 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
   .legend-swatch--hwm { height: 0; border-top: 2px dashed rgba(255,255,255,0.65); }
   .legend-swatch--events { height: 18px; border-left: 2px dotted #f1c40f; border-right: 2px dotted #e74c3c; }
   .legend-swatch--axis { height: auto; color: var(--text-muted); text-align: center; }
-  .legend-note { margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--border); color: var(--text); }
 
   #detail-panel {
     width: 480px;
@@ -1411,9 +1410,8 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
         <div class="legend-row"><span class="legend-swatch legend-swatch--reserved"></span><span><strong>Orange dashed</strong> is total reserved allocator memory, including inactive cached blocks. Enable “Reserved” to show it.</span></div>
         <div class="legend-row"><span class="legend-swatch legend-swatch--pool"></span><span><strong>Light dotted</strong> is reserved memory for each CUDA Graph or MemPool private pool.</span></div>
         <div class="legend-row"><span class="legend-swatch legend-swatch--hwm"></span><span><strong>White dashed</strong> is the high-water mark of active allocations.</span></div>
-        <div class="legend-row"><span class="legend-swatch legend-swatch--events"></span><span><strong>Yellow / red vertical</strong> markers are snapshot checkpoints / OOM events.</span></div>
+        <div class="legend-row"><span class="legend-swatch legend-swatch--events"></span><span><strong>Yellow vertical</strong> marks a call to <code>_snapshot()</code>; <strong>red</strong> marks an OOM. Multiple yellow lines mean memory was sampled multiple times.</span></div>
         <div class="legend-row"><span class="legend-swatch legend-swatch--axis">0→N</span><span>The x-axis is <strong>allocator event order</strong>, not elapsed time.</span></div>
-        <div class="legend-note">CUDA Graph capture creates private-pool storage. Replay normally reuses those fixed addresses: this chart shows memory retained for replay, not fresh memory allocated by every replay.</div>
       </div>
     </div>
   </div>
@@ -3064,7 +3062,6 @@ _MEMORY_COMPARISON_TEMPLATE = r"""<!DOCTYPE html>
   .legend-swatch--hwm { height: 0; border-top: 2px dashed rgba(255,255,255,0.65); }
   .legend-swatch--events { height: 18px; border-left: 2px dotted #f1c40f; border-right: 2px dotted #e74c3c; }
   .legend-swatch--axis { height: auto; color: var(--text-muted); text-align: center; }
-  .legend-note { margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--border); color: var(--text); }
 
   #detail-panel {
     width: 420px;
@@ -3543,9 +3540,8 @@ _MEMORY_COMPARISON_TEMPLATE = r"""<!DOCTYPE html>
         <div class="legend-row"><span class="legend-swatch legend-swatch--reserved"></span><span><strong>Orange dashed</strong> is total reserved allocator memory, including inactive cached blocks. Enable “Reserved” to show it.</span></div>
         <div class="legend-row"><span class="legend-swatch legend-swatch--pool"></span><span><strong>Light dotted</strong> is reserved memory for each CUDA Graph or MemPool private pool.</span></div>
         <div class="legend-row"><span class="legend-swatch legend-swatch--hwm"></span><span><strong>White dashed</strong> is the high-water mark of active allocations.</span></div>
-        <div class="legend-row"><span class="legend-swatch legend-swatch--events"></span><span><strong>Yellow / red vertical</strong> markers are snapshot checkpoints / OOM events.</span></div>
+        <div class="legend-row"><span class="legend-swatch legend-swatch--events"></span><span><strong>Yellow vertical</strong> marks a call to <code>_snapshot()</code>; <strong>red</strong> marks an OOM. Multiple yellow lines mean memory was sampled multiple times.</span></div>
         <div class="legend-row"><span class="legend-swatch legend-swatch--axis">0→N</span><span>The x-axis is <strong>allocator event order</strong>, not elapsed time.</span></div>
-        <div class="legend-note">CUDA Graph capture creates private-pool storage. Replay normally reuses those fixed addresses: this chart shows memory retained for replay, not fresh memory allocated by every replay.</div>
       </div>
     </div>
     <div class="chart-pane pane-left" id="chart-left">
