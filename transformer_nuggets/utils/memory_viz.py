@@ -894,6 +894,49 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
     z-index: 1;
   }
 
+  #chart-legend {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    z-index: 20;
+    font: 11px/1.45 var(--mono);
+  }
+  #legend-toggle {
+    width: 26px;
+    height: 26px;
+    display: grid;
+    place-items: center;
+    margin-left: auto;
+    color: var(--text-muted);
+    background: rgba(14,14,14,0.86);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  #legend-toggle:hover, #chart-legend.open #legend-toggle { color: var(--text); background: var(--surface); }
+  #legend-popover {
+    display: none;
+    width: min(370px, calc(100vw - 32px));
+    margin-top: 6px;
+    padding: 12px 14px;
+    color: var(--text-muted);
+    background: rgba(26,26,26,0.98);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.6);
+  }
+  #chart-legend.open #legend-popover { display: block; }
+  .legend-title { margin-bottom: 8px; color: var(--text); font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+  .legend-row { display: grid; grid-template-columns: 34px 1fr; gap: 8px; align-items: center; margin: 6px 0; }
+  .legend-swatch { display: block; width: 30px; height: 10px; }
+  .legend-swatch--alloc { background: linear-gradient(90deg, #6A51A3, #4C78A8, #59A14F, #B09A4A); opacity: 0.85; }
+  .legend-swatch--reserved { height: 0; border-top: 2px dashed #C97049; }
+  .legend-swatch--pool { height: 0; border-top: 2px dotted rgba(255,255,255,0.65); }
+  .legend-swatch--hwm { height: 0; border-top: 2px dashed rgba(255,255,255,0.65); }
+  .legend-swatch--events { height: 18px; border-left: 2px dotted #f1c40f; border-right: 2px dotted #e74c3c; }
+  .legend-swatch--axis { height: auto; color: var(--text-muted); text-align: center; }
+  .legend-note { margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--border); color: var(--text); }
+
   #detail-panel {
     width: 480px;
     border-left: 1px solid var(--border);
@@ -1359,7 +1402,21 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
   </div>
 </div>
 <div id="main">
-  <div id="chart-container"></div>
+  <div id="chart-container">
+    <div id="chart-legend">
+      <button id="legend-toggle" title="How to read this chart" aria-expanded="false">?</button>
+      <div id="legend-popover" role="dialog" aria-label="Memory chart legend">
+        <div class="legend-title">How to read</div>
+        <div class="legend-row"><span class="legend-swatch legend-swatch--alloc"></span><span><strong>Colored bands</strong> are allocation lifetimes; color follows the “Color by” setting.</span></div>
+        <div class="legend-row"><span class="legend-swatch legend-swatch--reserved"></span><span><strong>Orange dashed</strong> is total reserved allocator memory, including inactive cached blocks. Enable “Reserved” to show it.</span></div>
+        <div class="legend-row"><span class="legend-swatch legend-swatch--pool"></span><span><strong>Light dotted</strong> is reserved memory for each CUDA Graph or MemPool private pool.</span></div>
+        <div class="legend-row"><span class="legend-swatch legend-swatch--hwm"></span><span><strong>White dashed</strong> is the high-water mark of active allocations.</span></div>
+        <div class="legend-row"><span class="legend-swatch legend-swatch--events"></span><span><strong>Yellow / red vertical</strong> markers are snapshot checkpoints / OOM events.</span></div>
+        <div class="legend-row"><span class="legend-swatch legend-swatch--axis">0→N</span><span>The x-axis is <strong>allocator event order</strong>, not elapsed time.</span></div>
+        <div class="legend-note">CUDA Graph capture creates private-pool storage. Replay normally reuses those fixed addresses: this chart shows memory retained for replay, not fresh memory allocated by every replay.</div>
+      </div>
+    </div>
+  </div>
   <button id="panel-toggle" title="Show stack/details" aria-expanded="false">&#9654;</button>
   <div id="detail-panel" class="collapsed">
     <div id="resize-handle"></div>
@@ -2201,6 +2258,20 @@ document.addEventListener('pointerdown', event => {
   if (!controlsShell.contains(event.target)) setControlsCollapsed(true);
 });
 
+const chartLegend = document.getElementById('chart-legend');
+const legendToggle = document.getElementById('legend-toggle');
+function setLegendOpen(open) {
+  chartLegend.classList.toggle('open', open);
+  legendToggle.setAttribute('aria-expanded', String(open));
+}
+legendToggle.addEventListener('click', event => {
+  event.stopPropagation();
+  setLegendOpen(!chartLegend.classList.contains('open'));
+});
+document.addEventListener('pointerdown', event => {
+  if (!chartLegend.contains(event.target)) setLegendOpen(false);
+});
+
 const settingsTrigger = document.getElementById('settings-trigger');
 settingsTrigger.addEventListener('click', function(e) {
   if (e.target.closest('#settings-dropdown')) return;
@@ -2952,6 +3023,49 @@ _MEMORY_COMPARISON_TEMPLATE = r"""<!DOCTYPE html>
     z-index: 1;
   }
 
+  #chart-legend {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    z-index: 20;
+    font: 11px/1.45 var(--mono);
+  }
+  #legend-toggle {
+    width: 26px;
+    height: 26px;
+    display: grid;
+    place-items: center;
+    margin-left: auto;
+    color: var(--text-muted);
+    background: rgba(14,14,14,0.86);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  #legend-toggle:hover, #chart-legend.open #legend-toggle { color: var(--text); background: var(--surface); }
+  #legend-popover {
+    display: none;
+    width: min(370px, calc(100vw - 32px));
+    margin-top: 6px;
+    padding: 12px 14px;
+    color: var(--text-muted);
+    background: rgba(26,26,26,0.98);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.6);
+  }
+  #chart-legend.open #legend-popover { display: block; }
+  .legend-title { margin-bottom: 8px; color: var(--text); font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+  .legend-row { display: grid; grid-template-columns: 34px 1fr; gap: 8px; align-items: center; margin: 6px 0; }
+  .legend-swatch { display: block; width: 30px; height: 10px; }
+  .legend-swatch--alloc { background: linear-gradient(90deg, #6A51A3, #4C78A8, #59A14F, #B09A4A); opacity: 0.85; }
+  .legend-swatch--reserved { height: 0; border-top: 2px dashed #C97049; }
+  .legend-swatch--pool { height: 0; border-top: 2px dotted rgba(255,255,255,0.65); }
+  .legend-swatch--hwm { height: 0; border-top: 2px dashed rgba(255,255,255,0.65); }
+  .legend-swatch--events { height: 18px; border-left: 2px dotted #f1c40f; border-right: 2px dotted #e74c3c; }
+  .legend-swatch--axis { height: auto; color: var(--text-muted); text-align: center; }
+  .legend-note { margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--border); color: var(--text); }
+
   #detail-panel {
     width: 420px;
     border-left: 1px solid var(--border);
@@ -3421,6 +3535,19 @@ _MEMORY_COMPARISON_TEMPLATE = r"""<!DOCTYPE html>
 </div>
 <div id="main">
   <div id="charts-wrapper">
+    <div id="chart-legend">
+      <button id="legend-toggle" title="How to read this chart" aria-expanded="false">?</button>
+      <div id="legend-popover" role="dialog" aria-label="Memory chart legend">
+        <div class="legend-title">How to read</div>
+        <div class="legend-row"><span class="legend-swatch legend-swatch--alloc"></span><span><strong>Colored bands</strong> are allocation lifetimes; color follows the “Color by” setting.</span></div>
+        <div class="legend-row"><span class="legend-swatch legend-swatch--reserved"></span><span><strong>Orange dashed</strong> is total reserved allocator memory, including inactive cached blocks. Enable “Reserved” to show it.</span></div>
+        <div class="legend-row"><span class="legend-swatch legend-swatch--pool"></span><span><strong>Light dotted</strong> is reserved memory for each CUDA Graph or MemPool private pool.</span></div>
+        <div class="legend-row"><span class="legend-swatch legend-swatch--hwm"></span><span><strong>White dashed</strong> is the high-water mark of active allocations.</span></div>
+        <div class="legend-row"><span class="legend-swatch legend-swatch--events"></span><span><strong>Yellow / red vertical</strong> markers are snapshot checkpoints / OOM events.</span></div>
+        <div class="legend-row"><span class="legend-swatch legend-swatch--axis">0→N</span><span>The x-axis is <strong>allocator event order</strong>, not elapsed time.</span></div>
+        <div class="legend-note">CUDA Graph capture creates private-pool storage. Replay normally reuses those fixed addresses: this chart shows memory retained for replay, not fresh memory allocated by every replay.</div>
+      </div>
+    </div>
     <div class="chart-pane pane-left" id="chart-left">
       <span class="pane-label">__TITLE_LEFT__</span>
     </div>
@@ -4679,6 +4806,20 @@ controlsToggle.addEventListener('click', event => {
 });
 document.addEventListener('pointerdown', event => {
   if (!controlsShell.contains(event.target)) setControlsCollapsed(true);
+});
+
+const chartLegend = document.getElementById('chart-legend');
+const legendToggle = document.getElementById('legend-toggle');
+function setLegendOpen(open) {
+  chartLegend.classList.toggle('open', open);
+  legendToggle.setAttribute('aria-expanded', String(open));
+}
+legendToggle.addEventListener('click', event => {
+  event.stopPropagation();
+  setLegendOpen(!chartLegend.classList.contains('open'));
+});
+document.addEventListener('pointerdown', event => {
+  if (!chartLegend.contains(event.target)) setLegendOpen(false);
 });
 
 document.getElementById('hwm-toggle').onchange = function() {

@@ -637,6 +637,9 @@ class TestGenerateHTML:
         assert '<div id="detail-panel" class="collapsed">' in html
         assert 'id="controls-toggle"' in html
         assert 'id="panel-toggle"' in html
+        assert 'id="chart-legend"' in html
+        assert "memory retained for replay" in html
+        assert "allocator event order" in html
         assert "setDetailPanelCollapsed(false);" in html
 
     def test_exposes_default_allocator_diagnostics(self, snapshot):
@@ -749,6 +752,8 @@ class TestGenerateComparisonHTML:
         html = generate_memory_comparison_html(snapshot, snapshot)
         assert '<div id="controls" class="collapsed">' in html
         assert '<div id="detail-panel" class="collapsed">' in html
+        assert 'id="chart-legend"' in html
+        assert "memory retained for replay" in html
         assert "setDetailPanelCollapsed(false);" in html
         assert "const MAX_TS = Math.max(1, META.max_timestep);" in html
         assert "setReservedVisible" in html
@@ -835,6 +840,8 @@ const escapedFrame = detailBody.textContent.includes({json.dumps(payload)});
 const defaultCollapsed = detailPanel.classList.contains('collapsed') && controls.classList.contains('collapsed');
 controlsToggle.click();
 const controlsOpened = !controls.classList.contains('collapsed');
+legendToggle.click();
+const legendOpened = chartLegend.classList.contains('open') && legendToggle.getAttribute('aria-expanded') === 'true';
 document.getElementById('reserved-toggle').click();
 for (const tab of ['pools', 'events', 'segments', 'settings']) {{
   document.querySelector(`.detail-tab[data-tab="${{tab}}"]`).click();
@@ -853,6 +860,7 @@ setTimeout(() => {{
     escaped: escapedFrame,
     defaultCollapsed,
     controlsOpened,
+    legendOpened,
     injected: Boolean(document.getElementById('pwned')),
     canvasAligned: Math.abs(parseFloat(canvas.style.width) - container.getBoundingClientRect().width) < 1,
   }});
@@ -865,6 +873,7 @@ setTimeout(() => {{
             "escaped": True,
             "defaultCollapsed": True,
             "controlsOpened": True,
+            "legendOpened": True,
             "injected": False,
             "canvasAligned": True,
             "errors": [],
@@ -883,6 +892,8 @@ const escapedFrame = detailBody.textContent.includes({json.dumps(payload)});
 const defaultCollapsed = detailPanel.classList.contains('collapsed') && controls.classList.contains('collapsed');
 controlsToggle.click();
 const controlsOpened = !controls.classList.contains('collapsed');
+legendToggle.click();
+const legendOpened = chartLegend.classList.contains('open') && legendToggle.getAttribute('aria-expanded') === 'true';
 document.getElementById('reserved-toggle').click();
 for (const tab of ['pools', 'events', 'segments', 'settings']) {{
   document.querySelector(`.detail-tab[data-tab="${{tab}}"]`).click();
@@ -903,6 +914,7 @@ setTimeout(() => {{
     escaped: escapedFrame,
     defaultCollapsed,
     controlsOpened,
+    legendOpened,
     injected: Boolean(document.getElementById('pwned')),
     canvasAligned: canvases.every(canvas =>
       Math.abs(parseFloat(canvas.style.width) - canvas.parentElement.getBoundingClientRect().width) < 1
@@ -917,6 +929,7 @@ setTimeout(() => {{
             "escaped": True,
             "defaultCollapsed": True,
             "controlsOpened": True,
+            "legendOpened": True,
             "injected": False,
             "canvasAligned": True,
             "errors": [],
