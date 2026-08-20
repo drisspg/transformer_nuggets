@@ -22,9 +22,9 @@ import json
 import re
 import zlib
 from collections import defaultdict
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from collections.abc import Iterator
 from pathlib import Path
 from re import Pattern
 from typing import Any, Literal
@@ -33,7 +33,6 @@ from transformer_nuggets.utils.track_event import (
     default_track_event_path,
     write_track_event_trace,
 )
-
 
 TraceFormat = Literal["chrome_json", "track_event"]
 """Perfetto-compatible output format selector."""
@@ -65,6 +64,105 @@ def write_trace(path: str | Path, trace: dict[str, Any], *, indent: int | None =
     """Write a Chrome/Perfetto JSON trace to a plain or gzipped file."""
     with open_trace(path, "w") as f:
         json.dump(trace, f, indent=indent)
+
+
+def _annotation_name(entries: Sequence[Any] | None) -> str | None:
+    name = None
+    for annotation in entries or ():
+        if isinstance(annotation, dict) and "name" in annotation:
+            name = str(annotation["name"])
+        elif isinstance(annotation, str):
+            name = annotation
+    return name
+
+
+def _graph_annotation_box(
+    name: str,
+    pid: Any,
+    tid: Any,
+    start: float,
+    end: float,
+) -> dict[str, Any]:
+    return {
+        "ph": "X",
+        "cat": "gpu_user_annotation",
+        "name": name,
+        "pid": pid,
+        "tid": tid,
+        "ts": start,
+        "dur": end - start,
+        "args": {"transformer_nuggets.graph_annotation": True},
+    }
+
+
+def add_cuda_graph_annotation_boxes(
+    trace: dict[str, Any],
+    annotations: Mapping[int, Sequence[Any]] | None = None,
+) -> dict[str, Any]:
+    """Add GPU annotation spans for contiguous CUDA Graph regions.
+
+    Graph annotation metadata is joined by ``(graph id, graph node id)`` when an
+    annotation registry is supplied. CUPTI monitor JSON traces can also carry the
+    annotation list directly in each GPU event's ``annotation`` argument.
+    """
+    events = list(trace.get("traceEvents", []))
+    if any(event.get("args", {}).get("transformer_nuggets.graph_annotation") for event in events):
+        return trace.copy()
+
+    annotated_work: dict[tuple[Any, Any], list[tuple[dict[str, Any], str]]] = defaultdict(list)
+    for event in events:
+        if event.get("ph") != "X" or event.get("cat") not in {
+            "kernel",
+            "gpu_memcpy",
+            "gpu_memset",
+        }:
+            continue
+        args = event.get("args", {})
+        graph_id = args.get("graph id")
+        graph_node_id = args.get("graph node id")
+        if graph_id is None or not graph_node_id:
+            continue
+
+        entries = None
+        if annotations is not None:
+            entries = annotations.get((int(graph_id) << 32) | int(graph_node_id))
+        if entries is None and isinstance(args.get("annotation"), str):
+            try:
+                embedded = json.loads(args["annotation"])
+            except json.JSONDecodeError:
+                embedded = None
+            if isinstance(embedded, list):
+                entries = embedded
+        name = _annotation_name(entries)
+        if name is not None:
+            annotated_work[(event.get("pid"), event.get("tid"))].append((event, name))
+
+    annotation_boxes: list[dict[str, Any]] = []
+    for (pid, tid), stream_events in annotated_work.items():
+        region_name = None
+        region_start = 0.0
+        region_end = 0.0
+        for event, name in sorted(stream_events, key=lambda item: item[0]["ts"]):
+            start = float(event["ts"])
+            end = start + float(event.get("dur", 0.0))
+            if name != region_name:
+                if region_name is not None:
+                    annotation_boxes.append(
+                        _graph_annotation_box(region_name, pid, tid, region_start, region_end)
+                    )
+                region_name = name
+                region_start = start
+                region_end = end
+            else:
+                region_end = max(region_end, end)
+        if region_name is not None:
+            annotation_boxes.append(
+                _graph_annotation_box(region_name, pid, tid, region_start, region_end)
+            )
+
+    processed = trace.copy()
+    processed["traceEvents"] = [*events, *annotation_boxes]
+    return processed
 
 
 def default_trace_path(file_path: str | Path, *, gzip_by_default: bool = True) -> Path:

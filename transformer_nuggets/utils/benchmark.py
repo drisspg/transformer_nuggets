@@ -21,6 +21,7 @@ from torch.profiler import ProfilerActivity, profile, record_function, schedule
 from torch.utils import benchmark
 
 from transformer_nuggets.utils.perfetto import (
+    add_cuda_graph_annotation_boxes,
     perfetto_trace_path,
     read_trace,
     write_perfetto_trace,
@@ -551,6 +552,15 @@ def benchmark_cuda_function_in_microseconds_triton(func: Callable, *args, **kwar
         return do_bench(no_args) * 1e3
 
 
+def _cuda_graph_annotations() -> dict[int, list[object]]:
+    """Return captured CUDA Graph annotations when the prototype API is available."""
+    try:
+        from torch.cuda.graph_annotations import get_kernel_annotations
+    except ImportError:
+        return {}
+    return get_kernel_annotations()
+
+
 def _write_profiler_trace(
     prof: torch.profiler.profile,
     trace_path: Path,
@@ -561,8 +571,12 @@ def _write_profiler_trace(
     gzip_trace: bool = False,
 ) -> None:
     """Export a torch profiler trace through the canonical Perfetto writer."""
+    annotations = _cuda_graph_annotations()
     can_export_direct_json = (
-        trace_format == "chrome_json" and not split_overlaps and trace_path.suffix != ".gz"
+        trace_format == "chrome_json"
+        and not split_overlaps
+        and trace_path.suffix != ".gz"
+        and not annotations
     )
     if can_export_direct_json:
         prof.export_chrome_trace(str(trace_path))
@@ -573,7 +587,7 @@ def _write_profiler_trace(
         prof.export_chrome_trace(str(export_path))
         write_perfetto_trace(
             trace_path,
-            read_trace(export_path),
+            add_cuda_graph_annotation_boxes(read_trace(export_path), annotations),
             trace_format=trace_format,
             split_overlaps=split_overlaps,
             track_pattern=track_pattern,
@@ -605,8 +619,37 @@ def _write_cupti_monitor_trace(
     trace_path: Path,
     *,
     trace_format: Literal["chrome_json", "track_event"],
+    split_overlaps: bool = True,
+    track_pattern: str | None = "stream.*",
+    gzip_trace: bool = False,
 ) -> None:
-    """Export a monitor trace while hiding its unconditional ``.gz`` suffix."""
+    """Export a monitor trace and apply graph-aware postprocessing when needed."""
+    annotations = _cuda_graph_annotations()
+    if annotations:
+        export_path = trace_path.with_name(f"{trace_path.stem}.monitor-export.json")
+        monitor_path = Path(f"{export_path}.gz")
+        export_path.unlink(missing_ok=True)
+        monitor_path.unlink(missing_ok=True)
+        try:
+            prof.export_chrome_trace(str(export_path))
+            generated_path = export_path if export_path.exists() else monitor_path
+            if not generated_path.exists():
+                raise FileNotFoundError(
+                    f"CUPTI monitor export produced neither {export_path} nor {monitor_path}"
+                )
+            write_perfetto_trace(
+                trace_path,
+                add_cuda_graph_annotation_boxes(read_trace(generated_path), annotations),
+                trace_format=trace_format,
+                split_overlaps=split_overlaps,
+                track_pattern=track_pattern,
+                gzip_trace=gzip_trace,
+            )
+        finally:
+            export_path.unlink(missing_ok=True)
+            monitor_path.unlink(missing_ok=True)
+        return
+
     export_path = trace_path.with_name(f"{trace_path.name}.monitor-export")
     monitor_path = Path(f"{export_path}.gz")
     export_path.unlink(missing_ok=True)
@@ -1008,7 +1051,14 @@ def profiler(
 
     def trace_handler(prof) -> None:
         if use_cupti_monitor:
-            _write_cupti_monitor_trace(prof, path, trace_format=trace_format)
+            _write_cupti_monitor_trace(
+                prof,
+                path,
+                trace_format=trace_format,
+                split_overlaps=fix_overlapping_events,
+                track_pattern=overlap_track_pattern,
+                gzip_trace=gzip_trace,
+            )
             return
         _write_profiler_trace(
             prof,

@@ -4,6 +4,7 @@ import json
 import pytest
 
 from transformer_nuggets.utils.perfetto import (
+    add_cuda_graph_annotation_boxes,
     default_trace_path,
     default_track_event_path,
     read_trace,
@@ -15,6 +16,87 @@ from transformer_nuggets.utils.track_event import chrome_trace_to_track_event_tr
 
 def _duration_events(trace):
     return [event for event in trace["traceEvents"] if event.get("ph") == "X"]
+
+
+def test_cuda_graph_annotations_become_contiguous_gpu_boxes():
+    graph_id = 2
+    annotations = {
+        (graph_id << 32) | 1: [{"name": "attention"}],
+        (graph_id << 32) | 2: [{"name": "attention"}],
+        (graph_id << 32) | 3: [{"name": "loss"}],
+    }
+    trace = {
+        "traceEvents": [
+            {
+                "ph": "X",
+                "cat": "kernel",
+                "name": "kernel_a",
+                "pid": 0,
+                "tid": 7,
+                "ts": 10,
+                "dur": 3,
+                "args": {"graph id": graph_id, "graph node id": 1},
+            },
+            {
+                "ph": "X",
+                "cat": "kernel",
+                "name": "kernel_b",
+                "pid": 0,
+                "tid": 7,
+                "ts": 13,
+                "dur": 5,
+                "args": {"graph id": graph_id, "graph node id": 2},
+            },
+            {
+                "ph": "X",
+                "cat": "kernel",
+                "name": "kernel_c",
+                "pid": 0,
+                "tid": 7,
+                "ts": 18,
+                "dur": 2,
+                "args": {"graph id": graph_id, "graph node id": 3},
+            },
+        ]
+    }
+
+    processed = add_cuda_graph_annotation_boxes(trace, annotations)
+    boxes = [
+        event for event in processed["traceEvents"] if event.get("cat") == "gpu_user_annotation"
+    ]
+
+    assert [(box["name"], box["ts"], box["dur"]) for box in boxes] == [
+        ("attention", 10.0, 8.0),
+        ("loss", 18.0, 2.0),
+    ]
+    assert all(box["tid"] == 7 for box in boxes)
+    assert len(trace["traceEvents"]) == 3
+
+
+def test_cuda_graph_annotation_boxes_accept_monitor_embedded_metadata():
+    trace = {
+        "traceEvents": [
+            {
+                "ph": "X",
+                "cat": "kernel",
+                "name": "kernel",
+                "pid": 0,
+                "tid": 7,
+                "ts": 10,
+                "dur": 3,
+                "args": {
+                    "graph id": 2,
+                    "graph node id": 1,
+                    "annotation": '[{"name": "attention"}]',
+                },
+            }
+        ]
+    }
+
+    processed = add_cuda_graph_annotation_boxes(trace)
+
+    assert processed["traceEvents"][-1]["name"] == "attention"
+    assert processed["traceEvents"][-1]["cat"] == "gpu_user_annotation"
 
 
 def test_split_overlapping_slices_creates_adjacent_lanes():
@@ -163,7 +245,7 @@ def test_default_track_event_path_uses_native_perfetto_suffix():
 
 
 def test_track_event_conversion_preserves_instants_counters_and_warns_on_unsupported():
-    from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import TrackEvent, Trace
+    from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import Trace, TrackEvent
 
     trace = {
         "traceEvents": [
@@ -187,7 +269,7 @@ def test_track_event_conversion_preserves_instants_counters_and_warns_on_unsuppo
 
 
 def test_track_event_conversion_puts_gpu_annotations_on_separate_track():
-    from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import TrackEvent, Trace
+    from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import Trace, TrackEvent
 
     trace = {
         "traceEvents": [
@@ -224,7 +306,7 @@ def test_track_event_conversion_puts_gpu_annotations_on_separate_track():
 
 
 def test_track_event_conversion_attaches_paired_flows_to_slices():
-    from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import TrackEvent, Trace
+    from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import Trace, TrackEvent
 
     trace = {
         "traceEvents": [
@@ -255,9 +337,9 @@ def test_track_event_conversion_attaches_paired_flows_to_slices():
 
 def test_track_event_conversion_splits_crossing_slices_and_keeps_nested_slices():
     from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import (
+        Trace,
         TrackDescriptor,
         TrackEvent,
-        Trace,
     )
 
     trace = {
@@ -302,7 +384,7 @@ def test_track_event_conversion_splits_crossing_slices_and_keeps_nested_slices()
 
 
 def test_track_event_conversion_keeps_back_to_back_slices_separate():
-    from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import TrackEvent, Trace
+    from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import Trace, TrackEvent
 
     trace = {
         "traceEvents": [
