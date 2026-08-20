@@ -73,6 +73,29 @@ def test_cuda_graph_annotations_become_contiguous_gpu_boxes():
     assert len(trace["traceEvents"]) == 3
 
 
+def test_cuda_graph_annotation_boxes_label_backward_phase():
+    graph_id = 2
+    trace = {
+        "traceEvents": [
+            {
+                "ph": "X",
+                "cat": "kernel",
+                "name": "kernel",
+                "pid": 0,
+                "tid": 7,
+                "ts": 10,
+                "dur": 3,
+                "args": {"graph id": graph_id, "graph node id": 1},
+            }
+        ]
+    }
+    annotations = {(graph_id << 32) | 1: [{"name": "attention", "autograd_phase": "backward"}]}
+
+    processed = add_cuda_graph_annotation_boxes(trace, annotations)
+
+    assert processed["traceEvents"][-1]["name"] == "attention backward"
+
+
 def test_cuda_graph_annotation_boxes_accept_monitor_embedded_metadata():
     trace = {
         "traceEvents": [

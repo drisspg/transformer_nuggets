@@ -66,13 +66,21 @@ def write_trace(path: str | Path, trace: dict[str, Any], *, indent: int | None =
         json.dump(trace, f, indent=indent)
 
 
-def _annotation_name(entries: Sequence[Any] | None) -> str | None:
-    name = None
+def _annotation_label(entries: Sequence[Any] | None) -> str | None:
+    metadata: dict[str, Any] = {}
     for annotation in entries or ():
-        if isinstance(annotation, dict) and "name" in annotation:
-            name = str(annotation["name"])
+        if isinstance(annotation, dict):
+            metadata.update(annotation)
         elif isinstance(annotation, str):
-            name = annotation
+            metadata["name"] = annotation
+
+    name = metadata.get("name")
+    if name is None:
+        return None
+    name = str(name)
+    autograd_phase = metadata.get("autograd_phase")
+    if autograd_phase == "backward" and name != "backward":
+        return f"{name} backward"
     return name
 
 
@@ -133,7 +141,7 @@ def add_cuda_graph_annotation_boxes(
                 embedded = None
             if isinstance(embedded, list):
                 entries = embedded
-        name = _annotation_name(entries)
+        name = _annotation_label(entries)
         if name is not None:
             annotated_work[(event.get("pid"), event.get("tid"))].append((event, name))
 
