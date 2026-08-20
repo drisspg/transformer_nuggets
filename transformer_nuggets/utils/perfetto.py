@@ -128,7 +128,7 @@ def add_cuda_graph_annotation_boxes(
         args = event.get("args", {})
         graph_id = args.get("graph id")
         graph_node_id = args.get("graph node id")
-        if graph_id is None or not graph_node_id:
+        if graph_id is None or graph_node_id is None:
             continue
 
         entries = None

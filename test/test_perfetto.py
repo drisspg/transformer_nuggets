@@ -21,7 +21,7 @@ def _duration_events(trace):
 def test_cuda_graph_annotations_become_contiguous_gpu_boxes():
     graph_id = 2
     annotations = {
-        (graph_id << 32) | 1: [{"name": "attention"}],
+        (graph_id << 32) | 0: [{"name": "attention"}],
         (graph_id << 32) | 2: [{"name": "attention"}],
         (graph_id << 32) | 3: [{"name": "loss"}],
     }
@@ -35,7 +35,7 @@ def test_cuda_graph_annotations_become_contiguous_gpu_boxes():
                 "tid": 7,
                 "ts": 10,
                 "dur": 3,
-                "args": {"graph id": graph_id, "graph node id": 1},
+                "args": {"graph id": graph_id, "graph node id": 0},
             },
             {
                 "ph": "X",
