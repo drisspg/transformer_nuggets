@@ -1,9 +1,15 @@
+import html as html_lib
 import json
+import os
 import pickle
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
+import torch
 
+from transformer_nuggets.utils import memory_viz
 from transformer_nuggets.utils.memory_viz import (
     _extract_frames,
     _is_cpython_c_frame,
@@ -12,7 +18,6 @@ from transformer_nuggets.utils.memory_viz import (
     generate_memory_html,
     process_snapshot,
 )
-
 
 DATA_DIR = Path(__file__).parent / "data"
 SNAPSHOT_PATH = DATA_DIR / "mini_snapshot.pickle"
@@ -24,8 +29,8 @@ def snapshot():
         return pickle.load(f)
 
 
-def _make_event(action, addr, size, time_us=0, filename="test.py", name="func", line=1):
-    return {
+def _make_event(action, addr, size, time_us=0, filename="test.py", name="func", line=1, **extra):
+    event = {
         "action": action,
         "addr": addr,
         "size": size,
@@ -35,6 +40,8 @@ def _make_event(action, addr, size, time_us=0, filename="test.py", name="func", 
         "user_metadata": "",
         "frames": [{"filename": filename, "name": name, "line": line}],
     }
+    event.update(extra)
+    return event
 
 
 def _make_snapshot(events):
@@ -53,6 +60,74 @@ def _extract_named_bootstrap(html, script_id):
     start = html.index(marker) + len(marker)
     end = html.index("</script>", start)
     return json.loads(html[start:end])
+
+
+def _chrome_binary() -> str | None:
+    cached = [
+        *sorted(Path.home().glob(".agent-browser/browsers/chrome-*/chrome"), reverse=True),
+        *sorted(
+            Path.home().glob(".local/share/pyppeteer/local-chromium/*/chrome-linux/chrome"),
+            reverse=True,
+        ),
+    ]
+    candidates = [
+        os.environ.get("CHROME_BIN"),
+        shutil.which("google-chrome"),
+        shutil.which("google-chrome-stable"),
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+        *(str(path) for path in cached),
+    ]
+    return next(
+        (candidate for candidate in candidates if candidate and Path(candidate).is_file()), None
+    )
+
+
+def _run_browser_check(tmp_path: Path, document: str, test_script: str) -> dict:
+    chrome = _chrome_binary()
+    if chrome is None:
+        pytest.skip("Chrome/Chromium is required for memory visualizer browser tests")
+    collector = """
+<script>
+window.__memoryVizErrors = [];
+window.addEventListener('error', event => window.__memoryVizErrors.push(String(event.error || event.message)));
+window.addEventListener('unhandledrejection', event => window.__memoryVizErrors.push(String(event.reason)));
+</script>
+"""
+    finish = """
+function finishMemoryVizTest(result) {
+  const output = document.createElement('pre');
+  output.id = 'memory-viz-test-result';
+  output.textContent = JSON.stringify({...result, errors: window.__memoryVizErrors});
+  document.body.appendChild(output);
+}
+"""
+    instrumented = document.replace("<head>", f"<head>{collector}", 1).replace(
+        "</body>", f"<script>{finish}\n{test_script}</script></body>", 1
+    )
+    path = tmp_path / "memory_viz.html"
+    path.write_text(instrumented)
+    result = subprocess.run(
+        [
+            chrome,
+            "--headless=new",
+            "--no-sandbox",
+            "--disable-gpu",
+            "--allow-file-access-from-files",
+            "--run-all-compositor-stages-before-draw",
+            "--virtual-time-budget=1500",
+            "--dump-dom",
+            path.as_uri(),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    marker = '<pre id="memory-viz-test-result">'
+    start = result.stdout.index(marker) + len(marker)
+    end = result.stdout.index("</pre>", start)
+    return json.loads(html_lib.unescape(result.stdout[start:end]))
 
 
 class TestExtractFrames:
@@ -112,7 +187,7 @@ class TestHelpers:
 
 class TestProcessSnapshot:
     def test_returns_correct_tuple_shape(self, snapshot):
-        timeline, allocs, frames, stacks, max_ts, hwm_ts = process_snapshot(snapshot)
+        timeline, allocs, frames, stacks, max_ts, _hwm_ts = process_snapshot(snapshot)
         assert len(timeline) > 0
         assert len(allocs) > 0
         assert len(frames) > 0
@@ -128,7 +203,20 @@ class TestProcessSnapshot:
     def test_timeline_fields(self, snapshot):
         timeline, *_ = process_snapshot(snapshot)
         entry = timeline[0]
-        assert set(entry.keys()) == {"t", "a", "r", "h", "act", "s", "si"}
+        assert set(entry.keys()) == {
+            "step",
+            "t",
+            "a",
+            "r",
+            "h",
+            "act",
+            "s",
+            "si",
+            "addr",
+            "pool",
+            "device_free",
+            "metadata",
+        }
 
     def test_alloc_poly_fields(self, snapshot):
         _, allocs, *_ = process_snapshot(snapshot)
@@ -165,6 +253,329 @@ class TestProcessSnapshot:
             assert all(o >= 0 for o in poly["offsets"])
 
 
+class TestCurrentSnapshotSemantics:
+    def test_live_snapshot_block_is_not_replayed_twice(self):
+        snapshot = {
+            "device_traces": [[_make_event("alloc", 0x1100, 100)]],
+            "segments": [
+                {
+                    "device": 0,
+                    "address": 0x1000,
+                    "total_size": 4096,
+                    "stream": 0,
+                    "segment_pool_id": (0, 0),
+                    "blocks": [
+                        {
+                            "state": "active_allocated",
+                            "address": 0x1100,
+                            "size": 128,
+                            "requested_size": 100,
+                            "frames": [],
+                        }
+                    ],
+                }
+            ],
+            "allocator_settings": {},
+        }
+
+        timeline, allocs, *_ = process_snapshot(snapshot)
+
+        assert len(allocs) == 1
+        assert timeline[-1]["a"] == 100
+        assert max(event["h"] for event in timeline) == 100
+
+    def test_snapshot_only_blocks_use_address_and_requested_size(self):
+        snapshot = {
+            "device_traces": [[]],
+            "segments": [
+                {
+                    "device": 0,
+                    "address": 0x1000,
+                    "total_size": 4096,
+                    "stream": 0,
+                    "segment_pool_id": (0, 0),
+                    "blocks": [
+                        {
+                            "state": "active_allocated",
+                            "address": 0x1100,
+                            "size": 128,
+                            "requested_size": 100,
+                            "frames": [],
+                        },
+                        {
+                            "state": "active_allocated",
+                            "address": 0x1200,
+                            "size": 64,
+                            "requested_size": 50,
+                            "frames": [],
+                        },
+                    ],
+                }
+            ],
+            "allocator_settings": {},
+        }
+
+        timeline, allocs, *_ = process_snapshot(snapshot)
+
+        assert {alloc["addr"] for alloc in allocs} == {"0x1100", "0x1200"}
+        assert {alloc["s"] for alloc in allocs} == {100, 50}
+        assert timeline[0]["a"] == 150
+
+    def test_snapshot_blocks_without_addresses_use_segment_offsets(self):
+        snapshot = {
+            "device_traces": [[]],
+            "segments": [
+                {
+                    "device": 0,
+                    "address": 0x1000,
+                    "total_size": 4096,
+                    "stream": 0,
+                    "segment_pool_id": (0, 0),
+                    "blocks": [
+                        {
+                            "state": "active_allocated",
+                            "size": 1000,
+                            "requested_size": 900,
+                            "frames": [],
+                        },
+                        {
+                            "state": "active_allocated",
+                            "size": 1500,
+                            "requested_size": 1400,
+                            "frames": [],
+                        },
+                    ],
+                }
+            ],
+            "allocator_settings": {},
+        }
+
+        timeline, allocs, *_ = process_snapshot(snapshot)
+
+        assert [alloc["addr"] for alloc in allocs] == ["0x1000", "0x13e8"]
+        assert timeline[0]["a"] == 2300
+
+    @pytest.mark.parametrize("state", ["active_pending_free", "active_awaiting_free"])
+    def test_snapshot_pending_free_blocks_remain_visible(self, state):
+        snapshot = {
+            "device_traces": [[]],
+            "segments": [
+                {
+                    "device": 0,
+                    "address": 0x1000,
+                    "total_size": 4096,
+                    "stream": 0,
+                    "segment_pool_id": (0, 0),
+                    "blocks": [
+                        {
+                            "state": state,
+                            "address": 0x1100,
+                            "size": 128,
+                            "requested_size": 100,
+                            "frames": [],
+                        }
+                    ],
+                }
+            ],
+            "allocator_settings": {},
+        }
+
+        timeline, allocs, *_ = process_snapshot(snapshot)
+
+        assert timeline[0]["a"] == 100
+        assert allocs[0]["free_requested"] is True
+
+    def test_free_requested_waits_for_free_completed(self):
+        events = [
+            _make_event("alloc", 0x1000, 100),
+            _make_event("free_requested", 0x1000, 100),
+            _make_event("free_completed", 0x1000, 100),
+        ]
+
+        timeline, allocs, *_ = process_snapshot(_make_snapshot(events))
+
+        assert [event["a"] for event in timeline] == [100, 100, 0]
+        assert allocs[0]["free_requested"] is True
+
+    def test_unmatched_free_reconstructs_initial_allocation(self):
+        timeline, allocs, *_ = process_snapshot(
+            _make_snapshot([_make_event("free_completed", 0x1000, 100)])
+        )
+
+        assert len(allocs) == 1
+        assert allocs[0]["origin"] == "unmatched_free"
+        assert [event["a"] for event in timeline] == [100, 0]
+
+    def test_address_reuse_resets_annotations(self):
+        events = [
+            _make_event("alloc", 0x1000, 100),
+            _make_event("annotate", 0x1000, 0, user_metadata="first"),
+            _make_event("free_completed", 0x1000, 100),
+            _make_event("alloc", 0x1000, 200),
+        ]
+
+        _, allocs, *_ = process_snapshot(_make_snapshot(events))
+
+        assert allocs[0]["annotations"] == ["first"]
+        assert allocs[1]["annotations"] == []
+
+    def test_annotation_survives_evicted_alloc_event(self):
+        snapshot = {
+            "device_traces": [[_make_event("annotate", 0x1100, 0, user_metadata="weight")]],
+            "segments": [
+                {
+                    "device": 0,
+                    "address": 0x1000,
+                    "total_size": 4096,
+                    "stream": 0,
+                    "segment_pool_id": (0, 0),
+                    "blocks": [
+                        {
+                            "state": "active_allocated",
+                            "address": 0x1100,
+                            "size": 128,
+                            "requested_size": 100,
+                            "frames": [],
+                        }
+                    ],
+                }
+            ],
+            "allocator_settings": {"trace_alloc_overflowed": True},
+        }
+
+        _, allocs, *_ = process_snapshot(snapshot)
+
+        assert allocs[0]["annotations"] == ["weight"]
+
+    def test_segment_map_and_unmap_update_reserved_memory(self):
+        events = [
+            _make_event("segment_map", 0xA000, 4096),
+            _make_event("segment_unmap", 0xA000, 2048),
+        ]
+
+        timeline, *_ = process_snapshot(_make_snapshot(events))
+
+        assert [event["r"] for event in timeline] == [4096, 2048]
+
+    def test_private_pool_and_diagnostics_are_serialized(self):
+        events = [
+            _make_event("segment_alloc", 0x1000, 4096, pool_id=(1, 0)),
+            _make_event("alloc", 0x1100, 100, pool_id=(1, 0)),
+            _make_event("annotate", 0x1100, 0, user_metadata="graph output"),
+            _make_event("snapshot", 0, 0),
+            _make_event("oom", 0, 1024, device_free=512),
+        ]
+        snapshot = {
+            "device_traces": [events],
+            "segments": [
+                {
+                    "device": 0,
+                    "address": 0x1000,
+                    "total_size": 4096,
+                    "allocated_size": 100,
+                    "active_size": 100,
+                    "stream": 0,
+                    "segment_pool_id": (1, 0),
+                    "segment_type": "small",
+                    "blocks": [
+                        {
+                            "state": "active_allocated",
+                            "address": 0x1100,
+                            "size": 128,
+                            "requested_size": 100,
+                            "frames": [],
+                        },
+                        {
+                            "state": "inactive",
+                            "address": 0x1180,
+                            "size": 3968,
+                            "requested_size": 0,
+                            "frames": [],
+                        },
+                    ],
+                }
+            ],
+            "allocator_settings": {"trace_alloc_overflowed": False},
+        }
+
+        bootstrap = _extract_bootstrap(generate_memory_html(snapshot))
+
+        assert bootstrap["allocs"][0]["pool"] == [1, 0]
+        assert bootstrap["allocs"][0]["annotations"] == ["graph output"]
+        assert bootstrap["private_pools"][0]["reserved_bytes"] == 4096
+        assert bootstrap["private_pools"][0]["inactive_bytes"] == 3968
+        assert {event["act"] for event in bootstrap["events"]} >= {"snapshot", "oom"}
+        assert bootstrap["allocator_settings"]["trace_alloc_overflowed"] is False
+
+    def test_fx_metadata_is_preserved(self):
+        event = _make_event("alloc", 0x1000, 100)
+        event["category"] = "activations"
+        event["frames"][0].update(
+            fx_node_op="call_function",
+            fx_node_name="linear",
+            fx_original_trace="model.py:10",
+        )
+
+        bootstrap = _extract_bootstrap(generate_memory_html(_make_snapshot([event])))
+
+        assert bootstrap["allocs"][0]["category"] == "activations"
+        assert bootstrap["allocs"][0]["fx"][0]["fx_node_name"] == "linear"
+
+    @pytest.mark.slow
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="CUDA Graph snapshot test requires CUDA"
+    )
+    def test_cuda_graph_snapshot_is_not_double_counted(self):
+        torch.cuda.empty_cache()
+        torch.cuda.memory._record_memory_history(
+            max_entries=100_000,
+            stacks="all",
+            clear_history=True,
+        )
+        try:
+            x = torch.randn(1024, 1024, device="cuda")
+            output = torch.empty_like(x)
+            warmup_stream = torch.cuda.Stream()
+            warmup_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(warmup_stream):
+                torch.sin(x, out=output)
+            torch.cuda.current_stream().wait_stream(warmup_stream)
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                torch.sin(x, out=output)
+                captured_tmp = x * 2
+                output.add_(captured_tmp)
+            graph.replay()
+            torch.cuda.synchronize()
+
+            snapshot = torch.cuda.memory._snapshot()
+            timeline, *_ = process_snapshot(snapshot, torch.cuda.current_device())
+            expected_active = sum(
+                block.get("requested_size", block["size"])
+                for segment in snapshot["segments"]
+                if segment["device"] == torch.cuda.current_device()
+                for block in segment["blocks"]
+                if block["state"]
+                in {"active_allocated", "active_pending_free", "active_awaiting_free"}
+            )
+            expected_reserved = sum(
+                segment["total_size"]
+                for segment in snapshot["segments"]
+                if segment["device"] == torch.cuda.current_device()
+            )
+            bootstrap = _extract_bootstrap(
+                generate_memory_html(snapshot, device=torch.cuda.current_device())
+            )
+
+            assert timeline[-1]["a"] == expected_active
+            assert timeline[-1]["r"] == expected_reserved == torch.cuda.memory_reserved()
+            assert bootstrap["private_pools"]
+            assert bootstrap["meta"]["private_pool_reserved_bytes"] > 0
+        finally:
+            torch.cuda.memory._record_memory_history(enabled=None)
+
+
 class TestGenerateHTML:
     def test_produces_valid_html(self, snapshot):
         html = generate_memory_html(snapshot, title="Test")
@@ -178,6 +589,7 @@ class TestGenerateHTML:
             "__DOCUMENT_TITLE__",
             "__VISIBLE_TITLE__",
             "__BOOTSTRAP__",
+            "__D3_SOURCE__",
             "__TITLE_LEFT__",
             "__TITLE_RIGHT__",
         ]:
@@ -201,7 +613,52 @@ class TestGenerateHTML:
 
     def test_d3_loaded(self, snapshot):
         html = generate_memory_html(snapshot, title="Test")
-        assert "d3.v7" in html
+        assert "https://d3js.org v7.9.0" in html
+        assert '<script src="https://d3js.org' not in html
+
+    def test_negative_device_generates_empty_data(self, snapshot):
+        bootstrap = _extract_bootstrap(generate_memory_html(snapshot, device=-1))
+        assert bootstrap["allocs"] == []
+        assert bootstrap["segments"] == []
+        assert bootstrap["private_pools"] == []
+
+    def test_empty_snapshot_has_zero_safe_javascript(self):
+        html = generate_memory_html(_make_snapshot([]), title="Empty")
+        bootstrap = _extract_bootstrap(html)
+        assert bootstrap["timeline"] == [0]
+        assert bootstrap["reserved_timeline"] == [0]
+        assert "const MAX_TS = Math.max(1, META.max_timestep);" in html
+        assert "const hitBucketSize = MAX_TS / NUM_HIT_BUCKETS;" in html
+        assert "...RESERVED_TIMELINE.slice" not in html
+
+    def test_panels_and_controls_start_compact(self, snapshot):
+        html = generate_memory_html(snapshot, title="Test")
+        assert '<div id="controls" class="collapsed">' in html
+        assert '<div id="detail-panel" class="collapsed">' in html
+        assert 'id="controls-toggle"' in html
+        assert 'id="panel-toggle"' in html
+        assert "setDetailPanelCollapsed(false);" in html
+
+    def test_exposes_default_allocator_diagnostics(self, snapshot):
+        html = generate_memory_html(snapshot, title="Test")
+        for feature in [
+            "reserved-toggle",
+            "showPools",
+            "showEvents",
+            "showSegments",
+            "showSettings",
+            "reserved_timeline",
+            "private_pools",
+            "allocator_settings",
+        ]:
+            assert feature in html
+
+    def test_dynamic_text_is_escaped_before_inner_html(self, snapshot):
+        html = generate_memory_html(snapshot, title="Test")
+        assert "function escapeHtml(value)" in html
+        assert "${escapeHtml(primary)}" in html
+        assert "${escapeHtml(d.ctx || 'None')}" in html
+        assert "${escapeHtml(g.frame)}" in html
 
     def test_hwm_timestep_in_meta(self, snapshot):
         html = generate_memory_html(snapshot, title="Test")
@@ -235,7 +692,6 @@ class TestGenerateHTML:
         html = generate_memory_html(snapshot, title="Test")
         assert "function buildDerivedData()" in html
         assert "const derivedData = buildDerivedData();" in html
-        assert "stackSummaries" in html
         assert "peakAllocIndices" in html
         assert "leakGroups" in html
 
@@ -286,7 +742,21 @@ class TestGenerateComparisonHTML:
         html = generate_memory_comparison_html(snapshot, snapshot)
         assert "function applyPaneLayout()" in html
         assert "window.addEventListener('resize', applyPaneLayout);" in html
+        assert "setTimeout(applyPaneLayout, 200);" in html
         assert 'id="splitter"' not in html
+
+    def test_comparison_includes_allocator_diagnostics_and_safe_zoom(self, snapshot):
+        html = generate_memory_comparison_html(snapshot, snapshot)
+        assert '<div id="controls" class="collapsed">' in html
+        assert '<div id="detail-panel" class="collapsed">' in html
+        assert "setDetailPanelCollapsed(false);" in html
+        assert "const MAX_TS = Math.max(1, META.max_timestep);" in html
+        assert "setReservedVisible" in html
+        assert "id: 'pools'" in html
+        assert "id: 'events'" in html
+        assert "id: 'segments'" in html
+        assert "id: 'settings'" in html
+        assert "Math.max(1, TIMELINE.length - 1)" in html
 
     def test_uses_requested_devices_per_side(self):
         snapshot_left = {
@@ -302,7 +772,8 @@ class TestGenerateComparisonHTML:
                         {
                             "state": "active_allocated",
                             "size": 64,
-                            "addr": 0x1000,
+                            "requested_size": 64,
+                            "address": 0x1000,
                             "frames": [{"filename": "left.py", "name": "seed", "line": 1}],
                         }
                     ],
@@ -324,7 +795,8 @@ class TestGenerateComparisonHTML:
                         {
                             "state": "active_allocated",
                             "size": 128,
-                            "addr": 0x2000,
+                            "requested_size": 128,
+                            "address": 0x2000,
                             "frames": [{"filename": "right.py", "name": "seed", "line": 1}],
                         }
                     ],
@@ -344,8 +816,111 @@ class TestGenerateComparisonHTML:
         bootstrap_right = _extract_named_bootstrap(html, "bootstrap-right")
         assert bootstrap_left["meta"]["device"] == 0
         assert bootstrap_right["meta"]["device"] == 1
-        assert bootstrap_left["meta"]["num_allocs"] == 2
-        assert bootstrap_right["meta"]["num_allocs"] == 2
+        assert bootstrap_left["meta"]["num_allocs"] == 1
+        assert bootstrap_right["meta"]["num_allocs"] == 1
+
+
+class TestBrowserRuntime:
+    def test_single_view_handles_empty_data_resize_and_untrusted_frames(self, tmp_path):
+        payload = '</span><img id="pwned">'
+        snapshot = _make_snapshot(
+            [_make_event("alloc", 0x1000, 100, filename=f"/tmp/{payload}.py")]
+        )
+        result = _run_browser_check(
+            tmp_path,
+            generate_memory_html(snapshot),
+            f"""
+renderStack(0, 'malicious');
+const escapedFrame = detailBody.textContent.includes({json.dumps(payload)});
+const defaultCollapsed = detailPanel.classList.contains('collapsed') && controls.classList.contains('collapsed');
+controlsToggle.click();
+const controlsOpened = !controls.classList.contains('collapsed');
+document.getElementById('reserved-toggle').click();
+for (const tab of ['pools', 'events', 'segments', 'settings']) {{
+  document.querySelector(`.detail-tab[data-tab="${{tab}}"]`).click();
+}}
+const overlay = document.querySelector('#chart-container rect[pointer-events="all"]');
+overlay.dispatchEvent(new MouseEvent('mousemove', {{bubbles: true, clientX: 100, clientY: 100}}));
+window.dispatchEvent(new Event('resize'));
+document.getElementById('panel-toggle').click();
+setTimeout(() => {{
+  const invalid = [...document.querySelectorAll('*')].some(element =>
+    [...element.attributes].some(attr => /NaN|Infinity/.test(attr.value))
+  );
+  const canvas = document.getElementById('alloc-canvas');
+  finishMemoryVizTest({{
+    invalid,
+    escaped: escapedFrame,
+    defaultCollapsed,
+    controlsOpened,
+    injected: Boolean(document.getElementById('pwned')),
+    canvasAligned: Math.abs(parseFloat(canvas.style.width) - container.getBoundingClientRect().width) < 1,
+  }});
+}}, 400);
+""",
+        )
+
+        assert result == {
+            "invalid": False,
+            "escaped": True,
+            "defaultCollapsed": True,
+            "controlsOpened": True,
+            "injected": False,
+            "canvasAligned": True,
+            "errors": [],
+        }
+
+    def test_comparison_links_empty_and_nonempty_panes_without_nan(self, tmp_path):
+        payload = '</span><img id="pwned">'
+        left = _make_snapshot([])
+        right = _make_snapshot([_make_event("alloc", 0x1000, 100, filename=f"/tmp/{payload}.py")])
+        result = _run_browser_check(
+            tmp_path,
+            generate_memory_comparison_html(left, right),
+            f"""
+renderStack('right', 0, 'malicious');
+const escapedFrame = detailBody.textContent.includes({json.dumps(payload)});
+const defaultCollapsed = detailPanel.classList.contains('collapsed') && controls.classList.contains('collapsed');
+controlsToggle.click();
+const controlsOpened = !controls.classList.contains('collapsed');
+document.getElementById('reserved-toggle').click();
+for (const tab of ['pools', 'events', 'segments', 'settings']) {{
+  document.querySelector(`.detail-tab[data-tab="${{tab}}"]`).click();
+}}
+for (const overlay of document.querySelectorAll('.chart-pane rect[pointer-events="all"]')) {{
+  overlay.dispatchEvent(new MouseEvent('mousemove', {{bubbles: true, clientX: 80, clientY: 80}}));
+  overlay.dispatchEvent(new WheelEvent('wheel', {{bubbles: true, deltaY: -100, clientX: 80, clientY: 80}}));
+}}
+document.getElementById('panel-toggle').click();
+window.dispatchEvent(new Event('resize'));
+setTimeout(() => {{
+  const invalid = [...document.querySelectorAll('*')].some(element =>
+    [...element.attributes].some(attr => /NaN|Infinity/.test(attr.value))
+  );
+  const canvases = [...document.querySelectorAll('.chart-pane canvas')];
+  finishMemoryVizTest({{
+    invalid,
+    escaped: escapedFrame,
+    defaultCollapsed,
+    controlsOpened,
+    injected: Boolean(document.getElementById('pwned')),
+    canvasAligned: canvases.every(canvas =>
+      Math.abs(parseFloat(canvas.style.width) - canvas.parentElement.getBoundingClientRect().width) < 1
+    ),
+  }});
+}}, 400);
+""",
+        )
+
+        assert result == {
+            "invalid": False,
+            "escaped": True,
+            "defaultCollapsed": True,
+            "controlsOpened": True,
+            "injected": False,
+            "canvasAligned": True,
+            "errors": [],
+        }
 
 
 class TestNeverFreedAllocations:
@@ -386,12 +961,44 @@ class TestNeverFreedAllocations:
 
 
 class TestStackDeduplication:
+    def test_shared_frame_objects_use_identity_fast_paths(self, monkeypatch):
+        raw_frames = [{"filename": "a.py", "name": "foo", "line": 10}]
+        events = [
+            _make_event("alloc", 0x1000, 100),
+            _make_event("free_completed", 0x1000, 100),
+        ]
+        for event in events:
+            event["frames"] = raw_frames
+
+        extract_calls = 0
+        fx_calls = 0
+        original_extract = memory_viz._extract_frames
+        original_fx = memory_viz._fx_metadata
+
+        def extract(frames):
+            nonlocal extract_calls
+            extract_calls += 1
+            return original_extract(frames)
+
+        def fx(frames):
+            nonlocal fx_calls
+            fx_calls += 1
+            return original_fx(frames)
+
+        monkeypatch.setattr(memory_viz, "_extract_frames", extract)
+        monkeypatch.setattr(memory_viz, "_fx_metadata", fx)
+
+        process_snapshot(_make_snapshot(events))
+
+        assert extract_calls == 1
+        assert fx_calls == 1
+
     def test_identical_frames_share_stack_index(self):
         events = [
             _make_event("alloc", 0x1000, 1024, filename="a.py", name="foo", line=10),
             _make_event("alloc", 0x2000, 2048, filename="a.py", name="foo", line=10),
         ]
-        _, allocs, frames, stacks, *_ = process_snapshot(_make_snapshot(events))
+        _, allocs, _, stacks, *_ = process_snapshot(_make_snapshot(events))
         assert allocs[0]["si"] == allocs[1]["si"]
         assert len(stacks) == 1
 
@@ -405,7 +1012,7 @@ class TestStackDeduplication:
         assert len(stacks) == 2
 
     def test_real_snapshot_deduplicates(self, snapshot):
-        _, allocs, _, stacks, *_ = process_snapshot(snapshot)
+        _, allocs, *_ = process_snapshot(snapshot)
         used_stacks = {a["si"] for a in allocs}
         assert len(used_stacks) < len(allocs)
 
@@ -445,7 +1052,7 @@ class TestSegmentEvents:
             _make_event("alloc", 0x1000, 1024, time_us=2),
             _make_event("segment_free", 0xA000, 4096, time_us=3),
         ]
-        timeline, allocs, *_ = process_snapshot(_make_snapshot(events))
+        _, allocs, *_ = process_snapshot(_make_snapshot(events))
         assert len(allocs) == 1
         assert allocs[0]["s"] == 1024
 

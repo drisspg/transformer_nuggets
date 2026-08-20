@@ -1,14 +1,14 @@
 import ctypes
 import ctypes.util
 import functools
-import gzip
 import inspect
 import json
 import logging
 import os
 import random
 import statistics
-from collections.abc import Callable, Sequence
+import weakref
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,9 +22,11 @@ from torch.utils import benchmark
 
 from transformer_nuggets.utils.perfetto import (
     add_cuda_graph_annotation_boxes,
+    add_cuda_graph_annotation_tracks_to_native_trace,
     perfetto_trace_path,
     read_trace,
     write_perfetto_trace,
+    write_trace,
 )
 
 logger = logging.getLogger(__name__)
@@ -552,13 +554,38 @@ def benchmark_cuda_function_in_microseconds_triton(func: Callable, *args, **kwar
         return do_bench(no_args) * 1e3
 
 
-def _cuda_graph_annotations() -> dict[int, list[object]]:
+def _cuda_graph_annotations() -> Mapping[int, Sequence[object]]:
     """Return captured CUDA Graph annotations when the prototype API is available."""
     try:
         from torch.cuda.graph_annotations import get_kernel_annotations
     except ImportError:
         return {}
     return get_kernel_annotations()
+
+
+class _CudaGraphAnnotationSnapshot:
+    """Retain graph annotation keys across profiler-scope graph lifecycle changes."""
+
+    def __init__(self) -> None:
+        self.annotations: dict[int, list[object]] = {}
+        self._snapshot()
+        self._instantiate_hook = None
+        try:
+            from torch.cuda.graphs import register_graph_instantiate_hook
+        except ImportError:
+            return
+        self._instantiate_hook = register_graph_instantiate_hook(lambda graph: self._snapshot())
+
+    def _snapshot(self) -> None:
+        for tools_id, entries in _cuda_graph_annotations().items():
+            self.annotations[int(tools_id)] = list(entries)
+
+    def close(self) -> None:
+        """Remove the lifecycle hook after preserving the final live annotations."""
+        self._snapshot()
+        if self._instantiate_hook is not None:
+            self._instantiate_hook.remove()
+            self._instantiate_hook = None
 
 
 def _write_profiler_trace(
@@ -569,9 +596,10 @@ def _write_profiler_trace(
     split_overlaps: bool,
     track_pattern: str | None,
     gzip_trace: bool = False,
+    annotations: Mapping[int, Sequence[object]] | None = None,
 ) -> None:
     """Export a torch profiler trace through the canonical Perfetto writer."""
-    annotations = _cuda_graph_annotations()
+    annotations = _cuda_graph_annotations() if annotations is None else annotations
     can_export_direct_json = (
         trace_format == "chrome_json"
         and not split_overlaps
@@ -623,34 +651,9 @@ def _write_cupti_monitor_trace(
     track_pattern: str | None = "stream.*",
     gzip_trace: bool = False,
 ) -> None:
-    """Export a monitor trace and apply graph-aware postprocessing when needed."""
-    annotations = _cuda_graph_annotations()
-    if annotations:
-        export_path = trace_path.with_name(f"{trace_path.stem}.monitor-export.json")
-        monitor_path = Path(f"{export_path}.gz")
-        export_path.unlink(missing_ok=True)
-        monitor_path.unlink(missing_ok=True)
-        try:
-            prof.export_chrome_trace(str(export_path))
-            generated_path = export_path if export_path.exists() else monitor_path
-            if not generated_path.exists():
-                raise FileNotFoundError(
-                    f"CUPTI monitor export produced neither {export_path} nor {monitor_path}"
-                )
-            write_perfetto_trace(
-                trace_path,
-                add_cuda_graph_annotation_boxes(read_trace(generated_path), annotations),
-                trace_format=trace_format,
-                split_overlaps=split_overlaps,
-                track_pattern=track_pattern,
-                gzip_trace=gzip_trace,
-            )
-        finally:
-            export_path.unlink(missing_ok=True)
-            monitor_path.unlink(missing_ok=True)
-        return
-
-    export_path = trace_path.with_name(f"{trace_path.name}.monitor-export")
+    """Export a monitor trace through its native graph-annotation overlay path."""
+    export_suffix = ".pftrace" if trace_format == "track_event" else ".json"
+    export_path = trace_path.with_name(f"{trace_path.stem}.monitor-export{export_suffix}")
     monitor_path = Path(f"{export_path}.gz")
     export_path.unlink(missing_ok=True)
     monitor_path.unlink(missing_ok=True)
@@ -663,13 +666,23 @@ def _write_cupti_monitor_trace(
         )
 
     trace_path.unlink(missing_ok=True)
-    if trace_format == "track_event" or trace_path.suffix == ".gz":
-        generated_path.replace(trace_path)
+    if trace_format == "track_event":
+        try:
+            trace_path.write_bytes(
+                add_cuda_graph_annotation_tracks_to_native_trace(generated_path.read_bytes())
+            )
+        finally:
+            generated_path.unlink(missing_ok=True)
         return
-
     try:
-        with gzip.open(generated_path, "rb") as source, trace_path.open("wb") as destination:
-            destination.write(source.read())
+        write_trace(
+            trace_path,
+            add_cuda_graph_annotation_boxes(
+                read_trace(generated_path),
+                _cuda_graph_annotations(),
+            ),
+            indent=None,
+        )
     finally:
         generated_path.unlink(missing_ok=True)
 
@@ -693,44 +706,49 @@ def profile_function(
         torch.cuda.synchronize()
     name_context = nullcontext() if config.name is None else record_function(config.name)
     profile_memory = config.memory_profile_path is not None
-    with profile(
-        activities=activities,
-        profile_memory=profile_memory,
-        record_shapes=profile_memory,
-        with_stack=profile_memory,
-        **config.extra_kwargs,
-    ) as prof:
-        for _ in range(config.iters):
-            with name_context:
-                func(*args, **kwargs)
-                if config.sync:
-                    torch.cuda.synchronize()
+    annotation_snapshot = _CudaGraphAnnotationSnapshot()
+    try:
+        with profile(
+            activities=activities,
+            profile_memory=profile_memory,
+            record_shapes=profile_memory,
+            with_stack=profile_memory,
+            **config.extra_kwargs,
+        ) as prof:
+            for _ in range(config.iters):
+                with name_context:
+                    func(*args, **kwargs)
+                    if config.sync:
+                        torch.cuda.synchronize()
 
-    if config.file_path is not None:
-        trace_path = perfetto_trace_path(
-            config.file_path,
-            trace_format=config.trace_format,
-            gzip_trace=config.gzip_trace,
-        )
-        _write_profiler_trace(
-            prof,
-            trace_path,
-            trace_format=config.trace_format,
-            split_overlaps=config.fix_overlapping_events,
-            track_pattern=config.overlap_track_pattern,
-            gzip_trace=config.gzip_trace,
-        )
-        logger.info(f"💾 Trace file 📄 saved to: {bcolors.OKGREEN}{trace_path}{bcolors.ENDC}")
+        if config.file_path is not None:
+            trace_path = perfetto_trace_path(
+                config.file_path,
+                trace_format=config.trace_format,
+                gzip_trace=config.gzip_trace,
+            )
+            _write_profiler_trace(
+                prof,
+                trace_path,
+                trace_format=config.trace_format,
+                split_overlaps=config.fix_overlapping_events,
+                track_pattern=config.overlap_track_pattern,
+                gzip_trace=config.gzip_trace,
+                annotations=annotation_snapshot.annotations,
+            )
+            logger.info(f"💾 Trace file 📄 saved to: {bcolors.OKGREEN}{trace_path}{bcolors.ENDC}")
 
-    if profile_memory and config.memory_profile_path is not None:
-        with open(config.memory_profile_path, "w") as f:
-            f.write(profile_plot(prof))
+        if profile_memory and config.memory_profile_path is not None:
+            with open(config.memory_profile_path, "w") as f:
+                f.write(profile_plot(prof))
 
-    if config.file_path is None:
-        sort_by = "cpu_time_total" if not config.cuda else "cuda_time_total"
-        print(prof.key_averages().table(sort_by=sort_by, row_limit=config.row_limit))
+        if config.file_path is None:
+            sort_by = "cpu_time_total" if not config.cuda else "cuda_time_total"
+            print(prof.key_averages().table(sort_by=sort_by, row_limit=config.row_limit))
 
-    return prof
+        return prof
+    finally:
+        annotation_snapshot.close()
 
 
 class max_memory_usage:
@@ -1049,6 +1067,8 @@ def profiler(
 
     logger.info(f"💾 Trace file 📄 saved to: {bcolors.OKGREEN}{path}{bcolors.ENDC}")
 
+    annotation_snapshot = _CudaGraphAnnotationSnapshot()
+
     def trace_handler(prof) -> None:
         if use_cupti_monitor:
             _write_cupti_monitor_trace(
@@ -1067,24 +1087,29 @@ def profiler(
             split_overlaps=fix_overlapping_events,
             track_pattern=overlap_track_pattern,
             gzip_trace=gzip_trace,
+            annotations=annotation_snapshot.annotations,
         )
 
     prof_sched = schedule(wait=0, warmup=warmup, active=1_000_000) if warmup > 0 else None
-    experimental_config = (
-        _cupti_monitor_experimental_config(monitor_config) if use_cupti_monitor else None
-    )
-    torch_profiler = torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
-        on_trace_ready=trace_handler,
-        record_shapes=record_shapes,
-        profile_memory=profile_memory,
-        with_stack=with_stack,
-        schedule=prof_sched,
-        experimental_config=experimental_config,
-    )
+    try:
+        experimental_config = (
+            _cupti_monitor_experimental_config(monitor_config) if use_cupti_monitor else None
+        )
+        torch_profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            on_trace_ready=trace_handler,
+            record_shapes=record_shapes,
+            profile_memory=profile_memory,
+            with_stack=with_stack,
+            schedule=prof_sched,
+            experimental_config=experimental_config,
+        )
+    except BaseException:
+        annotation_snapshot.close()
+        raise
 
     @contextmanager
     def profile_context():
@@ -1092,6 +1117,11 @@ def profiler(
             torch_profiler.start()
             yield torch_profiler
         finally:
-            torch_profiler.stop()
+            try:
+                torch_profiler.stop()
+            finally:
+                annotation_snapshot.close()
 
-    return profile_context()
+    context = profile_context()
+    weakref.finalize(context, annotation_snapshot.close)
+    return context

@@ -1,6 +1,7 @@
 import html
 import json
-
+from functools import cache
+from pathlib import Path
 
 _SKIP_NAMES = {
     "torch::unwind::unwind()",
@@ -33,9 +34,7 @@ _BARE_NOISE_PREFIXES = (
 def _is_cpython_c_frame(fn: str, name: str) -> bool:
     if any(m in fn for m in _CPYTHON_MARKERS):
         return True
-    if fn.endswith(".c") and name.startswith(("_Py", "Py", "pyrun", "pymain", "run_")):
-        return True
-    return False
+    return fn.endswith(".c") and name.startswith(("_Py", "Py", "pyrun", "pymain", "run_"))
 
 
 def _is_bare_noise(name: str) -> bool:
@@ -68,212 +67,553 @@ def _extract_frames(frames: list[dict]) -> list[str]:
     return result
 
 
+def _normalize_pool_id(value: object) -> tuple[int, int] | None:
+    """Normalize allocator pool IDs while accepting older snapshots without them."""
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
+    return int(value[0]), int(value[1])
+
+
+def _is_private_pool(pool_id: tuple[int, int] | None) -> bool:
+    """Return whether a pool ID identifies a non-default allocator pool."""
+    return pool_id is not None and pool_id != (0, 0)
+
+
+def _block_address(block: dict, segment: dict, offset: int = 0) -> int:
+    """Read a block address or derive it from its position in the segment."""
+    return int(block.get("address", block.get("addr", int(segment.get("address", 0)) + offset)))
+
+
+def _block_requested_size(block: dict) -> int:
+    """Return user-requested allocation bytes rather than rounded block bytes."""
+    return int(block.get("requested_size", block.get("size", 0)))
+
+
+def _find_pool_id(segments: list[dict], addr: int) -> tuple[int, int] | None:
+    """Resolve an address by binary-searching segments sorted by start address."""
+    left = 0
+    right = len(segments) - 1
+    while left <= right:
+        middle = (left + right) // 2
+        segment = segments[middle]
+        start = int(segment.get("address", 0))
+        if addr < start:
+            right = middle - 1
+        elif addr >= start + int(segment.get("total_size", 0)):
+            left = middle + 1
+        else:
+            return _normalize_pool_id(segment.get("segment_pool_id"))
+    return None
+
+
+def _fx_metadata(raw_frames: list[dict]) -> list[dict]:
+    """Preserve FX source metadata that is not represented in display frame strings."""
+    keys = ("fx_node_op", "fx_node_name", "fx_node_target", "fx_original_trace")
+    result = []
+    for frame in raw_frames:
+        metadata = {key: frame[key] for key in keys if frame.get(key)}
+        if metadata:
+            result.append(metadata)
+    return result
+
+
+def _allocation_record(
+    *,
+    addr: int,
+    size: int,
+    stack_idx: int,
+    stream: int,
+    pool_id: tuple[int, int] | None,
+    time_us: float | None,
+    compile_context: object = "",
+    user_metadata: object = "",
+    category: object = None,
+    fx: list[dict] | None = None,
+    ghost: bool = False,
+    origin: str = "trace",
+    block_size: int | None = None,
+) -> dict:
+    """Create the serialized allocation record consumed by both D3 views."""
+    return {
+        "si": stack_idx,
+        "s": size,
+        "block_size": size if block_size is None else block_size,
+        "ts": [],
+        "offsets": [],
+        "addr": f"0x{addr:x}",
+        "addr_int": addr,
+        "stream": stream,
+        "pool": pool_id,
+        "time_us": time_us,
+        "ctx": compile_context or "",
+        "metadata": user_metadata or "",
+        "annotations": [],
+        "category": category,
+        "fx": fx or [],
+        "ghost": ghost,
+        "origin": origin,
+        "free_requested": False,
+    }
+
+
 def process_snapshot(
     snapshot: dict, device: int = 0
 ) -> tuple[list[dict], list[dict], list[str], list[list[int]], int, int]:
+    """Reconcile allocator history with current segment state into D3 timeline data."""
     traces = snapshot.get("device_traces", [])
-    if device >= len(traces):
+    if device < 0 or device >= len(traces):
         return [], [], [], [], 0, 0
+
+    device_segments = sorted(
+        (
+            segment
+            for segment in snapshot.get("segments", [])
+            if segment.get("device", 0) == device
+        ),
+        key=lambda segment: int(segment.get("address", 0)),
+    )
+    device_trace = traces[device]
 
     frame_to_idx: dict[str, int] = {}
     frames: list[str] = []
     stack_to_idx: dict[tuple[int, ...], int] = {}
     stacks: list[list[int]] = []
-
-    def intern_frame(f: str) -> int:
-        if f not in frame_to_idx:
-            frame_to_idx[f] = len(frames)
-            frames.append(f)
-        return frame_to_idx[f]
-
-    id_cache: dict[int, int] = {}
     content_cache: dict[tuple, int] = {}
+    stack_identity_cache: dict[int, tuple[list[dict], int]] = {}
+    fx_identity_cache: dict[int, tuple[list[dict], list[dict]]] = {}
 
     def get_stack_idx(raw_frames: list[dict]) -> int:
-        raw_id = id(raw_frames)
-        if raw_id in id_cache:
-            return id_cache[raw_id]
+        identity = stack_identity_cache.get(id(raw_frames))
+        if identity is not None and identity[0] is raw_frames:
+            return identity[1]
         content_key = tuple(
-            (f.get("filename", ""), f.get("name", ""), f.get("line", 0)) for f in raw_frames
+            (frame.get("filename", ""), frame.get("name", ""), frame.get("line", 0))
+            for frame in raw_frames
         )
         if content_key in content_cache:
-            result = content_cache[content_key]
-            id_cache[raw_id] = result
-            return result
-        extracted = _extract_frames(raw_frames)
-        frame_indices = [intern_frame(f) for f in extracted]
+            stack_idx = content_cache[content_key]
+            stack_identity_cache[id(raw_frames)] = (raw_frames, stack_idx)
+            return stack_idx
+        frame_indices = []
+        for frame in _extract_frames(raw_frames):
+            if frame not in frame_to_idx:
+                frame_to_idx[frame] = len(frames)
+                frames.append(frame)
+            frame_indices.append(frame_to_idx[frame])
         key = tuple(frame_indices)
         if key not in stack_to_idx:
             stack_to_idx[key] = len(stacks)
             stacks.append(frame_indices)
-        result = stack_to_idx[key]
-        id_cache[raw_id] = result
-        content_cache[content_key] = result
-        return result
+        stack_idx = stack_to_idx[key]
+        content_cache[content_key] = stack_idx
+        stack_identity_cache[id(raw_frames)] = (raw_frames, stack_idx)
+        return stack_idx
 
+    def get_fx_metadata(raw_frames: list[dict]) -> list[dict]:
+        identity = fx_identity_cache.get(id(raw_frames))
+        if identity is not None and identity[0] is raw_frames:
+            return identity[1]
+        metadata = _fx_metadata(raw_frames)
+        fx_identity_cache[id(raw_frames)] = (raw_frames, metadata)
+        return metadata
+
+    event_stack_indices = [get_stack_idx(entry.get("frames", [])) for entry in device_trace]
+    alloc_polys: list[dict] = []
+    live_by_addr: dict[int, int] = {}
+    annotations_by_addr: dict[int, list[object]] = {}
+    initially_allocated: list[int] = []
+    event_actions: dict[int, tuple[str, int]] = {}
+
+    for event_idx, entry in enumerate(device_trace):
+        action = entry.get("action", "")
+        addr = int(entry.get("addr", 0))
+        raw_frames = entry.get("frames", [])
+        match action:
+            case "alloc":
+                annotations_by_addr.pop(addr, None)
+                pool_id = _normalize_pool_id(entry.get("pool_id")) or _find_pool_id(
+                    device_segments, addr
+                )
+                alloc_id = len(alloc_polys)
+                alloc_polys.append(
+                    _allocation_record(
+                        addr=addr,
+                        size=int(entry.get("size", 0)),
+                        stack_idx=event_stack_indices[event_idx],
+                        stream=int(entry.get("stream", 0)),
+                        pool_id=pool_id,
+                        time_us=entry.get("time_us"),
+                        compile_context=entry.get("compile_context"),
+                        user_metadata=entry.get("user_metadata"),
+                        category=entry.get("category"),
+                        fx=get_fx_metadata(raw_frames),
+                    )
+                )
+                live_by_addr[addr] = alloc_id
+                event_actions[event_idx] = ("alloc", alloc_id)
+            case "free_requested":
+                alloc_id = live_by_addr.get(addr)
+                if alloc_id is not None:
+                    alloc_polys[alloc_id]["free_requested"] = True
+            case "free_completed" | "free":
+                annotations_by_addr.pop(addr, None)
+                alloc_id = live_by_addr.pop(addr, None)
+                if alloc_id is None:
+                    pool_id = _normalize_pool_id(entry.get("pool_id")) or _find_pool_id(
+                        device_segments, addr
+                    )
+                    alloc_id = len(alloc_polys)
+                    alloc_polys.append(
+                        _allocation_record(
+                            addr=addr,
+                            size=int(entry.get("size", 0)),
+                            stack_idx=event_stack_indices[event_idx],
+                            stream=int(entry.get("stream", 0)),
+                            pool_id=pool_id,
+                            time_us=None,
+                            compile_context=entry.get("compile_context"),
+                            user_metadata=entry.get("user_metadata"),
+                            category=entry.get("category"),
+                            fx=get_fx_metadata(raw_frames),
+                            ghost=True,
+                            origin="unmatched_free",
+                        )
+                    )
+                    initially_allocated.append(alloc_id)
+                event_actions[event_idx] = ("free", alloc_id)
+            case "annotate":
+                annotation = entry.get("user_metadata", "")
+                annotations_by_addr.setdefault(addr, []).append(annotation)
+                if addr in live_by_addr:
+                    alloc_polys[live_by_addr[addr]]["annotations"].append(annotation)
+            case _:
+                pass
+
+    for segment in device_segments:
+        pool_id = _normalize_pool_id(segment.get("segment_pool_id"))
+        block_offset = 0
+        for block in segment.get("blocks", []):
+            addr = _block_address(block, segment, block_offset)
+            block_offset += int(block.get("size", 0))
+            if block.get("state") not in {
+                "active_allocated",
+                "active_pending_free",
+                "active_awaiting_free",
+            }:
+                continue
+            if addr in live_by_addr:
+                continue
+            raw_frames = block.get("frames", [])
+            if not raw_frames and block.get("history"):
+                raw_frames = block["history"][0].get("frames", [])
+            alloc_id = len(alloc_polys)
+            alloc_polys.append(
+                _allocation_record(
+                    addr=addr,
+                    size=_block_requested_size(block),
+                    block_size=int(block.get("size", 0)),
+                    stack_idx=get_stack_idx(raw_frames),
+                    stream=int(segment.get("stream", 0)),
+                    pool_id=pool_id,
+                    time_us=None,
+                    user_metadata=block.get("user_metadata"),
+                    category=block.get("category"),
+                    fx=get_fx_metadata(raw_frames),
+                    ghost=True,
+                    origin="snapshot",
+                )
+            )
+            alloc_polys[alloc_id]["annotations"] = annotations_by_addr.get(addr, []).copy()
+            alloc_polys[alloc_id]["free_requested"] = block.get("state") != "active_allocated"
+            initially_allocated.append(alloc_id)
+            live_by_addr[addr] = alloc_id
+
+    current_stack: list[int] = []
+    stack_pos: dict[int, int] = {}
     allocated = 0
-    reserved = 0
     hwm = 0
     hwm_at_timestep = 0
     timeline: list[dict] = []
 
-    current_stack: list[int] = []
-    stack_pos: dict[int, int] = {}
-    alloc_id_by_addr: dict[int, int] = {}
+    def add_allocation(alloc_id: int, timestep: int) -> None:
+        nonlocal allocated
+        poly = alloc_polys[alloc_id]
+        poly["ts"].append(timestep)
+        poly["offsets"].append(allocated)
+        stack_pos[alloc_id] = len(current_stack)
+        current_stack.append(alloc_id)
+        allocated += poly["s"]
 
-    alloc_polys: list[dict] = []
-    timestep = 0
+    def free_allocation(alloc_id: int, timestep: int) -> None:
+        nonlocal allocated
+        idx_in_stack = stack_pos.pop(alloc_id, None)
+        if idx_in_stack is None:
+            return
+        poly = alloc_polys[alloc_id]
+        poly["ts"].append(timestep)
+        poly["offsets"].append(poly["offsets"][-1])
+        current_stack.pop(idx_in_stack)
+        allocated -= poly["s"]
+        for stack_idx in range(idx_in_stack, len(current_stack)):
+            above_id = current_stack[stack_idx]
+            stack_pos[above_id] = stack_idx
+            above = alloc_polys[above_id]
+            above["ts"].extend((timestep, timestep))
+            above["offsets"].extend((above["offsets"][-1], above["offsets"][-1] - poly["s"]))
 
-    for seg in snapshot.get("segments", []):
-        if seg.get("device", 0) != device:
-            continue
-        for block in seg.get("blocks", []):
-            if block.get("state", "") not in ("active_allocated", "active_pending_free"):
-                continue
-            size = block.get("size", 0)
-            addr = block.get("addr", seg.get("address", 0))
-            raw_frames = block.get("frames", [])
-            if not raw_frames and "history" in block and block["history"]:
-                raw_frames = block["history"][0].get("frames", [])
-            si = get_stack_idx(raw_frames)
-            offset = allocated
-            allocated += size
-            alloc_id = len(alloc_polys)
-            alloc_polys.append(
-                {
-                    "si": si,
-                    "s": size,
-                    "ts": [timestep],
-                    "offsets": [offset],
-                    "addr": f"0x{addr:x}",
-                    "stream": seg.get("stream", 0),
-                    "time_us": 0,
-                    "ctx": "",
-                }
-            )
-            stack_pos[alloc_id] = len(current_stack)
-            current_stack.append(alloc_id)
-            alloc_id_by_addr[addr] = alloc_id
-    if allocated > 0:
-        timestep += 1
-        if allocated > hwm:
-            hwm = allocated
-            hwm_at_timestep = 0
+    # Reverse unmatched frees so the earliest freed reconstructed block is stacked highest.
+    initially_allocated.reverse()
+    for alloc_id in initially_allocated:
+        add_allocation(alloc_id, 0)
+
+    final_reserved = sum(int(segment.get("total_size", 0)) for segment in device_segments)
+    reserved_delta = sum(
+        int(entry.get("size", 0))
+        * (1 if entry.get("action") in {"segment_alloc", "segment_map"} else -1)
+        for entry in device_trace
+        if entry.get("action") in {"segment_alloc", "segment_map", "segment_free", "segment_unmap"}
+    )
+    reserved = max(0, final_reserved - reserved_delta)
+    timestep_base = 1 if initially_allocated else 0
+    if initially_allocated:
+        hwm = allocated
         timeline.append(
             {
-                "t": 0,
+                "step": 0,
+                "t": None,
                 "a": allocated,
-                "r": 0,
+                "r": reserved,
                 "h": hwm,
                 "act": "preexisting",
                 "s": allocated,
                 "si": 0,
+                "addr": None,
+                "pool": None,
+                "device_free": None,
+                "metadata": "",
             }
         )
 
-    for i, entry in enumerate(traces[device]):
+    for event_idx, entry in enumerate(device_trace):
+        timestep = timestep_base + event_idx
+        event_action = event_actions.get(event_idx)
+        if event_action is not None:
+            action, alloc_id = event_action
+            if action == "alloc":
+                add_allocation(alloc_id, timestep)
+            else:
+                free_allocation(alloc_id, timestep)
+
         action = entry.get("action", "")
-        addr = entry.get("addr", 0)
-        size = entry.get("size", 0)
-        time_us = entry.get("time_us", i)
-        si = get_stack_idx(entry.get("frames", []))
-
-        match action:
-            case "alloc":
-                allocated += size
-                offset = allocated - size
-                alloc_id = len(alloc_polys)
-                alloc_polys.append(
-                    {
-                        "si": si,
-                        "s": size,
-                        "ts": [timestep],
-                        "offsets": [offset],
-                        "addr": f"0x{addr:x}",
-                        "stream": entry.get("stream", 0),
-                        "time_us": time_us,
-                        "ctx": entry.get("compile_context") or "",
-                    }
-                )
-                stack_pos[alloc_id] = len(current_stack)
-                current_stack.append(alloc_id)
-                alloc_id_by_addr[addr] = alloc_id
-                timestep += 1
-
-            case "free_completed" | "free_requested":
-                if addr not in alloc_id_by_addr:
-                    continue
-                allocated -= size
-                freed_id = alloc_id_by_addr.pop(addr)
-                poly = alloc_polys[freed_id]
-                poly["ts"].append(timestep)
-                poly["offsets"].append(poly["offsets"][-1])
-
-                idx_in_stack = stack_pos.pop(freed_id, None)
-                if idx_in_stack is not None:
-                    current_stack.pop(idx_in_stack)
-                    for j in range(idx_in_stack, len(current_stack)):
-                        stack_pos[current_stack[j]] = j
-                    for above_id in current_stack[idx_in_stack:]:
-                        above = alloc_polys[above_id]
-                        above["ts"].append(timestep)
-                        above["offsets"].append(above["offsets"][-1])
-                        above["ts"].append(timestep + 1)
-                        above["offsets"].append(above["offsets"][-1] - size)
-
-                timestep += 2
-
-            case "segment_alloc":
-                reserved += size
-            case "segment_free":
-                reserved -= size
-            case _:
-                pass
+        if action in {"segment_alloc", "segment_map"}:
+            reserved += int(entry.get("size", 0))
+        elif action in {"segment_free", "segment_unmap"}:
+            reserved = max(0, reserved - int(entry.get("size", 0)))
 
         if allocated > hwm:
             hwm = allocated
             hwm_at_timestep = timestep
         timeline.append(
             {
-                "t": time_us,
+                "step": timestep,
+                "t": entry.get("time_us"),
                 "a": allocated,
                 "r": reserved,
                 "h": hwm,
                 "act": action,
-                "s": size,
-                "si": si,
+                "s": int(entry.get("size", 0)),
+                "si": event_stack_indices[event_idx],
+                "addr": f"0x{int(entry['addr']):x}" if "addr" in entry else None,
+                "pool": _normalize_pool_id(entry.get("pool_id"))
+                or _find_pool_id(device_segments, int(entry.get("addr", 0))),
+                "device_free": entry.get("device_free"),
+                "metadata": entry.get("user_metadata", ""),
             }
         )
 
+    max_timestep = timestep_base + len(device_trace)
     for alloc_id in current_stack:
         poly = alloc_polys[alloc_id]
-        poly["ts"].append(timestep)
+        poly["ts"].append(max_timestep)
         poly["offsets"].append(poly["offsets"][-1])
 
-    return timeline, alloc_polys, frames, stacks, timestep, hwm_at_timestep
+    return timeline, alloc_polys, frames, stacks, max_timestep, hwm_at_timestep
 
 
 def _json_for_html(data: object) -> str:
     return json.dumps(data).replace("<", r"\u003c")
 
 
+@cache
+def _d3_source() -> str:
+    """Load the vendored D3 runtime for self-contained offline visualizations."""
+    source = Path(__file__).with_name("static").joinpath("d3.v7.min.js").read_text()
+    return source.replace("</script", r"<\/script")
+
+
+def _timeline_values(timeline: list[dict], max_timestep: int, key: str) -> list[int]:
+    """Expand sparse event samples into one value for every chart timestep."""
+    values = [0] * (max_timestep + 1)
+    entries_by_step = {entry["step"]: int(entry[key]) for entry in timeline}
+    current = 0
+    for timestep in range(max_timestep + 1):
+        current = entries_by_step.get(timestep, current)
+        values[timestep] = current
+    return values
+
+
+def _segment_data(snapshot: dict, device: int) -> list[dict]:
+    """Serialize current segment and block state for allocator-state inspection."""
+    result = []
+    for segment in snapshot.get("segments", []):
+        if segment.get("device", 0) != device:
+            continue
+        blocks = []
+        block_offset = 0
+        for block in segment.get("blocks", []):
+            blocks.append(
+                {
+                    "address": f"0x{_block_address(block, segment, block_offset):x}",
+                    "size": int(block.get("size", 0)),
+                    "requested_size": _block_requested_size(block),
+                    "state": block.get("state", "unknown"),
+                    "metadata": block.get("user_metadata", ""),
+                }
+            )
+            block_offset += int(block.get("size", 0))
+        result.append(
+            {
+                "address": f"0x{int(segment.get('address', 0)):x}",
+                "total_size": int(segment.get("total_size", 0)),
+                "allocated_size": int(segment.get("allocated_size", 0)),
+                "active_size": int(segment.get("active_size", 0)),
+                "stream": int(segment.get("stream", 0)),
+                "pool": _normalize_pool_id(segment.get("segment_pool_id")),
+                "segment_type": segment.get("segment_type", "unknown"),
+                "expandable": bool(segment.get("is_expandable", False)),
+                "metadata": segment.get("user_metadata", ""),
+                "blocks": blocks,
+            }
+        )
+    return result
+
+
+def _private_pool_data(
+    snapshot: dict, device: int, max_timestep: int, trace_step_offset: int
+) -> list[dict]:
+    """Summarize CUDA Graph and MemPool reserved and active memory over time."""
+    segments = sorted(
+        (
+            segment
+            for segment in snapshot.get("segments", [])
+            if segment.get("device", 0) == device
+        ),
+        key=lambda segment: int(segment.get("address", 0)),
+    )
+    trace = snapshot.get("device_traces", [])[device]
+    pools: dict[tuple[tuple[int, int], int], dict] = {}
+
+    def get_pool(pool_id: tuple[int, int], stream: int) -> dict:
+        key = (pool_id, stream)
+        if key not in pools:
+            pools[key] = {
+                "id": pool_id,
+                "stream": stream,
+                "reserved_bytes": 0,
+                "active_bytes": 0,
+                "allocated_bytes": 0,
+                "inactive_bytes": 0,
+                "num_segments": 0,
+                "num_blocks": 0,
+                "net_trace_delta": 0,
+                "events": [],
+            }
+        return pools[key]
+
+    for segment in segments:
+        pool_id = _normalize_pool_id(segment.get("segment_pool_id"))
+        if not _is_private_pool(pool_id):
+            continue
+        pool = get_pool(pool_id, int(segment.get("stream", 0)))
+        pool["reserved_bytes"] += int(segment.get("total_size", 0))
+        pool["active_bytes"] += int(segment.get("active_size", 0))
+        pool["allocated_bytes"] += int(segment.get("allocated_size", 0))
+        pool["num_segments"] += 1
+        for block in segment.get("blocks", []):
+            pool["num_blocks"] += 1
+            if block.get("state") == "inactive":
+                pool["inactive_bytes"] += int(block.get("size", 0))
+
+    for event_idx, entry in enumerate(trace):
+        action = entry.get("action")
+        if action not in {"segment_alloc", "segment_map", "segment_free", "segment_unmap"}:
+            continue
+        addr = int(entry.get("addr", 0))
+        pool_id = _normalize_pool_id(entry.get("pool_id")) or _find_pool_id(segments, addr)
+        if not _is_private_pool(pool_id):
+            continue
+        delta = int(entry.get("size", 0))
+        if action in {"segment_free", "segment_unmap"}:
+            delta = -delta
+        pool = get_pool(pool_id, int(entry.get("stream", 0)))
+        pool["net_trace_delta"] += delta
+        pool["events"].append((event_idx, delta))
+
+    for pool in pools.values():
+        current = max(0, pool["reserved_bytes"] - pool.pop("net_trace_delta"))
+        peak = current
+        points = [{"step": 0, "reserved": current}]
+        for event_idx, delta in pool.pop("events"):
+            current = max(0, current + delta)
+            peak = max(peak, current)
+            points.append(
+                {
+                    "step": min(max_timestep, trace_step_offset + event_idx),
+                    "reserved": current,
+                }
+            )
+        if points[-1]["step"] < max_timestep:
+            points.append({"step": max_timestep, "reserved": current})
+        pool["peak_reserved_bytes"] = peak
+        pool["timeline"] = points
+
+    return sorted(pools.values(), key=lambda pool: pool["reserved_bytes"], reverse=True)
+
+
 def _build_memory_viz_data(snapshot: dict, device: int, title: str) -> dict:
     timeline, alloc_polys, frames, stacks, max_ts, hwm_timestep = process_snapshot(
         snapshot, device
     )
-    max_at_time = [entry["a"] for entry in timeline]
-    hwm = max((entry["h"] for entry in timeline), default=0)
+    allocated_timeline = _timeline_values(timeline, max_ts, "a")
+    reserved_timeline = _timeline_values(timeline, max_ts, "r")
+    trace_step_offset = int(bool(timeline and timeline[0]["act"] == "preexisting"))
+    private_pools = (
+        _private_pool_data(snapshot, device, max_ts, trace_step_offset)
+        if 0 <= device < len(snapshot.get("device_traces", []))
+        else []
+    )
+    hwm = max(allocated_timeline, default=0)
+    reserved_hwm = max(reserved_timeline, default=0)
     return {
-        "timeline": max_at_time,
+        "timeline": allocated_timeline,
+        "reserved_timeline": reserved_timeline,
         "allocs": alloc_polys,
         "frames": frames,
         "stacks": stacks,
+        "events": timeline,
+        "segments": _segment_data(snapshot, device),
+        "private_pools": private_pools,
+        "allocator_settings": snapshot.get("allocator_settings", {}),
         "meta": {
             "title": title,
             "device": device,
             "num_events": len(timeline),
             "num_allocs": len(alloc_polys),
             "high_water_mark_bytes": hwm,
+            "reserved_high_water_mark_bytes": reserved_hwm,
+            "current_reserved_bytes": reserved_timeline[-1] if reserved_timeline else 0,
+            "private_pool_reserved_bytes": sum(pool["reserved_bytes"] for pool in private_pools),
+            "num_private_pools": len(private_pools),
             "hwm_timestep": hwm_timestep,
             "max_timestep": max_ts,
         },
@@ -289,6 +629,7 @@ def generate_memory_html(
         _MEMORY_VIZ_TEMPLATE.replace("__DOCUMENT_TITLE__", html.escape(title))
         .replace("__VISIBLE_TITLE__", html.escape(title))
         .replace("__BOOTSTRAP__", _json_for_html(_build_memory_viz_data(snapshot, device, title)))
+        .replace("__D3_SOURCE__", _d3_source())
     )
 
 
@@ -318,6 +659,7 @@ def generate_memory_comparison_html(
             "__BOOTSTRAP_RIGHT__",
             _json_for_html(_build_memory_viz_data(snapshot_right, device_right, title_right)),
         )
+        .replace("__D3_SOURCE__", _d3_source())
     )
 
 
@@ -451,11 +793,48 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
     cursor: pointer;
   }
 
+  #controls-shell {
+    position: relative;
+    flex-shrink: 0;
+    margin-left: auto;
+  }
+
+  #controls-toggle {
+    width: 26px;
+    height: 26px;
+    display: grid;
+    place-items: center;
+    background: rgba(255,255,255,0.04);
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 11px;
+  }
+  #controls-toggle:hover { color: var(--text); background: rgba(255,255,255,0.08); }
+
   #controls {
+    position: absolute;
+    top: calc(100% + 8px);
+    right: 0;
     display: flex;
-    gap: 12px;
+    gap: 10px;
     align-items: center;
     flex-wrap: wrap;
+    width: max-content;
+    max-width: min(860px, calc(100vw - 24px));
+    padding: 10px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.55);
+    z-index: 80;
+  }
+  #controls.collapsed { display: none; }
+
+  @media (max-width: 1050px) {
+    #header-mid { display: none; }
+    #header { padding: 10px 14px; }
   }
 
   .toggle {
@@ -536,19 +915,16 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
   }
 
   #panel-toggle {
-    position: absolute;
-    left: -24px;
-    top: 50%;
-    transform: translateY(-50%);
-    width: 24px;
+    width: 22px;
     height: 48px;
+    align-self: center;
+    flex-shrink: 0;
     background: var(--surface);
     border: 1px solid var(--border);
-    border-right: none;
     border-radius: 4px 0 0 4px;
     cursor: pointer;
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: 11px;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -694,6 +1070,12 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
 
   .hwm-line { stroke: var(--hwm-color); stroke-width: 0.75; stroke-dasharray: 8 4; }
   .hwm-label { fill: var(--hwm-color); font-size: 11px; font-family: var(--mono); font-weight: 500; letter-spacing: 0.02em; }
+  .reserved-line { fill: none; stroke: #C97049; stroke-width: 1.25; stroke-dasharray: 4 3; }
+  .pool-reserved-line { fill: none; stroke: rgba(255,255,255,0.45); stroke-width: 1; stroke-dasharray: 2 2; }
+  .event-marker { stroke-width: 1; stroke-dasharray: 2 3; opacity: 0.8; }
+  .event-marker.oom { stroke: #e74c3c; }
+  .event-marker.snapshot { stroke: #f1c40f; }
+  .detail-json { padding: 12px 16px; white-space: pre-wrap; word-break: break-word; font: 11px/1.5 var(--mono); color: var(--text-muted); }
 
   #search-input {
     background: rgba(255,255,255,0.04);
@@ -769,6 +1151,7 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
   .detail-tab:last-child { border-radius: 0 3px 3px 0; }
   .detail-tab + .detail-tab { border-left: none; }
   .detail-tab.active { background: var(--accent); color: white; border-color: var(--accent); }
+  .detail-tabs { flex-wrap: wrap; }
 
   .breakdown-row {
     display: flex;
@@ -919,6 +1302,8 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
   <h1>__VISIBLE_TITLE__</h1>
   <div id="header-mid">
     <span class="stat">Peak: <strong id="peak-stat"></strong></span>
+    <span class="stat">Reserved: <strong id="reserved-stat"></strong></span>
+    <span class="stat">Pools: <strong id="pools-stat"></strong></span>
     <span class="stat">Allocs: <strong id="allocs-stat"></strong></span>
     <span class="stat">Events: <strong id="events-stat"></strong></span>
     <span id="help-trigger" class="stat" style="cursor:help;position:relative;">
@@ -935,7 +1320,9 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
       </div>
     </span>
   </div>
-  <div id="controls">
+  <div id="controls-shell">
+    <button id="controls-toggle" title="Show controls" aria-expanded="false">&#9664;</button>
+    <div id="controls" class="collapsed">
     <div style="display:flex;align-items:center;gap:0;">
       <input type="text" id="search-input" placeholder="/ search allocations...">
       <button id="regex-toggle" title="Toggle regex mode">.*</button>
@@ -948,6 +1335,10 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
       <input type="checkbox" id="hwm-toggle" checked>
       High Water Mark
     </label>
+    <label class="toggle" title="Show cached allocator memory, including CUDA Graph private pools">
+      <input type="checkbox" id="reserved-toggle">
+      Reserved memory
+    </label>
     <label class="toggle" title="Hide allocations that were never freed during recording (weights, buffers, etc.) and zoom to dynamic range">
       <input type="checkbox" id="dim-persistent-toggle">
       Hide never-freed
@@ -958,17 +1349,19 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
           <select id="color-mode">
             <option value="stack">stack</option>
             <option value="size">size</option>
+            <option value="category">category</option>
             <option value="order">order</option>
           </select>
         </label>
       </div>
     </span>
+    </div>
   </div>
 </div>
 <div id="main">
   <div id="chart-container"></div>
-  <div id="detail-panel">
-    <div id="panel-toggle" title="Toggle detail panel">◀</div>
+  <button id="panel-toggle" title="Show stack/details" aria-expanded="false">&#9654;</button>
+  <div id="detail-panel" class="collapsed">
     <div id="resize-handle"></div>
     <div id="detail-header">
       <div class="detail-tabs"></div>
@@ -996,10 +1389,22 @@ _MEMORY_VIZ_TEMPLATE = r"""<!DOCTYPE html>
 <div id="perf-display"></div>
 
 <script id="memory-viz-bootstrap" type="application/json">__BOOTSTRAP__</script>
-<script src="https://d3js.org/d3.v7.min.js"></script>
+<script>__D3_SOURCE__</script>
 <script>
 const BOOTSTRAP = JSON.parse(document.getElementById('memory-viz-bootstrap').textContent);
-const { timeline: TIMELINE, allocs: ALLOCS, frames: FRAMES, stacks: STACKS, meta: META } = BOOTSTRAP;
+const {
+  timeline: TIMELINE,
+  reserved_timeline: RESERVED_TIMELINE,
+  allocs: ALLOCS,
+  frames: FRAMES,
+  stacks: STACKS,
+  events: EVENTS,
+  segments: SEGMENTS,
+  private_pools: PRIVATE_POOLS,
+  allocator_settings: ALLOCATOR_SETTINGS,
+  meta: META,
+} = BOOTSTRAP;
+const MAX_TS = Math.max(1, META.max_timestep);
 
 function resolveStack(stackIdx) {
   const indices = STACKS[stackIdx] || [];
@@ -1013,7 +1418,19 @@ function formatBytes(b) {
   return b + ' B';
 }
 
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, char => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  })[char]);
+}
+
+function formatPool(pool) {
+  return pool ? `(${pool[0]}, ${pool[1]})` : 'default/unknown';
+}
+
 document.getElementById('peak-stat').textContent = formatBytes(META.high_water_mark_bytes);
+document.getElementById('reserved-stat').textContent = formatBytes(META.current_reserved_bytes);
+document.getElementById('pools-stat').textContent = `${META.num_private_pools} / ${formatBytes(META.private_pool_reserved_bytes)}`;
 document.getElementById('allocs-stat').textContent = META.num_allocs.toLocaleString();
 document.getElementById('events-stat').textContent = META.num_events.toLocaleString();
 
@@ -1049,7 +1466,15 @@ function getSizeColor(allocIdx) {
   return SIZE_PALETTE[sizeToColorIdx.get(ALLOCS[allocIdx].s)];
 }
 
+const categoryValues = [...new Set(ALLOCS.map(a => a.category ?? 'unknown'))];
+const categoryToColorIdx = new Map(categoryValues.map((category, i) => [category, i]));
+
+function getCategoryColor(allocIdx) {
+  return PALETTE[categoryToColorIdx.get(ALLOCS[allocIdx].category ?? 'unknown') % PALETTE.length];
+}
+
 let colorMode = 'stack';
+let showReserved = false;
 
 function recolorAllocs() {
   let pIdx = 0;
@@ -1057,6 +1482,7 @@ function recolorAllocs() {
     const isPersistent = allocPersistent[i];
     switch (colorMode) {
       case 'size': allocColors[i] = getSizeColor(i); break;
+      case 'category': allocColors[i] = getCategoryColor(i); break;
       case 'order': allocColors[i] = PALETTE[i % PALETTE.length]; break;
       default: allocColors[i] = getColor(ALLOCS[i].si); break;
     }
@@ -1174,7 +1600,7 @@ function renderFrame(frame) {
     const parts = frame.split('::');
     const funcName = parts[parts.length - 1];
     const ns = parts.slice(0, -1).join('::');
-    return `<span class="frame-cpp">${ns}::</span><span class="frame-basename">${funcName}</span>`;
+    return `<span class="frame-cpp">${escapeHtml(ns)}::</span><span class="frame-basename">${escapeHtml(funcName)}</span>`;
   }
   if (hasColon) {
     const sp = frame.indexOf(' ', frame.lastIndexOf(':'));
@@ -1184,11 +1610,11 @@ function renderFrame(frame) {
       const lastSlash = filePart.lastIndexOf('/');
       const basename = lastSlash >= 0 ? filePart.substring(lastSlash + 1) : filePart;
       const dir = lastSlash >= 0 ? filePart.substring(0, lastSlash + 1) : '';
-      return `<span class="frame-file">${dir}</span><span class="frame-basename">${basename}</span> <span class="frame-func">${funcPart}</span>`;
+      return `<span class="frame-file">${escapeHtml(dir)}</span><span class="frame-basename">${escapeHtml(basename)}</span> <span class="frame-func">${escapeHtml(funcPart)}</span>`;
     }
-    return `<span class="frame-file">${frame}</span>`;
+    return `<span class="frame-file">${escapeHtml(frame)}</span>`;
   }
-  return frame;
+  return escapeHtml(frame);
 }
 
 function renderStack(stackIdx, label) {
@@ -1215,21 +1641,21 @@ function renderStackSelection() {
 
 // --- Chart setup ---
 const container = document.getElementById('chart-container');
-const containerRect = container.getBoundingClientRect();
+let containerRect = container.getBoundingClientRect();
 const margin = { top: 20, right: 60, bottom: 40, left: 80 };
-const width = containerRect.width - margin.left - margin.right;
-const height = containerRect.height - margin.top - margin.bottom;
+let width = Math.max(1, containerRect.width - margin.left - margin.right);
+let height = Math.max(1, containerRect.height - margin.top - margin.bottom);
 
 // Canvas for allocation polygons (behind SVG)
 const canvas = document.createElement('canvas');
 canvas.id = 'alloc-canvas';
-canvas.width = containerRect.width * devicePixelRatio;
-canvas.height = containerRect.height * devicePixelRatio;
+canvas.width = Math.max(1, containerRect.width * devicePixelRatio);
+canvas.height = Math.max(1, containerRect.height * devicePixelRatio);
 canvas.style.width = containerRect.width + 'px';
 canvas.style.height = containerRect.height + 'px';
 container.insertBefore(canvas, container.firstChild);
 const ctx = canvas.getContext('2d');
-ctx.scale(devicePixelRatio, devicePixelRatio);
+ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
 
 // SVG for axes, grid, HWM, zoom overlay
 const svg = d3.select('#chart-container').append('svg')
@@ -1238,11 +1664,11 @@ const svg = d3.select('#chart-container').append('svg')
 
 const g = svg.append('g').attr('transform', `translate(${margin.left},${margin.top})`);
 
-svg.append('defs').append('clipPath').attr('id', 'clip')
+const clipRect = svg.append('defs').append('clipPath').attr('id', 'clip')
   .append('rect').attr('width', width).attr('height', height);
 
-const xScale = d3.scaleLinear().domain([0, META.max_timestep]).range([0, width]);
-const yScale = d3.scaleLinear().domain([0, META.high_water_mark_bytes * 1.05]).range([height, 0]);
+const xScale = d3.scaleLinear().domain([0, MAX_TS]).range([0, width]);
+const yScale = d3.scaleLinear().domain([0, Math.max(1, META.high_water_mark_bytes) * 1.05]).range([height, 0]);
 
 const xAxis = d3.axisBottom(xScale).ticks(10);
 const yAxisFn = d3.axisLeft(yScale).ticks(8).tickFormat(d => formatBytes(d));
@@ -1267,6 +1693,11 @@ hwmG.append('text').attr('class', 'hwm-label')
   .attr('text-anchor', 'end')
   .text('HWM: ' + formatBytes(META.high_water_mark_bytes));
 
+const reservedPath = chartArea.append('path').attr('class', 'reserved-line').style('display', 'none');
+const poolLineG = chartArea.append('g').attr('class', 'pool-reserved-lines');
+const markerData = EVENTS.filter(event => event.act === 'oom' || event.act === 'snapshot');
+const markerG = chartArea.append('g').attr('class', 'event-markers');
+
 // --- Canvas rendering ---
 let currentTransform = d3.zoomIdentity;
 let searchMatcher = null;
@@ -1289,15 +1720,6 @@ for (let i = 0; i < ALLOCS.length; i++) {
 
 function buildDerivedData() {
   const stackFrameLabels = Array.from({ length: STACKS.length }, (_, stackIdx) => bestFrame(stackIdx));
-  const allocIndicesByStack = Array.from({ length: STACKS.length }, () => []);
-  const stackSummariesById = stackFrameLabels.map((frame, stackIdx) => ({
-    si: stackIdx,
-    frame,
-    count: 0,
-    totalBytes: 0,
-    firstTs: Infinity,
-    lastTs: -Infinity,
-  }));
   const peakAllocIndices = [];
   let peakTotalBytes = 0;
   const leakAllocIndices = [];
@@ -1311,13 +1733,6 @@ function buildDerivedData() {
     const alloc = ALLOCS[ai];
     const firstTs = allocStarts[ai];
     const lastTs = allocEnds[ai];
-    const summary = stackSummariesById[alloc.si];
-
-    allocIndicesByStack[alloc.si].push(ai);
-    summary.count += 1;
-    summary.totalBytes += alloc.s;
-    summary.firstTs = Math.min(summary.firstTs, firstTs);
-    summary.lastTs = Math.max(summary.lastTs, lastTs);
 
     if (firstTs <= peakTs && lastTs >= peakTs) {
       peakAllocIndices.push(ai);
@@ -1328,10 +1743,11 @@ function buildDerivedData() {
       leakAllocIndices.push(ai);
       leakTotalBytes += alloc.s;
 
-      let group = leakGroupsByFrame.get(summary.frame);
+      const frame = stackFrameLabels[alloc.si];
+      let group = leakGroupsByFrame.get(frame);
       if (!group) {
-        group = { frame: summary.frame, si: alloc.si, count: 0, totalBytes: 0 };
-        leakGroupsByFrame.set(summary.frame, group);
+        group = { frame, si: alloc.si, count: 0, totalBytes: 0 };
+        leakGroupsByFrame.set(frame, group);
       }
       group.count += 1;
       group.totalBytes += alloc.s;
@@ -1342,11 +1758,6 @@ function buildDerivedData() {
 
   return {
     stackFrameLabels,
-    allocIndicesByStack,
-    stackSummariesById,
-    stackSummaries: stackSummariesById
-      .filter(summary => summary.count > 0)
-      .sort((left, right) => right.totalBytes - left.totalBytes),
     peakAllocIndices,
     peakTotalBytes,
     leakAllocIndices,
@@ -1362,8 +1773,8 @@ recolorAllocs();
 let dimPersistent = false;
 
 // Bucket index for O(bucket_size) hit testing instead of O(n)
-const NUM_HIT_BUCKETS = Math.max(1, Math.min(2000, META.max_timestep));
-const hitBucketSize = META.max_timestep / NUM_HIT_BUCKETS;
+const NUM_HIT_BUCKETS = Math.max(1, Math.min(2000, MAX_TS));
+const hitBucketSize = MAX_TS / NUM_HIT_BUCKETS;
 const hitBuckets = new Array(NUM_HIT_BUCKETS + 1);
 for (let b = 0; b <= NUM_HIT_BUCKETS; b++) hitBuckets[b] = [];
 for (let ai = 0; ai < ALLOCS.length; ai++) {
@@ -1505,29 +1916,43 @@ function hitTest(mx, my) {
 }
 
 let yMode = 'fixed';
-const fullYDomain = [0, META.high_water_mark_bytes * 1.05];
 let customYDomain = null;
 
 function getBaseYDomain(d0, d1) {
-  if (yMode === 'autofit' || dimPersistent) {
-    let minY = Infinity, maxY = 0;
-    for (let ai = 0; ai < ALLOCS.length; ai++) {
-      if (allocEnds[ai] < d0 || allocStarts[ai] > d1) continue;
-      if (dimPersistent && allocPersistent[ai]) continue;
-      const d = ALLOCS[ai];
-      for (let i = 0; i < d.ts.length; i++) {
-        if (d.ts[i] >= d0 && d.ts[i] <= d1) {
-          minY = Math.min(minY, d.offsets[i]);
-          maxY = Math.max(maxY, d.offsets[i] + d.s);
-        }
+  const fixedPeak = Math.max(
+    1,
+    META.high_water_mark_bytes,
+    showReserved ? META.reserved_high_water_mark_bytes : 0,
+  );
+  if (yMode !== 'autofit' && !dimPersistent) return [0, fixedPeak * 1.05];
+
+  let minY = Infinity, maxY = 0;
+  for (let ai = 0; ai < ALLOCS.length; ai++) {
+    if (allocEnds[ai] < d0 || allocStarts[ai] > d1) continue;
+    if (dimPersistent && allocPersistent[ai]) continue;
+    const d = ALLOCS[ai];
+    let offset = d.offsets[0];
+    for (let i = 0; i < d.ts.length; i++) {
+      if (d.ts[i] <= d0) offset = d.offsets[i];
+      if (d.ts[i] >= d0 && d.ts[i] <= d1) {
+        minY = Math.min(minY, d.offsets[i]);
+        maxY = Math.max(maxY, d.offsets[i] + d.s);
       }
     }
-    if (maxY === 0) { minY = 0; maxY = META.high_water_mark_bytes; }
-    if (minY === Infinity) minY = 0;
-    const pad = (maxY - minY) * 0.05;
-    return [Math.max(0, minY - pad), maxY + pad];
+    minY = Math.min(minY, offset);
+    maxY = Math.max(maxY, offset + d.s);
   }
-  return fullYDomain;
+  if (showReserved) {
+    const start = Math.max(0, Math.floor(d0));
+    const end = Math.min(RESERVED_TIMELINE.length, Math.ceil(d1) + 1);
+    for (let timestep = start; timestep < end; timestep++) {
+      maxY = Math.max(maxY, RESERVED_TIMELINE[timestep]);
+    }
+  }
+  if (maxY === 0) { minY = 0; maxY = fixedPeak; }
+  if (minY === Infinity) minY = 0;
+  const pad = Math.max(1, (maxY - minY) * 0.05);
+  return [Math.max(0, minY - pad), maxY + pad];
 }
 
 function updateChart(transform) {
@@ -1550,16 +1975,35 @@ function updateChart(transform) {
   gridG.selectAll('path').attr('stroke', 'none');
 
   const hwmY = yScale(META.high_water_mark_bytes);
-  hwmG.select('.hwm-line').attr('y1', hwmY).attr('y2', hwmY);
-  hwmG.select('.hwm-label').attr('y', hwmY - 6);
+  hwmG.select('.hwm-line').attr('x2', width).attr('y1', hwmY).attr('y2', hwmY);
+  hwmG.select('.hwm-label').attr('x', width - 4).attr('y', hwmY - 6);
+
+  if (showReserved) {
+    reservedPath
+      .style('display', null)
+      .datum(RESERVED_TIMELINE)
+      .attr('d', d3.line().x((d, i) => newX(i)).y(d => yScale(d)));
+    poolLineG.selectAll('path').data(PRIVATE_POOLS).join('path')
+      .attr('class', 'pool-reserved-line')
+      .attr('d', pool => d3.line()
+        .x(point => newX(point.step))
+        .y(point => yScale(point.reserved))(pool.timeline));
+  } else {
+    reservedPath.style('display', 'none').attr('d', null);
+    poolLineG.selectAll('path').remove();
+  }
+  markerG.selectAll('line').data(markerData).join('line')
+    .attr('class', event => `event-marker ${event.act}`)
+    .attr('x1', event => newX(event.step)).attr('x2', event => newX(event.step))
+    .attr('y1', 0).attr('y2', height);
 
   drawCanvas();
   for (const hook of chartUpdateHooks) hook();
 }
 
 function transformForDomain(d0, d1) {
-  const range = d1 - d0;
-  return d3.zoomIdentity.translate(-d0 * width / range, 0).scale(META.max_timestep / range);
+  const range = Math.max(1e-9, d1 - d0);
+  return d3.zoomIdentity.translate(-d0 * width / range, 0).scale(MAX_TS / range);
 }
 
 const chartUpdateHooks = [];
@@ -1638,8 +2082,9 @@ zoomRect.on('mousemove', function(event) {
     const primary = info.userFrame || info.apiFrame;
     const secondary = info.userFrame && info.apiFrame ? info.apiFrame : null;
     const lines = [`<div class="tt-row"><span class="tt-label">Size:</span><span class="tt-value">${formatBytes(hit.s)}</span></div>`];
-    if (primary) lines.push(`<div class="tt-${info.userFrame ? 'user' : 'api'}">${primary}</div>`);
-    if (secondary) lines.push(`<div class="tt-api">${secondary}</div>`);
+    lines.push(`<div class="tt-row"><span class="tt-label">Pool:</span><span class="tt-value">${escapeHtml(formatPool(hit.pool))}</span></div>`);
+    if (primary) lines.push(`<div class="tt-${info.userFrame ? 'user' : 'api'}">${escapeHtml(primary)}</div>`);
+    if (secondary) lines.push(`<div class="tt-api">${escapeHtml(secondary)}</div>`);
     showTooltip(event, lines.join(''));
   } else {
     hideTooltip();
@@ -1697,7 +2142,10 @@ function navTarget() {
     const cx = (width / 2 - t.x) / t.k;
     t = t.translate(cx, 0).scale(1 / zoomFactor).translate(-cx, 0);
   }
-  return t;
+  const [domainStart, domainEnd] = t.rescaleX(xScale).domain();
+  const range = Math.min(MAX_TS, Math.max(MAX_TS / 2000, domainEnd - domainStart));
+  const start = Math.max(0, Math.min(MAX_TS - range, domainStart));
+  return transformForDomain(start, start + range);
 }
 
 function navLoop() {
@@ -1734,6 +2182,25 @@ document.addEventListener('keyup', function(event) {
   activeKeys.delete(event.key.toLowerCase());
 });
 
+const controlsShell = document.getElementById('controls-shell');
+const controls = document.getElementById('controls');
+const controlsToggle = document.getElementById('controls-toggle');
+
+function setControlsCollapsed(collapsed) {
+  controls.classList.toggle('collapsed', collapsed);
+  controlsToggle.textContent = collapsed ? '◀' : '▶';
+  controlsToggle.title = collapsed ? 'Show controls' : 'Hide controls';
+  controlsToggle.setAttribute('aria-expanded', String(!collapsed));
+}
+
+controlsToggle.addEventListener('click', event => {
+  event.stopPropagation();
+  setControlsCollapsed(!controls.classList.contains('collapsed'));
+});
+document.addEventListener('pointerdown', event => {
+  if (!controlsShell.contains(event.target)) setControlsCollapsed(true);
+});
+
 const settingsTrigger = document.getElementById('settings-trigger');
 settingsTrigger.addEventListener('click', function(e) {
   if (e.target.closest('#settings-dropdown')) return;
@@ -1742,6 +2209,12 @@ settingsTrigger.addEventListener('click', function(e) {
 
 document.getElementById('hwm-toggle').onchange = function() {
   hwmG.style('display', this.checked ? null : 'none');
+};
+
+document.getElementById('reserved-toggle').onchange = function() {
+  showReserved = this.checked;
+  customYDomain = null;
+  updateChart(currentTransform);
 };
 
 document.getElementById('autofit-toggle').onchange = function() {
@@ -1808,15 +2281,25 @@ function showDetails() {
     detailBody.innerHTML = '<div class="empty-detail">Click an allocation to see its details</div>';
     return;
   }
-  const ts = d.time_us ? new Date(d.time_us / 1000).toLocaleString() : 'N/A';
+  const ts = d.time_us === null || d.time_us === undefined
+    ? 'N/A'
+    : new Date(d.time_us / 1000).toLocaleString();
+  const lifetimeEnd = d.ts[d.ts.length - 1];
   detailStats.textContent = formatBytes(d.s);
   detailBody.innerHTML = `<div class="alloc-details"><table>
-    <tr><td>Size</td><td>${formatBytes(d.s)} (${d.s.toLocaleString()} bytes)</td></tr>
-    <tr><td>Address</td><td>${d.addr || 'N/A'}</td></tr>
-    <tr><td>Stream</td><td>${d.stream ?? 'N/A'}</td></tr>
-    <tr><td>Timestamp</td><td>${ts}</td></tr>
-    <tr><td>Compile ctx</td><td>${d.ctx || 'None'}</td></tr>
-    <tr><td>Lifetime</td><td>ts ${d.ts[0]} \u2192 ${d.ts[d.ts.length - 1]}${d.ts[d.ts.length - 1] >= META.max_timestep ? ' (never freed)' : ''}</td></tr>
+    <tr><td>Requested</td><td>${formatBytes(d.s)} (${d.s.toLocaleString()} bytes)</td></tr>
+    <tr><td>Block size</td><td>${formatBytes(d.block_size)}</td></tr>
+    <tr><td>Address</td><td>${escapeHtml(d.addr || 'N/A')}</td></tr>
+    <tr><td>Stream</td><td>${escapeHtml(d.stream ?? 'N/A')}</td></tr>
+    <tr><td>Pool</td><td>${escapeHtml(formatPool(d.pool))}</td></tr>
+    <tr><td>Origin</td><td>${escapeHtml(d.origin)}${d.ghost ? ' (reconstructed)' : ''}</td></tr>
+    <tr><td>Category</td><td>${escapeHtml(d.category ?? 'unknown')}</td></tr>
+    <tr><td>Timestamp</td><td>${escapeHtml(ts)}</td></tr>
+    <tr><td>Compile ctx</td><td>${escapeHtml(d.ctx || 'None')}</td></tr>
+    <tr><td>Metadata</td><td><pre>${escapeHtml(JSON.stringify(d.metadata || {}, null, 2))}</pre></td></tr>
+    <tr><td>Annotations</td><td><pre>${escapeHtml(JSON.stringify(d.annotations || [], null, 2))}</pre></td></tr>
+    <tr><td>FX</td><td><pre>${escapeHtml(JSON.stringify(d.fx || [], null, 2))}</pre></td></tr>
+    <tr><td>Lifetime</td><td>ts ${d.ts[0]} \u2192 ${lifetimeEnd}${lifetimeEnd >= META.max_timestep ? ' (never freed)' : ''}</td></tr>
   </table></div>`;
 }
 
@@ -1831,13 +2314,13 @@ function showPeakBreakdown() {
   let html = `<div class="peak-label">Allocations alive at peak (${formatBytes(META.high_water_mark_bytes)})</div>`;
   html += alive.map(ai => {
     const d = ALLOCS[ai];
-    const pct = (d.s / META.high_water_mark_bytes * 100).toFixed(1);
+    const pct = (d.s / Math.max(1, META.high_water_mark_bytes) * 100).toFixed(1);
     const barW = (d.s / maxAliveSize * 100).toFixed(0);
     return `<div class="breakdown-row" data-action="show-stack" data-stack-idx="${d.si}" data-label="${encodeURIComponent(formatBytes(d.s))}">
       <span class="bd-size">${formatBytes(d.s)}</span>
       <span class="bd-pct">${pct}%</span>
       <span class="bd-bar"><span class="bd-bar-fill" style="width:${barW}%"></span></span>
-      <span class="bd-frame">${derivedData.stackFrameLabels[d.si]}</span>
+      <span class="bd-frame">${escapeHtml(derivedData.stackFrameLabels[d.si])}</span>
     </div>`;
   }).join('');
   detailBody.innerHTML = html;
@@ -1876,24 +2359,93 @@ function showLeaks() {
       <span class="bd-count">\u00d7${g.count}</span>
       <span class="bd-pct">${pct}%</span>
       <span class="bd-bar"><span class="bd-bar-fill leak-bar" style="width:${barW}%"></span></span>
-      <span class="bd-frame">${g.frame}</span>
+      <span class="bd-frame">${escapeHtml(g.frame)}</span>
     </div>`;
   }).join('');
 
   detailBody.innerHTML = html;
 }
 
+function showPools() {
+  detailStats.textContent = `${PRIVATE_POOLS.length} private pools`;
+  if (!PRIVATE_POOLS.length) {
+    detailBody.innerHTML = '<div class="empty-detail">No live CUDA Graph or MemPool segments were present in this snapshot.</div>';
+    return;
+  }
+  const maxReserved = PRIVATE_POOLS.reduce(
+    (maximum, pool) => Math.max(maximum, pool.reserved_bytes),
+    1,
+  );
+  detailBody.innerHTML = '<div class="peak-label">Private pool reserved memory</div>' + PRIVATE_POOLS.map(pool => {
+    const width = (pool.reserved_bytes / maxReserved * 100).toFixed(0);
+    return `<div class="breakdown-row">
+      <span class="bd-size">${formatBytes(pool.reserved_bytes)}</span>
+      <span class="bd-count">${pool.num_segments} seg</span>
+      <span class="bd-pct">${formatBytes(pool.active_bytes)}</span>
+      <span class="bd-bar"><span class="bd-bar-fill" style="width:${width}%"></span></span>
+      <span class="bd-frame">pool ${escapeHtml(formatPool(pool.id))}, stream ${escapeHtml(pool.stream)}, peak ${formatBytes(pool.peak_reserved_bytes)}, inactive ${formatBytes(pool.inactive_bytes)}</span>
+    </div>`;
+  }).join('');
+}
 
+function showEvents() {
+  const visibleEvents = EVENTS.slice(-2000).reverse();
+  detailStats.textContent = `${EVENTS.length} events`;
+  if (!visibleEvents.length) {
+    detailBody.innerHTML = '<div class="empty-detail">No allocator history events were recorded.</div>';
+    return;
+  }
+  const overflowWarning = ALLOCATOR_SETTINGS.trace_alloc_overflowed
+    ? '<div class="peak-label" style="color:#e74c3c">Warning: allocator history overflowed; older events were overwritten.</div>'
+    : '';
+  detailBody.innerHTML = overflowWarning + '<div class="peak-label">Allocator state history (newest first)</div>' + visibleEvents.map(event => {
+    const oom = event.act === 'oom' ? `, device free ${formatBytes(event.device_free ?? 0)}` : '';
+    return `<div class="breakdown-row" data-action="show-event-stack" data-stack-idx="${event.si}" data-label="${encodeURIComponent(event.act)}">
+      <span class="bd-size">${formatBytes(event.s)}</span>
+      <span class="bd-count">t${event.step}</span>
+      <span class="bd-pct">${formatBytes(event.a)}</span>
+      <span class="bd-frame">${escapeHtml(event.act)} ${escapeHtml(event.addr ?? '')}, reserved ${formatBytes(event.r)}${oom}</span>
+    </div>`;
+  }).join('');
+}
+
+function showSegments() {
+  detailStats.textContent = `${SEGMENTS.length} segments`;
+  if (!SEGMENTS.length) {
+    detailBody.innerHTML = '<div class="empty-detail">No current allocator segments.</div>';
+    return;
+  }
+  detailBody.innerHTML = '<div class="peak-label">Current cached segment state</div>' + SEGMENTS.map(segment => {
+    const activeBlocks = segment.blocks.filter(block => block.state !== 'inactive').length;
+    return `<div class="breakdown-row">
+      <span class="bd-size">${formatBytes(segment.total_size)}</span>
+      <span class="bd-count">${activeBlocks}/${segment.blocks.length}</span>
+      <span class="bd-pct">${formatBytes(segment.allocated_size)}</span>
+      <span class="bd-frame">${escapeHtml(segment.address)}, pool ${escapeHtml(formatPool(segment.pool))}, stream ${escapeHtml(segment.stream)}, ${escapeHtml(segment.segment_type)}${segment.expandable ? ', expandable' : ''}</span>
+    </div>`;
+  }).join('');
+}
+
+function showSettings() {
+  detailStats.textContent = 'allocator settings';
+  detailBody.innerHTML = `<pre class="detail-json">${escapeHtml(JSON.stringify(ALLOCATOR_SETTINGS, null, 2))}</pre>`;
+}
 
 // --- Panel toggle & resize ---
 const detailPanel = document.getElementById('detail-panel');
 const panelToggle = document.getElementById('panel-toggle');
 const resizeHandle = document.getElementById('resize-handle');
 
-panelToggle.addEventListener('click', () => {
-  const collapsed = detailPanel.classList.toggle('collapsed');
+function setDetailPanelCollapsed(collapsed) {
+  detailPanel.classList.toggle('collapsed', collapsed);
   panelToggle.textContent = collapsed ? '▶' : '◀';
-  setTimeout(() => { updateChart(currentTransform); }, 200);
+  panelToggle.title = collapsed ? 'Show stack/details' : 'Hide stack/details';
+  panelToggle.setAttribute('aria-expanded', String(!collapsed));
+  setTimeout(resizeChart, 200);
+}
+
+panelToggle.addEventListener('click', () => {
+  setDetailPanelCollapsed(!detailPanel.classList.contains('collapsed'));
 });
 
 let resizing = false;
@@ -1913,15 +2465,19 @@ document.addEventListener('pointerup', () => {
   if (!resizing) return;
   resizing = false;
   resizeHandle.classList.remove('dragging');
-  updateChart(currentTransform);
+  resizeChart();
 });
 
 // --- Detail panel tabs ---
 const detailViews = [
-  { id: 'stack', label: 'Stack Trace', render: renderStackSelection, selectionViewId: 'stack' },
+  { id: 'stack', label: 'Stack', render: renderStackSelection, selectionViewId: 'stack' },
   { id: 'details', label: 'Details', render: showDetails, selectionViewId: 'details' },
-  { id: 'peak', label: 'At Peak', render: showPeakBreakdown, selectionViewId: 'stack' },
+  { id: 'peak', label: 'Peak', render: showPeakBreakdown, selectionViewId: 'stack' },
   { id: 'leaks', label: 'Leaks', render: showLeaks, selectionViewId: 'stack' },
+  { id: 'pools', label: 'Pools', render: showPools, selectionViewId: 'stack' },
+  { id: 'events', label: 'Events', render: showEvents, selectionViewId: 'stack' },
+  { id: 'segments', label: 'Segments', render: showSegments, selectionViewId: 'stack' },
+  { id: 'settings', label: 'Settings', render: showSettings, selectionViewId: 'stack' },
 ];
 const detailViewById = Object.fromEntries(detailViews.map(view => [view.id, view]));
 
@@ -1948,11 +2504,15 @@ function activateDetailView(viewId, { resetSearch = false } = {}) {
   if (resetSearch) {
     searchInput.value = '';
     applySearch('');
+  } else if (viewId !== 'leaks' && searchMatcher === null && searchMatchSet !== null) {
+    searchMatchSet = null;
+    drawCanvas();
   }
   renderActiveDetailView();
 }
 
 function handleAllocationSelection() {
+  setDetailPanelCollapsed(false);
   activateDetailView(detailViewById[uiState.activeDetailView].selectionViewId);
 }
 
@@ -1967,20 +2527,24 @@ detailTabs.addEventListener('click', function(event) {
 detailBody.addEventListener('click', function(event) {
   const row = event.target.closest('.breakdown-row');
   if (!row) return;
-  if (row.dataset.action === 'show-stack') {
+  if (row.dataset.action === 'show-stack' || row.dataset.action === 'show-event-stack') {
     selectStack(Number(row.dataset.stackIdx), decodeURIComponent(row.dataset.label));
     activateDetailView('stack');
     return;
   }
   if (row.dataset.action === 'apply-search') {
+    if (useRegex) {
+      useRegex = false;
+      regexToggle.classList.remove('active');
+    }
     applySearch(decodeURIComponent(row.dataset.query));
   }
 });
 
 // --- Feature 4: Minimap ---
 const minimapContainer = document.getElementById('minimap');
-const minimapRect = minimapContainer.getBoundingClientRect();
-const minimapW = minimapRect.width - 32;
+let minimapRect = minimapContainer.getBoundingClientRect();
+let minimapW = Math.max(1, minimapRect.width - 32);
 const minimapH = 32;
 const miniMargin = { left: 16, top: 4 };
 
@@ -1990,17 +2554,22 @@ const miniSvg = d3.select('#minimap').append('svg')
 const miniG = miniSvg.append('g')
   .attr('transform', `translate(${miniMargin.left},${miniMargin.top})`);
 
-const miniX = d3.scaleLinear().domain([0, META.max_timestep]).range([0, minimapW]);
-const miniY = d3.scaleLinear().domain([0, META.high_water_mark_bytes * 1.05]).range([minimapH, 0]);
+const miniX = d3.scaleLinear().domain([0, MAX_TS]).range([0, minimapW]);
+const miniY = d3.scaleLinear()
+  .domain([0, Math.max(1, META.high_water_mark_bytes, META.reserved_high_water_mark_bytes) * 1.05])
+  .range([minimapH, 0]);
 
-miniG.append('path')
+const miniArea = miniG.append('path')
   .datum(TIMELINE)
-  .attr('class', 'minimap-area')
-  .attr('d', d3.area()
-    .x((d, i) => i * minimapW / TIMELINE.length)
+  .attr('class', 'minimap-area');
+
+function minimapAreaPath() {
+  return d3.area()
+    .x((d, i) => i * minimapW / Math.max(1, TIMELINE.length - 1))
     .y0(minimapH)
-    .y1(d => miniY(d))
-  );
+    .y1(d => miniY(d))(TIMELINE);
+}
+miniArea.attr('d', minimapAreaPath());
 
 const viewportRect = miniG.append('rect')
   .attr('class', 'minimap-viewport')
@@ -2008,10 +2577,19 @@ const viewportRect = miniG.append('rect')
   .attr('height', minimapH);
 
 function updateMinimap() {
+  miniY.domain([
+    0,
+    Math.max(
+      1,
+      META.high_water_mark_bytes,
+      showReserved ? META.reserved_high_water_mark_bytes : 0,
+    ) * 1.05,
+  ]);
+  miniArea.attr('d', minimapAreaPath());
   const newX = currentTransform.rescaleX(xScale);
   const [d0, d1] = newX.domain();
   const x0 = miniX(Math.max(0, d0));
-  const x1 = miniX(Math.min(META.max_timestep, d1));
+  const x1 = miniX(Math.min(MAX_TS, d1));
   viewportRect.attr('x', x0).attr('width', Math.max(2, x1 - x0));
 }
 
@@ -2020,13 +2598,12 @@ chartUpdateHooks.push(updateMinimap);
 
 const miniDrag = d3.drag()
   .on('drag', function(event) {
-    const dx = event.dx;
-    const domainPerPx = META.max_timestep / minimapW;
-    const shift = dx * domainPerPx;
+    const domainPerPx = MAX_TS / minimapW;
+    const shift = event.dx * domainPerPx;
     const newX = currentTransform.rescaleX(xScale);
     const [d0, d1] = newX.domain();
     const range = d1 - d0;
-    const newD0 = Math.max(0, Math.min(META.max_timestep - range, d0 + shift));
+    const newD0 = Math.max(0, Math.min(MAX_TS - range, d0 + shift));
     zoomRect.call(zoom.transform, transformForDomain(newD0, newD0 + range));
   });
 
@@ -2038,9 +2615,42 @@ miniSvg.on('click', function(event) {
   const newX = currentTransform.rescaleX(xScale);
   const [d0, d1] = newX.domain();
   const range = d1 - d0;
-  const newD0 = Math.max(0, Math.min(META.max_timestep - range, clickTs - range / 2));
+  const newD0 = Math.max(0, Math.min(MAX_TS - range, clickTs - range / 2));
   zoomRect.transition().duration(300).call(zoom.transform, transformForDomain(newD0, newD0 + range));
 });
+
+function resizeChart() {
+  const [domainStart, domainEnd] = currentTransform.rescaleX(xScale).domain();
+  containerRect = container.getBoundingClientRect();
+  width = Math.max(1, containerRect.width - margin.left - margin.right);
+  height = Math.max(1, containerRect.height - margin.top - margin.bottom);
+
+  canvas.width = Math.max(1, containerRect.width * devicePixelRatio);
+  canvas.height = Math.max(1, containerRect.height * devicePixelRatio);
+  canvas.style.width = `${containerRect.width}px`;
+  canvas.style.height = `${containerRect.height}px`;
+  ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+
+  svg.attr('viewBox', `0 0 ${containerRect.width} ${containerRect.height}`);
+  clipRect.attr('width', width).attr('height', height);
+  xScale.range([0, width]);
+  yScale.range([height, 0]);
+  xAxisG.attr('transform', `translate(0,${height})`);
+  zoom.translateExtent([[0, 0], [width, height]]).extent([[0, 0], [width, height]]);
+  zoomRect.attr('width', width).attr('height', height);
+
+  minimapRect = minimapContainer.getBoundingClientRect();
+  minimapW = Math.max(1, minimapRect.width - 32);
+  miniSvg.attr('viewBox', `0 0 ${minimapW + 32} ${minimapH + 8}`);
+  miniX.range([0, minimapW]);
+  miniArea.attr('d', minimapAreaPath());
+
+  const start = Math.max(0, Math.min(MAX_TS, domainStart));
+  const end = Math.max(start + 1e-9, Math.min(MAX_TS, domainEnd));
+  zoomRect.call(zoom.transform, transformForDomain(start, end));
+}
+
+window.addEventListener('resize', resizeChart);
 </script>
 </body>
 </html>
@@ -2182,11 +2792,48 @@ _MEMORY_COMPARISON_TEMPLATE = r"""<!DOCTYPE html>
     cursor: pointer;
   }
 
+  #controls-shell {
+    position: relative;
+    flex-shrink: 0;
+    margin-left: auto;
+  }
+
+  #controls-toggle {
+    width: 26px;
+    height: 26px;
+    display: grid;
+    place-items: center;
+    background: rgba(255,255,255,0.04);
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 11px;
+  }
+  #controls-toggle:hover { color: var(--text); background: rgba(255,255,255,0.08); }
+
   #controls {
+    position: absolute;
+    top: calc(100% + 8px);
+    right: 0;
     display: flex;
-    gap: 12px;
+    gap: 8px;
     align-items: center;
     flex-wrap: wrap;
+    width: max-content;
+    max-width: min(900px, calc(100vw - 24px));
+    padding: 9px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.55);
+    z-index: 80;
+  }
+  #controls.collapsed { display: none; }
+
+  @media (max-width: 1180px) {
+    #header-mid { display: none; }
+    #header { padding: 10px 14px; }
   }
 
   #trace-toggle-group {
@@ -2326,19 +2973,16 @@ _MEMORY_COMPARISON_TEMPLATE = r"""<!DOCTYPE html>
   }
 
   #panel-toggle {
-    position: absolute;
-    left: -24px;
-    top: 50%;
-    transform: translateY(-50%);
-    width: 24px;
+    width: 22px;
     height: 48px;
+    align-self: center;
+    flex-shrink: 0;
     background: var(--surface);
     border: 1px solid var(--border);
-    border-right: none;
     border-radius: 4px 0 0 4px;
     cursor: pointer;
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: 11px;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -2483,6 +3127,12 @@ _MEMORY_COMPARISON_TEMPLATE = r"""<!DOCTYPE html>
 
   .hwm-line { stroke: var(--hwm-color); stroke-width: 0.75; stroke-dasharray: 8 4; }
   .hwm-label { fill: var(--hwm-color); font-size: 11px; font-family: var(--mono); font-weight: 500; letter-spacing: 0.02em; }
+  .reserved-line { fill: none; stroke: #C97049; stroke-width: 1.25; stroke-dasharray: 4 3; }
+  .pool-reserved-line { fill: none; stroke: rgba(255,255,255,0.45); stroke-width: 1; stroke-dasharray: 2 2; }
+  .event-marker { stroke-width: 1; stroke-dasharray: 2 3; opacity: 0.8; }
+  .event-marker.oom { stroke: #e74c3c; }
+  .event-marker.snapshot { stroke: #f1c40f; }
+  .detail-json { padding: 12px 16px; white-space: pre-wrap; word-break: break-word; font: 11px/1.5 var(--mono); color: var(--text-muted); }
 
   #search-input {
     background: rgba(255,255,255,0.04);
@@ -2561,6 +3211,7 @@ _MEMORY_COMPARISON_TEMPLATE = r"""<!DOCTYPE html>
   .detail-tab:last-child { border-radius: 0 3px 3px 0; }
   .detail-tab + .detail-tab { border-left: none; }
   .detail-tab.active { background: var(--accent); color: white; border-color: var(--accent); }
+  .detail-tabs { flex-wrap: wrap; }
 
   .lr-toggle {
     display: flex;
@@ -2710,12 +3361,10 @@ _MEMORY_COMPARISON_TEMPLATE = r"""<!DOCTYPE html>
 <div id="header">
   <h1><span class="title-left">__TITLE_LEFT__</span><span class="vs">vs</span><span class="title-right">__TITLE_RIGHT__</span></h1>
   <div id="header-mid">
-    <span class="stat stat-left">Peak: <strong id="peak-stat-left"></strong></span>
-    <span class="stat stat-left">Allocs: <strong id="allocs-stat-left"></strong></span>
-    <span class="stat stat-right">Peak: <strong id="peak-stat-right"></strong></span>
-    <span class="stat stat-right">Allocs: <strong id="allocs-stat-right"></strong></span>
+    <span class="stat stat-left">L <strong id="peak-stat-left"></strong> peak · <strong id="allocs-stat-left"></strong> allocs</span>
+    <span class="stat stat-right">R <strong id="peak-stat-right"></strong> peak · <strong id="allocs-stat-right"></strong> allocs</span>
     <span id="help-trigger" class="stat" style="cursor:help;position:relative;">
-      ? controls
+      ?
       <div id="help-dropdown">
         <div><kbd>scroll</kbd> zoom X</div>
         <div><kbd>drag</kbd> pan X</div>
@@ -2728,7 +3377,9 @@ _MEMORY_COMPARISON_TEMPLATE = r"""<!DOCTYPE html>
       </div>
     </span>
   </div>
-  <div id="controls">
+  <div id="controls-shell">
+    <button id="controls-toggle" title="Show controls" aria-expanded="false">&#9664;</button>
+    <div id="controls" class="collapsed">
     <div id="trace-toggle-group">
       <button class="trace-toggle-btn active-left" data-trace-side="left">__TITLE_LEFT__</button>
       <button class="trace-toggle-btn active-right" data-trace-side="right">__TITLE_RIGHT__</button>
@@ -2745,6 +3396,10 @@ _MEMORY_COMPARISON_TEMPLATE = r"""<!DOCTYPE html>
       <input type="checkbox" id="hwm-toggle" checked>
       HWM
     </label>
+    <label class="toggle" title="Show cached allocator memory, including CUDA Graph private pools">
+      <input type="checkbox" id="reserved-toggle">
+      Reserved
+    </label>
     <label class="toggle" title="Hide allocations that were never freed during recording">
       <input type="checkbox" id="dim-persistent-toggle">
       Hide never-freed
@@ -2755,11 +3410,13 @@ _MEMORY_COMPARISON_TEMPLATE = r"""<!DOCTYPE html>
           <select id="color-mode">
             <option value="stack">stack</option>
             <option value="size">size</option>
+            <option value="category">category</option>
             <option value="order">order</option>
           </select>
         </label>
       </div>
     </span>
+    </div>
   </div>
 </div>
 <div id="main">
@@ -2771,8 +3428,8 @@ _MEMORY_COMPARISON_TEMPLATE = r"""<!DOCTYPE html>
       <span class="pane-label">__TITLE_RIGHT__</span>
     </div>
   </div>
-  <div id="detail-panel">
-    <div id="panel-toggle" title="Toggle detail panel">&#9664;</div>
+  <button id="panel-toggle" title="Show stack/details" aria-expanded="false">&#9654;</button>
+  <div id="detail-panel" class="collapsed">
     <div id="resize-handle"></div>
     <div id="detail-header">
       <div style="display:flex;align-items:center;">
@@ -2809,7 +3466,7 @@ _MEMORY_COMPARISON_TEMPLATE = r"""<!DOCTYPE html>
 
 <script id="bootstrap-left" type="application/json">__BOOTSTRAP_LEFT__</script>
 <script id="bootstrap-right" type="application/json">__BOOTSTRAP_RIGHT__</script>
-<script src="https://d3js.org/d3.v7.min.js"></script>
+<script>__D3_SOURCE__</script>
 <script>
 const BOOTSTRAP_LEFT = JSON.parse(document.getElementById('bootstrap-left').textContent);
 const BOOTSTRAP_RIGHT = JSON.parse(document.getElementById('bootstrap-right').textContent);
@@ -2819,6 +3476,16 @@ function formatBytes(b) {
   if (Math.abs(b) >= 1024**2) return (b / 1024**2).toFixed(1) + ' MiB';
   if (Math.abs(b) >= 1024)    return (b / 1024).toFixed(0) + ' KiB';
   return b + ' B';
+}
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, char => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  })[char]);
+}
+
+function formatPool(pool) {
+  return pool ? `(${pool[0]}, ${pool[1]})` : 'default/unknown';
 }
 
 function hslToHex(h, s, l) {
@@ -2874,7 +3541,7 @@ function renderFrame(frame) {
     const parts = frame.split('::');
     const funcName = parts[parts.length - 1];
     const ns = parts.slice(0, -1).join('::');
-    return `<span class="frame-cpp">${ns}::</span><span class="frame-basename">${funcName}</span>`;
+    return `<span class="frame-cpp">${escapeHtml(ns)}::</span><span class="frame-basename">${escapeHtml(funcName)}</span>`;
   }
   if (hasColon) {
     const sp = frame.indexOf(' ', frame.lastIndexOf(':'));
@@ -2884,11 +3551,11 @@ function renderFrame(frame) {
       const lastSlash = filePart.lastIndexOf('/');
       const basename = lastSlash >= 0 ? filePart.substring(lastSlash + 1) : filePart;
       const dir = lastSlash >= 0 ? filePart.substring(0, lastSlash + 1) : '';
-      return `<span class="frame-file">${dir}</span><span class="frame-basename">${basename}</span> <span class="frame-func">${funcPart}</span>`;
+      return `<span class="frame-file">${escapeHtml(dir)}</span><span class="frame-basename">${escapeHtml(basename)}</span> <span class="frame-func">${escapeHtml(funcPart)}</span>`;
     }
-    return `<span class="frame-file">${frame}</span>`;
+    return `<span class="frame-file">${escapeHtml(frame)}</span>`;
   }
-  return frame;
+  return escapeHtml(frame);
 }
 
 // --- Shared tooltip ---
@@ -2917,6 +3584,7 @@ const EMPTY_STACK_DETAIL = '<div class="empty-detail">Click an allocation to ins
 
 let colorMode = 'stack';
 let dimPersistent = false;
+let showReserved = false;
 let searchMatcher = null;
 let useRegex = false;
 let activeSide = 'left';
@@ -2927,15 +3595,25 @@ const uiState = {
   selectedSide: null,
   selectedStackIdx: -1,
   selectedStackLabel: '',
-  selectedFrames: null,
-  selectedStacks: null,
 };
 
 // ============================================================
 // Chart pane factory
 // ============================================================
 function createChartPane(bootstrap, containerEl, minimapEl, paneId) {
-  const { timeline: TIMELINE, allocs: ALLOCS, frames: FRAMES, stacks: STACKS, meta: META } = bootstrap;
+  const {
+    timeline: TIMELINE,
+    reserved_timeline: RESERVED_TIMELINE,
+    allocs: ALLOCS,
+    frames: FRAMES,
+    stacks: STACKS,
+    events: EVENTS,
+    segments: SEGMENTS,
+    private_pools: PRIVATE_POOLS,
+    allocator_settings: ALLOCATOR_SETTINGS,
+    meta: META,
+  } = bootstrap;
+  const MAX_TS = Math.max(1, META.max_timestep);
 
   function resolveStack(stackIdx) {
     return (STACKS[stackIdx] || []).map(i => FRAMES[i]);
@@ -2968,6 +3646,8 @@ function createChartPane(bootstrap, containerEl, minimapEl, paneId) {
   const sortedSizes = [...new Set(allocSizes)].sort((a, b) => a - b);
   const sizeToColorIdx = new Map();
   sortedSizes.forEach((s, i) => sizeToColorIdx.set(s, i % SIZE_PALETTE.length));
+  const categoryValues = [...new Set(ALLOCS.map(a => a.category ?? 'unknown'))];
+  const categoryToColorIdx = new Map(categoryValues.map((category, i) => [category, i]));
 
   const allocStarts = new Float64Array(ALLOCS.length);
   const allocEnds = new Float64Array(ALLOCS.length);
@@ -2988,6 +3668,7 @@ function createChartPane(bootstrap, containerEl, minimapEl, paneId) {
     for (let i = 0; i < ALLOCS.length; i++) {
       switch (colorMode) {
         case 'size': allocColors[i] = SIZE_PALETTE[sizeToColorIdx.get(ALLOCS[i].s)]; break;
+        case 'category': allocColors[i] = PALETTE[categoryToColorIdx.get(ALLOCS[i].category ?? 'unknown') % PALETTE.length]; break;
         case 'order': allocColors[i] = PALETTE[i % PALETTE.length]; break;
         default: allocColors[i] = PALETTE[ALLOCS[i].si % PALETTE.length]; break;
       }
@@ -3042,8 +3723,8 @@ function createChartPane(bootstrap, containerEl, minimapEl, paneId) {
   recolorAllocs();
 
   // Hit bucket index
-  const NUM_HIT_BUCKETS = Math.max(1, Math.min(2000, META.max_timestep));
-  const hitBucketSize = META.max_timestep / NUM_HIT_BUCKETS;
+  const NUM_HIT_BUCKETS = Math.max(1, Math.min(2000, MAX_TS));
+  const hitBucketSize = MAX_TS / NUM_HIT_BUCKETS;
   const hitBuckets = new Array(NUM_HIT_BUCKETS + 1);
   for (let b = 0; b <= NUM_HIT_BUCKETS; b++) hitBuckets[b] = [];
   for (let ai = 0; ai < ALLOCS.length; ai++) {
@@ -3066,17 +3747,17 @@ function createChartPane(bootstrap, containerEl, minimapEl, paneId) {
   // --- Chart setup ---
   let containerRect = containerEl.getBoundingClientRect();
   const margin = { top: 20, right: 20, bottom: 40, left: 70 };
-  let chartWidth = containerRect.width - margin.left - margin.right;
-  let chartHeight = containerRect.height - margin.top - margin.bottom;
+  let chartWidth = Math.max(1, containerRect.width - margin.left - margin.right);
+  let chartHeight = Math.max(1, containerRect.height - margin.top - margin.bottom);
 
   const canvas = document.createElement('canvas');
-  canvas.width = containerRect.width * devicePixelRatio;
-  canvas.height = containerRect.height * devicePixelRatio;
+  canvas.width = Math.max(1, containerRect.width * devicePixelRatio);
+  canvas.height = Math.max(1, containerRect.height * devicePixelRatio);
   canvas.style.width = containerRect.width + 'px';
   canvas.style.height = containerRect.height + 'px';
   containerEl.insertBefore(canvas, containerEl.firstChild);
   const ctx = canvas.getContext('2d');
-  ctx.scale(devicePixelRatio, devicePixelRatio);
+  ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
 
   const svg = d3.select(containerEl).append('svg')
     .attr('viewBox', `0 0 ${containerRect.width} ${containerRect.height}`)
@@ -3087,8 +3768,8 @@ function createChartPane(bootstrap, containerEl, minimapEl, paneId) {
   const clipRect = svg.append('defs').append('clipPath').attr('id', `clip-${paneId}`)
     .append('rect').attr('width', chartWidth).attr('height', chartHeight);
 
-  const xScale = d3.scaleLinear().domain([0, META.max_timestep]).range([0, chartWidth]);
-  const yScale = d3.scaleLinear().domain([0, META.high_water_mark_bytes * 1.05]).range([chartHeight, 0]);
+  const xScale = d3.scaleLinear().domain([0, MAX_TS]).range([0, chartWidth]);
+  const yScale = d3.scaleLinear().domain([0, Math.max(1, META.high_water_mark_bytes) * 1.05]).range([chartHeight, 0]);
 
   const xAxis = d3.axisBottom(xScale).ticks(6);
   const yAxisFn = d3.axisLeft(yScale).ticks(6).tickFormat(d => formatBytes(d));
@@ -3109,10 +3790,13 @@ function createChartPane(bootstrap, containerEl, minimapEl, paneId) {
     .attr('x', chartWidth - 4).attr('y', yScale(META.high_water_mark_bytes) - 6)
     .attr('text-anchor', 'end')
     .text('HWM: ' + formatBytes(META.high_water_mark_bytes));
+  const reservedPath = chartArea.append('path').attr('class', 'reserved-line').style('display', 'none');
+  const poolLineG = chartArea.append('g').attr('class', 'pool-reserved-lines');
+  const markerData = EVENTS.filter(event => event.act === 'oom' || event.act === 'snapshot');
+  const markerG = chartArea.append('g').attr('class', 'event-markers');
 
   let currentTransform = d3.zoomIdentity;
   let hoveredAlloc = null;
-  const fullYDomain = [0, META.high_water_mark_bytes * 1.05];
   let customYDomain = null;
   let yMode = 'fixed';
 
@@ -3202,25 +3886,40 @@ function createChartPane(bootstrap, containerEl, minimapEl, paneId) {
   }
 
   function getBaseYDomain(d0, d1) {
-    if (yMode === 'autofit' || dimPersistent) {
-      let minY = Infinity, maxY = 0;
-      for (let ai = 0; ai < ALLOCS.length; ai++) {
-        if (allocEnds[ai] < d0 || allocStarts[ai] > d1) continue;
-        if (dimPersistent && allocPersistent[ai]) continue;
-        const d = ALLOCS[ai];
-        for (let i = 0; i < d.ts.length; i++) {
-          if (d.ts[i] >= d0 && d.ts[i] <= d1) {
-            minY = Math.min(minY, d.offsets[i]);
-            maxY = Math.max(maxY, d.offsets[i] + d.s);
-          }
+    const fixedPeak = Math.max(
+      1,
+      META.high_water_mark_bytes,
+      showReserved ? META.reserved_high_water_mark_bytes : 0,
+    );
+    if (yMode !== 'autofit' && !dimPersistent) return [0, fixedPeak * 1.05];
+
+    let minY = Infinity, maxY = 0;
+    for (let ai = 0; ai < ALLOCS.length; ai++) {
+      if (allocEnds[ai] < d0 || allocStarts[ai] > d1) continue;
+      if (dimPersistent && allocPersistent[ai]) continue;
+      const d = ALLOCS[ai];
+      let offset = d.offsets[0];
+      for (let i = 0; i < d.ts.length; i++) {
+        if (d.ts[i] <= d0) offset = d.offsets[i];
+        if (d.ts[i] >= d0 && d.ts[i] <= d1) {
+          minY = Math.min(minY, d.offsets[i]);
+          maxY = Math.max(maxY, d.offsets[i] + d.s);
         }
       }
-      if (maxY === 0) { minY = 0; maxY = META.high_water_mark_bytes; }
-      if (minY === Infinity) minY = 0;
-      const pad = (maxY - minY) * 0.05;
-      return [Math.max(0, minY - pad), maxY + pad];
+      minY = Math.min(minY, offset);
+      maxY = Math.max(maxY, offset + d.s);
     }
-    return fullYDomain;
+    if (showReserved) {
+      const start = Math.max(0, Math.floor(d0));
+      const end = Math.min(RESERVED_TIMELINE.length, Math.ceil(d1) + 1);
+      for (let timestep = start; timestep < end; timestep++) {
+        maxY = Math.max(maxY, RESERVED_TIMELINE[timestep]);
+      }
+    }
+    if (maxY === 0) { minY = 0; maxY = fixedPeak; }
+    if (minY === Infinity) minY = 0;
+    const pad = Math.max(1, (maxY - minY) * 0.05);
+    return [Math.max(0, minY - pad), maxY + pad];
   }
 
   const chartUpdateHooks = [];
@@ -3242,16 +3941,34 @@ function createChartPane(bootstrap, containerEl, minimapEl, paneId) {
     gridG.selectAll('path').attr('stroke', 'none');
 
     const hwmY = yScale(META.high_water_mark_bytes);
-    hwmG.select('.hwm-line').attr('y1', hwmY).attr('y2', hwmY);
-    hwmG.select('.hwm-label').attr('y', hwmY - 6);
+    hwmG.select('.hwm-line').attr('x2', chartWidth).attr('y1', hwmY).attr('y2', hwmY);
+    hwmG.select('.hwm-label').attr('x', chartWidth - 4).attr('y', hwmY - 6);
+    if (showReserved) {
+      reservedPath
+        .style('display', null)
+        .datum(RESERVED_TIMELINE)
+        .attr('d', d3.line().x((d, i) => newX(i)).y(d => yScale(d)));
+      poolLineG.selectAll('path').data(PRIVATE_POOLS).join('path')
+        .attr('class', 'pool-reserved-line')
+        .attr('d', pool => d3.line()
+          .x(point => newX(point.step))
+          .y(point => yScale(point.reserved))(pool.timeline));
+    } else {
+      reservedPath.style('display', 'none').attr('d', null);
+      poolLineG.selectAll('path').remove();
+    }
+    markerG.selectAll('line').data(markerData).join('line')
+      .attr('class', event => `event-marker ${event.act}`)
+      .attr('x1', event => newX(event.step)).attr('x2', event => newX(event.step))
+      .attr('y1', 0).attr('y2', chartHeight);
 
     drawCanvas();
     for (const hook of chartUpdateHooks) hook();
   }
 
   function transformForDomain(d0, d1) {
-    const range = d1 - d0;
-    return d3.zoomIdentity.translate(-d0 * chartWidth / range, 0).scale(META.max_timestep / range);
+    const range = Math.max(1e-9, d1 - d0);
+    return d3.zoomIdentity.translate(-d0 * chartWidth / range, 0).scale(MAX_TS / range);
   }
 
   // Zoom behavior
@@ -3268,7 +3985,7 @@ function createChartPane(bootstrap, containerEl, minimapEl, paneId) {
       if (!syncing && onZoomCallback) {
         const newX = event.transform.rescaleX(xScale);
         const [d0, d1] = newX.domain();
-        onZoomCallback(d0 / META.max_timestep, d1 / META.max_timestep);
+        onZoomCallback(d0 / MAX_TS, d1 / MAX_TS);
       }
     });
 
@@ -3333,8 +4050,9 @@ function createChartPane(bootstrap, containerEl, minimapEl, paneId) {
       const primary = info.userFrame || info.apiFrame;
       const secondary = info.userFrame && info.apiFrame ? info.apiFrame : null;
       const lines = [`<div class="tt-row"><span class="tt-label">Size:</span><span class="tt-value">${formatBytes(hit.s)}</span></div>`];
-      if (primary) lines.push(`<div class="tt-${info.userFrame ? 'user' : 'api'}">${primary}</div>`);
-      if (secondary) lines.push(`<div class="tt-api">${secondary}</div>`);
+      lines.push(`<div class="tt-row"><span class="tt-label">Pool:</span><span class="tt-value">${escapeHtml(formatPool(hit.pool))}</span></div>`);
+      if (primary) lines.push(`<div class="tt-${info.userFrame ? 'user' : 'api'}">${escapeHtml(primary)}</div>`);
+      if (secondary) lines.push(`<div class="tt-api">${escapeHtml(secondary)}</div>`);
       showTooltip(event, lines.join(''));
     } else {
       hideTooltip();
@@ -3354,31 +4072,49 @@ function createChartPane(bootstrap, containerEl, minimapEl, paneId) {
 
   // Minimap
   let mmRect = minimapEl.getBoundingClientRect();
-  let mmW = mmRect.width - 16;
+  let mmW = Math.max(1, mmRect.width - 16);
   const mmH = 32;
   const miniSvg = d3.select(minimapEl).append('svg')
     .attr('viewBox', `0 0 ${mmW + 16} ${mmH + 8}`);
   const miniG = miniSvg.append('g').attr('transform', 'translate(8,4)');
-  const miniX = d3.scaleLinear().domain([0, META.max_timestep]).range([0, mmW]);
-  const miniY = d3.scaleLinear().domain([0, META.high_water_mark_bytes * 1.05]).range([mmH, 0]);
+  const miniX = d3.scaleLinear().domain([0, MAX_TS]).range([0, mmW]);
+  const miniY = d3.scaleLinear()
+    .domain([0, Math.max(1, META.high_water_mark_bytes, META.reserved_high_water_mark_bytes) * 1.05])
+    .range([mmH, 0]);
 
   miniG.append('path')
     .datum(TIMELINE)
     .attr('class', 'minimap-area')
-    .attr('d', d3.area().x((d, i) => i * mmW / TIMELINE.length).y0(mmH).y1(d => miniY(d)));
+    .attr('d', d3.area().x((d, i) => i * mmW / Math.max(1, TIMELINE.length - 1)).y0(mmH).y1(d => miniY(d)));
 
   const viewportRect = miniG.append('rect')
     .attr('class', 'minimap-viewport').attr('y', 0).attr('height', mmH);
 
   function updateMinimap() {
+    miniY.domain([
+      0,
+      Math.max(
+        1,
+        META.high_water_mark_bytes,
+        showReserved ? META.reserved_high_water_mark_bytes : 0,
+      ) * 1.05,
+    ]);
+    miniG.select('.minimap-area').attr(
+      'd',
+      d3.area()
+        .x((d, i) => i * mmW / Math.max(1, TIMELINE.length - 1))
+        .y0(mmH)
+        .y1(d => miniY(d)),
+    );
     const newX = currentTransform.rescaleX(xScale);
     const [d0, d1] = newX.domain();
     const x0 = miniX(Math.max(0, d0));
-    const x1 = miniX(Math.min(META.max_timestep, d1));
+    const x1 = miniX(Math.min(MAX_TS, d1));
     viewportRect.attr('x', x0).attr('width', Math.max(2, x1 - x0));
   }
 
   function resize() {
+    const [domainStart, domainEnd] = currentTransform.rescaleX(xScale).domain();
     containerRect = containerEl.getBoundingClientRect();
     chartWidth = Math.max(1, containerRect.width - margin.left - margin.right);
     chartHeight = Math.max(1, containerRect.height - margin.top - margin.bottom);
@@ -3409,22 +4145,24 @@ function createChartPane(bootstrap, containerEl, minimapEl, paneId) {
     miniX.range([0, mmW]);
     miniG.select('.minimap-area').attr(
       'd',
-      d3.area().x((d, i) => i * mmW / TIMELINE.length).y0(mmH).y1(d => miniY(d))
+      d3.area().x((d, i) => i * mmW / Math.max(1, TIMELINE.length - 1)).y0(mmH).y1(d => miniY(d))
     );
 
-    updateChart(currentTransform);
+    const start = Math.max(0, Math.min(MAX_TS, domainStart));
+    const end = Math.max(start + 1e-9, Math.min(MAX_TS, domainEnd));
+    zoomRect.call(zoom.transform, transformForDomain(start, end));
   }
 
   updateMinimap();
   chartUpdateHooks.push(updateMinimap);
 
   const miniDrag = d3.drag().on('drag', function(event) {
-    const domainPerPx = META.max_timestep / mmW;
+    const domainPerPx = MAX_TS / mmW;
     const shift = event.dx * domainPerPx;
     const newX = currentTransform.rescaleX(xScale);
     const [d0, d1] = newX.domain();
     const range = d1 - d0;
-    const newD0 = Math.max(0, Math.min(META.max_timestep - range, d0 + shift));
+    const newD0 = Math.max(0, Math.min(MAX_TS - range, d0 + shift));
     zoomRect.call(zoom.transform, transformForDomain(newD0, newD0 + range));
   });
   viewportRect.call(miniDrag);
@@ -3435,7 +4173,7 @@ function createChartPane(bootstrap, containerEl, minimapEl, paneId) {
     const newX = currentTransform.rescaleX(xScale);
     const [d0, d1] = newX.domain();
     const range = d1 - d0;
-    const newD0 = Math.max(0, Math.min(META.max_timestep - range, clickTs - range / 2));
+    const newD0 = Math.max(0, Math.min(MAX_TS - range, clickTs - range / 2));
     zoomRect.transition().duration(300).call(zoom.transform, transformForDomain(newD0, newD0 + range));
   });
 
@@ -3452,6 +4190,10 @@ function createChartPane(bootstrap, containerEl, minimapEl, paneId) {
     ALLOCS,
     FRAMES,
     STACKS,
+    EVENTS,
+    SEGMENTS,
+    PRIVATE_POOLS,
+    ALLOCATOR_SETTINGS,
     derivedData,
     resolveStack,
     recolorAllocs,
@@ -3460,12 +4202,13 @@ function createChartPane(bootstrap, containerEl, minimapEl, paneId) {
     updateChart,
     paneId,
     setYMode(mode) { yMode = mode; customYDomain = null; updateChart(currentTransform); },
-    setDimPersistent(v) { customYDomain = null; updateChart(currentTransform); },
+    setDimPersistent() { customYDomain = null; updateChart(currentTransform); },
     setHwmVisible(v) { hwmG.style('display', v ? null : 'none'); },
+    setReservedVisible() { customYDomain = null; updateChart(currentTransform); },
     syncZoom(fracStart, fracEnd) {
       syncing = true;
-      const d0 = fracStart * META.max_timestep;
-      const d1 = fracEnd * META.max_timestep;
+      const d0 = fracStart * MAX_TS;
+      const d1 = fracEnd * MAX_TS;
       zoomRect.call(zoom.transform, transformForDomain(d0, d1));
       syncing = false;
     },
@@ -3485,7 +4228,7 @@ function createChartPane(bootstrap, containerEl, minimapEl, paneId) {
     getTransformFrac() {
       const newX = currentTransform.rescaleX(xScale);
       const [d0, d1] = newX.domain();
-      return [d0 / META.max_timestep, d1 / META.max_timestep];
+      return [d0 / MAX_TS, d1 / MAX_TS];
     },
   };
 }
@@ -3504,13 +4247,10 @@ rightPane.onZoom((f0, f1) => leftPane.syncZoom(f0, f1));
 
 // Click handling -> shared detail panel
 function handleAllocClick(alloc, side) {
-  const pane = panes[side];
   uiState.selectedAlloc = alloc;
   uiState.selectedSide = side;
   uiState.selectedStackIdx = alloc.si;
   uiState.selectedStackLabel = `${side === 'left' ? 'L' : 'R'}: ${formatBytes(alloc.s)}`;
-  uiState.selectedFrames = pane.FRAMES;
-  uiState.selectedStacks = pane.STACKS;
   handleAllocationSelection();
 }
 
@@ -3552,16 +4292,26 @@ function showDetails() {
     detailBody.innerHTML = '<div class="empty-detail">Click an allocation to see its details</div>';
     return;
   }
-  const ts = d.time_us ? new Date(d.time_us / 1000).toLocaleString() : 'N/A';
+  const ts = d.time_us === null || d.time_us === undefined
+    ? 'N/A'
+    : new Date(d.time_us / 1000).toLocaleString();
   const pane = panes[uiState.selectedSide];
+  const lifetimeEnd = d.ts[d.ts.length - 1];
   detailStats.textContent = `${uiState.selectedSide === 'left' ? 'L' : 'R'}: ${formatBytes(d.s)}`;
   detailBody.innerHTML = `<div class="alloc-details"><table>
     <tr><td>Pane</td><td>${uiState.selectedSide === 'left' ? 'Left' : 'Right'}</td></tr>
-    <tr><td>Size</td><td>${formatBytes(d.s)} (${d.s.toLocaleString()} bytes)</td></tr>
-    <tr><td>Address</td><td>${d.addr || 'N/A'}</td></tr>
-    <tr><td>Stream</td><td>${d.stream ?? 'N/A'}</td></tr>
-    <tr><td>Timestamp</td><td>${ts}</td></tr>
-    <tr><td>Lifetime</td><td>ts ${d.ts[0]} \u2192 ${d.ts[d.ts.length - 1]}${d.ts[d.ts.length - 1] >= pane.META.max_timestep ? ' (never freed)' : ''}</td></tr>
+    <tr><td>Requested</td><td>${formatBytes(d.s)} (${d.s.toLocaleString()} bytes)</td></tr>
+    <tr><td>Block size</td><td>${formatBytes(d.block_size)}</td></tr>
+    <tr><td>Address</td><td>${escapeHtml(d.addr || 'N/A')}</td></tr>
+    <tr><td>Stream</td><td>${escapeHtml(d.stream ?? 'N/A')}</td></tr>
+    <tr><td>Pool</td><td>${escapeHtml(formatPool(d.pool))}</td></tr>
+    <tr><td>Origin</td><td>${escapeHtml(d.origin)}${d.ghost ? ' (reconstructed)' : ''}</td></tr>
+    <tr><td>Timestamp</td><td>${escapeHtml(ts)}</td></tr>
+    <tr><td>Compile ctx</td><td>${escapeHtml(d.ctx || 'None')}</td></tr>
+    <tr><td>Metadata</td><td><pre>${escapeHtml(JSON.stringify(d.metadata || {}, null, 2))}</pre></td></tr>
+    <tr><td>Annotations</td><td><pre>${escapeHtml(JSON.stringify(d.annotations || [], null, 2))}</pre></td></tr>
+    <tr><td>FX</td><td><pre>${escapeHtml(JSON.stringify(d.fx || [], null, 2))}</pre></td></tr>
+    <tr><td>Lifetime</td><td>ts ${d.ts[0]} \u2192 ${lifetimeEnd}${lifetimeEnd >= pane.META.max_timestep ? ' (never freed)' : ''}</td></tr>
   </table></div>`;
 }
 
@@ -3575,13 +4325,13 @@ function showPeakBreakdown() {
   let html = `<div class="peak-label">${activeSide === 'left' ? 'Left' : 'Right'}: Allocations alive at peak (${formatBytes(pane.META.high_water_mark_bytes)})</div>`;
   html += alive.map(ai => {
     const d = pane.ALLOCS[ai];
-    const pct = (d.s / pane.META.high_water_mark_bytes * 100).toFixed(1);
+    const pct = (d.s / Math.max(1, pane.META.high_water_mark_bytes) * 100).toFixed(1);
     const barW = (d.s / maxAliveSize * 100).toFixed(0);
     return `<div class="breakdown-row" data-action="show-stack" data-side="${activeSide}" data-stack-idx="${d.si}" data-label="${encodeURIComponent(formatBytes(d.s))}">
       <span class="bd-size">${formatBytes(d.s)}</span>
       <span class="bd-pct">${pct}%</span>
       <span class="bd-bar"><span class="bd-bar-fill" style="width:${barW}%"></span></span>
-      <span class="bd-frame">${pane.derivedData.stackFrameLabels[d.si]}</span>
+      <span class="bd-frame">${escapeHtml(pane.derivedData.stackFrameLabels[d.si])}</span>
     </div>`;
   }).join('');
   detailBody.innerHTML = html;
@@ -3611,18 +4361,91 @@ function showLeaks() {
       <span class="bd-count">\u00d7${g.count}</span>
       <span class="bd-pct">${pct}%</span>
       <span class="bd-bar"><span class="bd-bar-fill leak-bar" style="width:${barW}%"></span></span>
-      <span class="bd-frame">${g.frame}</span>
+      <span class="bd-frame">${escapeHtml(g.frame)}</span>
     </div>`;
   }).join('');
   detailBody.innerHTML = html;
 }
 
+function showPools() {
+  const pane = panes[activeSide];
+  detailStats.textContent = `${pane.PRIVATE_POOLS.length} private pools`;
+  if (!pane.PRIVATE_POOLS.length) {
+    detailBody.innerHTML = '<div class="empty-detail">No live CUDA Graph or MemPool segments in this snapshot.</div>';
+    return;
+  }
+  const maxReserved = pane.PRIVATE_POOLS.reduce(
+    (maximum, pool) => Math.max(maximum, pool.reserved_bytes),
+    1,
+  );
+  detailBody.innerHTML = '<div class="peak-label">Private pool reserved memory</div>' + pane.PRIVATE_POOLS.map(pool => {
+    const width = (pool.reserved_bytes / maxReserved * 100).toFixed(0);
+    return `<div class="breakdown-row">
+      <span class="bd-size">${formatBytes(pool.reserved_bytes)}</span>
+      <span class="bd-count">${pool.num_segments} seg</span>
+      <span class="bd-pct">${formatBytes(pool.active_bytes)}</span>
+      <span class="bd-bar"><span class="bd-bar-fill" style="width:${width}%"></span></span>
+      <span class="bd-frame">pool ${escapeHtml(formatPool(pool.id))}, stream ${escapeHtml(pool.stream)}, peak ${formatBytes(pool.peak_reserved_bytes)}, inactive ${formatBytes(pool.inactive_bytes)}</span>
+    </div>`;
+  }).join('');
+}
+
+function showEvents() {
+  const pane = panes[activeSide];
+  const events = pane.EVENTS.slice(-2000).reverse();
+  detailStats.textContent = `${pane.EVENTS.length} events`;
+  if (!events.length) {
+    detailBody.innerHTML = '<div class="empty-detail">No allocator history events were recorded.</div>';
+    return;
+  }
+  const overflowWarning = pane.ALLOCATOR_SETTINGS.trace_alloc_overflowed
+    ? '<div class="peak-label" style="color:#e74c3c">Warning: allocator history overflowed; older events were overwritten.</div>'
+    : '';
+  detailBody.innerHTML = overflowWarning + '<div class="peak-label">Allocator state history (newest first)</div>' + events.map(event => {
+    const oom = event.act === 'oom' ? `, device free ${formatBytes(event.device_free ?? 0)}` : '';
+    return `<div class="breakdown-row" data-action="show-event-stack" data-side="${activeSide}" data-stack-idx="${event.si}" data-label="${encodeURIComponent(event.act)}">
+      <span class="bd-size">${formatBytes(event.s)}</span>
+      <span class="bd-count">t${event.step}</span>
+      <span class="bd-pct">${formatBytes(event.a)}</span>
+      <span class="bd-frame">${escapeHtml(event.act)} ${escapeHtml(event.addr ?? '')}, reserved ${formatBytes(event.r)}${oom}</span>
+    </div>`;
+  }).join('');
+}
+
+function showSegments() {
+  const pane = panes[activeSide];
+  detailStats.textContent = `${pane.SEGMENTS.length} segments`;
+  if (!pane.SEGMENTS.length) {
+    detailBody.innerHTML = '<div class="empty-detail">No current allocator segments.</div>';
+    return;
+  }
+  detailBody.innerHTML = '<div class="peak-label">Current cached segment state</div>' + pane.SEGMENTS.map(segment => {
+    const activeBlocks = segment.blocks.filter(block => block.state !== 'inactive').length;
+    return `<div class="breakdown-row">
+      <span class="bd-size">${formatBytes(segment.total_size)}</span>
+      <span class="bd-count">${activeBlocks}/${segment.blocks.length}</span>
+      <span class="bd-pct">${formatBytes(segment.allocated_size)}</span>
+      <span class="bd-frame">${escapeHtml(segment.address)}, pool ${escapeHtml(formatPool(segment.pool))}, stream ${escapeHtml(segment.stream)}, ${escapeHtml(segment.segment_type)}${segment.expandable ? ', expandable' : ''}</span>
+    </div>`;
+  }).join('');
+}
+
+function showSettings() {
+  const pane = panes[activeSide];
+  detailStats.textContent = 'allocator settings';
+  detailBody.innerHTML = `<pre class="detail-json">${escapeHtml(JSON.stringify(pane.ALLOCATOR_SETTINGS, null, 2))}</pre>`;
+}
+
 // Detail view system
 const detailViews = [
-  { id: 'stack', label: 'Stack Trace', render: renderStackSelection, hasLR: false },
+  { id: 'stack', label: 'Stack', render: renderStackSelection, hasLR: false },
   { id: 'details', label: 'Details', render: showDetails, hasLR: false },
-  { id: 'peak', label: 'At Peak', render: showPeakBreakdown, hasLR: true },
+  { id: 'peak', label: 'Peak', render: showPeakBreakdown, hasLR: true },
   { id: 'leaks', label: 'Leaks', render: showLeaks, hasLR: true },
+  { id: 'pools', label: 'Pools', render: showPools, hasLR: true },
+  { id: 'events', label: 'Events', render: showEvents, hasLR: true },
+  { id: 'segments', label: 'Segments', render: showSegments, hasLR: true },
+  { id: 'settings', label: 'Settings', render: showSettings, hasLR: true },
 ];
 const detailViewById = Object.fromEntries(detailViews.map(v => [v.id, v]));
 
@@ -3657,9 +4480,8 @@ function activateDetailView(viewId, { resetSearch = false } = {}) {
 }
 
 function handleAllocationSelection() {
-  const viewId = uiState.activeDetailView;
-  const sel = detailViewById[viewId];
-  activateDetailView(sel.hasLR ? viewId : (viewId === 'details' ? 'details' : 'stack'));
+  setDetailPanelCollapsed(false);
+  activateDetailView(uiState.activeDetailView === 'details' ? 'details' : 'stack');
 }
 
 renderDetailTabs();
@@ -3681,7 +4503,7 @@ lrToggle.addEventListener('click', function(event) {
 detailBody.addEventListener('click', function(event) {
   const row = event.target.closest('.breakdown-row');
   if (!row) return;
-  if (row.dataset.action === 'show-stack') {
+  if (row.dataset.action === 'show-stack' || row.dataset.action === 'show-event-stack') {
     const side = row.dataset.side || activeSide;
     uiState.selectedSide = side;
     uiState.selectedStackIdx = Number(row.dataset.stackIdx);
@@ -3690,6 +4512,10 @@ detailBody.addEventListener('click', function(event) {
     return;
   }
   if (row.dataset.action === 'apply-search') {
+    if (useRegex) {
+      useRegex = false;
+      regexToggleEl.classList.remove('active');
+    }
     applySearch(decodeURIComponent(row.dataset.query));
   }
 });
@@ -3704,9 +4530,16 @@ const rightEl = document.getElementById('chart-right');
 const leftMinimapEl = document.getElementById('minimap-left');
 const rightMinimapEl = document.getElementById('minimap-right');
 
-panelToggle.addEventListener('click', () => {
-  const collapsed = detailPanel.classList.toggle('collapsed');
+function setDetailPanelCollapsed(collapsed) {
+  detailPanel.classList.toggle('collapsed', collapsed);
   panelToggle.textContent = collapsed ? '\u25B6' : '\u25C0';
+  panelToggle.title = collapsed ? 'Show stack/details' : 'Hide stack/details';
+  panelToggle.setAttribute('aria-expanded', String(!collapsed));
+  setTimeout(applyPaneLayout, 200);
+}
+
+panelToggle.addEventListener('click', () => {
+  setDetailPanelCollapsed(!detailPanel.classList.contains('collapsed'));
 });
 
 let panelResizing = false;
@@ -3726,6 +4559,7 @@ document.addEventListener('pointerup', () => {
   if (!panelResizing) return;
   panelResizing = false;
   resizeHandle.classList.remove('dragging');
+  applyPaneLayout();
 });
 
 function syncTraceToggleButtons() {
@@ -3763,6 +4597,8 @@ function applyPaneLayout() {
     updateActiveDetailTab();
   }
 
+  if (visiblePanes.left) leftPane.resize();
+  if (visiblePanes.right) rightPane.resize();
   requestAnimationFrame(() => {
     if (visiblePanes.left) leftPane.resize();
     if (visiblePanes.right) rightPane.resize();
@@ -3826,9 +4662,34 @@ document.addEventListener('keydown', function(event) {
 });
 
 // --- Shared controls ---
+const controlsShell = document.getElementById('controls-shell');
+const controls = document.getElementById('controls');
+const controlsToggle = document.getElementById('controls-toggle');
+
+function setControlsCollapsed(collapsed) {
+  controls.classList.toggle('collapsed', collapsed);
+  controlsToggle.textContent = collapsed ? '◀' : '▶';
+  controlsToggle.title = collapsed ? 'Show controls' : 'Hide controls';
+  controlsToggle.setAttribute('aria-expanded', String(!collapsed));
+}
+
+controlsToggle.addEventListener('click', event => {
+  event.stopPropagation();
+  setControlsCollapsed(!controls.classList.contains('collapsed'));
+});
+document.addEventListener('pointerdown', event => {
+  if (!controlsShell.contains(event.target)) setControlsCollapsed(true);
+});
+
 document.getElementById('hwm-toggle').onchange = function() {
   leftPane.setHwmVisible(this.checked);
   rightPane.setHwmVisible(this.checked);
+};
+
+document.getElementById('reserved-toggle').onchange = function() {
+  showReserved = this.checked;
+  leftPane.setReservedVisible();
+  rightPane.setReservedVisible();
 };
 
 document.getElementById('autofit-toggle').onchange = function() {
@@ -3888,8 +4749,9 @@ function navTick() {
     const half = range / 2 * zoomFactor;
     newF0 = center - half; newF1 = center + half;
   }
-  newF0 = Math.max(0, newF0);
-  newF1 = Math.min(1, newF1);
+  const newRange = Math.min(1, Math.max(1 / 2000, newF1 - newF0));
+  if (newF0 < 0) { newF0 = 0; newF1 = newRange; }
+  if (newF1 > 1) { newF1 = 1; newF0 = 1 - newRange; }
   leftPane.syncZoom(newF0, newF1);
   rightPane.syncZoom(newF0, newF1);
   requestAnimationFrame(navTick);

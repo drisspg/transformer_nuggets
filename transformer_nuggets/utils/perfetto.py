@@ -18,7 +18,9 @@ can reuse them.
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
+import math
 import re
 import zlib
 from collections import defaultdict
@@ -84,13 +86,36 @@ def _annotation_label(entries: Sequence[Any] | None) -> str | None:
     return name
 
 
+_GPU_EVENT_CATEGORIES = frozenset({"kernel", "gpu_memcpy", "gpu_memset"})
+_GRAPH_ANNOTATION_MARKER = "transformer_nuggets.graph_annotation"
+_GRAPH_ANNOTATION_SOURCE = "transformer_nuggets.graph_annotation_source"
+
+
+@dataclass(frozen=True)
+class _GpuTraceEvent:
+    """Validated GPU work event used to construct graph annotation spans."""
+
+    pid: int | str | None
+    tid: int | str | None
+    device: int | str | None
+    graph_id: int | None
+    graph_node_id: int | None
+    correlation: int | str | None
+    name: str | None
+    start: float
+    end: float
+    index: int
+
+
 def _graph_annotation_box(
     name: str,
     pid: Any,
     tid: Any,
     start: float,
     end: float,
+    source: str,
 ) -> dict[str, Any]:
+    """Build a marked annotation box for one graph replay source."""
     return {
         "ph": "X",
         "cat": "gpu_user_annotation",
@@ -99,8 +124,132 @@ def _graph_annotation_box(
         "tid": tid,
         "ts": start,
         "dur": end - start,
-        "args": {"transformer_nuggets.graph_annotation": True},
+        "args": {
+            _GRAPH_ANNOTATION_MARKER: True,
+            _GRAPH_ANNOTATION_SOURCE: source,
+        },
     }
+
+
+def _trace_identity(value: Any) -> int | str | None:
+    """Validate a Chrome trace identity field used for grouping GPU work."""
+    if value is None or (isinstance(value, (int, str)) and not isinstance(value, bool)):
+        return value
+    return None
+
+
+def _finite_float(value: Any) -> float | None:
+    """Return a finite trace timestamp or duration, skipping malformed values."""
+    try:
+        result = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _embedded_annotation(args: Mapping[str, Any]) -> Sequence[Any] | None:
+    """Read an event-local annotation list, which overrides the global registry."""
+    if "annotation" not in args:
+        return None
+    embedded = args["annotation"]
+    if isinstance(embedded, str):
+        try:
+            embedded = json.loads(embedded)
+        except json.JSONDecodeError:
+            return ()
+    return embedded if isinstance(embedded, list) else ()
+
+
+def _gpu_trace_event(
+    event: Any,
+    index: int,
+    annotations: Mapping[int, Sequence[Any]] | None,
+) -> _GpuTraceEvent | None:
+    """Normalize one GPU duration event, returning ``None`` for malformed input."""
+    if not isinstance(event, Mapping):
+        return None
+    if event.get("ph") != "X" or event.get("cat") not in _GPU_EVENT_CATEGORIES:
+        return None
+    args = event.get("args", {})
+    if not isinstance(args, Mapping):
+        return None
+
+    start = _finite_float(event.get("ts"))
+    duration = _finite_float(event.get("dur", 0.0))
+    if start is None or duration is None or duration < 0:
+        return None
+
+    pid = _trace_identity(event.get("pid"))
+    tid = _trace_identity(event.get("tid"))
+    if (event.get("pid") is not None and pid is None) or (
+        event.get("tid") is not None and tid is None
+    ):
+        return None
+    device_value = next(
+        (args[name] for name in ("device", "device id", "device_id") if name in args), None
+    )
+    device = _trace_identity(device_value)
+    if device_value is not None and device is None:
+        return None
+
+    graph_id = args.get("graph id")
+    graph_node_id = args.get("graph node id")
+    if graph_id is None or graph_node_id is None:
+        return _GpuTraceEvent(
+            pid, tid, device, None, None, None, None, start, start + duration, index
+        )
+    if isinstance(graph_id, bool) or isinstance(graph_node_id, bool):
+        return None
+    try:
+        graph_id = int(graph_id)
+        graph_node_id = int(graph_node_id)
+    except (TypeError, ValueError):
+        return None
+
+    correlation = _trace_identity(args.get("correlation"))
+    if args.get("correlation") is not None and correlation is None:
+        return None
+    entries = _embedded_annotation(args)
+    if entries is None and annotations is not None:
+        entries = annotations.get((graph_id << 32) | graph_node_id)
+    return _GpuTraceEvent(
+        pid,
+        tid,
+        device,
+        graph_id,
+        graph_node_id,
+        correlation,
+        _annotation_label(entries),
+        start,
+        start + duration,
+        index,
+    )
+
+
+def _annotation_source(
+    event: _GpuTraceEvent,
+    replay: tuple[str, int | str],
+) -> str:
+    """Serialize the physical track and replay identity that generated a box."""
+    return json.dumps(
+        [event.pid, event.tid, event.device, event.graph_id, *replay],
+        separators=(",", ":"),
+    )
+
+
+def _generated_annotation_sources(events: Sequence[Any]) -> set[str]:
+    """Return sources with annotation boxes already synthesized in this trace."""
+    sources = set()
+    for event in events:
+        if not isinstance(event, Mapping):
+            continue
+        args = event.get("args")
+        if not isinstance(args, Mapping) or not args.get(_GRAPH_ANNOTATION_MARKER):
+            continue
+        source = args.get(_GRAPH_ANNOTATION_SOURCE)
+        if isinstance(source, str):
+            sources.add(source)
+    return sources
 
 
 def add_cuda_graph_annotation_boxes(
@@ -110,67 +259,239 @@ def add_cuda_graph_annotation_boxes(
     """Add GPU annotation spans for contiguous CUDA Graph regions.
 
     Graph annotation metadata is joined by ``(graph id, graph node id)`` when an
-    annotation registry is supplied. CUPTI monitor JSON traces can also carry the
-    annotation list directly in each GPU event's ``annotation`` argument.
+    annotation registry is supplied. Event-local ``annotation`` metadata takes
+    precedence. Boxes never cross unannotated GPU work, physical-device tracks,
+    graph/replay boundaries, or a repeated graph node when correlation is absent.
     """
-    events = list(trace.get("traceEvents", []))
-    if any(event.get("args", {}).get("transformer_nuggets.graph_annotation") for event in events):
+    raw_events = trace.get("traceEvents", ())
+    events = list(raw_events) if isinstance(raw_events, Sequence) else []
+    if any(
+        isinstance(event, Mapping)
+        and isinstance(event.get("args"), Mapping)
+        and event["args"].get(_GRAPH_ANNOTATION_MARKER)
+        and _GRAPH_ANNOTATION_SOURCE not in event["args"]
+        for event in events
+    ):
         return trace.copy()
-
-    annotated_work: dict[tuple[Any, Any], list[tuple[dict[str, Any], str]]] = defaultdict(list)
-    for event in events:
-        if event.get("ph") != "X" or event.get("cat") not in {
-            "kernel",
-            "gpu_memcpy",
-            "gpu_memset",
-        }:
-            continue
-        args = event.get("args", {})
-        graph_id = args.get("graph id")
-        graph_node_id = args.get("graph node id")
-        if graph_id is None or graph_node_id is None:
-            continue
-
-        entries = None
-        if annotations is not None:
-            entries = annotations.get((int(graph_id) << 32) | int(graph_node_id))
-        if entries is None and isinstance(args.get("annotation"), str):
-            try:
-                embedded = json.loads(args["annotation"])
-            except json.JSONDecodeError:
-                embedded = None
-            if isinstance(embedded, list):
-                entries = embedded
-        name = _annotation_label(entries)
-        if name is not None:
-            annotated_work[(event.get("pid"), event.get("tid"))].append((event, name))
+    generated_sources = _generated_annotation_sources(events)
+    work_by_track: dict[
+        tuple[int | str | None, int | str | None, int | str | None], list[_GpuTraceEvent]
+    ] = defaultdict(list)
+    for index, event in enumerate(events):
+        gpu_event = _gpu_trace_event(event, index, annotations)
+        if gpu_event is not None:
+            work_by_track[(gpu_event.pid, gpu_event.tid, gpu_event.device)].append(gpu_event)
 
     annotation_boxes: list[dict[str, Any]] = []
-    for (pid, tid), stream_events in annotated_work.items():
-        region_name = None
-        region_start = 0.0
-        region_end = 0.0
-        for event, name in sorted(stream_events, key=lambda item: item[0]["ts"]):
-            start = float(event["ts"])
-            end = start + float(event.get("dur", 0.0))
-            if name != region_name:
-                if region_name is not None:
+    for stream_events in work_by_track.values():
+        active: tuple[str, str, float, float] | None = None
+        previous_graph_id = None
+        replay_index = 0
+        seen_nodes: set[int] = set()
+        for event in sorted(stream_events, key=lambda item: (item.start, item.end, item.index)):
+            if event.graph_id is None or event.graph_node_id is None:
+                if active is not None:
+                    name, source, start, end = active
                     annotation_boxes.append(
-                        _graph_annotation_box(region_name, pid, tid, region_start, region_end)
+                        _graph_annotation_box(name, event.pid, event.tid, start, end, source)
                     )
-                region_name = name
-                region_start = start
-                region_end = end
+                    active = None
+                continue
+
+            if event.graph_id != previous_graph_id:
+                if previous_graph_id is not None:
+                    replay_index += 1
+                previous_graph_id = event.graph_id
+                seen_nodes.clear()
+            if event.correlation is None:
+                if event.graph_node_id in seen_nodes:
+                    replay_index += 1
+                    seen_nodes.clear()
+                seen_nodes.add(event.graph_node_id)
+                replay = ("nodes", replay_index)
             else:
-                region_end = max(region_end, end)
-        if region_name is not None:
+                replay = ("correlation", event.correlation)
+            source = _annotation_source(event, replay)
+
+            if event.name is None or source in generated_sources:
+                if active is not None:
+                    name, active_source, start, end = active
+                    annotation_boxes.append(
+                        _graph_annotation_box(
+                            name, event.pid, event.tid, start, end, active_source
+                        )
+                    )
+                    active = None
+                continue
+            if active is None or (event.name, source) != active[:2]:
+                if active is not None:
+                    name, active_source, start, end = active
+                    annotation_boxes.append(
+                        _graph_annotation_box(
+                            name, event.pid, event.tid, start, end, active_source
+                        )
+                    )
+                active = (event.name, source, event.start, event.end)
+            else:
+                active = (active[0], active[1], active[2], max(active[3], event.end))
+        if active is not None:
+            name, source, start, end = active
             annotation_boxes.append(
-                _graph_annotation_box(region_name, pid, tid, region_start, region_end)
+                _graph_annotation_box(name, event.pid, event.tid, start, end, source)
             )
 
     processed = trace.copy()
     processed["traceEvents"] = [*events, *annotation_boxes]
     return processed
+
+
+@dataclass(frozen=True)
+class _NativeGpuTraceEvent:
+    """GPU render-stage event with optional embedded graph annotation metadata."""
+
+    track: tuple[str, str, str, str]
+    graph_id: str | None
+    correlation: str | None
+    node_id: str
+    name: str | None
+    timestamp: int
+    duration: int
+    clock_id: int
+
+
+def _native_track_uuid(track: tuple[str, str, str, str]) -> int:
+    """Return a stable nonzero TrackEvent UUID for a native GPU annotation track."""
+    value = int.from_bytes(hashlib.blake2b(repr(track).encode(), digest_size=8).digest(), "little")
+    return (value & ((1 << 63) - 1)) or 1
+
+
+def _native_gpu_event(packet: Any) -> _NativeGpuTraceEvent | None:
+    """Extract annotation metadata from one native CUPTI GPU render-stage packet."""
+    if not packet.HasField("gpu_render_stage_event"):
+        return None
+    event = packet.gpu_render_stage_event
+    if event.duration <= 0:
+        return None
+    metadata = {item.name: item.value for item in event.extra_data}
+    track = (
+        metadata.get("process_id", "unknown"),
+        metadata.get("device id", str(event.gpu_id)),
+        metadata.get("stream id", str(event.hw_queue_iid)),
+        str(event.hw_queue_iid),
+    )
+    return _NativeGpuTraceEvent(
+        track=track,
+        graph_id=metadata.get("graph id"),
+        correlation=metadata.get("correlation"),
+        node_id=metadata.get("graph node id", str(event.event_id)),
+        name=_annotation_label([metadata]) if metadata.get("graph id") is not None else None,
+        timestamp=int(packet.timestamp),
+        duration=int(event.duration),
+        clock_id=int(packet.timestamp_clock_id),
+    )
+
+
+def add_cuda_graph_annotation_tracks_to_native_trace(payload: bytes) -> bytes:
+    """Append TrackEvent annotation slices while preserving native CUPTI GPU packets."""
+    compressed = payload.startswith(b"\x1f\x8b")
+    try:
+        raw_payload = gzip.decompress(payload) if compressed else payload
+    except (EOFError, OSError):
+        return payload
+    try:
+        from google.protobuf.message import DecodeError
+        from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import Trace, TrackEvent
+    except ImportError:
+        return payload
+
+    trace = Trace()
+    try:
+        trace.ParseFromString(raw_payload)
+    except DecodeError:
+        return payload
+    if any(
+        packet.HasField("track_descriptor")
+        and packet.track_descriptor.name.startswith("GPU annotations stream ")
+        for packet in trace.packet
+    ):
+        return payload
+
+    work_by_track: dict[tuple[str, str, str, str], list[_NativeGpuTraceEvent]] = defaultdict(list)
+    for packet in trace.packet:
+        event = _native_gpu_event(packet)
+        if event is not None:
+            work_by_track[event.track].append(event)
+
+    slices: list[tuple[tuple[str, str, str, str], str, int, int, int]] = []
+    for track, events in work_by_track.items():
+        active: tuple[str, str | None, str | None, int, int, int] | None = None
+        seen_nodes: set[str] = set()
+        replay_index = 0
+        for event in sorted(events, key=lambda item: item.timestamp):
+            if event.correlation is None:
+                if event.node_id in seen_nodes:
+                    replay_index += 1
+                    seen_nodes.clear()
+                seen_nodes.add(event.node_id)
+                replay = f"nodes:{replay_index}"
+            else:
+                replay = f"correlation:{event.correlation}"
+            identity = (event.graph_id, replay)
+            if event.name is None:
+                if active is not None:
+                    name, _graph_id, _replay, start, end, clock_id = active
+                    slices.append((track, name, start, end, clock_id))
+                    active = None
+                continue
+            if active is None or (event.name, *identity) != active[:3]:
+                if active is not None:
+                    name, _graph_id, _replay, start, end, clock_id = active
+                    slices.append((track, name, start, end, clock_id))
+                active = (
+                    event.name,
+                    event.graph_id,
+                    replay,
+                    event.timestamp,
+                    event.timestamp + event.duration,
+                    event.clock_id,
+                )
+            else:
+                active = (*active[:4], max(active[4], event.timestamp + event.duration), active[5])
+        if active is not None:
+            name, _graph_id, _replay, start, end, clock_id = active
+            slices.append((track, name, start, end, clock_id))
+
+    if not slices:
+        return payload
+
+    for track in sorted({track for track, *_ in slices}):
+        descriptor_packet = trace.packet.add()
+        descriptor_packet.timestamp = 0
+        descriptor = descriptor_packet.track_descriptor
+        descriptor.uuid = _native_track_uuid(track)
+        descriptor.name = f"GPU annotations stream {track[2]}"
+        descriptor.sibling_order_rank = -10
+
+    markers = []
+    for index, (track, name, start, end, clock_id) in enumerate(slices):
+        markers.append((start, 1, index, track, name, clock_id))
+        markers.append((end, 0, index, track, name, clock_id))
+    for timestamp, begin_rank, _index, track, name, clock_id in sorted(markers):
+        packet = trace.packet.add()
+        packet.timestamp = timestamp
+        if clock_id:
+            packet.timestamp_clock_id = clock_id
+        packet.trusted_packet_sequence_id = 2001
+        event = packet.track_event
+        event.track_uuid = _native_track_uuid(track)
+        if begin_rank:
+            event.type = TrackEvent.TYPE_SLICE_BEGIN
+            event.name = name
+        else:
+            event.type = TrackEvent.TYPE_SLICE_END
+
+    output = trace.SerializeToString()
+    return gzip.compress(output) if compressed else output
 
 
 def default_trace_path(file_path: str | Path, *, gzip_by_default: bool = True) -> Path:

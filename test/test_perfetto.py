@@ -5,6 +5,7 @@ import pytest
 
 from transformer_nuggets.utils.perfetto import (
     add_cuda_graph_annotation_boxes,
+    add_cuda_graph_annotation_tracks_to_native_trace,
     default_trace_path,
     default_track_event_path,
     read_trace,
@@ -16,6 +17,14 @@ from transformer_nuggets.utils.track_event import chrome_trace_to_track_event_tr
 
 def _duration_events(trace):
     return [event for event in trace["traceEvents"] if event.get("ph") == "X"]
+
+
+def _annotation_boxes(trace):
+    return [
+        event
+        for event in trace["traceEvents"]
+        if isinstance(event, dict) and event.get("cat") == "gpu_user_annotation"
+    ]
 
 
 def test_cuda_graph_annotations_become_contiguous_gpu_boxes():
@@ -97,6 +106,7 @@ def test_cuda_graph_annotation_boxes_label_backward_phase():
 
 
 def test_cuda_graph_annotation_boxes_accept_monitor_embedded_metadata():
+    graph_id = 2
     trace = {
         "traceEvents": [
             {
@@ -108,7 +118,7 @@ def test_cuda_graph_annotation_boxes_accept_monitor_embedded_metadata():
                 "ts": 10,
                 "dur": 3,
                 "args": {
-                    "graph id": 2,
+                    "graph id": graph_id,
                     "graph node id": 1,
                     "annotation": '[{"name": "attention"}]',
                 },
@@ -116,10 +126,309 @@ def test_cuda_graph_annotation_boxes_accept_monitor_embedded_metadata():
         ]
     }
 
-    processed = add_cuda_graph_annotation_boxes(trace)
+    processed = add_cuda_graph_annotation_boxes(
+        trace,
+        {(graph_id << 32) | 1: [{"name": "registry label"}]},
+    )
 
     assert processed["traceEvents"][-1]["name"] == "attention"
     assert processed["traceEvents"][-1]["cat"] == "gpu_user_annotation"
+
+
+def test_cuda_graph_annotation_boxes_split_on_unannotated_gpu_work():
+    graph_id = 2
+    annotations = {(graph_id << 32) | 1: [{"name": "attention"}]}
+    trace = {
+        "traceEvents": [
+            {
+                "ph": "X",
+                "cat": "kernel",
+                "pid": 0,
+                "tid": 7,
+                "ts": 0,
+                "dur": 2,
+                "args": {"graph id": graph_id, "graph node id": 1, "correlation": 4},
+            },
+            {"ph": "X", "cat": "kernel", "pid": 0, "tid": 7, "ts": 2, "dur": 2, "args": {}},
+            {
+                "ph": "X",
+                "cat": "kernel",
+                "pid": 0,
+                "tid": 7,
+                "ts": 4,
+                "dur": 2,
+                "args": {"graph id": graph_id, "graph node id": 1, "correlation": 4},
+            },
+        ]
+    }
+
+    processed = add_cuda_graph_annotation_boxes(trace, annotations)
+
+    assert [(box["ts"], box["dur"]) for box in _annotation_boxes(processed)] == [
+        (0.0, 2.0),
+        (4.0, 2.0),
+    ]
+
+
+@pytest.mark.parametrize("with_correlation", [False, True])
+def test_cuda_graph_annotation_boxes_split_at_replay_boundaries(with_correlation):
+    graph_id = 2
+    annotations = {(graph_id << 32) | 0: [{"name": "attention"}]}
+    args = {"graph id": graph_id, "graph node id": 0}
+    if with_correlation:
+        first_args = {**args, "correlation": 4}
+        second_args = {**args, "correlation": 5}
+    else:
+        first_args = second_args = args
+    trace = {
+        "traceEvents": [
+            {
+                "ph": "X",
+                "cat": "kernel",
+                "pid": 0,
+                "tid": 7,
+                "ts": 0,
+                "dur": 2,
+                "args": first_args,
+            },
+            {
+                "ph": "X",
+                "cat": "kernel",
+                "pid": 0,
+                "tid": 7,
+                "ts": 2,
+                "dur": 2,
+                "args": second_args,
+            },
+        ]
+    }
+
+    processed = add_cuda_graph_annotation_boxes(trace, annotations)
+
+    assert [(box["ts"], box["dur"]) for box in _annotation_boxes(processed)] == [
+        (0.0, 2.0),
+        (2.0, 2.0),
+    ]
+
+
+def test_cuda_graph_annotation_boxes_keep_devices_separate():
+    graph_id = 2
+    annotations = {(graph_id << 32) | 0: [{"name": "attention"}]}
+    trace = {
+        "traceEvents": [
+            {
+                "ph": "X",
+                "cat": "kernel",
+                "pid": 0,
+                "tid": 7,
+                "ts": 0,
+                "dur": 2,
+                "args": {"graph id": graph_id, "graph node id": 0, "device": 0},
+            },
+            {
+                "ph": "X",
+                "cat": "kernel",
+                "pid": 0,
+                "tid": 7,
+                "ts": 2,
+                "dur": 2,
+                "args": {"graph id": graph_id, "graph node id": 0, "device": 1},
+            },
+        ]
+    }
+
+    processed = add_cuda_graph_annotation_boxes(trace, annotations)
+
+    assert [(box["ts"], box["dur"]) for box in _annotation_boxes(processed)] == [
+        (0.0, 2.0),
+        (2.0, 2.0),
+    ]
+
+
+def test_cuda_graph_annotation_boxes_skip_malformed_events():
+    trace = {
+        "traceEvents": [
+            "not an event",
+            {"ph": "X", "cat": "kernel", "args": "not an args mapping"},
+            {
+                "ph": "X",
+                "cat": "kernel",
+                "pid": 0,
+                "tid": 7,
+                "ts": "not a timestamp",
+                "dur": 2,
+                "args": {"graph id": 2, "graph node id": 0},
+            },
+        ]
+    }
+
+    assert add_cuda_graph_annotation_boxes(trace, {(2 << 32): [{"name": "attention"}]}) == trace
+
+
+def test_native_cuda_graph_annotation_tracks_preserve_gpu_packets():
+    from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import Trace, TrackEvent
+
+    trace = Trace()
+    for timestamp, annotation in [(100, "attention"), (110, "attention"), (120, None)]:
+        packet = trace.packet.add()
+        packet.timestamp = timestamp
+        packet.timestamp_clock_id = 6
+        event = packet.gpu_render_stage_event
+        event.duration = 10
+        event.event_id = timestamp
+        event.gpu_id = 0
+        event.hw_queue_iid = 7
+        metadata = {
+            "process_id": "123",
+            "device id": "0",
+            "stream id": "7",
+            "graph id": "2",
+            "correlation": "4",
+        }
+        if annotation is not None:
+            metadata["name"] = annotation
+        for name, value in metadata.items():
+            item = event.extra_data.add()
+            item.name = name
+            item.value = value
+
+    output = add_cuda_graph_annotation_tracks_to_native_trace(
+        gzip.compress(trace.SerializeToString())
+    )
+    processed = Trace()
+    processed.ParseFromString(gzip.decompress(output))
+
+    assert sum(packet.HasField("gpu_render_stage_event") for packet in processed.packet) == 3
+    assert any(
+        packet.HasField("track_descriptor")
+        and packet.track_descriptor.name == "GPU annotations stream 7"
+        for packet in processed.packet
+    )
+    annotation_events = [
+        packet.track_event for packet in processed.packet if packet.HasField("track_event")
+    ]
+    assert [event.type for event in annotation_events] == [
+        TrackEvent.TYPE_SLICE_BEGIN,
+        TrackEvent.TYPE_SLICE_END,
+    ]
+    assert annotation_events[0].name == "attention"
+
+
+def test_native_annotation_tracks_require_graph_identity_and_label_backward():
+    from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import Trace, TrackEvent
+
+    trace = Trace()
+    for timestamp, metadata in [
+        (100, {"name": "unrelated eager metadata", "stream id": "7"}),
+        (
+            110,
+            {
+                "name": "attention",
+                "autograd_phase": "backward",
+                "stream id": "7",
+                "graph id": "2",
+                "correlation": "4",
+            },
+        ),
+    ]:
+        packet = trace.packet.add()
+        packet.timestamp = timestamp
+        event = packet.gpu_render_stage_event
+        event.duration = 10
+        event.event_id = timestamp
+        event.gpu_id = 0
+        event.hw_queue_iid = 7
+        for name, value in metadata.items():
+            item = event.extra_data.add()
+            item.name = name
+            item.value = value
+
+    processed = Trace()
+    processed.ParseFromString(
+        add_cuda_graph_annotation_tracks_to_native_trace(trace.SerializeToString())
+    )
+    annotation_begins = [
+        packet.track_event
+        for packet in processed.packet
+        if packet.HasField("track_event")
+        and packet.track_event.type == TrackEvent.TYPE_SLICE_BEGIN
+    ]
+
+    assert [event.name for event in annotation_begins] == ["attention backward"]
+
+
+def test_native_annotation_tracks_skip_truncated_gzip():
+    payload = b"\x1f\x8btruncated"
+    assert add_cuda_graph_annotation_tracks_to_native_trace(payload) == payload
+
+
+def test_cuda_graph_annotation_boxes_skip_overflowing_timestamps():
+    event = {
+        "ph": "X",
+        "cat": "kernel",
+        "pid": 0,
+        "tid": 7,
+        "ts": 10**10_000,
+        "dur": 2,
+        "args": {"graph id": 2, "graph node id": 0},
+    }
+
+    assert add_cuda_graph_annotation_boxes(
+        {"traceEvents": [event]}, {(2 << 32): [{"name": "attention"}]}
+    ) == {"traceEvents": [event]}
+
+
+def test_legacy_cuda_graph_annotation_box_remains_idempotent():
+    trace = {
+        "traceEvents": [
+            {
+                "ph": "X",
+                "cat": "kernel",
+                "pid": 0,
+                "tid": 7,
+                "ts": 0,
+                "dur": 2,
+                "args": {"graph id": 2, "graph node id": 0},
+            },
+            {
+                "ph": "X",
+                "cat": "gpu_user_annotation",
+                "name": "attention",
+                "pid": 0,
+                "tid": 7,
+                "ts": 0,
+                "dur": 2,
+                "args": {"transformer_nuggets.graph_annotation": True},
+            },
+        ]
+    }
+
+    assert add_cuda_graph_annotation_boxes(trace, {(2 << 32): [{"name": "attention"}]}) == trace
+
+
+def test_cuda_graph_annotation_box_idempotency_is_per_replay_source():
+    graph_id = 2
+    annotations = {(graph_id << 32) | 0: [{"name": "attention"}]}
+    first = {
+        "ph": "X",
+        "cat": "kernel",
+        "pid": 0,
+        "tid": 7,
+        "ts": 0,
+        "dur": 2,
+        "args": {"graph id": graph_id, "graph node id": 0, "correlation": 4},
+    }
+    second = {**first, "ts": 2, "args": {**first["args"], "correlation": 5}}
+
+    once = add_cuda_graph_annotation_boxes({"traceEvents": [first]}, annotations)
+    twice = add_cuda_graph_annotation_boxes(
+        {"traceEvents": [*once["traceEvents"], second]}, annotations
+    )
+
+    assert [(box["ts"], box["dur"]) for box in _annotation_boxes(twice)] == [
+        (0.0, 2.0),
+        (2.0, 2.0),
+    ]
 
 
 def test_split_overlapping_slices_creates_adjacent_lanes():
