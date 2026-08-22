@@ -12,6 +12,8 @@ A grab-bag of experimental transformer kernels and utilities (mostly PyTorch + T
 - **`transformer_nuggets/cute`**: CUTE DSL experiments and tooling (includes an intra-kernel profiler).
 - **`transformer_nuggets/misc`**: Odds and ends (e.g. attention wrappers, utilities).
 - **`transformer_nuggets/llama`**: LLaMA-ish model + training/finetune scripts (research-grade).
+- **Logical roofline analysis**: eager FX/AOT training attribution, raw Kineto trace
+  decoration, per-kernel Perfetto tracks, ranked fusion findings, and replay/NCU follow-ups.
 
 This repository is research code: APIs are not stable and may change.
 
@@ -37,7 +39,8 @@ pip install -e .
 Optional extras:
 
 ```shell
-pip install "transformer_nuggets[llama]"  # llama training utilities
+pip install "transformer_nuggets[llama]"       # llama training utilities
+pip install "transformer_nuggets[huggingface]" # Hugging Face profiling example
 ```
 
 ### Quick examples
@@ -45,6 +48,19 @@ pip install "transformer_nuggets[llama]"  # llama training utilities
 Use torchao for quantization experiments.
 
 Use PyTorch FlexAttention instead of the old local FlashAttention experiments.
+
+Annotate an existing PyTorch profiler trace with logical roofline metadata:
+
+```shell
+annotate-roofline trace.json.gz -o trace.roofline.pftrace \
+  --formula-module my_project.roofline_formulas \
+  --peak-compute-tflops 1000 --peak-memory-gbps 4000
+```
+
+Profile an eager callable or forward/backward training step from Python with
+`transformer_nuggets.fx_analysis.profile_fx_fusion` or `profile_aot_training`.
+Logical formulas and physical NCU counters are intentionally kept separate. See
+`.agents/skills/analyzing-pytorch-rooflines/SKILL.md` for the workflow contract.
 
 CUTE intra-kernel profiling (writes a Perfetto trace):
 
