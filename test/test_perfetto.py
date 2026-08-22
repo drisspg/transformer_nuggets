@@ -616,6 +616,15 @@ def test_track_event_conversion_puts_gpu_annotations_on_separate_track():
                 "ts": 0,
                 "dur": 10,
             },
+            {
+                "ph": "X",
+                "cat": "gpu_roofline_annotation",
+                "name": "roofline_0",
+                "pid": 0,
+                "tid": 7,
+                "ts": 0,
+                "dur": 10,
+            },
         ]
     }
 
@@ -635,6 +644,7 @@ def test_track_event_conversion_puts_gpu_annotations_on_separate_track():
 
     assert event_tracks["kernel"] == "stream 7"
     assert event_tracks["burst_0"] == "GPU annotations stream 7"
+    assert event_tracks["roofline_0"] == "Roofline stream 7"
 
 
 def test_track_event_conversion_attaches_paired_flows_to_slices():

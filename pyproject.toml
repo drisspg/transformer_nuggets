@@ -10,10 +10,12 @@ dynamic = ["version"]
 authors = [{ name = "Driss Guessous", email = "drisspguessous@gmail.com" }]
 description = "A place to store reusable transformer components found around the interwebs"
 readme = "README.md"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: BSD License",
     "Operating System :: OS Independent",
 ]
 
@@ -46,6 +48,10 @@ cupti-monitor = [
     "cupti-python>=13.3",
 ]
 
+huggingface = [
+    "transformers",
+]
+
 llama = [
     "sentencepiece==0.1.99",
     "datasets==2.15.0",
@@ -57,6 +63,7 @@ llama = [
 merge-traces = "transformer_nuggets.utils.merge_traces:app"
 merge-memory = "transformer_nuggets.utils.merge_memory:app"
 compare-memory = "transformer_nuggets.utils.compare_memory:app"
+annotate-roofline = "transformer_nuggets.roofline:app"
 
 # ---------- TOOL CONFIGURATIONS ------------
 [tool.hatch.version]

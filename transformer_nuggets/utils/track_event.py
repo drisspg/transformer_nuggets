@@ -38,6 +38,7 @@ class ChromeTrack:
     tid: Any
     name: str
     sort_index: int = 0
+    sort_bias: int = 0
     key: TrackKey = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -246,26 +247,36 @@ def _event_args(event: TraceDict) -> dict[str, Any]:
     return args if isinstance(args, dict) else {}
 
 
+_GPU_ANNOTATION_TRACKS = {
+    "gpu_user_annotation": ("GPU annotations", -10),
+    "gpu_roofline_annotation": ("Roofline", -20),
+}
+
+
 def _event_track(
     metadata: ChromeMetadata,
     event: TraceDict,
-    annotation_track_cache: dict[TrackKey, ChromeTrack],
+    annotation_track_cache: dict[tuple[TrackKey, str], ChromeTrack],
 ) -> ChromeTrack:
     pid = event.get("pid", 0)
     tid = event.get("tid", 0)
     base_track = metadata.track_for(pid, tid)
-    if event.get("cat") != "gpu_user_annotation":
+    category = str(event.get("cat", ""))
+    track_config = _GPU_ANNOTATION_TRACKS.get(category)
+    if track_config is None:
         return base_track
 
-    key = base_track.key
+    label, sort_bias = track_config
+    key = (base_track.key, category)
     annotation_track = annotation_track_cache.get(key)
     if annotation_track is not None:
         return annotation_track
     annotation_track = ChromeTrack(
         pid=pid,
-        tid=f"{tid}:gpu_user_annotation",
-        name=f"GPU annotations {base_track.name}",
+        tid=f"{tid}:{category}",
+        name=f"{label} {base_track.name}",
         sort_index=base_track.sort_index,
+        sort_bias=sort_bias,
     )
     annotation_track_cache[key] = annotation_track
     return annotation_track
@@ -371,7 +382,7 @@ def parse_chrome_trace(trace: TraceDict) -> ParsedChromeTrace:
     counters: list[CounterSample] = []
     flows: list[FlowInstant] = []
     unsupported: set[str] = set()
-    annotation_track_cache: dict[TrackKey, ChromeTrack] = {}
+    annotation_track_cache: dict[tuple[TrackKey, str], ChromeTrack] = {}
 
     for idx, event in enumerate(events):
         if _hide_chrome_event(event):
@@ -412,8 +423,6 @@ def parse_chrome_trace(trace: TraceDict) -> ParsedChromeTrace:
                     ts_us=float(event.get("ts", 0) or 0),
                 )
             )
-        elif ph in {"B", "E"}:
-            unsupported.add(str(ph))
         else:
             unsupported.add(str(ph))
 
@@ -732,8 +741,7 @@ def _define_duration_tracks(
             desc.uuid = track_uuid
             desc.parent_uuid = process_uuids[track.pid]
             desc.name = track.name
-            annotation_bias = -10 if str(track.tid).endswith(":gpu_user_annotation") else 0
-            desc.sibling_order_rank = track.sort_index * 100 + annotation_bias + lane
+            desc.sibling_order_rank = track.sort_index * 100 + track.sort_bias + lane
             if lane_count > 1:
                 desc.sibling_merge_behavior = (
                     protos.TrackDescriptor.SIBLING_MERGE_BEHAVIOR_BY_SIBLING_MERGE_KEY
