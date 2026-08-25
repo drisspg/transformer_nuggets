@@ -87,6 +87,11 @@ def _annotation_label(entries: Sequence[Any] | None) -> str | None:
 
 
 _GPU_EVENT_CATEGORIES = frozenset({"kernel", "gpu_memcpy", "gpu_memset"})
+_GPU_OVERLAY_TRACKS = {
+    "gpu_user_annotation": ("annotations", -10),
+    "gpu_roofline_annotation": ("Roofline", -20),
+}
+_GPU_OVERLAY_CATEGORIES = frozenset(_GPU_OVERLAY_TRACKS)
 _GRAPH_ANNOTATION_MARKER = "transformer_nuggets.graph_annotation"
 _GRAPH_ANNOTATION_SOURCE = "transformer_nuggets.graph_annotation_source"
 
@@ -359,7 +364,7 @@ class _NativeGpuTraceEvent:
     clock_id: int
 
 
-def _native_track_uuid(track: tuple[str, str, str, str]) -> int:
+def _native_track_uuid(track: tuple[Any, ...]) -> int:
     """Return a stable nonzero TrackEvent UUID for a native GPU annotation track."""
     value = int.from_bytes(hashlib.blake2b(repr(track).encode(), digest_size=8).digest(), "little")
     return (value & ((1 << 63) - 1)) or 1
@@ -411,7 +416,10 @@ def add_cuda_graph_annotation_tracks_to_native_trace(payload: bytes) -> bytes:
         return payload
     if any(
         packet.HasField("track_descriptor")
-        and packet.track_descriptor.name.startswith("GPU annotations stream ")
+        and (
+            packet.track_descriptor.name == "annotations"
+            or packet.track_descriptor.name.startswith("annotations overlap")
+        )
         for packet in trace.packet
     ):
         return payload
@@ -464,26 +472,63 @@ def add_cuda_graph_annotation_tracks_to_native_trace(payload: bytes) -> bytes:
     if not slices:
         return payload
 
-    for track in sorted({track for track, *_ in slices}):
-        descriptor_packet = trace.packet.add()
-        descriptor_packet.timestamp = 0
-        descriptor = descriptor_packet.track_descriptor
-        descriptor.uuid = _native_track_uuid(track)
-        descriptor.name = f"GPU annotations stream {track[2]}"
-        descriptor.sibling_order_rank = -10
-
-    markers = []
+    process_uuids = {
+        str(packet.track_descriptor.process.pid): packet.track_descriptor.uuid
+        for packet in trace.packet
+        if packet.HasField("track_descriptor") and packet.track_descriptor.HasField("process")
+    }
+    slices_by_process: dict[
+        tuple[str, int], list[tuple[int, tuple[str, str, str, str], str, int, int, int]]
+    ] = defaultdict(list)
     for index, (track, name, start, end, clock_id) in enumerate(slices):
-        markers.append((start, 1, index, track, name, clock_id))
-        markers.append((end, 0, index, track, name, clock_id))
-    for timestamp, begin_rank, _index, track, name, clock_id in sorted(markers):
+        slices_by_process[(track[0], clock_id)].append((index, track, name, start, end, clock_id))
+
+    assigned_slices: list[tuple[int, str, int, int, int, int]] = []
+    lane_counts: dict[tuple[str, int], int] = {}
+    for process_key, process_slices in slices_by_process.items():
+        lane_end_times: list[int] = []
+        for index, _track, name, start, end, clock_id in sorted(
+            process_slices, key=lambda item: (item[3], item[4], item[0])
+        ):
+            lane = next(
+                (lane for lane, lane_end in enumerate(lane_end_times) if start >= lane_end),
+                len(lane_end_times),
+            )
+            if lane == len(lane_end_times):
+                lane_end_times.append(end)
+            else:
+                lane_end_times[lane] = end
+            assigned_slices.append((index, name, start, end, clock_id, lane))
+        lane_counts[process_key] = len(lane_end_times)
+
+    for (process_id, clock_id), lane_count in sorted(lane_counts.items()):
+        for lane in range(lane_count):
+            descriptor_packet = trace.packet.add()
+            descriptor_packet.timestamp = 0
+            descriptor = descriptor_packet.track_descriptor
+            descriptor.uuid = _native_track_uuid(("annotations", process_id, clock_id, lane))
+            descriptor.name = _overlap_lane_name("annotations", lane)
+            descriptor.parent_uuid = process_uuids.get(process_id, 0)
+            descriptor.sibling_order_rank = -10 + lane
+
+    process_by_slice = {
+        index: (track[0], clock_id)
+        for index, (track, _name, _start, _end, clock_id) in enumerate(slices)
+    }
+    markers = []
+    for index, name, start, end, clock_id, lane in assigned_slices:
+        process_id, process_clock_id = process_by_slice[index]
+        track_uuid = _native_track_uuid(("annotations", process_id, process_clock_id, lane))
+        markers.append((start, 1, index, track_uuid, name, clock_id))
+        markers.append((end, 0, index, track_uuid, name, clock_id))
+    for timestamp, begin_rank, _index, track_uuid, name, clock_id in sorted(markers):
         packet = trace.packet.add()
         packet.timestamp = timestamp
         if clock_id:
             packet.timestamp_clock_id = clock_id
         packet.trusted_packet_sequence_id = 2001
         event = packet.track_event
-        event.track_uuid = _native_track_uuid(track)
+        event.track_uuid = track_uuid
         if begin_rank:
             event.type = TrackEvent.TYPE_SLICE_BEGIN
             event.name = name
@@ -541,6 +586,105 @@ def _assign_lanes(slices: list[_Slice]) -> dict[int, int]:
         assignments[slc.index] = lane
 
     return assignments
+
+
+def separate_gpu_annotation_slices(trace: dict[str, Any]) -> dict[str, Any]:
+    """Move GPU overlays to process-level annotation tracks without dropping events."""
+    events = list(trace.get("traceEvents", []))
+    thread_names: dict[tuple[Any, Any], str] = {}
+    sort_indices: dict[tuple[Any, Any], int] = {}
+    for event in events:
+        if event.get("ph") != "M":
+            continue
+        key = (event.get("pid", 0), event.get("tid", 0))
+        if event.get("name") == "thread_name":
+            thread_names[key] = event.get("args", {}).get("name", f"track {key[1]}")
+        elif event.get("name") == "thread_sort_index":
+            sort_indices[key] = int(event.get("args", {}).get("sort_index", 0) or 0)
+
+    overlays: dict[tuple[Any, str], list[_Slice]] = defaultdict(list)
+    for index, event in enumerate(events):
+        category = event.get("cat")
+        if event.get("ph") != "X" or category not in _GPU_OVERLAY_CATEGORIES:
+            continue
+        duration = float(event.get("dur", 0) or 0)
+        if duration <= 0:
+            continue
+        overlays[(event.get("pid", 0), category)].append(
+            _Slice(
+                event=event,
+                index=index,
+                ts=float(event.get("ts", 0) or 0),
+                dur=duration,
+            )
+        )
+
+    if not overlays:
+        return trace.copy()
+
+    allocate_tids = _make_tid_allocator(events)
+    remapped_tids: dict[int, Any] = {}
+    metadata: list[dict[str, Any]] = []
+    for (pid, category), slices in overlays.items():
+        slices.sort(key=lambda item: (item.ts, item.end_ts, item.index))
+        assignments = _assign_lanes(slices)
+        lane_count = max(assignments.values(), default=0) + 1
+        lane_tids = allocate_tids(pid, f"transformer_nuggets:{category}", lane_count)
+        label, sort_bias = _GPU_OVERLAY_TRACKS[category]
+        source_sort_indices = [
+            sort_indices.get(
+                (pid, item.event.get("tid", 0)),
+                _sort_index(item.event.get("tid", 0), 0),
+            )
+            for item in slices
+        ]
+        sort_base = min(source_sort_indices, default=0) + sort_bias
+        first_timestamp = min((item.ts for item in slices), default=0.0)
+        for lane, tid in lane_tids.items():
+            metadata.extend(
+                [
+                    {
+                        "ph": "M",
+                        "name": "thread_name",
+                        "pid": pid,
+                        "tid": tid,
+                        "ts": first_timestamp,
+                        "args": {"name": _overlap_lane_name(label, lane)},
+                    },
+                    {
+                        "ph": "M",
+                        "name": "thread_sort_index",
+                        "pid": pid,
+                        "tid": tid,
+                        "ts": first_timestamp,
+                        "args": {"sort_index": sort_base + lane},
+                    },
+                ]
+            )
+        for item in slices:
+            remapped_tids[item.index] = lane_tids[assignments[item.index]]
+
+    processed_events: list[dict[str, Any]] = []
+    for index, event in enumerate(events):
+        if index not in remapped_tids:
+            processed_events.append(event)
+            continue
+        processed = event.copy()
+        args = dict(processed.get("args", {}))
+        source_tid = processed.get("tid", 0)
+        args.setdefault("transformer_nuggets.annotation_category", processed.get("cat"))
+        args.setdefault("transformer_nuggets.annotation_source_tid", source_tid)
+        source_name = thread_names.get((processed.get("pid", 0), source_tid))
+        if source_name is not None:
+            args.setdefault("transformer_nuggets.annotation_source_track", source_name)
+        processed["args"] = args
+        processed["cat"] = "annotation"
+        processed["tid"] = remapped_tids[index]
+        processed_events.append(processed)
+
+    processed = trace.copy()
+    processed["traceEvents"] = [*processed_events, *metadata]
+    return processed
 
 
 def _stable_string_sort_index(value: Any, lane: int) -> int:
@@ -609,6 +753,16 @@ def _compile_pattern(pattern: str | Pattern[str] | None) -> Pattern[str] | None:
     return re.compile(pattern)
 
 
+def _overlap_lane_name(track_name: str, lane: int) -> str:
+    """Name the primary stream plainly and only suffix true overlap lanes."""
+    name = track_name.rstrip()
+    if lane == 0:
+        return name
+    if lane == 1:
+        return f"{name} overlap"
+    return f"{name} overlap {lane}"
+
+
 def split_overlapping_slices(
     trace: dict[str, Any],
     *,
@@ -619,8 +773,10 @@ def split_overlapping_slices(
     Perfetto does not render overlapping duration slices on one track reliably;
     for CUDA streams this can produce confusing empty-looking rows or hidden
     slices. This helper keeps non-overlapping tracks unchanged and, only for
-    tracks that actually overlap, remaps their duration slices to adjacent tids
-    named ``"<original name> #0"``, ``"<original name> #1"``, ...
+    tracks that actually overlap, keeps lane zero under the original name and
+    names additional tids ``"<original name> overlap"``,
+    ``"<original name> overlap 2"``, ... GPU annotation overlays are excluded;
+    their independent lane assignment is handled by the annotation post-pass.
 
     Args:
         trace: Chrome/Perfetto trace dictionary.
@@ -642,7 +798,7 @@ def split_overlapping_slices(
 
     track_slices: dict[tuple[Any, Any], list[_Slice]] = defaultdict(list)
     for idx, event in enumerate(events):
-        if event.get("ph") != "X":
+        if event.get("ph") != "X" or event.get("cat") in _GPU_OVERLAY_CATEGORIES:
             continue
         dur = float(event.get("dur", 0) or 0)
         if dur <= 0:
@@ -692,7 +848,7 @@ def split_overlapping_slices(
         metadata_needed[(pid, original_tid, lane)] = {
             "pid": pid,
             "tid": new_tid,
-            "name": f"{original_name.rstrip()} #{lane}",
+            "name": _overlap_lane_name(original_name, lane),
             "sort_index": _sort_index(original_tid, lane),
             "ts": event.get("ts", 0),
         }
@@ -722,7 +878,7 @@ def split_overlapping_slices(
                 new_event["tid"] = tid_mappings[(pid, tid, 0)]
                 if event.get("name") == "thread_name":
                     original_name = original_names.get((pid, tid), f"track {tid}")
-                    new_event["args"] = {"name": f"{original_name.rstrip()} #0"}
+                    new_event["args"] = {"name": _overlap_lane_name(original_name, 0)}
         else:
             pid = event.get("pid", 0)
             tid = event.get("tid", 0)
@@ -802,16 +958,23 @@ def _reassign_sort_indices(
         elif event.get("name") == "thread_sort_index":
             sort_indices[key] = int(event.get("args", {}).get("sort_index", 0) or 0)
 
-    lane_re = re.compile(r"^(.*?)\s+#(\d+)$")
+    overlap_re = re.compile(r"^(.*?) overlap(?: (\d+))?$")
+    overlap_bases = {
+        (key[0], match.group(1))
+        for key, name in thread_names.items()
+        if (match := overlap_re.match(name))
+    }
     groups: dict[str, list[tuple[tuple[Any, Any], int, int]]] = defaultdict(list)
     singles: list[tuple[tuple[Any, Any], int]] = []
 
     for key, name in thread_names.items():
-        match = lane_re.match(name)
+        match = overlap_re.match(name)
         if match:
-            base = f"{key[0]}:{match.group(1)}"
-            lane = int(match.group(2))
-            groups[base].append((key, lane, sort_indices.get(key, 0)))
+            base_name = match.group(1)
+            lane = int(match.group(2) or 1)
+            groups[f"{key[0]}:{base_name}"].append((key, lane, sort_indices.get(key, 0)))
+        elif (key[0], name) in overlap_bases:
+            groups[f"{key[0]}:{name}"].append((key, 0, sort_indices.get(key, 0)))
         elif track_pattern is None or track_pattern.search(name):
             singles.append((key, sort_indices.get(key, 0)))
 
@@ -899,6 +1062,7 @@ def write_perfetto_trace(
         raise ValueError(f"Unsupported trace_format: {trace_format!r}")
 
     path = default_trace_path(path, gzip_by_default=gzip_trace)
+    trace = separate_gpu_annotation_slices(trace)
     if split_overlaps:
         trace = split_overlapping_slices(trace, track_pattern=track_pattern)
     write_trace(path, trace)

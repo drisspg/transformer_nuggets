@@ -9,6 +9,7 @@ from transformer_nuggets.utils.perfetto import (
     default_trace_path,
     default_track_event_path,
     read_trace,
+    separate_gpu_annotation_slices,
     split_overlapping_slices,
     write_trace,
 )
@@ -269,6 +270,10 @@ def test_native_cuda_graph_annotation_tracks_preserve_gpu_packets():
     from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import Trace, TrackEvent
 
     trace = Trace()
+    process_packet = trace.packet.add()
+    process_packet.track_descriptor.uuid = 999
+    process_packet.track_descriptor.process.pid = 123
+    process_packet.track_descriptor.process.process_name = "python"
     for timestamp, annotation in [(100, "attention"), (110, "attention"), (120, None)]:
         packet = trace.packet.add()
         packet.timestamp = timestamp
@@ -292,18 +297,24 @@ def test_native_cuda_graph_annotation_tracks_preserve_gpu_packets():
             item.name = name
             item.value = value
 
+    original_packets = [packet.SerializeToString() for packet in trace.packet]
     output = add_cuda_graph_annotation_tracks_to_native_trace(
         gzip.compress(trace.SerializeToString())
     )
     processed = Trace()
     processed.ParseFromString(gzip.decompress(output))
 
+    assert [
+        packet.SerializeToString() for packet in processed.packet[: len(original_packets)]
+    ] == (original_packets)
     assert sum(packet.HasField("gpu_render_stage_event") for packet in processed.packet) == 3
-    assert any(
-        packet.HasField("track_descriptor")
-        and packet.track_descriptor.name == "GPU annotations stream 7"
+    annotation_descriptors = [
+        packet.track_descriptor
         for packet in processed.packet
-    )
+        if packet.HasField("track_descriptor") and packet.track_descriptor.name == "annotations"
+    ]
+    assert len(annotation_descriptors) == 1
+    assert annotation_descriptors[0].parent_uuid == 999
     annotation_events = [
         packet.track_event for packet in processed.packet if packet.HasField("track_event")
     ]
@@ -312,6 +323,59 @@ def test_native_cuda_graph_annotation_tracks_preserve_gpu_packets():
         TrackEvent.TYPE_SLICE_END,
     ]
     assert annotation_events[0].name == "attention"
+
+
+def test_native_annotation_tracks_merge_streams_and_split_overlaps():
+    from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import Trace, TrackEvent
+
+    trace = Trace()
+    process_packet = trace.packet.add()
+    process_packet.track_descriptor.uuid = 999
+    process_packet.track_descriptor.process.pid = 123
+    for timestamp, duration, stream, name in [
+        (100, 20, "7", "attention"),
+        (105, 10, "8", "optimizer"),
+    ]:
+        packet = trace.packet.add()
+        packet.timestamp = timestamp
+        packet.timestamp_clock_id = 6
+        event = packet.gpu_render_stage_event
+        event.duration = duration
+        event.event_id = timestamp
+        event.gpu_id = 0
+        event.hw_queue_iid = int(stream)
+        for key, value in {
+            "process_id": "123",
+            "device id": "0",
+            "stream id": stream,
+            "graph id": "2",
+            "correlation": stream,
+            "name": name,
+        }.items():
+            item = event.extra_data.add()
+            item.name = key
+            item.value = value
+
+    processed = Trace()
+    processed.ParseFromString(
+        add_cuda_graph_annotation_tracks_to_native_trace(trace.SerializeToString())
+    )
+    names_by_uuid = {
+        packet.track_descriptor.uuid: packet.track_descriptor.name
+        for packet in processed.packet
+        if packet.HasField("track_descriptor") and packet.track_descriptor.name
+    }
+    annotation_tracks = {
+        packet.track_event.name: names_by_uuid[packet.track_event.track_uuid]
+        for packet in processed.packet
+        if packet.HasField("track_event")
+        and packet.track_event.type == TrackEvent.TYPE_SLICE_BEGIN
+    }
+
+    assert annotation_tracks == {
+        "attention": "annotations",
+        "optimizer": "annotations overlap",
+    }
 
 
 def test_native_annotation_tracks_require_graph_identity_and_label_backward():
@@ -456,8 +520,151 @@ def test_split_overlapping_slices_creates_adjacent_lanes():
         for event in fixed["traceEvents"]
         if event.get("ph") == "M" and event.get("name") == "thread_name"
     }
-    assert thread_names[700] == "stream 7 #0"
-    assert thread_names[701] == "stream 7 #1"
+    assert thread_names[700] == "stream 7"
+    assert thread_names[701] == "stream 7 overlap"
+
+
+def test_split_overlapping_slices_ignores_gpu_annotation_spans():
+    trace = {
+        "traceEvents": [
+            {
+                "ph": "M",
+                "name": "thread_name",
+                "pid": 0,
+                "tid": 7,
+                "args": {"name": "stream 7"},
+            },
+            {"ph": "X", "cat": "kernel", "name": "a", "pid": 0, "tid": 7, "ts": 0, "dur": 10},
+            {"ph": "X", "cat": "kernel", "name": "b", "pid": 0, "tid": 7, "ts": 5, "dur": 10},
+            {
+                "ph": "X",
+                "cat": "gpu_user_annotation",
+                "name": "attention",
+                "pid": 0,
+                "tid": 7,
+                "ts": 0,
+                "dur": 15,
+            },
+        ]
+    }
+
+    fixed = split_overlapping_slices(trace, track_pattern="stream.*")
+    thread_names = {
+        event["tid"]: event["args"]["name"]
+        for event in fixed["traceEvents"]
+        if event.get("ph") == "M" and event.get("name") == "thread_name"
+    }
+    annotations = [
+        event for event in fixed["traceEvents"] if event.get("cat") == "gpu_user_annotation"
+    ]
+
+    assert set(thread_names.values()) == {"stream 7", "stream 7 overlap"}
+    assert annotations[0]["tid"] == 700
+
+
+def test_gpu_annotations_are_aggregated_without_dropping_source_metadata():
+    trace = {
+        "traceEvents": [
+            {
+                "ph": "M",
+                "name": "thread_name",
+                "pid": 0,
+                "tid": 7,
+                "args": {"name": "stream 7"},
+            },
+            {
+                "ph": "M",
+                "name": "thread_name",
+                "pid": 0,
+                "tid": 8,
+                "args": {"name": "stream 8"},
+            },
+            {
+                "ph": "X",
+                "cat": "gpu_user_annotation",
+                "name": "attention",
+                "pid": 0,
+                "tid": 7,
+                "ts": 0,
+                "dur": 10,
+                "args": {"detail": "left"},
+            },
+            {
+                "ph": "X",
+                "cat": "gpu_user_annotation",
+                "name": "optimizer",
+                "pid": 0,
+                "tid": 8,
+                "ts": 5,
+                "dur": 10,
+                "args": {"detail": "right"},
+            },
+        ]
+    }
+
+    processed = separate_gpu_annotation_slices(trace)
+    thread_names = {
+        event["tid"]: event["args"]["name"]
+        for event in processed["traceEvents"]
+        if event.get("ph") == "M" and event.get("name") == "thread_name"
+    }
+    annotations = [event for event in processed["traceEvents"] if event.get("cat") == "annotation"]
+
+    assert {thread_names[event["tid"]] for event in annotations} == {
+        "annotations",
+        "annotations overlap",
+    }
+    assert {event["name"] for event in annotations} == {"attention", "optimizer"}
+    assert {event["args"]["detail"] for event in annotations} == {"left", "right"}
+    assert {
+        event["args"]["transformer_nuggets.annotation_source_tid"] for event in annotations
+    } == {
+        7,
+        8,
+    }
+
+
+def test_overlap_lane_sort_indices_stay_adjacent():
+    trace = {
+        "traceEvents": [
+            {"ph": "M", "name": "thread_name", "pid": 0, "tid": 7, "args": {"name": "stream 7"}},
+            {
+                "ph": "M",
+                "name": "thread_sort_index",
+                "pid": 0,
+                "tid": 7,
+                "args": {"sort_index": 10},
+            },
+            {"ph": "M", "name": "thread_name", "pid": 0, "tid": 8, "args": {"name": "stream 8"}},
+            {
+                "ph": "M",
+                "name": "thread_sort_index",
+                "pid": 0,
+                "tid": 8,
+                "args": {"sort_index": 11},
+            },
+            {"ph": "X", "name": "a", "pid": 0, "tid": 7, "ts": 0, "dur": 10},
+            {"ph": "X", "name": "b", "pid": 0, "tid": 7, "ts": 5, "dur": 10},
+            {"ph": "X", "name": "c", "pid": 0, "tid": 8, "ts": 0, "dur": 10},
+        ]
+    }
+
+    fixed = split_overlapping_slices(trace, track_pattern="stream.*")
+    names = {
+        event["tid"]: event["args"]["name"]
+        for event in fixed["traceEvents"]
+        if event.get("ph") == "M" and event.get("name") == "thread_name"
+    }
+    sort_indices = {
+        event["tid"]: event["args"]["sort_index"]
+        for event in fixed["traceEvents"]
+        if event.get("ph") == "M" and event.get("name") == "thread_sort_index"
+    }
+    ordered_names = [
+        name for tid, name in sorted(names.items(), key=lambda item: sort_indices[item[0]])
+    ]
+
+    assert ordered_names == ["stream 7", "stream 7 overlap", "stream 8"]
 
 
 def test_split_overlapping_slices_leaves_non_overlapping_tracks_unchanged():
@@ -600,12 +807,13 @@ def test_track_event_conversion_preserves_instants_counters_and_warns_on_unsuppo
     assert TrackEvent.TYPE_COUNTER in event_types
 
 
-def test_track_event_conversion_puts_gpu_annotations_on_separate_track():
+def test_track_event_conversion_splits_annotation_overlaps_from_gpu_work():
     from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import Trace, TrackEvent
 
     trace = {
         "traceEvents": [
             {"ph": "M", "name": "thread_name", "pid": 0, "tid": 7, "args": {"name": "stream 7"}},
+            {"ph": "M", "name": "thread_name", "pid": 0, "tid": 8, "args": {"name": "stream 8"}},
             {"ph": "X", "cat": "kernel", "name": "kernel", "pid": 0, "tid": 7, "ts": 0, "dur": 10},
             {
                 "ph": "X",
@@ -614,6 +822,15 @@ def test_track_event_conversion_puts_gpu_annotations_on_separate_track():
                 "pid": 0,
                 "tid": 7,
                 "ts": 0,
+                "dur": 10,
+            },
+            {
+                "ph": "X",
+                "cat": "gpu_user_annotation",
+                "name": "burst_1",
+                "pid": 0,
+                "tid": 8,
+                "ts": 5,
                 "dur": 10,
             },
             {
@@ -643,7 +860,8 @@ def test_track_event_conversion_puts_gpu_annotations_on_separate_track():
     }
 
     assert event_tracks["kernel"] == "stream 7"
-    assert event_tracks["burst_0"] == "GPU annotations stream 7"
+    assert event_tracks["burst_0"] == "annotations"
+    assert event_tracks["burst_1"] == "annotations overlap"
     assert event_tracks["roofline_0"] == "Roofline stream 7"
 
 
@@ -711,8 +929,9 @@ def test_track_event_conversion_splits_crossing_slices_and_keeps_nested_slices()
     event_tracks = {event.name: names_by_uuid[event.track_uuid] for event in begin_events}
     event_track_uuids = {event.name: event.track_uuid for event in begin_events}
 
-    assert set(names_by_uuid.values()) >= {"stream 1"}
-    assert event_tracks["outer"] == event_tracks["inner"] == event_tracks["crossing"] == "stream 1"
+    assert set(names_by_uuid.values()) >= {"stream 1", "stream 1 overlap"}
+    assert event_tracks["outer"] == event_tracks["inner"] == "stream 1"
+    assert event_tracks["crossing"] == "stream 1 overlap"
     assert event_track_uuids["outer"] == event_track_uuids["inner"]
     assert event_track_uuids["crossing"] != event_track_uuids["outer"]
 

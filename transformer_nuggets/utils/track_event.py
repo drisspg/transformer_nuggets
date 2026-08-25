@@ -248,7 +248,7 @@ def _event_args(event: TraceDict) -> dict[str, Any]:
 
 
 _GPU_ANNOTATION_TRACKS = {
-    "gpu_user_annotation": ("GPU annotations", -10),
+    "gpu_user_annotation": ("annotations", -10),
     "gpu_roofline_annotation": ("Roofline", -20),
 }
 
@@ -267,14 +267,15 @@ def _event_track(
         return base_track
 
     label, sort_bias = track_config
-    key = (base_track.key, category)
+    annotation_key = (pid, category) if category == "gpu_user_annotation" else base_track.key
+    key = (annotation_key, category)
     annotation_track = annotation_track_cache.get(key)
     if annotation_track is not None:
         return annotation_track
     annotation_track = ChromeTrack(
         pid=pid,
-        tid=f"{tid}:{category}",
-        name=f"{label} {base_track.name}",
+        tid=category if category == "gpu_user_annotation" else f"{tid}:{category}",
+        name=label if category == "gpu_user_annotation" else f"{label} {base_track.name}",
         sort_index=base_track.sort_index,
         sort_bias=sort_bias,
     )
@@ -576,9 +577,12 @@ def assign_trackevent_lanes(
         slices_by_track[slc.track.key].append(slc)
 
     lane_by_index: dict[int, int] = {}
-    for _track_key, slices in slices_by_track.items():
+    for slices in slices_by_track.values():
         track_name = slices[0].track.name
-        should_split = split_overlaps and (pattern is None or pattern.search(track_name))
+        is_annotation_track = track_name == "annotations" or track_name.endswith(" · annotations")
+        should_split = split_overlaps and (
+            is_annotation_track or pattern is None or pattern.search(track_name)
+        )
         assignments = (
             _assign_nesting_lanes(slices) if should_split else {slc.index: 0 for slc in slices}
         )
@@ -721,6 +725,15 @@ def _define_process_tracks(
     return process_uuids
 
 
+def _overlap_track_name(track_name: str, lane: int) -> str:
+    """Keep the primary track name and label only additional overlap lanes."""
+    if lane == 0:
+        return track_name
+    if lane == 1:
+        return f"{track_name} overlap"
+    return f"{track_name} overlap {lane}"
+
+
 def _define_duration_tracks(
     builder: Any,
     trace: AssignedTrace,
@@ -740,7 +753,7 @@ def _define_duration_tracks(
             desc = packet.track_descriptor
             desc.uuid = track_uuid
             desc.parent_uuid = process_uuids[track.pid]
-            desc.name = track.name
+            desc.name = _overlap_track_name(track.name, lane)
             desc.sibling_order_rank = track.sort_index * 100 + track.sort_bias + lane
             if lane_count > 1:
                 desc.sibling_merge_behavior = (
