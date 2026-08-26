@@ -50,18 +50,30 @@ def merge_traces(
         ts_offset = _get_min_ts(events) if align_timestamps else 0.0
         label = labels[idx] if labels else f"Rank {idx}"
 
-        merged_events.append(
-            {
-                "ph": "M",
-                "name": "process_name",
-                "pid": idx,
-                "tid": 0,
-                "args": {"name": label},
-            }
+        merged_events.extend(
+            [
+                {
+                    "ph": "M",
+                    "name": "process_name",
+                    "pid": idx,
+                    "tid": 0,
+                    "args": {"name": label},
+                },
+                {
+                    "ph": "M",
+                    "name": "process_sort_index",
+                    "pid": idx,
+                    "tid": 0,
+                    "args": {"sort_index": idx},
+                },
+            ]
         )
 
         for ev in events:
-            if ev.get("ph") == "M" and ev.get("name") == "process_name":
+            if ev.get("ph") == "M" and ev.get("name") in {
+                "process_name",
+                "process_sort_index",
+            }:
                 continue
             ev["pid"] = idx
             if align_timestamps and "ts" in ev:

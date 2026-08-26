@@ -983,7 +983,16 @@ def test_merge_traces_writes_native_pftrace(tmp_path):
     inputs = []
     for idx in range(2):
         path = tmp_path / f"rank{idx}.json"
-        events = [{"ph": "X", "name": f"op{idx}", "pid": 7, "tid": 3, "ts": 100 + idx, "dur": 5}]
+        events = [
+            {
+                "ph": "M",
+                "name": "process_sort_index",
+                "pid": 7,
+                "tid": 0,
+                "args": {"sort_index": 100 + idx},
+            },
+            {"ph": "X", "name": f"op{idx}", "pid": 7, "tid": 3, "ts": 100 + idx, "dur": 5},
+        ]
         path.write_text(json.dumps({"traceEvents": events}))
         inputs.append(str(path))
 
@@ -992,12 +1001,12 @@ def test_merge_traces_writes_native_pftrace(tmp_path):
 
     trace = Trace()
     trace.ParseFromString(output.read_bytes())
-    process_names = {
-        p.track_descriptor.process.process_name
+    process_ranks = {
+        p.track_descriptor.process.process_name: p.track_descriptor.sibling_order_rank
         for p in trace.packet
         if p.HasField("track_descriptor") and p.track_descriptor.HasField("process")
     }
-    assert {"impl a", "impl b"} <= process_names
+    assert process_ranks["impl a"] < process_ranks["impl b"]
     slice_names = {
         p.track_event.name
         for p in trace.packet
