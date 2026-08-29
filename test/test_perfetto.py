@@ -1013,3 +1013,79 @@ def test_merge_traces_writes_native_pftrace(tmp_path):
         if p.HasField("track_event") and p.track_event.name
     }
     assert {"op0", "op1"} <= slice_names
+
+
+def test_merge_traces_accepts_native_pftrace_inputs(tmp_path):
+    from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import Trace
+
+    from transformer_nuggets.utils.merge_traces import merge_traces
+    from transformer_nuggets.utils.track_event import write_track_event_trace
+
+    inputs = []
+    for index in range(2):
+        path = tmp_path / f"rank{index}.pftrace"
+        write_track_event_trace(
+            path,
+            {
+                "traceEvents": [
+                    {
+                        "ph": "M",
+                        "name": "process_name",
+                        "pid": 7,
+                        "tid": 0,
+                        "args": {"name": "worker"},
+                    },
+                    {
+                        "ph": "X",
+                        "name": f"op{index}",
+                        "pid": 7,
+                        "tid": 3,
+                        "ts": 100 + index,
+                        "dur": 5,
+                    },
+                ]
+            },
+        )
+        inputs.append(str(path))
+
+    output = tmp_path / "merged.pftrace"
+    merge_traces(inputs, str(output), labels=["rank 0", "rank 1"])
+
+    trace = Trace()
+    trace.ParseFromString(output.read_bytes())
+    descriptor_uuids = [
+        packet.track_descriptor.uuid
+        for packet in trace.packet
+        if packet.HasField("track_descriptor")
+    ]
+    assert len(descriptor_uuids) == len(set(descriptor_uuids))
+    process_names = {
+        packet.track_descriptor.process.process_name
+        for packet in trace.packet
+        if packet.HasField("track_descriptor") and packet.track_descriptor.HasField("process")
+    }
+    assert any(name.startswith("rank 0") for name in process_names)
+    assert any(name.startswith("rank 1") for name in process_names)
+    slice_names = {
+        packet.track_event.name
+        for packet in trace.packet
+        if packet.HasField("track_event") and packet.track_event.name
+    }
+    assert {"op0", "op1"} <= slice_names
+    sequence_ids = {
+        packet.trusted_packet_sequence_id
+        for packet in trace.packet
+        if packet.HasField("track_event")
+    }
+    assert len(sequence_ids) == 2
+
+
+def test_merge_traces_rejects_native_input_with_json_output(tmp_path):
+    from transformer_nuggets.utils.merge_traces import merge_traces
+    from transformer_nuggets.utils.track_event import write_track_event_trace
+
+    input_path = tmp_path / "rank0.pftrace"
+    write_track_event_trace(input_path, {"traceEvents": []})
+
+    with pytest.raises(ValueError, match="native Perfetto inputs require"):
+        merge_traces([str(input_path)], str(tmp_path / "merged.json"))
