@@ -39,6 +39,7 @@ pip install -e .
 Optional extras:
 
 ```shell
+pip install "transformer_nuggets[cute]"        # CuTeDSL + TVM-FFI kernels
 pip install "transformer_nuggets[llama]"       # llama training utilities
 pip install "transformer_nuggets[huggingface]" # Hugging Face profiling example
 ```

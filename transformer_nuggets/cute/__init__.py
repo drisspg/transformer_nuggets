@@ -9,7 +9,17 @@ from transformer_nuggets.cute.cache import (
 )
 from transformer_nuggets.cute.base import CuteOp
 from transformer_nuggets.cute.element_wise import ElementwiseOp, elementwise_op
-from transformer_nuggets.cute.utils import visualize_tv_layout
+from transformer_nuggets.cute.utils import (
+    TMA_ALIGNMENT_BYTES,
+    compile_tvm_ffi,
+    get_device_properties,
+    make_fake_compact_tensor,
+    make_fake_strided_tensor,
+    requires_int64_abi,
+    tensor_supports_contiguous_dim,
+    tensor_supports_tma,
+    visualize_tv_layout,
+)
 from transformer_nuggets.cute import profiler
 from transformer_nuggets.cute.blockscaled_tma import (
     DEFAULT_PERSISTENT_CTAS_PER_SM,

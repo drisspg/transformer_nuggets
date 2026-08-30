@@ -48,6 +48,11 @@ cupti-monitor = [
     "cupti-python>=13.3",
 ]
 
+cute = [
+    "nvidia-cutlass-dsl[cu13]>=4.5.0",
+    "apache-tvm-ffi>=0.1.12",
+]
+
 huggingface = [
     "transformers",
 ]

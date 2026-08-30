@@ -8,7 +8,7 @@ from cuda.bindings import driver as cuda
 from transformer_nuggets.cute.base import CuteOp
 from transformer_nuggets.cute.cache import compile_tvm_ffi_and_cache
 from transformer_nuggets.cute.utils import (
-    fake_stream,
+    get_tensor_alignment,
     make_fake_compact_tensor,
     torch_dtype_to_cute_dtype,
 )
@@ -110,6 +110,7 @@ class ToBlocked(CuteOp):
         output_blocked = cute.make_tensor(output.iterator, block_scale_layout)
         gO_blocked = cute.zipped_divide(output_blocked, tiler_mn)
 
+        self.kernel.set_name_prefix(self.get_name())
         self.kernel(
             gI,
             gO_blocked,
@@ -117,7 +118,6 @@ class ToBlocked(CuteOp):
             tv_layout_linear,
             linear_layout,
             smem_swizzle,
-            _name_prefix=self.get_name(),
         ).launch(
             grid=[cute.size(gI, mode=[1]), 1, 1],
             block=[cute.size(thread_layout), 1, 1],
@@ -125,22 +125,33 @@ class ToBlocked(CuteOp):
         )
 
     def interface(self, scales: torch.Tensor):
-        output = torch.empty_like(scales)
+        if scales.ndim != 2 or not scales.is_cuda or not scales.is_contiguous():
+            raise ValueError("scales must be a compact rank-2 CUDA tensor")
+        tile_extent = 4 * self.K_BLOCKS_PER_TB
+        if any(size % tile_extent for size in scales.shape):
+            raise ValueError(f"both scale dimensions must be divisible by {tile_extent}")
 
-        assumed_align = 512  # Scales are 128*4 byte aligned
-        # K dimension must be divisible by 4 * K_BLOCKS_PER_TB
-        k_divisibility = 4 * self.K_BLOCKS_PER_TB
+        output = torch.empty_like(scales)
+        assumed_align = min(
+            get_tensor_alignment(scales, dim=-1),
+            get_tensor_alignment(output, dim=-1),
+        )
+        k_divisibility = tile_extent
         dtype = torch_dtype_to_cute_dtype(scales.dtype)
-        m = cute.sym_int()
-        n = cute.sym_int()
+        m = cute.sym_int(divisibility=tile_extent)
+        n = cute.sym_int(divisibility=tile_extent)
         input_cute = make_fake_compact_tensor(dtype, (m, n), assumed_align=assumed_align)
         output_cute = make_fake_compact_tensor(dtype, (m, n), assumed_align=assumed_align)
+        dtype_name = str(scales.dtype).removeprefix("torch.")
         compiled = compile_tvm_ffi_and_cache(
             self,
-            f"{self.get_name()}_dtype={scales.dtype}_kdiv={k_divisibility}",
+            (
+                f"{self.get_name()}_dtype={scales.dtype}_kdiv={k_divisibility}"
+                f"_align={assumed_align}"
+            ),
             input_cute,
             output_cute,
-            fake_stream(),
+            name=f"{self.get_name()}_{dtype_name}_a{assumed_align}",
         )
         compiled(scales, output)
         return output.view(-1, 32, 16)

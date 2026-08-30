@@ -14,7 +14,6 @@ from transformer_nuggets.cute.cache import (
     set_cache_hashing,
 )
 from transformer_nuggets.cute.utils import (
-    fake_stream,
     get_tensor_alignment,
     make_fake_compact_tensor,
     torch_dtype_to_cute_dtype,
@@ -88,10 +87,16 @@ class DynamicElementwiseOp(CuteOp[[torch.Tensor, torch.Tensor], torch.Tensor]):
             f"dynamic_elementwise_{op_name}"
             f"_t{config.thr_m}x{config.thr_n}"
             f"_v{config.val_m}x{config.val_n}"
+            f"_o{config.order[0]}{config.order[1]}"
         )
 
-    def get_key(self, dtype: torch.dtype, config: DynamicElementwiseConfig) -> str:
-        return f"{self.get_name(config)}_dtype={dtype}_order={config.order}"
+    def get_key(
+        self,
+        dtype: torch.dtype,
+        config: DynamicElementwiseConfig,
+        assumed_align: int,
+    ) -> str:
+        return f"{self.get_name(config)}_dtype={dtype}_order={config.order}_align={assumed_align}"
 
     def _select_parameters(self, M: int, N: int) -> tuple[int, int, int, int]:
         """Choose parameters based on tensor size."""
@@ -102,6 +107,15 @@ class DynamicElementwiseOp(CuteOp[[torch.Tensor, torch.Tensor], torch.Tensor]):
             return 4, 32, 8, 8
 
     def interface(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        if a.ndim != 2 or b.shape != a.shape:
+            raise ValueError("a and b must be rank-2 tensors with the same shape")
+        if a.dtype != b.dtype:
+            raise TypeError("a and b must have the same dtype")
+        if a.device != b.device or not a.is_cuda:
+            raise ValueError("a and b must be CUDA tensors on the same device")
+        if not a.is_contiguous() or not b.is_contiguous():
+            raise ValueError("a and b must be compact tensors")
+
         M, N = a.shape
         c = torch.empty(M, N, device=a.device, dtype=a.dtype)
 
@@ -123,9 +137,10 @@ class DynamicElementwiseOp(CuteOp[[torch.Tensor, torch.Tensor], torch.Tensor]):
         fake_a = make_fake_compact_tensor(dtype, (m, n), assumed_align=assumed_align)
         fake_b = make_fake_compact_tensor(dtype, (m, n), assumed_align=assumed_align)
         fake_c = make_fake_compact_tensor(dtype, (m, n), assumed_align=assumed_align)
+        dtype_name = str(c.dtype).removeprefix("torch.")
         compiled = compile_tvm_ffi_and_cache(
             self,
-            self.get_key(c.dtype, config),
+            self.get_key(c.dtype, config, assumed_align),
             self.op,
             fake_a,
             fake_b,
@@ -135,7 +150,7 @@ class DynamicElementwiseOp(CuteOp[[torch.Tensor, torch.Tensor], torch.Tensor]):
             config.val_m,
             config.val_n,
             config.order,
-            fake_stream(),
+            name=f"{self.get_name(config)}_{dtype_name}_a{assumed_align}",
         )
         compiled(a, b, c)
         return c
@@ -166,7 +181,8 @@ class DynamicElementwiseOp(CuteOp[[torch.Tensor, torch.Tensor], torch.Tensor]):
 
         op_name = getattr(self.op, "__name__", str(self.op)).lower()
         kernel_name = f"dynamic_elementwise_{op_name}_t{thr_m}x{thr_n}_v{val_m}x{val_n}"
-        self.kernel(op, gA, gB, gC, cC, tv_layout, mC.shape, _name_prefix=kernel_name).launch(
+        self.kernel.set_name_prefix(kernel_name)
+        self.kernel(op, gA, gB, gC, cC, tv_layout, mC.shape).launch(
             grid=[cute.size(gC, mode=[1]), 1, 1],
             block=[cute.size(tv_layout, mode=[0]), 1, 1],
             stream=stream,

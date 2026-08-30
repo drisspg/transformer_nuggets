@@ -7,6 +7,8 @@ from collections.abc import Callable
 
 import cutlass.cute as cute
 
+from transformer_nuggets.cute.utils import compile_tvm_ffi
+
 
 logger = logging.getLogger(__name__)
 
@@ -70,18 +72,10 @@ def _generate_cache_key(*args, use_hashing: bool = False, **kwargs) -> str:
 
     for arg in args:
         if isinstance(arg, cute.Tensor):
-            # Get string representation and extract the shape:stride pattern
-            tensor_str = str(arg)
-            # Format is: Tensor<address@mem o (shape):(stride)>
-            # We want just the (shape):(stride) part
-            if " o " in tensor_str and ")>" in tensor_str:
-                # Extract everything after ' o ' and before '>'
-                inner_part = tensor_str.split(" o ")[1].rstrip(">")
-                # inner_part should be like "(?,?):(?,1)"
-                key_parts.append(f"tensor_{inner_part}_dtype={arg.element_type}")
-            else:
-                # Fallback if format is different
-                key_parts.append(f"tensor_shape={arg.shape}_dtype={arg.element_type}")
+            key_parts.append(
+                f"tensor_shape={arg.shape}_stride={arg.stride}_dtype={arg.element_type}"
+                f"_align={getattr(arg, '_assumed_align', None)}"
+            )
         elif hasattr(arg, "__name__"):
             key_parts.append(f"op={arg.__name__}")
         else:
@@ -97,15 +91,6 @@ def _generate_cache_key(*args, use_hashing: bool = False, **kwargs) -> str:
         return hashlib.sha256(key_str.encode()).hexdigest()
     else:
         return key_str
-
-
-def _with_tvm_ffi_options(kwargs: dict[str, Any]) -> dict[str, Any]:
-    options = kwargs.get("options")
-    if options is None:
-        kwargs["options"] = "--enable-tvm-ffi"
-    elif "--enable-tvm-ffi" not in str(options):
-        kwargs["options"] = f"{options} --enable-tvm-ffi"
-    return kwargs
 
 
 def compile_and_cache(func: Callable, cache_key: str, *args, **kwargs):
@@ -144,8 +129,28 @@ def compile_and_cache(func: Callable, cache_key: str, *args, **kwargs):
     return compiled_kernel
 
 
-def compile_tvm_ffi_and_cache(func: Callable, cache_key: str, *args, **kwargs):
-    return compile_and_cache(func, cache_key, *args, **_with_tvm_ffi_options(kwargs))
+def compile_tvm_ffi_and_cache(
+    func: Callable,
+    cache_key: str,
+    *args,
+    name: str | None = None,
+):
+    """Cache one canonical fake-tensor TVM-FFI compilation."""
+    if hasattr(func, "__call__") and hasattr(func, "get_key"):
+        func_name = func.__class__.__name__
+    else:
+        func_name = func.__name__
+    full_cache_key = f"{func_name}_{cache_key}"
+
+    compiled_kernel = _kernel_cache.get(full_cache_key)
+    if compiled_kernel is not None:
+        logger.debug(f"Cache hit for {func_name} (key: {full_cache_key})")
+        return compiled_kernel
+
+    logger.debug(f"Cache miss for {func_name} (key: {full_cache_key}) - Compiling...")
+    compiled_kernel = compile_tvm_ffi(func, *args, name=name)
+    _kernel_cache.set(full_cache_key, compiled_kernel)
+    return compiled_kernel
 
 
 def auto_compile_and_cache(func: Callable, *args, cache_extra=None, **kwargs):
@@ -190,10 +195,17 @@ def auto_compile_and_cache(func: Callable, *args, cache_extra=None, **kwargs):
     return compile_and_cache(jit_func, cache_key, *args, **kwargs)
 
 
-def auto_compile_tvm_ffi_and_cache(func: Callable, *args, cache_extra=None, **kwargs):
-    return auto_compile_and_cache(
-        func, *args, cache_extra=cache_extra, **_with_tvm_ffi_options(kwargs)
-    )
+def auto_compile_tvm_ffi_and_cache(
+    func: Callable,
+    *args,
+    cache_extra=None,
+    name: str | None = None,
+):
+    """Compile through TVM-FFI using the existing automatic in-memory cache key."""
+    cache_key = _generate_cache_key(*args, use_hashing=_kernel_cache._use_hashing)
+    if cache_extra is not None:
+        cache_key = f"{cache_key}_extra_{cache_extra}"
+    return compile_tvm_ffi_and_cache(func, cache_key, *args, name=name)
 
 
 def clear_cute_cache():

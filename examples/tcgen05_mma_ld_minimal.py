@@ -25,9 +25,10 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import const_expr
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass._mlir.dialects import llvm
+
+from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 
 
 @dsl_user_op
@@ -234,29 +235,33 @@ class MinimalTcgen05MmaLd:
 
         self.SharedStorage = SharedStorage
 
+    def get_name(self) -> str:
+        """Return the stable compile and kernel prefix."""
+        return "minimal_tcgen05_mma_ld"
+
     def __call__(self, a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
-        k = a.shape[1]
-        n = b.shape[0]
         assumed_align = 32
-        a_cute = (
-            from_dlpack(a, assumed_align=assumed_align)
-            .mark_layout_dynamic(leading_dim=1)
-            .mark_compact_shape_dynamic(mode=1, divisibility=k)
+        for name, tensor, shape in (
+            ("a", a, (128, 16)),
+            ("b", b, (128, 16)),
+            ("out", out, (128, 128)),
+        ):
+            if tensor.shape != shape or not tensor.is_cuda or not tensor.is_contiguous():
+                raise ValueError(f"{name} must be a compact CUDA tensor with shape {shape}")
+            if tensor.data_ptr() % assumed_align:
+                raise ValueError(f"{name} must be {assumed_align}-byte aligned")
+
+        compiled = compile_tvm_ffi(
+            self._launch,
+            make_fake_compact_tensor(self.io_dtype, a.shape, assumed_align=assumed_align),
+            make_fake_compact_tensor(self.io_dtype, b.shape, assumed_align=assumed_align),
+            make_fake_compact_tensor(self.io_dtype, out.shape, assumed_align=assumed_align),
+            name=self.get_name(),
         )
-        b_cute = (
-            from_dlpack(b, assumed_align=assumed_align)
-            .mark_layout_dynamic(leading_dim=1)
-            .mark_compact_shape_dynamic(mode=1, divisibility=k)
-        )
-        out_cute = (
-            from_dlpack(out, assumed_align=assumed_align)
-            .mark_layout_dynamic(leading_dim=1)
-            .mark_compact_shape_dynamic(mode=1, divisibility=n)
-        )
-        self._launch(a_cute, b_cute, out_cute)
+        compiled(a, b, out)
 
     @cute.jit
-    def _launch(self, a: cute.Tensor, b: cute.Tensor, out: cute.Tensor):
+    def _launch(self, a: cute.Tensor, b: cute.Tensor, out: cute.Tensor, stream):
         tiled_mma = cute.make_tiled_mma(self.mma_op)
         a_smem_layout = sm100_utils.make_smem_layout_a(
             tiled_mma,
@@ -289,6 +294,7 @@ class MinimalTcgen05MmaLd:
             tiled_mma,
         )
 
+        self.kernel.set_name_prefix(self.get_name())
         self.kernel(
             tiled_mma,
             tma_atom_a,
@@ -298,8 +304,11 @@ class MinimalTcgen05MmaLd:
             out,
             a_smem_layout,
             b_smem_layout,
-            _name_prefix="minimal_tcgen05_mma_ld",
-        ).launch(grid=(1, 1, 1), block=(self.threads_per_cta, 1, 1))
+        ).launch(
+            grid=(1, 1, 1),
+            block=(self.threads_per_cta, 1, 1),
+            stream=stream,
+        )
 
     @cute.kernel
     def kernel(

@@ -19,7 +19,10 @@ from transformer_nuggets.cute.blockscaled_tma import (
 )
 from transformer_nuggets.cute.cache import compile_tvm_ffi_and_cache
 from transformer_nuggets.cute.profiler import group_by_unit, profile_session
-from transformer_nuggets.cute.utils import fake_stream, make_fake_compact_tensor
+from transformer_nuggets.cute.utils import (
+    make_fake_compact_tensor,
+    tensor_supports_contiguous_dim,
+)
 
 
 MXFP8_TMA_PROFILE_TAGS = BLOCKSCALED_TMA_PROFILE_TAGS
@@ -236,8 +239,12 @@ class Mxfp8TmaGemv(BlockscaledTmaGemv):
                 raise ValueError(
                     f"{name} must have shape {expected_shape}, got {tuple(tensor.shape)}"
                 )
-            if not tensor.is_cuda or not tensor.is_contiguous():
-                raise ValueError(f"{name} must be a contiguous CUDA tensor")
+            if (
+                not tensor.is_cuda
+                or not tensor.is_contiguous()
+                or not tensor_supports_contiguous_dim(tensor, alignment_bytes=16)
+            ):
+                raise ValueError(f"{name} must be a compact 16-byte-aligned CUDA tensor")
 
         if self.block_scale_layout is BlockScaleLayout.RAW:
             expected_scale_shapes = {
@@ -262,8 +269,12 @@ class Mxfp8TmaGemv(BlockscaledTmaGemv):
                         f"{name} must contain {expected_scale_numels[name]} swizzled elements"
                     )
         for name, tensor in (("input_scale", input_scale), ("weight_scale", weight_scale)):
-            if not tensor.is_cuda or not tensor.is_contiguous():
-                raise ValueError(f"{name} must be a contiguous CUDA tensor")
+            if (
+                not tensor.is_cuda
+                or not tensor.is_contiguous()
+                or not tensor_supports_contiguous_dim(tensor, alignment_bytes=16)
+            ):
+                raise ValueError(f"{name} must be a compact 16-byte-aligned CUDA tensor")
         if q_input.dtype != torch.float8_e4m3fn or weight.dtype != torch.float8_e4m3fn:
             raise TypeError("q_input and weight must use torch.float8_e4m3fn")
         if input_scale.element_size() != 1 or weight_scale.element_size() != 1:
@@ -281,8 +292,11 @@ class Mxfp8TmaGemv(BlockscaledTmaGemv):
             or output.dtype != torch.bfloat16
             or output.device != q_input.device
             or not output.is_contiguous()
+            or not tensor_supports_contiguous_dim(output, alignment_bytes=16)
         ):
-            raise ValueError("output must be a contiguous [1, N] BF16 tensor on the input device")
+            raise ValueError(
+                "output must be a compact 16-byte-aligned [1, N] BF16 tensor on the input device"
+            )
 
         expected_profile_numel = self.num_profile_units * (1 + self.max_profile_events_per_cta)
         if self.enable_profiling:
@@ -292,6 +306,7 @@ class Mxfp8TmaGemv(BlockscaledTmaGemv):
                 profile_buffer.dtype != torch.int64
                 or profile_buffer.device != q_input.device
                 or not profile_buffer.is_contiguous()
+                or not tensor_supports_contiguous_dim(profile_buffer, alignment_bytes=16)
                 or profile_buffer.numel() != expected_profile_numel
             ):
                 raise ValueError(
@@ -328,8 +343,7 @@ class Mxfp8TmaGemv(BlockscaledTmaGemv):
             make_fake_compact_tensor(cutlass.BFloat16, (1, self.n)),
             None,
             fake_profile_buffer,
-            fake_stream(),
-            _name_prefix=self.get_name(),
+            name=self.get_name(),
         )
         compiled(
             weight,

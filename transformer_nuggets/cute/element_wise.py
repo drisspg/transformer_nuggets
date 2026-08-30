@@ -6,14 +6,14 @@ from operator import mul, add
 import cutlass
 import cutlass.cute as cute
 from cuda.bindings import driver as cuda
-from cutlass.cute.runtime import from_dlpack
 
 from transformer_nuggets.utils.benchmark import benchmark_cuda_function_in_microseconds
 from transformer_nuggets.cute.cache import compile_tvm_ffi_and_cache, get_cache_stats
 from transformer_nuggets.cute.base import CuteOp
 from transformer_nuggets.cute.utils import (
-    fake_stream,
+    compile_tvm_ffi,
     make_fake_compact_tensor,
+    tensor_supports_contiguous_dim,
     torch_dtype_to_cute_dtype,
 )
 
@@ -78,25 +78,41 @@ class ElementwiseOp(CuteOp[[torch.Tensor, torch.Tensor, torch.Tensor], None]):
         cfg = self.config
         return f"elementwise_{op_name}_t{cfg.thr_m}x{cfg.thr_n}_v{cfg.val_m}x{cfg.val_n}"
 
-    def get_key(self, dtype: torch.dtype) -> str:
-        return f"{self.get_name()}_dtype={dtype}"
+    def get_key(self, dtype: torch.dtype, assumed_align: int) -> str:
+        return f"{self.get_name()}_dtype={dtype}_align={assumed_align}"
 
     def interface(
         self, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, *, assumed_align: int = 16
     ) -> None:
+        if a.shape != b.shape or a.shape != c.shape:
+            raise ValueError("a, b, and c must have the same shape")
+        if a.dtype != b.dtype or a.dtype != c.dtype:
+            raise TypeError("a, b, and c must have the same dtype")
+        if a.device != b.device or a.device != c.device or not a.is_cuda:
+            raise ValueError("a, b, and c must be CUDA tensors on the same device")
+        if any(
+            not tensor.is_contiguous()
+            or not tensor_supports_contiguous_dim(tensor, alignment_bytes=assumed_align)
+            for tensor in (a, b, c)
+        ):
+            raise ValueError(
+                f"a, b, and c must be compact tensors with {assumed_align}-byte alignment"
+            )
+
         dtype = torch_dtype_to_cute_dtype(c.dtype)
         m, n = cute.sym_int(), cute.sym_int()
         fake_a = make_fake_compact_tensor(dtype, (m, n), assumed_align=assumed_align)
         fake_b = make_fake_compact_tensor(dtype, (m, n), assumed_align=assumed_align)
         fake_c = make_fake_compact_tensor(dtype, (m, n), assumed_align=assumed_align)
+        dtype_name = str(c.dtype).removeprefix("torch.")
         compiled = compile_tvm_ffi_and_cache(
             self,
-            self.get_key(c.dtype),
+            self.get_key(c.dtype, assumed_align),
             self.op,
             fake_a,
             fake_b,
             fake_c,
-            fake_stream(),
+            name=f"{self.get_name()}_{dtype_name}_a{assumed_align}",
         )
         return compiled(a, b, c)
 
@@ -120,7 +136,8 @@ class ElementwiseOp(CuteOp[[torch.Tensor, torch.Tensor, torch.Tensor], None]):
         gC = cute.zipped_divide(mC, tiler_mn)
         cC = cute.zipped_divide(cute.make_identity_tensor(mC.shape), tiler_mn)
 
-        self.kernel(op, gA, gB, gC, cC, tv_layout, mC.shape, _name_prefix=self.get_name()).launch(
+        self.kernel.set_name_prefix(self.get_name())
+        self.kernel(op, gA, gB, gC, cC, tv_layout, mC.shape).launch(
             grid=[cute.size(gC, mode=[1]), 1, 1],
             block=[cute.size(tv_layout, mode=[0]), 1, 1],
             stream=stream,
@@ -151,7 +168,12 @@ def naive_elementwise_add_kernel(
 
 
 @cute.jit
-def naive_elementwise_add(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
+def naive_elementwise_add(
+    mA: cute.Tensor,
+    mB: cute.Tensor,
+    mC: cute.Tensor,
+    stream: cuda.CUstream,
+):
     num_threads_per_block = 256
 
     m, n = mA.shape
@@ -159,7 +181,9 @@ def naive_elementwise_add(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
     kernel = naive_elementwise_add_kernel(mA, mB, mC)
 
     kernel.launch(
-        grid=((m * n) // num_threads_per_block, 1, 1), block=(num_threads_per_block, 1, 1)
+        grid=((m * n) // num_threads_per_block, 1, 1),
+        block=(num_threads_per_block, 1, 1),
+        stream=stream,
     )
 
 
@@ -213,11 +237,15 @@ if __name__ == "__main__":
 
     c.zero_()
 
-    # For naive kernel, we still need CUTE tensors
-    a_ = from_dlpack(a, assumed_align=16)
-    b_ = from_dlpack(b, assumed_align=16)
-    c_ = from_dlpack(c, assumed_align=16)
-    naive_elementwise_add_compiled = cute.compile(naive_elementwise_add, a_, b_, c_)
+    dtype = torch_dtype_to_cute_dtype(a.dtype)
+    m, n = cute.sym_int(), cute.sym_int()
+    naive_elementwise_add_compiled = compile_tvm_ffi(
+        naive_elementwise_add,
+        make_fake_compact_tensor(dtype, (m, n)),
+        make_fake_compact_tensor(dtype, (m, n)),
+        make_fake_compact_tensor(dtype, (m, n)),
+        name="naive_elementwise_add",
+    )
 
     # Note: elementwise_op is now cached automatically!
     # First call will compile, subsequent calls use cache
@@ -227,7 +255,7 @@ if __name__ == "__main__":
     print("=" * 50 + "\n")
 
     print("1. Naive elementwise add kernel:")
-    benchmark(partial(naive_elementwise_add_compiled, a_, b_, c_), a)
+    benchmark(partial(naive_elementwise_add_compiled, a, b, c), a)
 
     print("2. PyTorch add (baseline):")
     benchmark(partial(torch.add, a, b, out=c), a)

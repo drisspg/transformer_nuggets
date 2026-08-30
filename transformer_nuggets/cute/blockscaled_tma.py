@@ -1399,6 +1399,7 @@ class BlockscaledTmaGemv(CuteOp):
             tma_atom_sfw = None
             tma_tensor_sfw = None
         name = self.get_name()
+        self.kernel.set_name_prefix(name)
         self.kernel(
             tma_atom_w,
             tma_tensor_w,
@@ -1413,7 +1414,6 @@ class BlockscaledTmaGemv(CuteOp):
             mO,
             prof_buf,
             self.enable_profiling,
-            _name_prefix=name,
         ).launch(
             grid=[self.grid_ctas, 1, 1],
             block=[(self.num_compute_warps + int(self.dedicated_producer_warp)) * 32, 1, 1],
@@ -1421,12 +1421,12 @@ class BlockscaledTmaGemv(CuteOp):
         )
         if cutlass.const_expr(self.split_k > 1):
             assert mFinal is not None
+            self.reduce_split_k.set_name_prefix(f"{name}_reduce")
             self.reduce_split_k(
                 mO,
                 mFinal,
                 mGFW,
                 mGFX,
-                _name_prefix=f"{name}_reduce",
             ).launch(
                 grid=[(self.n + 255) // 256, 1, 1],
                 block=[256, 1, 1],

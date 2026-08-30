@@ -1,14 +1,35 @@
-import torch
+from __future__ import annotations
+
 import hashlib
-from typing import Any
+import re
+from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 import cutlass
 import cutlass.cute as cute
+import torch
 from cuda.bindings import driver as cuda
+
+_VALID_NAME = re.compile(r"[a-z][a-z0-9_]*\Z")
+TMA_ALIGNMENT_BYTES = 16
+
+
+def _contains_torch_tensor(value: Any) -> bool:
+    if isinstance(value, torch.Tensor):
+        return True
+    if isinstance(value, (tuple, list)):
+        return any(_contains_torch_tensor(item) for item in value)
+    if isinstance(value, dict):
+        return any(
+            _contains_torch_tensor(key) or _contains_torch_tensor(item)
+            for key, item in value.items()
+        )
+    return False
 
 
 def torch_dtype_to_cute_dtype(dtype: torch.dtype):
+    """Map a supported Torch dtype to its CuTeDSL numeric type."""
     match dtype:
         case torch.float16:
             return cutlass.Float16
@@ -27,31 +48,112 @@ def torch_dtype_to_cute_dtype(dtype: torch.dtype):
 
 
 def current_cuda_stream() -> cuda.CUstream:
+    """Return the current Torch CUDA stream as a CUDA Python handle."""
     return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
 
-def fake_stream() -> cuda.CUstream:
-    return cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+@lru_cache(maxsize=8)
+def get_device_properties(device: torch.device) -> Any:
+    """Return cached CUDA properties for a device."""
+    return torch.cuda.get_device_properties(device)
 
 
-def make_fake_tensor(dtype, shape: tuple, divisibility: int = 1, leading_dim: int = -1):
-    if leading_dim < 0:
-        leading_dim = len(shape) + leading_dim
-    stride = tuple(
-        1 if i == leading_dim else cute.sym_int64(divisibility=divisibility)
-        for i in range(len(shape))
+def requires_int64_abi(*tensors: torch.Tensor | None) -> bool:
+    """Check reachable offsets and every stride exposed through the CuTe ABI."""
+    for tensor in tensors:
+        if tensor is None:
+            continue
+        strides = tensor.stride()
+        if any(abs(stride) > 2**31 - 1 for stride in strides):
+            return True
+        if (
+            tensor.numel()
+            and 1 + sum((size - 1) * stride for size, stride in zip(tensor.shape, strides)) > 2**31
+        ):
+            return True
+    return False
+
+
+def tensor_supports_contiguous_dim(
+    tensor: torch.Tensor,
+    *,
+    dim: int = -1,
+    alignment_bytes: int = 1,
+) -> bool:
+    """Return whether one mode is contiguous with aligned slice origins."""
+    if tensor.ndim == 0 or not -tensor.ndim <= dim < tensor.ndim or alignment_bytes < 1:
+        return False
+    dim %= tensor.ndim
+    element_size = tensor.element_size()
+    return (
+        tensor.stride(dim) == 1
+        and tensor.data_ptr() % alignment_bytes == 0
+        and all(
+            index == dim or stride * element_size % alignment_bytes == 0
+            for index, stride in enumerate(tensor.stride())
+        )
     )
+
+
+def tensor_supports_tma(tensor: torch.Tensor) -> bool:
+    """Return whether a CUDA tensor has a TMA-compatible aligned row layout."""
+    return tensor.is_cuda and tensor_supports_contiguous_dim(
+        tensor,
+        alignment_bytes=TMA_ALIGNMENT_BYTES,
+    )
+
+
+def make_fake_strided_tensor(
+    dtype: Any,
+    shape: tuple[Any, ...],
+    *,
+    contiguous_dim: int = -1,
+    stride_divisibility: int = 1,
+    assumed_align: int | None = None,
+    use_int64_strides: bool = True,
+) -> Any:
+    """Create a fake tensor with one contiguous mode and dynamic other strides."""
+    if not shape:
+        raise ValueError("make_fake_strided_tensor requires at least one dimension")
+    if not -len(shape) <= contiguous_dim < len(shape):
+        raise ValueError(f"contiguous_dim is out of range for rank {len(shape)}")
+    if stride_divisibility < 1:
+        raise ValueError("stride_divisibility must be positive")
+    if assumed_align is not None and assumed_align < 1:
+        raise ValueError("assumed_align must be positive")
+    contiguous_dim %= len(shape)
+    sym_int = cute.sym_int64 if use_int64_strides else cute.sym_int
+    strides = tuple(
+        1 if index == contiguous_dim else sym_int(divisibility=stride_divisibility)
+        for index in range(len(shape))
+    )
+    if assumed_align is None:
+        alignment_bits = stride_divisibility * dtype.width
+        if alignment_bits % 8:
+            raise ValueError("sub-byte fake tensors require an explicit assumed_align")
+        assumed_align = max(1, alignment_bits // 8)
     return cute.runtime.make_fake_tensor(
         dtype,
         shape,
-        stride=stride,
-        assumed_align=max(1, divisibility * dtype.width // 8),
+        stride=strides,
+        assumed_align=assumed_align,
+    )
+
+
+def make_fake_tensor(dtype, shape: tuple, divisibility: int = 1, leading_dim: int = -1):
+    """Compatibility wrapper for :func:`make_fake_strided_tensor`."""
+    return make_fake_strided_tensor(
+        dtype,
+        shape,
+        contiguous_dim=leading_dim,
+        stride_divisibility=divisibility,
     )
 
 
 def make_fake_compact_tensor(
     dtype, shape: tuple, stride_order: tuple[int, ...] | None = None, assumed_align: int = 16
 ):
+    """Create a fake compact tensor for a TVM-FFI compile signature."""
     if stride_order is None:
         stride_order = tuple(reversed(range(len(shape))))
     return cute.runtime.make_fake_compact_tensor(
@@ -62,39 +164,46 @@ def make_fake_compact_tensor(
     )
 
 
+def compile_tvm_ffi(
+    entrypoint: Any,
+    *compile_args: Any,
+    name: str | None = None,
+) -> Any:
+    """Compile fake arguments with the canonical typed TVM-FFI stream ABI."""
+    if name is None:
+        get_name = getattr(entrypoint, "get_name", None)
+        if not callable(get_name):
+            raise TypeError("compile_tvm_ffi() requires entrypoint.get_name() or name=")
+        name = get_name()
+    if not isinstance(name, str) or _VALID_NAME.fullmatch(name) is None:
+        raise ValueError(
+            "CuTeDSL compile names must start with a lowercase letter and contain "
+            f"only lowercase letters, digits, and underscores; got {name!r}"
+        )
+    if any(_contains_torch_tensor(arg) for arg in compile_args):
+        raise TypeError("compile_tvm_ffi() accepts fake CuTe tensors, not runtime Torch tensors")
+
+    jit_wrapper = entrypoint if hasattr(entrypoint, "set_name_prefix") else entrypoint.__call__
+    jit_wrapper.set_name_prefix(name)
+    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    return cute.compile[cute.EnableTVMFFI](entrypoint, *compile_args, stream)
+
+
 def get_tensor_alignment(tensor: torch.Tensor, dim: int) -> int:
-    """Calculate the maximum alignment for a tensor assuming a specific dimension is contiguous.
-
-    Args:
-        tensor: The tensor to check
-        dim: The dimension assumed to be contiguous (negative indexing supported)
-
-    Returns:
-        Maximum alignment in bytes that divides both the pointer and the contiguous region size
-    """
-    # Handle negative indexing
-    if dim < 0:
-        dim = tensor.ndim + dim
-
-    # Get the size of the assumed contiguous dimension
-    contiguous_elements = tensor.shape[dim]
-
-    # Convert to bytes
+    """Return the largest power-of-two alignment shared by all slices along ``dim``."""
+    if tensor.ndim == 0 or not -tensor.ndim <= dim < tensor.ndim:
+        return 1
+    dim %= tensor.ndim
+    if tensor.stride(dim) != 1:
+        return 1
     element_size = tensor.element_size()
-    contiguous_bytes = contiguous_elements * element_size
-
-    # Get pointer
-    ptr = tensor.data_ptr()
-
-    # Find the best alignment that divides both pointer and size
-    max_align = 128
-
-    while max_align > 1:
-        if ptr % max_align == 0 and contiguous_bytes % max_align == 0:
-            break
-        max_align //= 2
-
-    return max_align
+    for alignment in (128, 64, 32, 16, 8, 4, 2):
+        if tensor.data_ptr() % alignment == 0 and all(
+            index == dim or stride * element_size % alignment == 0
+            for index, stride in enumerate(tensor.stride())
+        ):
+            return alignment
+    return 1
 
 
 def get_max_power_of_two_divisibility(value: int, cap: int = 128) -> int:

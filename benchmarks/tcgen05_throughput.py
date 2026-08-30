@@ -35,9 +35,9 @@ import torch
 import typer
 from cutlass import cute, pipeline, utils
 from cutlass.cute.nvgpu import tcgen05
-from cutlass.cute.runtime import make_fake_compact_tensor
 from cutlass.cute.typing import Float32, Int32, Int64
 
+from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.utils.benchmark import CudaBenchmarkStats
 
 CTA_THREADS = 128
@@ -277,15 +277,7 @@ def compile_probe(shape: Shape):
         stride_order=(0,),
         assumed_align=16,
     )
-    op.__call__.set_name_prefix(op.get_name())
-    compiled = cute.compile[cute.EnableTVMFFI](
-        op,
-        output,
-        1,
-        1,
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-    )
-    return op, compiled
+    return op, compile_tvm_ffi(op, output, 1, 1)
 
 
 @dataclass(frozen=True)
