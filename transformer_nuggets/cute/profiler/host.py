@@ -38,7 +38,7 @@ Or use the context manager:
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections.abc import Callable, Iterator
 from typing import Literal
 
@@ -58,10 +58,12 @@ __all__ = [
     "TagTable",
     "Event",
     "PostProcessContext",
+    "ProfileSession",
     "allocate_profile_buffer",
     "decode_events",
     "events_to_perfetto",
     "profile_session",
+    "validate_event_counts",
 ]
 
 
@@ -76,6 +78,7 @@ class Event:
         tag_name: Human-readable tag name from TagTable.
         tid: Thread/lane ID (used as Perfetto tid).
         unit_id: Profiling unit ID (e.g., block index).
+        event_idx: Static or allocated slot index within the profiling unit.
         pid: Process ID for grouping in Perfetto (e.g., CTA/block grouping).
         extra_args: Optional dict of extra args to include in Perfetto trace.
     """
@@ -88,6 +91,7 @@ class Event:
     unit_id: int = 0
     pid: int | None = None
     extra_args: dict | None = None
+    event_idx: int | None = None
 
 
 @dataclass
@@ -185,6 +189,25 @@ class TagTable:
 
     def __len__(self) -> int:
         return len(self._names)
+
+
+@dataclass
+class ProfileSession:
+    """Mutable result populated when a profiling context exits.
+
+    Iteration yields ``(prof, tags)`` to preserve the original tuple-unpacking
+    API while direct attribute access supports post-capture analysis.
+    """
+
+    prof: ProfileBuf
+    tags: TagTable
+    events: list[Event] = field(default_factory=list)
+    trace: dict | None = None
+
+    def __iter__(self) -> Iterator[ProfileBuf | TagTable]:
+        """Yield the legacy ``(prof, tags)`` pair."""
+        yield self.prof
+        yield self.tags
 
 
 @dataclass
@@ -312,6 +335,7 @@ def _decode_events_legacy(buf: ProfileBuf, tag_table: TagTable, tid_base: int) -
                     tag_name=_tag_name_or_unknown(tag_table, tag_id),
                     tid=tid + tid_base,
                     unit_id=unit_id,
+                    event_idx=i,
                 )
             )
 
@@ -362,10 +386,12 @@ def _decode_events_compact(buf: ProfileBuf, tag_table: TagTable, tid_base: int) 
     starts = start_ns[valid].tolist()
     durs = dur_ns[valid].tolist()
     tags = tag_ids[valid].tolist()
-    units = torch.nonzero(valid, as_tuple=True)[0].tolist()
+    unit_indices, slot_indices = torch.nonzero(valid, as_tuple=True)
+    units = unit_indices.tolist()
+    event_indices = slot_indices.tolist()
 
     events = []
-    for s, d, t, u in zip(starts, durs, tags, units):
+    for s, d, t, u, i in zip(starts, durs, tags, units, event_indices):
         events.append(
             Event(
                 start_ns=s,
@@ -374,6 +400,7 @@ def _decode_events_compact(buf: ProfileBuf, tag_table: TagTable, tid_base: int) 
                 tag_name=_tag_name_or_unknown(tag_table, t),
                 tid=u + tid_base,
                 unit_id=u,
+                event_idx=i,
             )
         )
     return events
@@ -479,6 +506,8 @@ def events_to_perfetto(
             "dur_ns": event.dur_ns,
             "unit_id": event.unit_id,
         }
+        if event.event_idx is not None:
+            args["event_idx"] = event.event_idx
         if event.extra_args:
             args.update(event.extra_args)
 
@@ -510,6 +539,25 @@ def events_to_perfetto(
     return trace
 
 
+def validate_event_counts(
+    events: list[Event], num_units: int, expected_events_per_unit: int
+) -> None:
+    """Raise when any profiling unit has an unexpected decoded event count."""
+    counts = [0] * num_units
+    for event in events:
+        counts[event.unit_id] += 1
+    mismatches = [
+        f"unit {unit_id}: {count}"
+        for unit_id, count in enumerate(counts)
+        if count != expected_events_per_unit
+    ]
+    if mismatches:
+        details = ", ".join(mismatches)
+        raise RuntimeError(
+            f"Expected {expected_events_per_unit} events per profiling unit; got {details}"
+        )
+
+
 @contextmanager
 def profile_session(
     max_events_per_unit: int,
@@ -524,7 +572,8 @@ def profile_session(
     split_overlaps: bool = True,
     trace_format: Literal["chrome_json", "track_event"] = "track_event",
     compact: bool = False,
-) -> Iterator[tuple[ProfileBuf, TagTable]]:
+    expected_events_per_unit: int | None = None,
+) -> Iterator[ProfileSession]:
     """Context manager for profiling a kernel session.
 
     Allocates a profile buffer, yields it for use in kernel launches,
@@ -561,7 +610,8 @@ def profile_session(
             - int: Just the count (uses "Unit" as name in traces)
             - tuple[int, str]: (count, name) for nicer trace labels (e.g., (4, "Block"))
         tag_names: List of tag names for this session.
-        trace_path: Optional path to write Perfetto trace JSON. If None, no file is written.
+        trace_path: Optional path to write the Perfetto trace. If None, no file is
+            written, but ``session.trace`` still contains the in-memory trace dict.
         device: Device to allocate on.
         stream: CUDA stream for allocation.
         pid: Process ID for trace (e.g., GPU rank).
@@ -578,10 +628,19 @@ def profile_session(
             side). Slot 0 of each unit's slice is the 64-bit anchor; the
             decoder reconstructs full timestamps from the anchor + each
             record's low-32-bit timer reading.
+        expected_events_per_unit: Optional exact decoded event count required
+            for every allocated profiling unit. Validation runs before event
+            post-processing so filters cannot hide missing or overwritten slots.
+            With sparse sampling, allocate buffer units only for sampled units or
+            omit this validation when unsampled zero-event units remain allocated.
 
     Yields:
-        Tuple of (ProfileBuf, TagTable).
+        ProfileSession. It supports legacy ``(prof, tags)`` tuple unpacking and
+        exposes ``events`` and ``trace`` after the context exits.
     """
+    if expected_events_per_unit is not None and expected_events_per_unit < 0:
+        raise ValueError("expected_events_per_unit must be non-negative")
+
     prof = allocate_profile_buffer(
         max_events_per_unit=max_events_per_unit,
         num_units=num_units,
@@ -590,8 +649,9 @@ def profile_session(
         compact=compact,
     )
     tag_table = TagTable(tag_names)
+    session = ProfileSession(prof=prof, tags=tag_table)
 
-    yield prof, tag_table
+    yield session
 
     if stream is not None:
         stream.synchronize()
@@ -599,6 +659,8 @@ def profile_session(
         torch.cuda.synchronize()
 
     events = decode_events(prof, tag_table)
+    if expected_events_per_unit is not None:
+        validate_event_counts(events, prof.num_units, expected_events_per_unit)
 
     ctx = PostProcessContext(
         tag_table=tag_table,
@@ -608,19 +670,20 @@ def profile_session(
 
     if post_process_events is not None:
         events = post_process_events(events, ctx)
+    session.events = events
+
+    trace = events_to_perfetto(
+        events,
+        trace_path=None,
+        pid=pid,
+        unit_name=prof.unit_name,
+        split_overlaps=False,
+    )
+    if post_process_trace is not None:
+        trace = post_process_trace(trace, ctx)
+    session.trace = trace
 
     if trace_path is not None:
-        trace = events_to_perfetto(
-            events,
-            trace_path=None,
-            pid=pid,
-            unit_name=prof.unit_name,
-            split_overlaps=False,
-        )
-
-        if post_process_trace is not None:
-            trace = post_process_trace(trace, ctx)
-
         write_perfetto_trace(
             trace_path,
             trace,

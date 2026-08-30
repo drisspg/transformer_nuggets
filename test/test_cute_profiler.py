@@ -33,7 +33,7 @@ from transformer_nuggets.cute.profiler import (
     region_end,
     region_start,
 )
-from transformer_nuggets.cute.profiler.host import decode_events
+from transformer_nuggets.cute.profiler.host import decode_events, events_to_perfetto
 
 
 NUM_BLOCKS = 4
@@ -74,6 +74,8 @@ def test_legacy_atomic_roundtrip():
     assert units_seen == set(range(NUM_BLOCKS))
     tags_seen = {e.tag_id for e in events}
     assert tags_seen == set(range(NUM_ITERS))
+    for unit_id in range(NUM_BLOCKS):
+        assert {e.event_idx for e in events if e.unit_id == unit_id} == set(range(NUM_ITERS))
     for e in events:
         assert e.start_ns > 0
         assert e.dur_ns >= 0
@@ -104,10 +106,13 @@ def test_legacy_raw_event_stop_roundtrip():
         max_events_per_unit=NUM_ITERS,
         num_units=(NUM_BLOCKS, "Block"),
         tag_names=[f"t{i}" for i in range(NUM_ITERS)],
-    ) as (prof, tags):
-        _launch_raw_legacy(from_dlpack(prof.tensor), Int32(prof.max_events_per_unit))
+    ) as session:
+        _launch_raw_legacy(
+            from_dlpack(session.prof.tensor), Int32(session.prof.max_events_per_unit)
+        )
 
-    events = decode_events(prof, tags)
+    events = session.events
+    assert session.trace is not None
     assert len(events) == NUM_BLOCKS * NUM_ITERS
     for e in events:
         assert e.start_ns > 0
@@ -177,21 +182,49 @@ def _launch_compact_gmem(prof_buf, max_events):
     )
 
 
-def test_compact_gmem_roundtrip():
-    """compact_event_stop records events that decode with reconstructed 64-bit timestamps."""
+def test_compact_gmem_roundtrip(tmp_path):
+    """Compact events populate the session result and preserve their static slots."""
+    trace_path = tmp_path / "compact_gmem.pftrace"
     with profile_session(
         max_events_per_unit=NUM_ITERS + 1,
         num_units=(NUM_BLOCKS, "Block"),
         tag_names=[f"t{i}" for i in range(NUM_ITERS)],
         compact=True,
-    ) as (prof, tags):
-        _launch_compact_gmem(from_dlpack(prof.tensor), Int32(prof.max_events_per_unit))
+        expected_events_per_unit=NUM_ITERS,
+        trace_path=str(trace_path),
+    ) as session:
+        _launch_compact_gmem(
+            from_dlpack(session.prof.tensor), Int32(session.prof.max_events_per_unit)
+        )
 
-    events = decode_events(prof, tags)
+    events = session.events
+    assert session.trace is not None
+    assert trace_path.exists()
     assert len(events) == NUM_BLOCKS * NUM_ITERS
+    for unit_id in range(NUM_BLOCKS):
+        assert {e.event_idx for e in events if e.unit_id == unit_id} == set(range(NUM_ITERS))
     for e in events:
         # Anchors put all events near the same 64-bit timer band.
         assert e.start_ns > (1 << 40), "start_ns should be a reconstructed 64-bit globaltimer"
+
+    trace = events_to_perfetto([events[0]], split_overlaps=False)
+    duration_event = next(event for event in trace["traceEvents"] if event.get("ph") == "X")
+    assert duration_event["args"]["event_idx"] == events[0].event_idx
+
+
+def test_expected_event_count_validation_rejects_missing_events():
+    """profile_session validates raw decoded counts before post-processing."""
+    with pytest.raises(RuntimeError, match=f"Expected {NUM_ITERS + 1} events"):
+        with profile_session(
+            max_events_per_unit=NUM_ITERS + 1,
+            num_units=(NUM_BLOCKS, "Block"),
+            tag_names=[f"t{i}" for i in range(NUM_ITERS)],
+            compact=True,
+            expected_events_per_unit=NUM_ITERS + 1,
+        ) as session:
+            _launch_compact_gmem(
+                from_dlpack(session.prof.tensor), Int32(session.prof.max_events_per_unit)
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +279,8 @@ def test_compact_smem_roundtrip():
     assert units_seen == set(range(NUM_BLOCKS))
     tags_seen = {e.tag_id for e in events}
     assert tags_seen == set(range(NUM_ITERS))
+    for unit_id in range(NUM_BLOCKS):
+        assert {e.event_idx for e in events if e.unit_id == unit_id} == set(range(NUM_ITERS))
     for e in events:
         assert e.start_ns > (1 << 40)
 

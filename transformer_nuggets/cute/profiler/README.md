@@ -7,7 +7,7 @@ Profile code regions **inside** GPU kernels and export to [Perfetto](https://ui.
 ## Quick Start
 
 ```python
-from transformer_nuggets.cute.profiler import profile_session, profile_region
+from transformer_nuggets.cute.profiler import profile_session, profile_region, summarize_by_tag
 
 @cute.kernel
 def my_kernel(output, prof_buf, max_events):
@@ -17,13 +17,65 @@ def my_kernel(output, prof_buf, max_events):
             compute_something()
 
 with profile_session(
-    max_events_per_unit=64,
+    max_events_per_unit=4,
     num_units=(num_blocks, "Block"),
     tag_names=["compute"],
     trace_path="trace.pftrace",
-) as (prof, _):
-    my_kernel(output, prof.tensor, prof.max_events_per_unit)
+    expected_events_per_unit=4,
+) as session:
+    my_kernel(output, session.prof.tensor, session.prof.max_events_per_unit)
+
+print(summarize_by_tag(session.events)["compute"])
 ```
+
+`session.events` and `session.trace` are populated after the context exits. Existing code can still use `as (prof, tags)` because `ProfileSession` preserves tuple unpacking.
+
+## Session Analysis and Validation
+
+The built-in host helpers cover the common first pass:
+
+```python
+from transformer_nuggets.cute.profiler import (
+    dependency_gaps,
+    overlap_between,
+    summarize_by_tag,
+)
+
+summaries = summarize_by_tag(session.events)
+wait_p50_ns = summaries["consumer_wait"].p50_ns
+
+load_compute_overlap = overlap_between(
+    session.events, "producer_load", "consumer_compute_store"
+)
+
+load_to_compute = dependency_gaps(
+    session.events, "producer_load", "consumer_compute_store"
+)
+```
+
+- `summarize_by_tag` reports count, total, mean, min, p50, p95, and max duration.
+- `overlap_between` merges intervals and, by default, measures overlap independently within each profiling unit so unrelated CTAs cannot inflate it.
+- `dependency_gaps` pairs repeated tags positionally after `event_idx` ordering within each unit. Use `successor_offset=N` when producer iteration `i` enables successor iteration `i + N`; use complete static streams plus event-count validation, because dropped events would shift later pairs. Legacy atomic slots are only meaningful here when allocation order is deterministic.
+- `expected_events_per_unit=N` validates raw decoded counts before post-processing and raises if a unit emitted too few or too many events. With sparse sampling, allocate buffer units only for sampled units or omit validation when unsampled zero-event units remain allocated.
+
+## Worked Performance Example
+
+Run the complete serialized-versus-buffered producer/consumer example:
+
+```shell
+python examples/cute_profiler_buffering.py
+```
+
+It compares two otherwise identical warp-specialized kernels:
+
+- one SMEM stage forces `load i -> wait i -> compute/store i -> release i -> load i+1`;
+- two stages allow the producer's load of tile `i + 1` to overlap the consumer's work on tile `i`.
+
+The example uses a compile-time profiling specialization, deterministic event slots, compact shared-memory records, sparse CTA sampling, stable producer/consumer Perfetto lanes, decoded median durations, and a numeric producer-load/consumer-work overlap calculation. Decoded events and Perfetto details preserve `event_idx`, so a consumer event can be paired with the exact producer/tile slot that enabled it. The example separately checks correctness and times the unprofiled specializations.
+
+A representative B200 run on August 30, 2026 measured 177.449 us with one stage and 133.475 us with two stages over five interleaved timing rounds (1.329x speedup). The sampled CTA's producer-load overlap rose from 0.0% to 74.2%, while median producer acquire and consumer wait both fell from 224 ns to 64 ns. The median wait-to-compute dependency gap was 0 ns in both variants, showing that the consumer starts immediately once data is ready. Treat these numbers as a worked interpretation, not expected constants; rerun on the target kernel and GPU.
+
+The script writes `data/buffering_1_stage.pftrace` and `data/buffering_2_stage.pftrace` for side-by-side inspection in Perfetto.
 
 ## Three Modes
 
@@ -103,7 +155,7 @@ Decision rule:
 - **Pick compact-gmem** when total kernel slowdown matters most (e.g. you're profiling something that already runs under other tooling), or when you don't want to plumb a smem `MemRange` through your `SharedStorage`.
 - **Pick legacy** when you need atomic slot allocation, per-event thread IDs, or backwards compatibility.
 
-The smem path requires a CTA-local `Int64` tensor with `1 + max_events_per_unit` slots, allocated through either `SmemAllocator.allocate_array` or a `cute.struct.MemRange`. See `agent_space/bench_profile_overhead.py:GEMMCompactSmem` for a full working example.
+The smem path requires a CTA-local `Int64` tensor with `1 + max_events_per_unit` slots, allocated through either `SmemAllocator.allocate_array` or a `cute.struct.MemRange`. See `examples/cute_profiler_buffering.py` for a complete compact-smem performance-debugging example.
 
 ## API
 
@@ -111,12 +163,22 @@ The smem path requires a CTA-local `Int64` tensor with `1 + max_events_per_unit`
 
 | Function | Description |
 |----------|-------------|
-| `profile_session(...)` | Context manager: allocate, yield, decode, write trace |
+| `profile_session(...)` | Context manager returning `ProfileSession`; allocate, validate, decode, post-process, and optionally write trace |
 | `allocate_profile_buffer(max_events_per_unit, num_units, device)` | Allocate buffer |
-| `decode_events(buf, tag_table)` | Decode to `Event` list |
+| `decode_events(buf, tag_table)` | Decode to `Event` list, preserving each unit-local `event_idx` slot |
 | `events_to_perfetto(events, path)` | Write native Perfetto TrackEvent `.pftrace` by default, or Chrome JSON/JSON.GZ with `trace_format="chrome_json"` |
+| `validate_event_counts(events, num_units, expected_events_per_unit)` | Validate exact per-unit decoded counts |
 | `TagTable(names)` | Map tag names ↔ integer IDs |
+| `ProfileSession` | `.prof`/`.tags` during capture; `.events`/`.trace` after exit; preserves tuple unpacking |
 | `PostProcessContext` | Context passed to post-processing callbacks |
+
+### Analysis (`analysis.py`)
+
+| Function | Description |
+|----------|-------------|
+| `summarize_by_tag(events)` | Count and duration statistics per tag |
+| `overlap_between(events, left_tag, right_tag)` | Per-unit interval overlap and left/right overlap fractions |
+| `dependency_gaps(events, predecessor_tag, successor_tag, successor_offset=0)` | Matched predecessor-end to successor-start gaps |
 
 ### Device (`ops.py`)
 

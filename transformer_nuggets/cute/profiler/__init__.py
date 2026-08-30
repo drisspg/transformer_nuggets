@@ -32,10 +32,21 @@ from transformer_nuggets.cute.profiler.host import (
     TagTable,
     Event,
     PostProcessContext,
+    ProfileSession,
     allocate_profile_buffer,
     decode_events,
     events_to_perfetto,
     profile_session,
+    validate_event_counts,
+)
+
+from transformer_nuggets.cute.profiler.analysis import (
+    EventSummary,
+    OverlapSummary,
+    DependencyGapSummary,
+    summarize_by_tag,
+    overlap_between,
+    dependency_gaps,
 )
 
 from transformer_nuggets.cute.profiler.ops import (
@@ -77,10 +88,19 @@ __all__ = [
     "TagTable",
     "Event",
     "PostProcessContext",
+    "ProfileSession",
+    # Host-side analysis
+    "EventSummary",
+    "OverlapSummary",
+    "DependencyGapSummary",
+    "summarize_by_tag",
+    "overlap_between",
+    "dependency_gaps",
     "allocate_profile_buffer",
     "decode_events",
     "events_to_perfetto",
     "profile_session",
+    "validate_event_counts",
     # Device-side
     "read_globaltimer",
     "static_start",
