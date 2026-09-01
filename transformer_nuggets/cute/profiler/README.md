@@ -313,6 +313,56 @@ with profile_session(
 
 The source slice receives an `unblocks` argument and the destination receives `depends_on`, so the relationship remains readable in Perfetto's slice details as well as through the arrow.
 
+## Declarative pipeline analysis
+
+`transformer_nuggets.cute.profiler.pipeline` turns explicit warp roles and
+resource handoffs into a logical schedule, joins that plan to IKET measurements,
+and writes a native Perfetto trace with direct dependency flows, blocker
+metadata, and ring-occupancy counters. It lives under the CuTe package and
+therefore requires the `transformer-nuggets[cute]` extra, although the analysis
+and Task Scheduling adapter do not import CuTeDSL directly.
+
+```python
+from transformer_nuggets.cute.profiler.pipeline import (
+    PipelineAnnotations,
+    analyze_pipeline,
+    extract_plan,
+    load_iket_capture,
+    write_pipeline_perfetto,
+)
+
+PIPELINE = PipelineAnnotations("my_kernel", iteration_name="tile")
+PIPELINE.resource(
+    "operand",
+    label="Operand ring",
+    depth=2,
+    storage="SMEM",
+    description="TMA producer to MMA consumer.",
+)
+
+# In the CuTeDSL implementation:
+# @PIPELINE.role(...)
+# PIPELINE.region(..., produces=("operand",))
+# PIPELINE.region(..., consumes=("operand",), releases=("operand",))
+# PIPELINE.iteration_end()
+
+plan = extract_plan("annotated_kernel.py")
+timeline = plan.schedule(iterations=4)
+measured = load_iket_capture("iket.trace.json", timeline, cta=(0, 0, 0))
+analysis = analyze_pipeline(timeline, measured)
+write_pipeline_perfetto("pipeline.pftrace", timeline, measured, analysis=analysis)
+```
+
+The analysis reports finite critical paths and slack, latest-arriving blockers,
+wait/busy decomposition, ring occupancy and run-ahead, depth+1 counterfactuals,
+and the steady-state maximum cycle ratio (RecMII versus per-role ResMII).
+Logical weights remain metadata; only measured timestamps use Perfetto's time
+axis.
+
+Current regions are assumed to begin before acquire/wait, so wait is inferred
+from predecessor overlap. Add a second marker after the wait when an exact
+wait/work split is required.
+
 ## Buffer Layout
 
 Each unit owns `1 + 4 * max_events_per_unit` int64s:
