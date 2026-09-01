@@ -79,6 +79,7 @@ class DurationSlice:
     dur_us: float
     lane: int = 0
     flow_ids: tuple[int, ...] = ()
+    terminating_flow_ids: tuple[int, ...] = ()
     flow_latencies_us: tuple[tuple[int, float], ...] = ()
 
     @property
@@ -498,7 +499,7 @@ def _smallest_containing_slice(
 def _paired_flow_ids_by_slice(
     slices: list[DurationSlice],
     flows: list[FlowInstant],
-) -> tuple[dict[int, set[int]], dict[int, dict[int, float]]]:
+) -> tuple[dict[int, set[int]], dict[int, set[int]], dict[int, dict[int, float]]]:
     flows_by_id: dict[int, list[FlowInstant]] = defaultdict(list)
     for flow in flows:
         flow_id = _flow_id(flow.event.get("id"))
@@ -519,6 +520,7 @@ def _paired_flow_ids_by_slice(
             kernel_slices_by_correlation[correlation_id].append(slc)
 
     flow_ids_by_slice: dict[int, set[int]] = defaultdict(set)
+    terminating_flow_ids_by_slice: dict[int, set[int]] = defaultdict(set)
     latencies_by_slice: dict[int, dict[int, float]] = defaultdict(dict)
     for flow_id, markers in flows_by_id.items():
         sources: list[FlowInstant] = []
@@ -555,13 +557,13 @@ def _paired_flow_ids_by_slice(
                 destination_slice = _smallest_containing_slice(slices, destination)
             if destination_slice is None:
                 continue
-            flow_ids_by_slice[destination_slice.index].add(flow_id)
+            terminating_flow_ids_by_slice[destination_slice.index].add(flow_id)
             launch_ts = source_slice.ts_us if source_slice is not None else source.ts_us
             latencies_by_slice[destination_slice.index][flow_id] = (
                 destination_slice.ts_us - launch_ts
             )
 
-    return flow_ids_by_slice, latencies_by_slice
+    return flow_ids_by_slice, terminating_flow_ids_by_slice, latencies_by_slice
 
 
 def assign_trackevent_lanes(
@@ -589,12 +591,11 @@ def assign_trackevent_lanes(
         lane_by_index.update(assignments)
 
     if include_flows:
-        flow_ids_by_slice, latencies_by_slice = _paired_flow_ids_by_slice(
-            parsed.duration_slices,
-            parsed.flows,
+        flow_ids_by_slice, terminating_flow_ids_by_slice, latencies_by_slice = (
+            _paired_flow_ids_by_slice(parsed.duration_slices, parsed.flows)
         )
     else:
-        flow_ids_by_slice, latencies_by_slice = {}, {}
+        flow_ids_by_slice, terminating_flow_ids_by_slice, latencies_by_slice = {}, {}, {}
 
     # Mutate the internal slice models in place instead of allocating a second
     # DurationSlice for every Chrome ``X`` event. These objects are converter
@@ -602,6 +603,7 @@ def assign_trackevent_lanes(
     for slc in parsed.duration_slices:
         slc.lane = lane_by_index[slc.index]
         slc.flow_ids = tuple(sorted(flow_ids_by_slice.get(slc.index, ())))
+        slc.terminating_flow_ids = tuple(sorted(terminating_flow_ids_by_slice.get(slc.index, ())))
         slc.flow_latencies_us = tuple(sorted(latencies_by_slice.get(slc.index, {}).items()))
 
     return AssignedTrace(
@@ -867,6 +869,7 @@ def _emit_duration_markers(
             _copy_event_payload(track_event, event, event_args)
             _add_correlation_id(track_event, event_args.get("correlation"))
             track_event.flow_ids.extend(slc.flow_ids)
+            track_event.terminating_flow_ids.extend(slc.terminating_flow_ids)
             if slc.flow_latencies_us:
                 for flow_id, latency_us in slc.flow_latencies_us:
                     suffix = "" if len(slc.flow_latencies_us) == 1 else f"[{flow_id}]"

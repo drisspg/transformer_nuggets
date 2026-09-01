@@ -40,6 +40,7 @@ from transformer_nuggets.cute.profiler import (
 )
 from transformer_nuggets.cute.profiler.postprocessors import (
     compose,
+    link_dependency_flow,
     rename_processes,
     rename_threads,
 )
@@ -325,6 +326,15 @@ def capture_profile(
         post_process_trace=compose(
             rename_processes({PROFILE_UNIT: f"{num_stages}-stage CTA {PROFILED_CTA}"}),
             rename_threads({PRODUCER_WARP: "Producer warp", CONSUMER_WARP: "Consumer warp"}),
+            link_dependency_flow("producer_acquire", "producer_load"),
+            link_dependency_flow("producer_load", "consumer_wait"),
+            link_dependency_flow("consumer_wait", "consumer_compute_store"),
+            link_dependency_flow(
+                "consumer_compute_store",
+                "producer_acquire",
+                successor_offset=num_stages,
+                flow_name="stage_release_to_reacquire",
+            ),
         ),
     ) as session:
         launch = op.compile(src, dst, session.prof.tensor)

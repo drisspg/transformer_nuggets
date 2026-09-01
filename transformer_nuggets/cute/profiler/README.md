@@ -71,7 +71,7 @@ It compares two otherwise identical warp-specialized kernels:
 - one SMEM stage forces `load i -> wait i -> compute/store i -> release i -> load i+1`;
 - two stages allow the producer's load of tile `i + 1` to overlap the consumer's work on tile `i`.
 
-The example uses a compile-time profiling specialization, deterministic event slots, compact shared-memory records, sparse CTA sampling, stable producer/consumer Perfetto lanes, decoded median durations, and a numeric producer-load/consumer-work overlap calculation. Decoded events and Perfetto details preserve `event_idx`, so a consumer event can be paired with the exact producer/tile slot that enabled it. The example separately checks correctness and times the unprofiled specializations.
+The example uses a compile-time profiling specialization, deterministic event slots, compact shared-memory records, sparse CTA sampling, stable producer/consumer Perfetto lanes, decoded median durations, and a numeric producer-load/consumer-work overlap calculation. Its Perfetto traces draw direct arrows for acquire → load → wait → compute and compute/release → stage reacquire; the final edge advances by the configured pipeline depth. Decoded events and Perfetto details preserve `event_idx`, so a consumer event can be paired with the exact producer/tile slot that enabled it. The example separately checks correctness and times the unprofiled specializations.
 
 A representative B200 run on August 30, 2026 measured 177.449 us with one stage and 133.475 us with two stages over five interleaved timing rounds (1.329x speedup). The sampled CTA's producer-load overlap rose from 0.0% to 74.2%, while median producer acquire and consumer wait both fell from 224 ns to 64 ns. The median wait-to-compute dependency gap was 0 ns in both variants, showing that the consumer starts immediately once data is ready. Treat these numbers as a worked interpretation, not expected constants; rerun on the target kernel and GPU.
 
@@ -216,7 +216,6 @@ Pass `trace_format="chrome_json"` to `profile_session` or `events_to_perfetto` t
 
 ## Post-Processing
 
-
 You can pass callbacks to `profile_session` to mutate events or the Perfetto trace before writing:
 
 - `post_process_events(events, ctx) -> events`: Rename, filter, or regroup events.
@@ -285,6 +284,34 @@ def add_tile_coords(events, ctx):
 ```
 
 The `extra_args` dict is merged into each event's `args` in the Perfetto trace.
+
+### Example: Draw Pipeline Dependencies
+
+`link_dependency_flow` pairs repeated tags by `event_idx` within each profiling unit and draws direct arrows between the matched Perfetto slices. Use `successor_offset` when a released stage is reused by a later pipeline iteration:
+
+```python
+from transformer_nuggets.cute.profiler.postprocessors import (
+    compose,
+    link_dependency_flow,
+)
+
+with profile_session(
+    ...,
+    post_process_trace=compose(
+        link_dependency_flow("producer_load", "consumer_wait"),
+        link_dependency_flow("consumer_wait", "consumer_compute"),
+        link_dependency_flow(
+            "consumer_compute",
+            "producer_acquire",
+            successor_offset=num_stages,
+            flow_name="stage_release_to_reacquire",
+        ),
+    ),
+) as session:
+    ...
+```
+
+The source slice receives an `unblocks` argument and the destination receives `depends_on`, so the relationship remains readable in Perfetto's slice details as well as through the arrow.
 
 ## Buffer Layout
 

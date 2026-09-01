@@ -22,6 +22,7 @@ __all__ = [
     "compose",
     "rename_processes",
     "rename_threads",
+    "link_dependency_flow",
 ]
 
 
@@ -228,6 +229,110 @@ def rename_processes(name_map: dict[int, str]):
         return trace
 
     return _rename
+
+
+def append_slice_relation(event: dict, key: str, label: str) -> None:
+    """Append one readable dependency label to a duration slice."""
+    args = event.setdefault("args", {})
+    args[key] = f"{args[key]}, {label}" if key in args else label
+
+
+def trace_event_order(event: dict) -> tuple[bool, int, float]:
+    """Order profiler slices by static event slot, falling back to timestamp."""
+    event_idx = event.get("args", {}).get("event_idx")
+    return event_idx is None, event_idx if event_idx is not None else 0, event["ts"]
+
+
+def next_flow_id(trace: dict) -> int:
+    """Return an unused positive flow ID for a Chrome trace dictionary."""
+    flow_ids = [
+        event["id"]
+        for event in trace["traceEvents"]
+        if event.get("ph") in {"s", "t", "f"} and isinstance(event.get("id"), int)
+    ]
+    return max(flow_ids, default=0) + 1
+
+
+def link_dependency_flow(
+    predecessor_tag: str,
+    successor_tag: str,
+    *,
+    successor_offset: int = 0,
+    flow_name: str | None = None,
+):
+    """Draw one repeated producer-to-consumer dependency in Perfetto.
+
+    Slices are paired independently within each profiling unit after ordering by
+    ``event_idx``. ``successor_offset=N`` links predecessor ``i`` to successor
+    ``i + N``, matching :func:`dependency_gaps` for fixed-depth pipelines.
+
+    Args:
+        predecessor_tag: Name of the source duration slices.
+        successor_tag: Name of the destination duration slices.
+        successor_offset: Positional offset applied to the successor stream.
+        flow_name: Optional name for the emitted Perfetto flow.
+
+    Returns:
+        Trace post-processor that adds direct dependency arrows and readable
+        ``unblocks``/``depends_on`` slice arguments.
+    """
+    if successor_offset < 0:
+        raise ValueError("successor_offset must be non-negative")
+    relation_name = flow_name or f"{predecessor_tag}_to_{successor_tag}"
+
+    def _link(trace: dict, ctx: PostProcessContext) -> dict:
+        del ctx
+        by_unit: dict[int, dict[str, list[dict]]] = {}
+        for event in trace["traceEvents"]:
+            if event.get("ph") != "X" or event.get("name") not in {
+                predecessor_tag,
+                successor_tag,
+            }:
+                continue
+            unit_id = event.get("args", {}).get("unit_id")
+            if unit_id is None:
+                continue
+            by_unit.setdefault(unit_id, {}).setdefault(event["name"], []).append(event)
+
+        flow_id = next_flow_id(trace)
+        for tags in by_unit.values():
+            predecessors = sorted(tags.get(predecessor_tag, ()), key=trace_event_order)
+            successors = sorted(tags.get(successor_tag, ()), key=trace_event_order)
+            pair_count = min(len(predecessors), max(0, len(successors) - successor_offset))
+            for pair_idx in range(pair_count):
+                predecessor = predecessors[pair_idx]
+                successor_idx = pair_idx + successor_offset
+                successor = successors[successor_idx]
+                predecessor_label = f"{predecessor_tag}[{pair_idx}]"
+                successor_label = f"{successor_tag}[{successor_idx}]"
+                append_slice_relation(predecessor, "unblocks", successor_label)
+                append_slice_relation(successor, "depends_on", predecessor_label)
+                trace["traceEvents"].extend(
+                    (
+                        {
+                            "name": relation_name,
+                            "cat": "pipeline",
+                            "ph": "s",
+                            "ts": predecessor["ts"] + predecessor["dur"] / 2,
+                            "pid": predecessor["pid"],
+                            "tid": predecessor["tid"],
+                            "id": flow_id,
+                        },
+                        {
+                            "name": relation_name,
+                            "cat": "pipeline",
+                            "ph": "f",
+                            "ts": successor["ts"] + successor["dur"] / 2,
+                            "pid": successor["pid"],
+                            "tid": successor["tid"],
+                            "id": flow_id,
+                        },
+                    )
+                )
+                flow_id += 1
+        return trace
+
+    return _link
 
 
 def rename_threads(name_map: dict[tuple[int, int] | int, str]):

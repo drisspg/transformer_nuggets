@@ -3,6 +3,7 @@ import pytest
 from transformer_nuggets.cute.profiler import (
     Event,
     dependency_gaps,
+    link_dependency_flow,
     overlap_between,
     summarize_by_tag,
     validate_event_counts,
@@ -107,3 +108,55 @@ def test_dependency_gaps_empty_and_invalid_offset():
 
     with pytest.raises(ValueError, match="successor_offset must be non-negative"):
         dependency_gaps([], "produce", "consume", successor_offset=-1)
+
+
+def test_link_dependency_flow_pairs_static_slots_with_pipeline_offset():
+    def trace_slice(name: str, event_idx: int, ts: float, tid: int) -> dict:
+        return {
+            "name": name,
+            "ph": "X",
+            "ts": ts,
+            "dur": 1.0,
+            "pid": 0,
+            "tid": tid,
+            "args": {"unit_id": 0, "event_idx": event_idx},
+        }
+
+    first_compute = trace_slice("compute", 3, 3.0, 1)
+    second_compute = trace_slice("compute", 7, 7.0, 1)
+    first_acquire = trace_slice("acquire", 0, 0.0, 0)
+    second_acquire = trace_slice("acquire", 4, 4.0, 0)
+    third_acquire = trace_slice("acquire", 8, 8.0, 0)
+    trace = {
+        "traceEvents": [
+            second_compute,
+            first_acquire,
+            third_acquire,
+            first_compute,
+            second_acquire,
+        ]
+    }
+
+    processed = link_dependency_flow(
+        "compute",
+        "acquire",
+        successor_offset=1,
+        flow_name="release_to_reacquire",
+    )(trace, None)
+
+    flows = [event for event in processed["traceEvents"] if event.get("cat") == "pipeline"]
+    assert [(event["ph"], event["id"], event["name"]) for event in flows] == [
+        ("s", 1, "release_to_reacquire"),
+        ("f", 1, "release_to_reacquire"),
+        ("s", 2, "release_to_reacquire"),
+        ("f", 2, "release_to_reacquire"),
+    ]
+    assert first_compute["args"]["unblocks"] == "acquire[1]"
+    assert second_acquire["args"]["depends_on"] == "compute[0]"
+    assert second_compute["args"]["unblocks"] == "acquire[2]"
+    assert third_acquire["args"]["depends_on"] == "compute[1]"
+
+
+def test_link_dependency_flow_rejects_negative_offset():
+    with pytest.raises(ValueError, match="successor_offset must be non-negative"):
+        link_dependency_flow("produce", "consume", successor_offset=-1)

@@ -872,11 +872,15 @@ def test_track_event_conversion_attaches_paired_flows_to_slices():
         "traceEvents": [
             {"ph": "M", "name": "thread_name", "pid": 0, "tid": 1, "args": {"name": "cpu"}},
             {"ph": "M", "name": "thread_name", "pid": 0, "tid": 2, "args": {"name": "gpu"}},
+            {"ph": "M", "name": "thread_name", "pid": 0, "tid": 3, "args": {"name": "cpu2"}},
             {"ph": "X", "name": "cudaLaunchKernel", "pid": 0, "tid": 1, "ts": 0, "dur": 10},
             {"ph": "X", "name": "kernel", "pid": 0, "tid": 2, "ts": 20, "dur": 5},
+            {"ph": "X", "name": "consume", "pid": 0, "tid": 3, "ts": 30, "dur": 5},
             {"ph": "s", "name": "ac2g", "pid": 0, "tid": 1, "ts": 1, "id": 99},
             {"ph": "f", "name": "ac2g", "pid": 0, "tid": 2, "ts": 20, "id": 99},
-            {"ph": "f", "name": "single-ended-noise", "pid": 0, "tid": 2, "ts": 22, "id": 100},
+            {"ph": "s", "name": "g2c", "pid": 0, "tid": 2, "ts": 22, "id": 101},
+            {"ph": "f", "name": "g2c", "pid": 0, "tid": 3, "ts": 30, "id": 101},
+            {"ph": "f", "name": "single-ended-noise", "pid": 0, "tid": 2, "ts": 23, "id": 100},
         ]
     }
 
@@ -889,10 +893,18 @@ def test_track_event_conversion_attaches_paired_flows_to_slices():
         and packet.track_event.type == TrackEvent.TYPE_SLICE_BEGIN
     ]
     flow_ids_by_name = {event.name: tuple(event.flow_ids) for event in begins}
+    terminating_flow_ids_by_name = {
+        event.name: tuple(event.terminating_flow_ids) for event in begins
+    }
 
     assert flow_ids_by_name["cudaLaunchKernel"] == (99,)
-    assert flow_ids_by_name["kernel"] == (99,)
+    assert terminating_flow_ids_by_name["cudaLaunchKernel"] == ()
+    assert flow_ids_by_name["kernel"] == (101,)
+    assert terminating_flow_ids_by_name["kernel"] == (99,)
+    assert flow_ids_by_name["consume"] == ()
+    assert terminating_flow_ids_by_name["consume"] == (101,)
     assert all(100 not in flow_ids for flow_ids in flow_ids_by_name.values())
+    assert all(100 not in flow_ids for flow_ids in terminating_flow_ids_by_name.values())
 
 
 def test_track_event_conversion_splits_crossing_slices_and_keeps_nested_slices():
