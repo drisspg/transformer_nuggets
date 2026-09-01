@@ -363,6 +363,10 @@ Current regions are assumed to begin before acquire/wait, so wait is inferred
 from predecessor overlap. Add a second marker after the wait when an exact
 wait/work split is required.
 
+CUTLASS 4.7 Task Scheduling objects can be adapted with
+`plan_from_task_manager`; this adapter is duck-typed and does not import
+CuTeDSL at package import time.
+
 ## Buffer Layout
 
 Each unit owns `1 + 4 * max_events_per_unit` int64s:

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from enum import Enum
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import Trace, TrackEvent
@@ -21,6 +23,7 @@ from transformer_nuggets.cute.profiler.pipeline import (
     analyze_pipeline,
     extract_plan,
     load_iket_capture,
+    plan_from_task_manager,
     write_pipeline_perfetto,
 )
 from transformer_nuggets.utils.merge_traces import merge_traces
@@ -306,3 +309,55 @@ def test_perfetto_splits_crossing_role_envelopes_and_normalizes_suffix(
     assert len({event.track_uuid for event in begins}) == 2
     assert all(descriptors[event.track_uuid].sibling_merge_behavior for event in begins)
     assert any(descriptor.HasField("process") for descriptor in descriptors.values())
+
+
+def test_task_scheduling_adapter_maps_staged_resources() -> None:
+    class Stage(Enum):
+        ConsumerWork = "consumer_work"
+        ProducerWork = "producer_work"
+
+    class PipelineConfig:
+        def __init__(self, stages: int) -> None:
+            self.num_stages = stages
+            self.pipeline_type = "AsyncAsync"
+
+    class ResourceStub:
+        def __init__(self, name: str, stages: int | None = None) -> None:
+            self.name = name
+            self.pipeline_config = PipelineConfig(stages) if stages else None
+
+    source = ResourceStub("source")
+    staged = ResourceStub("staged", 2)
+    output = ResourceStub("output")
+    tasks = [
+        SimpleNamespace(
+            name="Load",
+            warp_start=0,
+            warp_end=1,
+            src_resources=[source],
+            dst_resources=[staged],
+            loop_schedule_list=[
+                (source, Stage.ConsumerWork, 0, None, "read"),
+                (staged, Stage.ProducerWork, 0, None, "load"),
+            ],
+        ),
+        SimpleNamespace(
+            name="Compute",
+            warp_start=1,
+            warp_end=2,
+            src_resources=[staged],
+            dst_resources=[output],
+            loop_schedule_list=[
+                (staged, Stage.ConsumerWork, 0, None, "consume"),
+                (output, Stage.ProducerWork, 0, None, "store"),
+            ],
+        ),
+    ]
+
+    plan = plan_from_task_manager(SimpleNamespace(tasks=tasks), name="ts")
+
+    assert plan.resources["staged"].depth == 2
+    assert {(edge.kind, edge.distance) for edge in plan.dependencies} == {
+        ("data", 0),
+        ("reuse", 2),
+    }

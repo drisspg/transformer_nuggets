@@ -24,6 +24,7 @@ _LAZY_EXPORTS = {
     "PipelineAnalysis": ("analysis", "PipelineAnalysis"),
     "analyze_pipeline": ("analysis", "analyze_pipeline"),
     "load_iket_capture": ("iket", "load_iket_capture"),
+    "plan_from_task_manager": ("task_scheduling", "plan_from_task_manager"),
     "write_pipeline_perfetto": ("perfetto", "write_pipeline_perfetto"),
 }
 
@@ -57,5 +58,6 @@ __all__ = [
     "analyze_pipeline",
     "extract_plan",
     "load_iket_capture",
+    "plan_from_task_manager",
     "write_pipeline_perfetto",
 ]
