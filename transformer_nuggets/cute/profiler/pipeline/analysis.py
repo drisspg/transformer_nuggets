@@ -163,8 +163,13 @@ def analyze_pipeline(
     measured: MeasuredCapture,
     *,
     timer_epsilon_ns: int = 32,
+    cycle_cap: int = 10_000,
 ) -> PipelineAnalysis:
-    """Analyze the unrolled logical plan and one wait-inclusive measured capture."""
+    """Analyze the unrolled logical plan and one wait-inclusive measured capture.
+
+    ``cycle_cap`` bounds the simple-cycle enumeration behind the critical cycle; densely
+    annotated plans (tens of regions per role) can need a few million.
+    """
     edges = concrete_edges(timeline)
     logical_weights = {item.key: float(item.region.weight) for item in timeline.regions}
     logical_critical_path = critical_path(tuple(logical_weights), edges, logical_weights)
@@ -193,7 +198,7 @@ def analyze_pipeline(
             timeline,
             measured_weights,
         ),
-        logical_critical_cycle=critical_cycle(timeline, logical_weights),
+        logical_critical_cycle=critical_cycle(timeline, logical_weights, cycle_cap=cycle_cap),
     )
 
 
