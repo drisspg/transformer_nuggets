@@ -106,12 +106,31 @@ class PipelineAnnotations:
         consumes: Iterable[str] = (),
         produces: Iterable[str] = (),
         releases: Iterable[str] = (),
+        count: int = 1,
+        index: int | None = None,
     ) -> None:
-        """Start a named IKET range when profiling is enabled."""
+        """Start a named IKET range when profiling is enabled.
+
+        A region inside a ``cutlass.range_constexpr`` loop passes the compile-time
+        loop variable as ``index`` and the trip count as a literal ``count``; the
+        traced range is named ``name[index]`` and the extractor expands the call
+        into ``count`` regions. Tokens containing ``{index}`` are substituted per
+        copy; plain ``consumes`` attach to the first copy and plain ``produces`` /
+        ``releases`` to the last, so the group behaves as one region externally.
+        """
         if not self.iket_enabled:
             return
         if self.active_role is None:
             raise RuntimeError(f"Pipeline region {name!r} executed outside an annotated role")
+        if index is not None:
+            if type(index) is not int:
+                raise TypeError(
+                    f"Pipeline region {name!r} index must be a compile-time int "
+                    f"(use cutlass.range_constexpr), got {type(index).__name__}"
+                )
+            if not 0 <= index < count:
+                raise ValueError(f"Pipeline region {name!r} index {index} outside count {count}")
+            name = indexed_region_name(name, index)
         iket = load_iket()
         if self.region_open:
             iket.range_pop()
@@ -126,6 +145,11 @@ class PipelineAnnotations:
             raise RuntimeError("PIPELINE.iteration_end() has no active region")
         load_iket().range_pop()
         self.region_open = False
+
+
+def indexed_region_name(name: str, index: int) -> str:
+    """Name one copy of a ``count``-expanded region."""
+    return f"{name}[{index}]"
 
 
 @dataclass(frozen=True)
@@ -333,29 +357,69 @@ class _AnnotatedPlanExtractor:
         ]
         calls.sort(key=lambda node: node.lineno)
         regions: list[ParsedRegion] = []
-        for order, call in enumerate(calls):
+        for position, call in enumerate(calls):
             end_line = (
-                calls[order + 1].lineno - 1 if order + 1 < len(calls) else function.end_lineno
+                calls[position + 1].lineno - 1
+                if position + 1 < len(calls)
+                else function.end_lineno
             )
-            regions.append(
-                ParsedRegion(
-                    region=Region(
-                        name=positional_literal(call, 0, str),
-                        role=role.name,
-                        label=keyword_literal(call, "label", str),
-                        order=order,
-                        weight=keyword_literal(call, "weight", int),
-                        description=keyword_literal(call, "description", str),
-                        source=SourceLocation(str(self.path), call.lineno, end_line),
-                    ),
-                    consumes=keyword_string_tuple(call, "consumes"),
-                    produces=keyword_string_tuple(call, "produces"),
-                    releases=keyword_string_tuple(call, "releases"),
-                )
-            )
+            source = SourceLocation(str(self.path), call.lineno, end_line)
+            regions.extend(self.expand_region(call, role, source, len(regions)))
         if not regions:
             raise ValueError(f"Role function {function.name!r} declares no regions")
         return regions
+
+    def expand_region(
+        self,
+        call: ast.Call,
+        role: Role,
+        source: SourceLocation,
+        first_order: int,
+    ) -> list[ParsedRegion]:
+        """Lower one region call into ``count`` regions with per-copy tokens."""
+        name = positional_literal(call, 0, str)
+        count = keyword_literal(call, "count", int, default=1)
+        if count < 1:
+            raise ValueError(f"Region {name!r} at line {call.lineno} has count {count} < 1")
+        has_index = any(item.arg == "index" for item in call.keywords)
+        if (count > 1) != has_index:
+            raise ValueError(
+                f"Region {name!r} at line {call.lineno} must pass both count>1 and index"
+            )
+        label = keyword_literal(call, "label", str)
+        weight = keyword_literal(call, "weight", int)
+        description = keyword_literal(call, "description", str)
+        consumes = keyword_string_tuple(call, "consumes")
+        produces = keyword_string_tuple(call, "produces")
+        releases = keyword_string_tuple(call, "releases")
+        if count == 1:
+            region = Region(name, role.name, label, first_order, weight, description, source)
+            return [ParsedRegion(region, consumes, produces, releases)]
+
+        def copy_tokens(tokens: tuple[str, ...], index: int, plain_at: int) -> tuple[str, ...]:
+            return tuple(
+                token.replace("{index}", str(index))
+                for token in tokens
+                if "{index}" in token or index == plain_at
+            )
+
+        return [
+            ParsedRegion(
+                Region(
+                    indexed_region_name(name, index),
+                    role.name,
+                    f"{label} [{index}]",
+                    first_order + index,
+                    weight,
+                    description,
+                    source,
+                ),
+                consumes=copy_tokens(consumes, index, 0),
+                produces=copy_tokens(produces, index, count - 1),
+                releases=copy_tokens(releases, index, count - 1),
+            )
+            for index in range(count)
+        ]
 
 
 def descendants_without_nested_functions(

@@ -24,6 +24,7 @@ from transformer_nuggets.cute.profiler.pipeline import (
     extract_plan,
     load_iket_capture,
     plan_from_task_manager,
+    report,
     write_pipeline_perfetto,
 )
 from transformer_nuggets.utils.merge_traces import merge_traces
@@ -361,3 +362,146 @@ def test_task_scheduling_adapter_maps_staged_resources() -> None:
         ("data", 0),
         ("reuse", 2),
     }
+
+
+INDEXED_SOURCE = """
+PIPELINE = PipelineAnnotations("indexed", iteration_name="chunk")
+PIPELINE.resource("x_0", label="X hi", depth=1, storage="SMEM", description="hi half")
+PIPELINE.resource("x_1", label="X lo", depth=1, storage="SMEM", description="lo half")
+PIPELINE.resource("acc", label="Acc", depth=1, storage="TMEM", description="accumulator")
+
+class Kernel:
+    @PIPELINE.role("state", label="State", warp_start=0, warp_end=4, color="#f80")
+    def run_state(self):
+        PIPELINE.region(
+            "state.split", label="Split", weight=2, description="store halves",
+            produces=("x_0", "x_1"),
+        )
+        PIPELINE.region(
+            "state.wait", label="Wait", weight=1, description="wait acc",
+            consumes=("acc",), releases=("acc",),
+        )
+        PIPELINE.iteration_end()
+
+    @PIPELINE.role("mma", label="MMA", warp_start=4, warp_end=5, color="#08f")
+    def run_mma(self):
+        for split in cutlass.range_constexpr(2):
+            PIPELINE.region(
+                "mma.pass", label="Pass", weight=2, description="one half",
+                consumes=("x_{index}",), releases=("x_{index}",), produces=("acc",),
+                count=2, index=split,
+            )
+        PIPELINE.iteration_end()
+"""
+
+
+def test_indexed_regions_expand_with_per_copy_tokens(tmp_path: Path) -> None:
+    source = tmp_path / "indexed.py"
+    source.write_text(INDEXED_SOURCE)
+
+    plan = extract_plan(source)
+
+    assert [region.name for region in plan.regions.values() if region.role == "mma"] == [
+        "mma.pass[0]",
+        "mma.pass[1]",
+    ]
+    edges = {(edge.source, edge.target, edge.resource, edge.kind) for edge in plan.dependencies}
+    assert ("state.split", "mma.pass[0]", "x_0", "data") in edges
+    assert ("state.split", "mma.pass[1]", "x_1", "data") in edges
+    # Plain produces attach to the last copy only.
+    assert ("mma.pass[1]", "state.wait", "acc", "data") in edges
+    assert not any(
+        edge.source == "mma.pass[0]" and edge.resource == "acc" for edge in plan.dependencies
+    )
+    assert plan.schedule(iterations=2).logical_duration > 0
+
+
+def test_indexed_region_requires_count_and_index_together(tmp_path: Path) -> None:
+    source = tmp_path / "bad.py"
+    source.write_text(INDEXED_SOURCE.replace("count=2, index=split,", "count=2,"))
+    with pytest.raises(ValueError, match="count>1 and index"):
+        extract_plan(source)
+
+
+def test_runtime_indexed_region_names_and_rejects_dynamic_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    annotations = PipelineAnnotations("test", iteration_name="tile")
+    annotations.enable_iket()
+    pushed: list[str] = []
+    fake_iket = SimpleNamespace(range_push=pushed.append, range_pop=lambda: None)
+    monkeypatch.setattr(pipeline_annotations, "load_iket", lambda: fake_iket)
+
+    @annotations.role("mma", label="MMA", warp_start=0, warp_end=1, color="#fff")
+    def body(index) -> None:
+        annotations.region("pass", label="Pass", weight=1, description="p", count=2, index=index)
+        annotations.iteration_end()
+
+    body(1)
+    assert pushed == ["pass[1]"]
+    with pytest.raises(TypeError, match="compile-time int"):
+        body(SimpleNamespace())
+    with pytest.raises(ValueError, match="outside count"):
+        body(2)
+
+
+def test_report_lists_regions_and_scheduler_findings() -> None:
+    timeline = toy_plan().schedule(iterations=4)
+    measured = logical_capture(timeline)
+    analysis = analyze_pipeline(timeline, measured)
+
+    text = report(timeline, measured, analysis, unprofiled_iteration_ns=100.0)
+
+    assert "per iteration ~" in text and "instrumentation +" in text
+    assert "load     load.x" in text and "compute  compute.x" in text
+    assert "iteration 2 timeline" in text
+    assert "RecMII" in text and "critical cycle: " in text
+
+
+def test_capture_cli_reanalyzes_an_existing_trace(tmp_path: Path, capsys) -> None:
+    from transformer_nuggets.cute.profiler.pipeline.capture import main
+
+    source = tmp_path / "annotated.py"
+    source.write_text(ANNOTATED_SOURCE)
+    timeline = extract_plan(source).schedule(iterations=3)
+    names = ["load.x", "compute.x"]
+    locations = [{"ctaId": [0, 0, 0], "warpId": 0}, {"ctaId": [0, 0, 0], "warpId": 1}]
+    ranges = [
+        {
+            "startTs": 1_000 + item.start * 10,
+            "endTs": 1_000 + item.end * 10,
+            "rangeNameIdx": names.index(item.region.name),
+            "warpLocIdxs": [0 if item.region.role == "load" else 1] * 2,
+        }
+        for item in timeline.regions
+    ]
+    trace = tmp_path / "iket.trace.json"
+    trace.write_text(
+        json.dumps(
+            {
+                "stringTable": names,
+                "locationTable": locations,
+                "launches": [{"kernelName": "demo", "ranges": ranges}],
+            }
+        )
+    )
+
+    rc = main(
+        [
+            "--tag",
+            "demo",
+            "--annotated",
+            str(source),
+            "--iterations",
+            "3",
+            "--out",
+            str(tmp_path / "traces"),
+            "--from-trace",
+            str(trace),
+        ]
+    )
+
+    assert rc == 0
+    assert (tmp_path / "traces" / "demo.enriched.pftrace").exists()
+    assert "RecMII" in (tmp_path / "traces" / "demo.report.txt").read_text()
+    assert "iteration 1 timeline" in capsys.readouterr().out

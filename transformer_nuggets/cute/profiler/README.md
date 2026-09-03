@@ -363,6 +363,42 @@ Current regions are assumed to begin before acquire/wait, so wait is inferred
 from predecessor overlap. Add a second marker after the wait when an exact
 wait/work split is required.
 
+Region names are source literals. For a region inside a
+`cutlass.range_constexpr` loop, pass the compile-time loop variable and the trip
+count so each copy gets its own range:
+
+```python
+for split in cutlass.range_constexpr(2):
+    PIPELINE.region(
+        "mma.pass", label="kg@X pass", weight=2, description="one hi/lo half",
+        consumes=("x_{index}",), releases=("x_{index}",), produces=("acc",),
+        count=2, index=split,
+    )
+```
+
+This expands to `mma.pass[0]` and `mma.pass[1]`. Tokens containing `{index}`
+are substituted per copy; plain `consumes` attach to the first copy and plain
+`produces`/`releases` to the last, so the group acts as one region externally.
+
+`report(timeline, measured, analysis)` renders the text you read after every
+capture: per-role region medians over the steady-state iterations, one
+iteration's timeline in ns, and the RecMII/ResMII/critical-cycle findings.
+Regions shorter than about twice the ~50 ns range push/pop overhead are
+flagged. The capture CLI wraps the whole loop and keeps successive experiments
+side by side:
+
+```
+python -m transformer_nuggets.cute.profiler.pipeline.capture \
+    --tag 02_split_stages --annotated rev_annotated.py --iterations 8 \
+    --unprofiled-iteration-ns 950 -- python profile_kernel.py --iket
+```
+
+It runs the command under `run-iket` with `CUTE_DSL_NO_CACHE=1` (the command
+must launch the annotated kernel exactly once), then writes
+`traces/<tag>.raw_iket.{trace.json,pftrace}`, `traces/<tag>.enriched.pftrace`,
+and `traces/<tag>.report.txt`. `--from-trace <trace.json>` re-analyzes an
+existing capture without a GPU.
+
 CUTLASS 4.7 Task Scheduling objects can be adapted with
 `plan_from_task_manager`; this adapter is duck-typed and does not import
 CuTeDSL at package import time.
