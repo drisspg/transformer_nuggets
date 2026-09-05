@@ -978,13 +978,22 @@ def attach_oom_observer(
     torch.cuda.memory._record_memory_history(max_entries=max_entries, stacks="all")
 
 
-def get_process_rank():
-    """Get process rank even if distributed is not initialized"""
+def get_process_rank() -> int | None:
+    """Global process rank, or None outside a distributed launch.
+
+    Uses the process group when initialized, else torchrun's RANK, else
+    LOCAL_RANK. Trace filenames key on this, so it must be unique across nodes,
+    not just within one.
+    """
     import os
 
-    # Check for LOCAL_RANK which torchrun sets
-    if "LOCAL_RANK" in os.environ:
-        return int(os.environ["LOCAL_RANK"])
+    import torch.distributed as dist
+
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank()
+    for var in ("RANK", "LOCAL_RANK"):
+        if var in os.environ:
+            return int(os.environ[var])
     return None
 
 
