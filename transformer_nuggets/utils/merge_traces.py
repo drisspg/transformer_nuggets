@@ -31,12 +31,31 @@ def _is_native_trace(path: str | Path) -> bool:
     return Path(path).suffix in {".pftrace", ".perfetto-trace"}
 
 
+# TrackDescriptor.child_ordering value meaning "sort children by sibling_order_rank".
+_EXPLICIT_CHILD_ORDERING = 3
+# Kineto exports one synthetic "python" process per CUDA device with this rank offset.
+_KINETO_DEVICE_PROCESS_RANK = 5_000_000
+_THREAD_RANK_BASE = 100
+_GLOBAL_TRACK_RANK = 10_000_000
+_TID_STRIDE = 1_000_000
+
+
 def _merge_native_traces(
     input_paths: list[str],
     output_path: str,
     labels: list[str] | None,
 ) -> None:
-    """Merge native traces while isolating each input's incremental state and tracks."""
+    """Merge native traces into one process group per input.
+
+    Every input's sequence, track, and flow ids are remapped into disjoint
+    ranges. Each input's processes are folded into a single process named by its
+    label: Kineto emits the python process plus one empty "python" process per
+    CUDA device, all with small pids that collide across ranks, which otherwise
+    pools streams from different ranks into one Perfetto group. Stream,
+    annotation, and global tracks are re-parented under the folded process,
+    groups are ordered by input index, and python threads sort before GPU
+    streams inside a group.
+    """
     from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import Trace
 
     merged = Trace()
@@ -51,6 +70,7 @@ def _merge_native_traces(
         track_uuids: dict[int, int] = {}
         flow_ids: dict[int, int] = {}
         label = labels[index] if labels else f"Rank {index}"
+        pid = index + 1
 
         def remap(mapping: dict[int, int], value: int, next_id: int) -> tuple[int, int]:
             if value == 0:
@@ -62,7 +82,33 @@ def _merge_native_traces(
                 next_id += 1
             return mapped, next_id
 
+        # Pick the input's primary process (the real one, not a Kineto device
+        # process) and alias every other process uuid onto it so their children
+        # re-parent through the ordinary uuid remap below.
+        process_descriptors = [
+            packet.track_descriptor
+            for packet in source.packet
+            if packet.HasField("track_descriptor") and packet.track_descriptor.HasField("process")
+        ]
+        real_processes = [
+            descriptor
+            for descriptor in process_descriptors
+            if descriptor.sibling_order_rank < _KINETO_DEVICE_PROCESS_RANK
+        ] or process_descriptors
+        primary_uuid = real_processes[0].uuid if real_processes else 0
+        if primary_uuid:
+            _, next_track_uuid = remap(track_uuids, primary_uuid, next_track_uuid)
+            for descriptor in process_descriptors:
+                track_uuids[descriptor.uuid] = track_uuids[primary_uuid]
+        emitted_process = False
+        thread_rank = _THREAD_RANK_BASE
+
         for source_packet in source.packet:
+            if source_packet.HasField("track_descriptor"):
+                descriptor = source_packet.track_descriptor
+                if descriptor.HasField("process") and descriptor.uuid != primary_uuid:
+                    continue  # folded into the primary process
+
             packet = merged.packet.add()
             packet.CopyFrom(source_packet)
 
@@ -86,11 +132,22 @@ def _merge_native_traces(
                     next_track_uuid,
                 )
                 if descriptor.HasField("process"):
-                    process_name = descriptor.process.process_name
-                    descriptor.process.process_name = (
-                        f"{label} · {process_name}" if process_name else label
-                    )
+                    descriptor.process.pid = pid
+                    descriptor.process.process_name = label
                     descriptor.sibling_order_rank = index
+                    descriptor.child_ordering = _EXPLICIT_CHILD_ORDERING
+                    emitted_process = True
+                else:
+                    if descriptor.HasField("thread"):
+                        descriptor.thread.pid = pid
+                        descriptor.thread.tid += index * _TID_STRIDE
+                    if descriptor.parent_uuid == 0 and primary_uuid:
+                        # Global tracks (e.g. Kineto events) join the rank's group.
+                        descriptor.parent_uuid = track_uuids[primary_uuid]
+                        descriptor.sibling_order_rank = _GLOBAL_TRACK_RANK
+                    elif descriptor.name.startswith("thread ") or descriptor.HasField("thread"):
+                        descriptor.sibling_order_rank = thread_rank
+                        thread_rank += 1
                 if descriptor.sibling_merge_key:
                     descriptor.sibling_merge_key = f"{index}:{descriptor.sibling_merge_key}"
 
@@ -125,6 +182,8 @@ def _merge_native_traces(
                             flow_id,
                             next_flow_id,
                         )
+
+        assert emitted_process or not primary_uuid, f"{path}: primary process descriptor dropped"
 
     Path(output_path).write_bytes(merged.SerializeToString())
 

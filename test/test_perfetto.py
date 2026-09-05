@@ -1101,3 +1101,68 @@ def test_merge_traces_rejects_native_input_with_json_output(tmp_path):
 
     with pytest.raises(ValueError, match="native Perfetto inputs require"):
         merge_traces([str(input_path)], str(tmp_path / "merged.json"))
+
+
+def test_merge_traces_folds_each_rank_into_one_process(tmp_path):
+    """Kineto emits a python process plus one 'python' process per CUDA device
+    with small pids that collide across ranks; the merge must give each rank a
+    single uniquely-numbered process with GPU and global tracks under it."""
+    from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import Trace
+
+    from transformer_nuggets.utils.merge_traces import merge_traces
+
+    def kineto_like_trace(path, pid):
+        trace = Trace()
+        for uuid, parent, name, rank, process_pid in (
+            (11, 0, "", pid, pid),  # real python process
+            (12, 0, "", 5_000_000, 0),  # device 0 process, same pid on every rank
+            (13, 0, "", 5_000_001, 1),  # empty device 1 process
+            (21, 11, "thread 1 (python)", 100, None),
+            (22, 12, "stream 7", 700, None),
+            (23, 12, "annotations", 690, None),
+            (24, 0, "Kineto events", 2**31 - 1, None),
+        ):
+            descriptor = trace.packet.add().track_descriptor
+            descriptor.uuid, descriptor.parent_uuid, descriptor.name = uuid, parent, name
+            descriptor.sibling_order_rank = rank
+            if process_pid is not None:
+                descriptor.process.pid = process_pid
+                descriptor.process.process_name = "python"
+        for track_uuid, name in ((21, "launch"), (22, "kernel")):
+            packet = trace.packet.add()
+            packet.timestamp = 10
+            packet.trusted_packet_sequence_id = 1
+            packet.track_event.track_uuid = track_uuid
+            packet.track_event.name = name
+        path.write_bytes(trace.SerializeToString())
+        return str(path)
+
+    inputs = [kineto_like_trace(tmp_path / f"rank{i}.pftrace", pid=4000 + i) for i in range(2)]
+    output = tmp_path / "merged.pftrace"
+    merge_traces(inputs, str(output), labels=["Rank 0", "Rank 1"])
+
+    trace = Trace()
+    trace.ParseFromString(output.read_bytes())
+    descriptors = {
+        p.track_descriptor.uuid: p.track_descriptor
+        for p in trace.packet
+        if p.HasField("track_descriptor")
+    }
+    processes = [d for d in descriptors.values() if d.HasField("process")]
+    assert [d.process.process_name for d in processes] == ["Rank 0", "Rank 1"]
+    assert len({d.process.pid for d in processes}) == 2
+    assert [d.sibling_order_rank for d in processes] == [0, 1]
+    for process in processes:
+        children = sorted(
+            (d for d in descriptors.values() if d.parent_uuid == process.uuid),
+            key=lambda d: d.sibling_order_rank,
+        )
+        assert [d.name for d in children] == [
+            "thread 1 (python)",
+            "annotations",
+            "stream 7",
+            "Kineto events",
+        ]
+    assert all(d.parent_uuid or d.HasField("process") for d in descriptors.values())
+    event_tracks = {p.track_event.track_uuid for p in trace.packet if p.HasField("track_event")}
+    assert event_tracks <= set(descriptors)
