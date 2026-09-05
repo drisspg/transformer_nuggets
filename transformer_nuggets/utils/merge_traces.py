@@ -40,10 +40,70 @@ _GLOBAL_TRACK_RANK = 10_000_000
 _TID_STRIDE = 1_000_000
 
 
+def _collective_end_timestamps(trace) -> list[int]:
+    """End timestamps of NCCL kernels on GPU stream tracks, in launch order.
+
+    Every rank completes a given collective at (nearly) the same instant, so
+    these are shared reference points for aligning traces recorded against
+    different host clocks.
+    """
+    stream_uuids = {
+        packet.track_descriptor.uuid
+        for packet in trace.packet
+        if packet.HasField("track_descriptor")
+        and packet.track_descriptor.name.startswith("stream")
+    }
+    interned: dict[int, dict[int, str]] = {}
+    open_slices: dict[int, list[tuple[int, str]]] = {}
+    ends: list[tuple[int, int]] = []
+    for packet in trace.packet:
+        if packet.HasField("interned_data"):
+            names = interned.setdefault(packet.trusted_packet_sequence_id, {})
+            for entry in packet.interned_data.event_names:
+                names[entry.iid] = entry.name
+        if not packet.HasField("track_event"):
+            continue
+        event = packet.track_event
+        if event.track_uuid not in stream_uuids:
+            continue
+        name = event.name or interned.get(packet.trusted_packet_sequence_id, {}).get(
+            event.name_iid, ""
+        )
+        stack = open_slices.setdefault(event.track_uuid, [])
+        if event.type == event.TYPE_SLICE_BEGIN:
+            stack.append((packet.timestamp, name))
+        elif event.type == event.TYPE_SLICE_END and stack:
+            start, name = stack.pop()
+            if "nccl" in name.lower():
+                ends.append((start, packet.timestamp))
+    ends.sort()
+    return [end for _, end in ends]
+
+
+def _clock_offsets(traces: list, reference_index: int = 0) -> list[int]:
+    """Per-input timestamp offsets that make matching collectives end together.
+
+    Offset i is the median of ``end_k(i) - end_k(reference)`` over collectives
+    the two inputs have in common. Inputs without collectives get no shift.
+    """
+    ends = [_collective_end_timestamps(trace) for trace in traces]
+    reference = ends[reference_index]
+    offsets = []
+    for own in ends:
+        count = min(len(own), len(reference))
+        if count == 0:
+            offsets.append(0)
+            continue
+        deltas = sorted(own[k] - reference[k] for k in range(count))
+        offsets.append(deltas[count // 2])
+    return offsets
+
+
 def _merge_native_traces(
     input_paths: list[str],
     output_path: str,
     labels: list[str] | None,
+    align_timestamps: bool = False,
 ) -> None:
     """Merge native traces into one process group per input.
 
@@ -55,17 +115,31 @@ def _merge_native_traces(
     annotation, and global tracks are re-parented under the folded process,
     groups are ordered by input index, and python threads sort before GPU
     streams inside a group.
+
+    With ``align_timestamps`` each input is shifted so its NCCL collectives end
+    at the same time as input 0's; ranks on different hosts otherwise appear
+    offset by their host clock difference (hundreds of microseconds and up).
     """
     from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import Trace
+
+    sources = []
+    for path in input_paths:
+        source = Trace()
+        source.ParseFromString(Path(path).read_bytes())
+        sources.append(source)
+    offsets = _clock_offsets(sources) if align_timestamps else [0] * len(sources)
+    # Timestamps are unsigned and only relative time matters: express every
+    # shift as a non-negative subtraction from the most-advanced clock.
+    offsets = [offset - max(offsets) for offset in offsets]
 
     merged = Trace()
     next_sequence_id = 1
     next_track_uuid = 1
     next_flow_id = 1
 
-    for index, path in enumerate(input_paths):
-        source = Trace()
-        source.ParseFromString(Path(path).read_bytes())
+    for index, source in enumerate(sources):
+        path = input_paths[index]
+        offset = offsets[index]
         sequence_ids: dict[int, int] = {}
         track_uuids: dict[int, int] = {}
         flow_ids: dict[int, int] = {}
@@ -111,6 +185,8 @@ def _merge_native_traces(
 
             packet = merged.packet.add()
             packet.CopyFrom(source_packet)
+            if offset and packet.HasField("timestamp"):
+                packet.timestamp = max(packet.timestamp - offset, 0)
 
             sequence_id, next_sequence_id = remap(
                 sequence_ids,
@@ -200,6 +276,10 @@ def merge_traces(
     Perfetto TrackEvent protobuf, anything else writes Chrome JSON (gzipped for
     ``.gz``). Native inputs require native output because conversion back to Chrome
     JSON is intentionally unsupported.
+
+    ``align_timestamps`` rebases Chrome JSON inputs to a common start. For native
+    inputs it instead shifts each rank so its NCCL collectives end together with
+    rank 0's, cancelling host clock offsets between nodes.
     """
     native_inputs = [_is_native_trace(path) for path in input_paths]
     if any(native_inputs):
@@ -207,9 +287,7 @@ def merge_traces(
             raise ValueError("cannot merge a mixture of native Perfetto and Chrome JSON traces")
         if not _is_native_trace(output_path):
             raise ValueError("native Perfetto inputs require a .pftrace or .perfetto-trace output")
-        if align_timestamps:
-            raise ValueError("timestamp alignment is not supported for native Perfetto inputs")
-        _merge_native_traces(input_paths, output_path, labels)
+        _merge_native_traces(input_paths, output_path, labels, align_timestamps)
         return
 
     merged_events: list[dict] = []

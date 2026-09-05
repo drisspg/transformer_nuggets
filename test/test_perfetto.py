@@ -1166,3 +1166,50 @@ def test_merge_traces_folds_each_rank_into_one_process(tmp_path):
     assert all(d.parent_uuid or d.HasField("process") for d in descriptors.values())
     event_tracks = {p.track_event.track_uuid for p in trace.packet if p.HasField("track_event")}
     assert event_tracks <= set(descriptors)
+
+
+def test_merge_traces_aligns_native_inputs_on_collective_ends(tmp_path):
+    """Ranks on different hosts stamp with different clocks; matching NCCL
+    kernels end at the same instant, so aligning on them cancels the offset."""
+    from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import Trace
+
+    from transformer_nuggets.utils.merge_traces import merge_traces
+
+    def rank_trace(path, clock_offset):
+        trace = Trace()
+        process = trace.packet.add().track_descriptor
+        process.uuid, process.process.pid, process.process.process_name = 1, 9, "python"
+        stream = trace.packet.add().track_descriptor
+        stream.uuid, stream.parent_uuid, stream.name = 2, 1, "stream 7"
+        for start, end, name in (
+            (1_000, 1_500, "compute_kernel"),
+            (2_000, 2_400, "ncclDevKernel_AllGather_RING_LL"),
+            (5_000, 5_300, "ncclDevKernel_ReduceScatter_Sum_bf16_RING_LL"),
+        ):
+            for ts, kind in ((start, "TYPE_SLICE_BEGIN"), (end, "TYPE_SLICE_END")):
+                packet = trace.packet.add()
+                packet.timestamp = ts + clock_offset
+                packet.trusted_packet_sequence_id = 1
+                packet.track_event.track_uuid = 2
+                packet.track_event.type = getattr(packet.track_event, kind)
+                packet.track_event.name = name
+        path.write_bytes(trace.SerializeToString())
+        return str(path)
+
+    inputs = [
+        rank_trace(tmp_path / "rank0.pftrace", clock_offset=100_000),
+        rank_trace(tmp_path / "rank1.pftrace", clock_offset=100_000 + 900_000),  # host clock ahead
+    ]
+    output = tmp_path / "merged.pftrace"
+    merge_traces(inputs, str(output), align_timestamps=True)
+
+    trace = Trace()
+    trace.ParseFromString(output.read_bytes())
+    ends_by_rank: dict[int, list[int]] = {}
+    for packet in trace.packet:
+        event = packet.track_event
+        if packet.HasField("track_event") and event.type == event.TYPE_SLICE_END:
+            ends_by_rank.setdefault(packet.trusted_packet_sequence_id, []).append(packet.timestamp)
+    first, second = ends_by_rank.values()
+    assert first == second
+    assert min(first) > 0
