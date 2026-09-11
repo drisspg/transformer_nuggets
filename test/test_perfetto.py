@@ -1213,3 +1213,44 @@ def test_merge_traces_aligns_native_inputs_on_collective_ends(tmp_path):
     first, second = ends_by_rank.values()
     assert first == second
     assert min(first) > 0
+
+
+def test_merge_traces_aligns_native_inputs_without_collectives_on_first_event(tmp_path):
+    """Single-process A/B traces share no collectives; align their first events
+    instead of leaving each at its absolute wall-clock time."""
+    from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import Trace
+
+    from transformer_nuggets.utils.merge_traces import merge_traces
+
+    def variant_trace(path, start):
+        trace = Trace()
+        process = trace.packet.add().track_descriptor
+        process.uuid, process.process.pid, process.process.process_name = 1, 9, "python"
+        stream = trace.packet.add().track_descriptor
+        stream.uuid, stream.parent_uuid, stream.name = 2, 1, "stream 7"
+        for ts, kind in ((start, "TYPE_SLICE_BEGIN"), (start + 500, "TYPE_SLICE_END")):
+            packet = trace.packet.add()
+            packet.timestamp = ts
+            packet.trusted_packet_sequence_id = 1
+            packet.track_event.track_uuid = 2
+            packet.track_event.type = getattr(packet.track_event, kind)
+            packet.track_event.name = "compute_kernel"
+        path.write_bytes(trace.SerializeToString())
+        return str(path)
+
+    inputs = [
+        variant_trace(tmp_path / "pre.pftrace", start=1_000),
+        variant_trace(tmp_path / "post.pftrace", start=60_000_000_000),  # a minute later
+    ]
+    output = tmp_path / "merged.pftrace"
+    merge_traces(inputs, str(output), labels=["pre", "post"], align_timestamps=True)
+
+    trace = Trace()
+    trace.ParseFromString(output.read_bytes())
+    starts_by_input: dict[int, int] = {}
+    for packet in trace.packet:
+        event = packet.track_event
+        if packet.HasField("track_event") and event.type == event.TYPE_SLICE_BEGIN:
+            starts_by_input[packet.trusted_packet_sequence_id] = packet.timestamp
+    first, second = starts_by_input.values()
+    assert first == second

@@ -80,19 +80,30 @@ def _collective_end_timestamps(trace) -> list[int]:
     return [end for _, end in ends]
 
 
+def _first_timestamp(trace) -> int:
+    """Earliest track event; descriptors carry an explicit timestamp of 0."""
+    return min(
+        (packet.timestamp for packet in trace.packet if packet.HasField("track_event")),
+        default=0,
+    )
+
+
 def _clock_offsets(traces: list, reference_index: int = 0) -> list[int]:
     """Per-input timestamp offsets that make matching collectives end together.
 
     Offset i is the median of ``end_k(i) - end_k(reference)`` over collectives
-    the two inputs have in common. Inputs without collectives get no shift.
+    the two inputs have in common. Without common collectives (single-process
+    A/B traces recorded minutes apart) the input is instead shifted so its first
+    event lines up with the reference's first event.
     """
     ends = [_collective_end_timestamps(trace) for trace in traces]
     reference = ends[reference_index]
+    reference_start = _first_timestamp(traces[reference_index])
     offsets = []
-    for own in ends:
+    for own, trace in zip(ends, traces, strict=True):
         count = min(len(own), len(reference))
         if count == 0:
-            offsets.append(0)
+            offsets.append(_first_timestamp(trace) - reference_start)
             continue
         deltas = sorted(own[k] - reference[k] for k in range(count))
         offsets.append(deltas[count // 2])
@@ -119,6 +130,7 @@ def _merge_native_traces(
     With ``align_timestamps`` each input is shifted so its NCCL collectives end
     at the same time as input 0's; ranks on different hosts otherwise appear
     offset by their host clock difference (hundreds of microseconds and up).
+    Inputs without collectives in common are aligned on their first event.
     """
     from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import Trace
 
@@ -279,7 +291,8 @@ def merge_traces(
 
     ``align_timestamps`` rebases Chrome JSON inputs to a common start. For native
     inputs it instead shifts each rank so its NCCL collectives end together with
-    rank 0's, cancelling host clock offsets between nodes.
+    rank 0's, cancelling host clock offsets between nodes; inputs without common
+    collectives are aligned on their first event.
     """
     native_inputs = [_is_native_trace(path) for path in input_paths]
     if any(native_inputs):
