@@ -63,6 +63,20 @@ Profile an eager callable or forward/backward training step from Python with
 Logical formulas and physical NCU counters are intentionally kept separate. See
 `.agents/skills/analyzing-pytorch-rooflines/SKILL.md` for the workflow contract.
 
+Time an already-captured CUDA graph without capturing its replay into another graph:
+
+```python
+from transformer_nuggets.utils import benchmark_cuda_graph_stats
+
+# graph is a captured torch.cuda.CUDAGraph; select its device before timing.
+stats = benchmark_cuda_graph_stats(graph, num_iters=100, warmup_iters=20)
+print(f"Replay median: {stats.median_us:.2f} us")
+```
+
+Input updates and correctness checks stay outside timing. Warmup and measurement
+both replay the graph, including any captured mutations. For a callable that still
+needs capture, use `benchmark_cuda_function_stats(fn, USE_CUDA_GRAPHS=True)`.
+
 CUTE intra-kernel profiling (writes a Perfetto trace):
 
 ```shell

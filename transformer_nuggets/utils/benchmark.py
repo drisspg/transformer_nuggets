@@ -365,6 +365,75 @@ def _call_do_bench_using_profiling(
         return do_bench_using_profiling(fn, **call_kwargs)
 
 
+def _time_cuda_graph_replay_samples_us(
+    graph: torch.cuda.CUDAGraph,
+    *,
+    num_iters: int,
+    warmup_iters: int,
+) -> list[float]:
+    if num_iters <= 0:
+        raise ValueError("num_iters must be positive")
+    if warmup_iters < 0:
+        raise ValueError("warmup_iters must be non-negative")
+
+    for _ in range(warmup_iters):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    samples_us = []
+    for _ in range(num_iters):
+        start.record()
+        graph.replay()
+        end.record()
+        torch.cuda.synchronize()
+        samples_us.append(start.elapsed_time(end) * 1e3)
+    return samples_us
+
+
+def benchmark_cuda_graph_stats(
+    graph: torch.cuda.CUDAGraph,
+    *,
+    num_iters: int = 100,
+    warmup_iters: int = 20,
+    confidence: float = 0.95,
+    n_resamples: int = 1000,
+    seed: int = 0,
+    lock_clocks: bool = False,
+) -> CudaBenchmarkStats:
+    """Time an already-captured CUDA graph without capturing or invoking its Python body.
+
+    Warm up with replay, then collect one CUDA-event interval per replay and
+    return microsecond samples, quantiles, and a bootstrap median confidence
+    interval. Capture, input updates, and correctness checks stay outside timing.
+    Fixed buffers normally represent a warm/reused-buffer workload. Event timing
+    includes GPU work and may include host submission gaps, not just kernel time.
+
+    The caller must select the graph's CUDA device and order input updates before
+    replay on the current stream. The graph and its buffers remain caller-owned;
+    warmup and measurement both execute any captured mutations. This helper
+    synchronizes the current device after warmup and after each timed replay.
+
+    Args:
+        graph: An already-captured graph, ready to replay on the current device.
+        num_iters: Number of measured replays; must be positive.
+        warmup_iters: Number of untimed replays; may be zero.
+        confidence: Bootstrap confidence level in (0, 1).
+        n_resamples: Number of bootstrap resamples.
+        seed: Seed for bootstrap resampling, not the captured workload.
+        lock_clocks: Lock SM clocks during warmup and measurement (requires root).
+    """
+    ctx = locked_clocks() if lock_clocks else nullcontext()
+    with ctx:
+        samples_us = _time_cuda_graph_replay_samples_us(
+            graph, num_iters=num_iters, warmup_iters=warmup_iters
+        )
+    return CudaBenchmarkStats.from_samples(
+        samples_us, confidence=confidence, n_resamples=n_resamples, seed=seed
+    )
+
+
 def _benchmark_cuda_graph_replay_samples_us(
     func: Callable,
     *args,
@@ -372,8 +441,8 @@ def _benchmark_cuda_graph_replay_samples_us(
 ) -> list[float]:
     """Capture one CUDA graph and return per-replay CUDA-event timings in us.
 
-    This measures steady-state replay latency. It intentionally excludes host
-    launch gaps that dominate tiny eager kernels. Any GPU-side work inside the
+    This measures steady-state replay latency, avoiding per-kernel Python
+    dispatch within the graph. Any GPU-side work inside the
     captured callable is included. Host-to-device copy-in from CPU tensors is
     not represented unless the callable stages data into static GPU buffers as
     part of the captured region.
@@ -393,20 +462,9 @@ def _benchmark_cuda_graph_replay_samples_us(
             no_args()
         torch.cuda.synchronize()
 
-        for _ in range(warmup_iters):
-            graph.replay()
-        torch.cuda.synchronize()
-
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        samples_us = []
-        for _ in range(num_iters):
-            start.record()
-            graph.replay()
-            end.record()
-            torch.cuda.synchronize()
-            samples_us.append(start.elapsed_time(end) * 1e3)
-        return samples_us
+        return _time_cuda_graph_replay_samples_us(
+            graph, num_iters=num_iters, warmup_iters=warmup_iters
+        )
 
 
 def benchmark_cuda_function_stats(func: Callable, *args, **kwargs) -> CudaBenchmarkStats:
@@ -415,7 +473,8 @@ def benchmark_cuda_function_stats(func: Callable, *args, **kwargs) -> CudaBenchm
     By default this collects per-iteration timings from Inductor's GPU
     benchmarker. With ``USE_CUDA_GRAPHS=True`` it instead captures one static
     CUDA graph and returns per-replay timings, which is often closer to NCU for
-    tiny static kernels.
+    tiny static kernels. For an already-captured graph, use
+    :func:`benchmark_cuda_graph_stats` to time replay without another capture.
 
     Args:
         func: Callable to benchmark.
@@ -502,7 +561,8 @@ def benchmark_cuda_function_in_microseconds(func: Callable, *args, **kwargs) -> 
 
     By default this uses Inductor's profiler-based benchmark helper. With
     ``USE_CUDA_GRAPHS=True`` it instead captures one static CUDA graph and times
-    replay latency with CUDA events.
+    replay latency with CUDA events. For an already-captured graph, use
+    :func:`benchmark_cuda_graph_stats` instead.
 
     Consumed benchmark kwargs:
       - ``NUM_ITERS``

@@ -7,6 +7,7 @@ from transformer_nuggets.utils.benchmark import (
     benchmark_cuda_function_in_microseconds,
     benchmark_cuda_function_in_microseconds_triton,
     benchmark_cuda_function_stats,
+    benchmark_cuda_graph_stats,
     benchmark_torch_function_in_microseconds,
     cuda_memory_usage,
     locked_clocks,
