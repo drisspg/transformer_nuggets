@@ -106,6 +106,38 @@ def test_cuda_graph_annotation_boxes_label_backward_phase():
     assert processed["traceEvents"][-1]["name"] == "attention backward"
 
 
+def test_cuda_graph_annotation_boxes_read_fields_baked_into_args():
+    # export_chrome_trace(cuda_graph_annotations=...) merges annotation fields into args.
+    trace = {
+        "traceEvents": [
+            {
+                "ph": "X",
+                "cat": "kernel",
+                "name": f"kernel_{node}",
+                "pid": 0,
+                "tid": 7,
+                "ts": 10 + 5 * node,
+                "dur": 3,
+                "args": {"graph id": 2, "graph node id": node, **fields},
+            }
+            for node, fields in enumerate(
+                [
+                    {"name": "L2 CSA core"},
+                    {"name": "L2 CSA core"},
+                    {"name": "L2 CSA core", "autograd_phase": "backward"},
+                ]
+            )
+        ]
+    }
+
+    boxes = _annotation_boxes(add_cuda_graph_annotation_boxes(trace))
+
+    assert [(box["name"], box["ts"], box["dur"]) for box in boxes] == [
+        ("L2 CSA core", 10, 8),
+        ("L2 CSA core backward", 20, 3),
+    ]
+
+
 def test_cuda_graph_annotation_boxes_accept_monitor_embedded_metadata():
     graph_id = 2
     trace = {

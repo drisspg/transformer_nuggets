@@ -153,8 +153,17 @@ def _finite_float(value: Any) -> float | None:
 
 
 def _embedded_annotation(args: Mapping[str, Any]) -> Sequence[Any] | None:
-    """Read an event-local annotation list, which overrides the global registry."""
+    """Read an event-local annotation list, which overrides the global registry.
+
+    ``export_chrome_trace(cuda_graph_annotations=...)`` merges each annotation's
+    fields straight into the graphed event's ``args``; kernel args carry no ``name``
+    otherwise, so a ``name`` there is the baked annotation.
+    """
     if "annotation" not in args:
+        if "name" in args:
+            return [
+                {key: args[key] for key in ("name", "autograd_phase") if key in args}
+            ]
         return None
     embedded = args["annotation"]
     if isinstance(embedded, str):
