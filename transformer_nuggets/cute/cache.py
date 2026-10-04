@@ -93,6 +93,11 @@ def _generate_cache_key(*args, use_hashing: bool = False, **kwargs) -> str:
         return key_str
 
 
+def _cache_name(func: Callable) -> str:
+    """CuteOp instances (they define get_key) are keyed by class; plain functions by name."""
+    return func.__class__.__name__ if hasattr(func, "get_key") else func.__name__
+
+
 def compile_and_cache(func: Callable, cache_key: str, *args, **kwargs):
     """
     Compile a @cute.jit decorated function with an explicit cache key.
@@ -106,15 +111,7 @@ def compile_and_cache(func: Callable, cache_key: str, *args, **kwargs):
     Returns:
         Compiled kernel that can be executed with the same tensor arguments
     """
-    # Handle CuteOp instances
-    if hasattr(func, "__call__") and hasattr(func, "get_key"):
-        jit_func = func
-        func_name = func.__class__.__name__
-    else:
-        jit_func = func
-        func_name = func.__name__
-
-    # Use provided cache key directly
+    func_name = _cache_name(func)
     full_cache_key = f"{func_name}_{cache_key}"
 
     # Check cache
@@ -124,7 +121,7 @@ def compile_and_cache(func: Callable, cache_key: str, *args, **kwargs):
         return compiled_kernel
 
     logger.debug(f"Cache miss for {func_name} (key: {full_cache_key}) - Compiling...")
-    compiled_kernel = cute.compile(jit_func, *args, **kwargs)
+    compiled_kernel = cute.compile(func, *args, **kwargs)
     _kernel_cache.set(full_cache_key, compiled_kernel)
     return compiled_kernel
 
@@ -136,10 +133,7 @@ def compile_tvm_ffi_and_cache(
     name: str | None = None,
 ):
     """Cache one canonical fake-tensor TVM-FFI compilation."""
-    if hasattr(func, "__call__") and hasattr(func, "get_key"):
-        func_name = func.__class__.__name__
-    else:
-        func_name = func.__name__
+    func_name = _cache_name(func)
     full_cache_key = f"{func_name}_{cache_key}"
 
     compiled_kernel = _kernel_cache.get(full_cache_key)
@@ -168,12 +162,6 @@ def auto_compile_and_cache(func: Callable, *args, cache_extra=None, **kwargs):
     Returns:
         Compiled kernel that can be executed with the same tensor arguments
     """
-    # Handle CuteOp instances
-    if hasattr(func, "__call__") and hasattr(func, "get_key"):
-        jit_func = func
-    else:
-        jit_func = func
-
     # Generate cache key from function and arguments
     cache_key = _generate_cache_key(*args, use_hashing=_kernel_cache._use_hashing, **kwargs)
 
@@ -192,7 +180,7 @@ def auto_compile_and_cache(func: Callable, *args, cache_extra=None, **kwargs):
             extra_str = str(cache_extra)
         cache_key = f"{cache_key}_extra_{extra_str}"
 
-    return compile_and_cache(jit_func, cache_key, *args, **kwargs)
+    return compile_and_cache(func, cache_key, *args, **kwargs)
 
 
 def auto_compile_tvm_ffi_and_cache(
