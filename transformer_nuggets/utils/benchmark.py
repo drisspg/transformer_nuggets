@@ -140,8 +140,8 @@ def lazy_import_error(error_msg: str):
         def wrapper(*args, **kwargs):
             try:
                 return func(*args, **kwargs)
-            except ImportError:
-                raise ImportError(error_msg)
+            except ImportError as err:
+                raise ImportError(error_msg) from err
 
         return wrapper
 
