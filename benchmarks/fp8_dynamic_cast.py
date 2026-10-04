@@ -97,8 +97,7 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
     triton_hp_tensor = high_precision_tensor.clone()
 
     # Triton does different rounding as far as I can tell
-    if True:
-        correctness_check(high_precision_tensor, triton_hp_tensor, config)
+    correctness_check(high_precision_tensor, triton_hp_tensor, config)
 
     triton_time = benchmark_cuda_function_in_microseconds(
         dynamic_scaled_quant,
