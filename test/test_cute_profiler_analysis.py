@@ -1,5 +1,7 @@
 import pytest
 
+pytest.importorskip("cutlass")  # transformer_nuggets.cute imports CuTeDSL
+
 from transformer_nuggets.cute.profiler import (
     Event,
     dependency_gaps,
