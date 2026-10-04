@@ -8,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+pytest.importorskip("cutlass")  # transformer_nuggets.cute imports CuTeDSL
 from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import Trace, TrackEvent
 
 import transformer_nuggets.cute.profiler.pipeline.annotations as pipeline_annotations
