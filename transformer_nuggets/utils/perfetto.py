@@ -161,9 +161,7 @@ def _embedded_annotation(args: Mapping[str, Any]) -> Sequence[Any] | None:
     """
     if "annotation" not in args:
         if "name" in args:
-            return [
-                {key: args[key] for key in ("name", "autograd_phase") if key in args}
-            ]
+            return [{key: args[key] for key in ("name", "autograd_phase") if key in args}]
         return None
     embedded = args["annotation"]
     if isinstance(embedded, str):
