@@ -111,10 +111,11 @@ def input_and_weight_grads(x, w13, offs, scores, act, dh, dy, opts):
     # Input gradient: varlen-M, dh [T, 2I] @ w13[e] [2I, D].
     dx = flex_grouped_gemm(dh, w13, offs, **opts)
     # Weight gradients: varlen-K (the reduction runs over each expert's tokens), written
-    # directly in the parameter layout: dw13[e] = dh_e.T @ x_e, dw2[e] = (s * dy)_e.T @ act_e.
+    # directly in the parameter layout: dw13[e] = dh_e.T @ x_e, dw2[e] = dy_e.T @ (s * act)_e.
+    # Scaling act [T, I] instead of dy [T, D] materializes the smaller tensor.
     dw13 = flex_grouped_gemm(dh.mT, x, offs, **opts)
-    scaled_dy = (dy.float() * scores[:, None]).to(dy.dtype)
-    dw2 = flex_grouped_gemm(scaled_dy.mT, act, offs, **opts)
+    scaled_act = (act.float() * scores[:, None]).to(act.dtype)
+    dw2 = flex_grouped_gemm(dy.mT, scaled_act, offs, **opts)
     return dx, dw13, dw2
 
 
