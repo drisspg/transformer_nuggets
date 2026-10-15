@@ -55,14 +55,14 @@ def _has_flex_gemm_sm100() -> bool:
 
 
 @pytest.mark.skipif(not _has_flex_gemm_sm100(), reason="requires FlexGEMM and an SM100 GPU")
-@pytest.mark.parametrize("mode", ["fused", "save_h", "recompute"])
+@pytest.mark.parametrize("impl_name", ["GroupedGLUV1", "GroupedGLUV2", "GroupedGLUV3"])
 @pytest.mark.parametrize("glu_name", ["situ_glu", "swiglu"])
-def test_grouped_glu_experts_matches_reference(glu_name, mode):
+def test_grouped_glu_experts_matches_reference(glu_name, impl_name):
     from transformer_nuggets.moe import flex_gemm_experts as fge
 
     torch.manual_seed(0)
     glu = getattr(fge, glu_name)
-    experts = fge.GroupedGLUExperts(256, 192, 8, glu=glu, mode=mode)
+    experts = fge.GroupedGLUExperts(256, 192, 8, glu=glu, impl=getattr(fge, impl_name))
     experts = experts.to(device="cuda", dtype=torch.bfloat16)
     # Ragged experts, including an empty one.
     offs = torch.tensor([200, 13, 0, 301, 77, 150, 99, 184]).cumsum(0).to("cuda", torch.int32)
