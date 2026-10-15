@@ -25,7 +25,10 @@ only thing written to memory).
 ``GroupedGLUV3``: + epilogue fusion in the backward
     The ``dy @ w2[e]`` epilogue runs ``torch.func.vjp`` of the GLU itself, reading the
     saved interleaved ``h`` in place and writing the interleaved ``dh`` that the next
-    GEMMs consume. No elementwise kernel touches ``h`` or ``dh``.
+    GEMMs consume. No elementwise kernel touches ``h`` or ``dh``. The same epilogue
+    also stores ``s * act`` and ``act * g`` (the router-score gradient's row-sum
+    input), so the forward saves only ``h``: 44 MiB of activations at the shape below,
+    vs 66 MiB for V1/V2.
 
 Run ``python -m transformer_nuggets.moe.flex_gemm_experts`` for the GPU-time table. On
 GB200 (T=8192 routed tokens, D=2048, I=1408, E=8, bf16, ``autotune=True,
@@ -107,14 +110,13 @@ def flex_grouped_gemm(
 # --------------------------------------------------------------------------------------
 
 
-def input_and_weight_grads(x, w13, offs, scores, act, dh, dy, opts):
+def input_and_weight_grads(x, w13, offs, dh, dy, scaled_act, opts):
     # Input gradient: varlen-M, dh [T, 2I] @ w13[e] [2I, D].
     dx = flex_grouped_gemm(dh, w13, offs, **opts)
     # Weight gradients: varlen-K (the reduction runs over each expert's tokens), written
     # directly in the parameter layout: dw13[e] = dh_e.T @ x_e, dw2[e] = dy_e.T @ (s * act)_e.
     # Scaling act [T, I] instead of dy [T, D] materializes the smaller tensor.
     dw13 = flex_grouped_gemm(dh.mT, x, offs, **opts)
-    scaled_act = (act.float() * scores[:, None]).to(act.dtype)
     dw2 = flex_grouped_gemm(dy.mT, scaled_act, offs, **opts)
     return dx, dw13, dw2
 
@@ -142,7 +144,8 @@ def v1_backward(x, w13, w2, offs, scores, h, act, dy, glu, opts):
     _, glu_vjp = torch.func.vjp(glu, *gate_and_up(h))
     d_gate, d_up = glu_vjp(g * scores[:, None])
     dh = torch.stack([d_gate, d_up], dim=-1).view_as(h).to(h.dtype)
-    dx, dw13, dw2 = input_and_weight_grads(x, w13, offs, scores, act, dh, dy, opts)
+    scaled_act = (act.float() * scores[:, None]).to(act.dtype)
+    dx, dw13, dw2 = input_and_weight_grads(x, w13, offs, dh, dy, scaled_act, opts)
     return dx, dw13, dw2, d_scores.to(scores.dtype)
 
 
@@ -214,44 +217,52 @@ def v3_forward(x, w13, w2, offs, scores, glu, opts):
 
     act, h = flex_grouped_gemm(x, w13.mT, offs, glu_and_keep_h, **opts)
 
-    def scale_and_keep_unscaled(acc):
-        # The unscaled output gives the router-score gradient without recomputing g.
-        return (acc.float() * scores[:, None]).to(acc.dtype), acc
+    def scale_by_router_score(acc):
+        return (acc.float() * scores[:, None]).to(acc.dtype)
 
-    y, y_unscaled = flex_grouped_gemm(act, w2.mT, offs, scale_and_keep_unscaled, **opts)
-    return y, h, act, y_unscaled
+    y = flex_grouped_gemm(act, w2.mT, offs, scale_by_router_score, **opts)
+    # Only h is saved: the backward GEMM epilogue rebuilds everything else from it.
+    return y, h
 
 
 @torch.compile(fullgraph=True)
-def v3_backward(x, w13, w2, offs, scores, h, act, y_unscaled, dy, glu, opts):
+def v3_backward(x, w13, w2, offs, scores, h, dy, glu, opts):
     def glu_backward(acc):
-        # acc is g = dy @ w2[e]. Read gate/up from the saved interleaved h in place, run
-        # torch.func.vjp of the GLU, and store dh interleaved: all inside the GEMM.
+        # acc is g = dy @ w2[e]. Read gate/up from the saved interleaved h in place and
+        # run torch.func.vjp of the GLU, which also returns act = glu(gate, up). One
+        # kernel stores three results:
+        #   dh          interleaved [T, 2I], the GLU gradient
+        #   s * act     [T, I], the A operand of dw2
+        #   act * g     [T, I]; its row sum is the router-score gradient, because
+        #               sum_d dy * (act @ w2.T) = sum_i act * (dy @ w2) = sum_i act * g
         gate, up = h.view(acc.shape[0], acc.shape[1], 2).unbind(-1)
-        _, glu_vjp = torch.func.vjp(glu, gate.float(), up.float())
-        d_gate, d_up = glu_vjp(acc.float() * scores[:, None])
-        dh = torch.stack([d_gate, d_up], dim=-1)
-        return dh.view(acc.shape[0], 2 * acc.shape[1]).to(acc.dtype)
+        act, glu_vjp = torch.func.vjp(glu, gate.float(), up.float())
+        g = acc.float()
+        d_gate, d_up = glu_vjp(g * scores[:, None])
+        dh = torch.stack([d_gate, d_up], dim=-1).view(acc.shape[0], 2 * acc.shape[1])
+        act = act.to(acc.dtype)  # the rounding the forward fed to the down-projection
+        scaled_act = (act.float() * scores[:, None]).to(acc.dtype)
+        return dh.to(acc.dtype), scaled_act, (act.float() * g).to(acc.dtype)
 
-    dh = flex_grouped_gemm(dy, w2, offs, glu_backward, **opts)
-    d_scores = (dy.float() * y_unscaled.float()).sum(-1)
-    dx, dw13, dw2 = input_and_weight_grads(x, w13, offs, scores, act, dh, dy, opts)
+    dh, scaled_act, act_times_g = flex_grouped_gemm(dy, w2, offs, glu_backward, **opts)
+    d_scores = act_times_g.float().sum(-1)
+    dx, dw13, dw2 = input_and_weight_grads(x, w13, offs, dh, dy, scaled_act, opts)
     return dx, dw13, dw2, d_scores.to(scores.dtype)
 
 
 class GroupedGLUV3(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w13, w2, offs, scores, glu, opts):
-        y, h, act, y_unscaled = v3_forward(x, w13, w2, offs, scores, glu, opts)
-        ctx.save_for_backward(x, w13, w2, offs, scores, h, act, y_unscaled)
+        y, h = v3_forward(x, w13, w2, offs, scores, glu, opts)
+        ctx.save_for_backward(x, w13, w2, offs, scores, h)
         ctx.glu, ctx.opts = glu, opts
         return y
 
     @staticmethod
     def backward(ctx, dy):
-        x, w13, w2, offs, scores, h, act, y_unscaled = ctx.saved_tensors
+        x, w13, w2, offs, scores, h = ctx.saved_tensors
         dx, dw13, dw2, d_scores = v3_backward(
-            x, w13, w2, offs, scores, h, act, y_unscaled, dy.contiguous(), ctx.glu, ctx.opts
+            x, w13, w2, offs, scores, h, dy.contiguous(), ctx.glu, ctx.opts
         )
         return dx, dw13, dw2, None, d_scores, None, None
 
