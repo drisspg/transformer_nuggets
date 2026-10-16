@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Grouped GLU experts on FlexGEMM, written three ways with increasing fusion.
+"""Build fused GEMM epilogues in PyTorch: a worked MoE example.
 
-Start with ``reference_grouped_glu`` for the ordinary PyTorch computation, then read
-V1 -> V2 -> V3. Each version keeps the same six GEMMs (two forward, four backward)
-and moves more elementwise work into their epilogues. An epilogue runs before the
-GEMM stores its result; it can transform that result and write auxiliary outputs
+The MoE supplies the workload; the lesson is how to compose ordinary PyTorch functions
+into GEMM kernels with FlexGEMM. Start with ``reference_grouped_glu``, then read
+``flex_grouped_gemm`` and V1 -> V2 -> V3. Each version keeps the same six GEMMs (two
+forward, four backward) and moves more work into their epilogues. An epilogue runs
+before the GEMM stores its result, transforming it or writing auxiliary outputs
 without a separate elementwise kernel. All GEMMs here use the QuACK backend.
 
 Inputs and forward math
@@ -21,18 +22,27 @@ For each expert e's rows (``s = scores[:, None]`` below):
     act = glu(h[:, 0::2], h[:, 1::2])   # [T, I]
     y   = s * (act @ w2[e].T)          # [T, D]
 
-What each version teaches
--------------------------
-    Version   Forward epilogues      Backward epilogue       Saved intermediates
-    V1        Identity               Identity                h, act
-    V2        GLU + save h; scale y   Identity                h, act
-    V3        Same as V2             GLU VJP + dw2/ds inputs  h
+FlexGEMM techniques to take away
+-------------------------------
+V1: Start from the math.
+    ``flex_grouped_gemm`` wraps ``flex_gemm(F.grouped_mm, ...)`` with an identity
+    epilogue. GLU and scaling remain outside the GEMMs. The explicit backward makes
+    the producer/consumer relationships visible before deciding what to fuse.
+V2: Write an epilogue as a PyTorch function.
+    ``glu_and_keep_h`` returns both the activation and the pre-activation: a tuple
+    becomes multiple kernel outputs, including a value saved for backward.
+    ``scale_by_router_score`` captures scores from its enclosing scope. The backward
+    is unchanged from V1, isolating what forward epilogue fusion buys.
+V3: Compose autograd and reductions inside an epilogue.
+    ``glu_backward`` captures saved h and calls ``torch.func.vjp`` on the activation.
+    Its traced derivative runs inside the GEMM kernel. The same epilogue returns dh,
+    scaled act, and grouped partial sums for the router gradient; only the final sum
+    runs outside. Recomputing act here also removes it from the saved intermediates.
 
 Each version has an explicit ``torch.autograd.Function`` and compiled forward/backward.
-V1 leaves GLU and scaling to ordinary PyTorch ops, which Inductor can fuse separately.
-V2 fuses the forward but reuses V1's backward. V3 recomputes act from h inside the
-backward GEMM epilogue, rather than saving act across forward/backward. At the shape
-below, that reduces saved intermediates from 66 MiB to 44 MiB (excluding inputs/weights).
+FlexGEMM does not derive the whole backward: we choose its GEMMs and fusion boundaries;
+``torch.func.vjp`` derives the local activation gradient. V1/V2 save h and act, while
+V3 saves only h: 66 MiB versus 44 MiB at the shape below, excluding inputs/weights.
 
 Backward math
 -------------
@@ -45,9 +55,17 @@ Given ``dy = dL/dy``, the common algebra is (omitting dtype conversions):
     dw13[e] = dh_e.T @ x_e           # [2I, D], reduce over expert e's rows
     dw2[e]  = dy_e.T @ (s * act)_e    # [D, I]
 
-``torch.func.vjp`` supplies the GLU derivative for either activation; there is no
-hand-written SwiGLU/SiTU-GLU backward. V3 fuses dh, s * act, and partial sums for ds
-into the g GEMM's epilogue. The remaining three GEMMs share ``input_and_weight_grads``.
+The remaining three GEMMs after g share ``input_and_weight_grads``.
+
+Try changing the computation
+---------------------------
+``swiglu`` and ``situ_glu`` are ordinary PyTorch functions, not named compiler modes.
+To try a different GLU, write a deterministic pointwise ``glu(gate, up)`` returning
+the same shape and pass it as ``GroupedGLUExperts(..., glu=your_glu)``. The epilogues
+call that function and its VJP; no activation-specific backward needs to be written.
+Both the forward operations and their derivatives must be supported by the compiler.
+Use ``reference_grouped_glu`` to check outputs and gradients, then compare V1/V2/V3:
+fusing more work is an experiment, not a guarantee that the most fused version wins.
 
 Recorded timings
 ----------------
