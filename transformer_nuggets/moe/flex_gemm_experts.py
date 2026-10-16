@@ -1,38 +1,60 @@
 # SPDX-License-Identifier: Apache-2.0
 """Grouped GLU experts on FlexGEMM, written three ways with increasing fusion.
 
-This file is a worked example of how to build an MoE expert MLP on FlexGEMM. The
-caller owns dispatch ("pool") and combine ("unpool"): tokens arrive sorted by expert
-with int32 end offsets ``offs`` and one router score ``s`` per routed token. The math is
+Start with ``reference_grouped_glu`` for the ordinary PyTorch computation, then read
+V1 -> V2 -> V3. Each version keeps the same six GEMMs (two forward, four backward)
+and moves more elementwise work into their epilogues. An epilogue runs before the
+GEMM stores its result; it can transform that result and write auxiliary outputs
+without a separate elementwise kernel. All GEMMs here use the QuACK backend.
 
-    h   = x @ w13[e].T              # [T, 2I], gate/up columns interleaved
-    act = glu(h[:, 0::2], h[:, 1::2])
-    y   = s * (act @ w2[e].T)
+Inputs and forward math
+-----------------------
+The caller owns dispatch and combine. This module sees T routed token copies sorted
+by expert, not the original unsorted tokens. D is the hidden size, I the intermediate
+size, and E the number of experts. ``offs`` is int32 [E] cumulative end offsets:
+``[2, 2, 5]`` assigns rows 0:2 to expert 0, no rows to expert 1, and rows 2:5 to expert 2.
+``scores`` has one router weight per routed row.
 
-Each version is a self-contained ``torch.autograd.Function`` whose forward and backward
-are ``torch.compile``'d functions built from ``flex_grouped_gemm`` calls. Every GEMM is a
-QuACK grouped GEMM; the versions differ only in how much work rides inside GEMM
-epilogues (``epilogue(acc)`` is compiled into the GEMM's store, so its result is the
-only thing written to memory).
+For each expert e's rows (``s = scores[:, None]`` below):
 
-``GroupedGLUV1``: grouped GEMMs, everything else in plain PyTorch
-    Six grouped GEMMs per step: varlen-M for the forward and the input gradient,
-    varlen-K for the weight gradients. GLU, router scaling and the GLU backward
-    (``torch.func.vjp``) are ordinary PyTorch ops that Inductor fuses into Triton.
-``GroupedGLUV2``: + epilogue fusion in the forward
-    The up-projection epilogue applies the GLU and also stores ``h`` for the backward;
-    the down-projection epilogue applies the router score. Same backward as V1.
-``GroupedGLUV3``: + epilogue fusion in the backward
-    The ``dy @ w2[e]`` epilogue runs ``torch.func.vjp`` of the GLU itself, reading the
-    saved interleaved ``h`` in place and writing the interleaved ``dh`` that the next
-    GEMMs consume. No elementwise kernel touches ``h`` or ``dh``. The same epilogue
-    also stores ``s * act`` and fp32 partial row sums of ``act * g`` (the router-score
-    gradient), so the forward saves only ``h``: 44 MiB of activations at the shape below,
-    vs 66 MiB for V1/V2.
+    h   = x @ w13[e].T                 # [T, 2I]: gate_0, up_0, gate_1, up_1, ...
+    act = glu(h[:, 0::2], h[:, 1::2])   # [T, I]
+    y   = s * (act @ w2[e].T)          # [T, D]
 
-Run ``python -m transformer_nuggets.moe.flex_gemm_experts`` for the GPU-time table. On
-GB200 (T=8192 routed tokens, D=2048, I=1408, E=8, bf16, ``autotune=True,
-fast_math=True``), fwd+bwd GPU kernel time per step, lower is better:
+What each version teaches
+-------------------------
+    Version   Forward epilogues      Backward epilogue       Saved intermediates
+    V1        Identity               Identity                h, act
+    V2        GLU + save h; scale y   Identity                h, act
+    V3        Same as V2             GLU VJP + dw2/ds inputs  h
+
+Each version has an explicit ``torch.autograd.Function`` and compiled forward/backward.
+V1 leaves GLU and scaling to ordinary PyTorch ops, which Inductor can fuse separately.
+V2 fuses the forward but reuses V1's backward. V3 recomputes act from h inside the
+backward GEMM epilogue, rather than saving act across forward/backward. At the shape
+below, that reduces saved intermediates from 66 MiB to 44 MiB (excluding inputs/weights).
+
+Backward math
+-------------
+Given ``dy = dL/dy``, the common algebra is (omitting dtype conversions):
+
+    g       = dy @ w2[e]             # [T, I], before applying the router score
+    ds      = sum_i(act * g)         # [T], one scalar per routed row
+    dh      = GLU_vjp(h, s * g)      # [T, 2I], gate/up gradients interleaved
+    dx      = dh @ w13[e]            # [T, D]
+    dw13[e] = dh_e.T @ x_e           # [2I, D], reduce over expert e's rows
+    dw2[e]  = dy_e.T @ (s * act)_e    # [D, I]
+
+``torch.func.vjp`` supplies the GLU derivative for either activation; there is no
+hand-written SwiGLU/SiTU-GLU backward. V3 fuses dh, s * act, and partial sums for ds
+into the g GEMM's epilogue. The remaining three GEMMs share ``input_and_weight_grads``.
+
+Recorded timings
+----------------
+Run ``python -m transformer_nuggets.moe.flex_gemm_experts`` for a fresh GPU-time table.
+The following measurements were recorded in commit c0ed3ef on GB200 (T=8192 routed
+tokens, D=2048, I=1408, E=8, bf16, ``autotune=True, fast_math=True``).
+Fwd+bwd GPU kernel time per step, lower is better:
 
     impl                     SwiGLU    SiTU-GLU
     eager F.grouped_mm      908 us    1142 us
@@ -40,6 +62,7 @@ fast_math=True``), fwd+bwd GPU kernel time per step, lower is better:
     V1                      522 us     566 us
     V2                      473 us     502 us
     V3                      437 us     447 us
+
 Requires an SM100 GPU and a PyTorch build with ``torch._higher_order_ops.flex_gemm``
 including pytorch/pytorch#201088 (``autotune`` kernel option); V3 also needs #201086 and
 #201087 (interleaved epilogue tensors), and fast SiTU-GLU epilogues need #201085
@@ -89,10 +112,12 @@ def flex_grouped_gemm(
 ) -> Tensor:
     """``epilogue(F.grouped_mm(a, b, offs=offs))`` as one fused FlexGEMM/QuACK kernel.
 
-    ``epilogue`` receives the fp32 accumulator tile and may read captured tensors; it is
-    compiled into the GEMM's store, so its result is the only thing written to memory.
-    2-D ``a`` with 3-D ``b`` is varlen-M (MoE forward, input gradient); 2-D ``a``
-    (m-major) with 2-D ``b`` is varlen-K (weight gradients).
+    ``epilogue`` may capture tensors and return one tensor or a tuple of outputs.
+    Omit it for an identity epilogue. ``offs`` partitions different axes by operand rank:
+
+    * 2-D ``a`` @ 3-D ``b``: split output rows by expert (varlen-M: forward, dx, g).
+    * 2-D ``a`` @ 2-D ``b``: split the reduction by expert (varlen-K: weight gradients).
+      ``a`` is a transposed token matrix, so each expert produces its own weight gradient.
     """
     from torch._higher_order_ops import flex_gemm
 
@@ -115,7 +140,7 @@ def input_and_weight_grads(x, w13, offs, dh, dy, scaled_act, opts):
     dx = flex_grouped_gemm(dh, w13, offs, **opts)
     # Weight gradients: varlen-K (the reduction runs over each expert's tokens), written
     # directly in the parameter layout: dw13[e] = dh_e.T @ x_e, dw2[e] = dy_e.T @ (s * act)_e.
-    # Scaling act [T, I] instead of dy [T, D] materializes the smaller tensor.
+    # Put the score on act, not dy: [T, I] is smaller than [T, D] at the example's I < D.
     dw13 = flex_grouped_gemm(dh.mT, x, offs, **opts)
     dw2 = flex_grouped_gemm(dy.mT, scaled_act, offs, **opts)
     return dx, dw13, dw2
@@ -137,10 +162,10 @@ def v1_forward(x, w13, w2, offs, scores, glu, opts):
 
 @torch.compile(fullgraph=True)
 def v1_backward(x, w13, w2, offs, scores, h, act, dy, glu, opts):
-    # g = dL/d(act @ w2.T) before the router scaling.
+    # g = dy @ w2; dL/dact = scores[:, None] * g. Keep g unscaled for d_scores.
     g = flex_grouped_gemm(dy, w2, offs, **opts).float()
     d_scores = (act.float() * g).sum(-1)
-    # GLU backward from autograd's own formulas: torch.func.vjp traces into ATen ops.
+    # The VJP maps dL/dact to (dL/dgate, dL/dup), tracing ordinary PyTorch ops.
     _, glu_vjp = torch.func.vjp(glu, *gate_and_up(h))
     d_gate, d_up = glu_vjp(g * scores[:, None])
     dh = torch.stack([d_gate, d_up], dim=-1).view_as(h).to(h.dtype)
@@ -225,21 +250,19 @@ def v3_forward(x, w13, w2, offs, scores, glu, opts):
     return y, h
 
 
-# Column group for the in-epilogue partial sums; must divide the GEMM tile N.
+# Reduce scores in column groups: I and the GEMM tile N must be divisible by this size.
 SCORE_GRAD_GROUP = 32
 
 
 @torch.compile(fullgraph=True)
 def v3_backward(x, w13, w2, offs, scores, h, dy, glu, opts):
     def glu_backward(acc):
-        # acc is g = dy @ w2[e]. Read gate/up from the saved interleaved h in place and
-        # run torch.func.vjp of the GLU, which also returns act = glu(gate, up). One
-        # kernel stores three results:
-        #   dh          interleaved [T, 2I], the GLU gradient
-        #   s * act     [T, I], the A operand of dw2
-        #   partials    [T, I / G] fp32 sums of act * g over groups of G columns; their
-        #               row sum is the router-score gradient, because
-        #               sum_d dy * (act @ w2.T) = sum_i act * (dy @ w2) = sum_i act * g
+        # acc is g = dy @ w2[e]. The VJP also recomputes act from saved h.
+        # One GEMM writes everything needed by the remaining backward:
+        #   dh          [T, 2I], interleaved gate/up gradients for dx and dw13
+        #   scaled_act  [T, I], the right operand of dw2
+        #   partials    [T, I / SCORE_GRAD_GROUP], fp32 partial sums for d_scores
+        # The epilogue reduces within column groups; the row sum runs after the GEMM.
         gate, up = h.view(acc.shape[0], acc.shape[1], 2).unbind(-1)
         act, glu_vjp = torch.func.vjp(glu, gate.float(), up.float())
         g = acc.float()
