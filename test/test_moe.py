@@ -57,12 +57,15 @@ def _has_flex_gemm_sm100() -> bool:
 @pytest.mark.skipif(not _has_flex_gemm_sm100(), reason="requires FlexGEMM and an SM100 GPU")
 @pytest.mark.parametrize("impl_name", ["GroupedGLUV1", "GroupedGLUV2", "GroupedGLUV3"])
 @pytest.mark.parametrize("glu_name", ["situ_glu", "swiglu"])
-def test_grouped_glu_experts_matches_reference(glu_name, impl_name):
+@pytest.mark.parametrize("chunked", [False, True], ids=["interleaved", "chunked"])
+def test_grouped_glu_experts_matches_reference(glu_name, impl_name, chunked):
     from transformer_nuggets.moe import flex_gemm_experts as fge
 
     torch.manual_seed(0)
     glu = getattr(fge, glu_name)
-    experts = fge.GroupedGLUExperts(256, 192, 8, glu=glu, impl=getattr(fge, impl_name))
+    experts = fge.GroupedGLUExperts(
+        256, 192, 8, glu=glu, impl=getattr(fge, impl_name), chunked=chunked
+    )
     experts = experts.to(device="cuda", dtype=torch.bfloat16)
     # Ragged experts, including an empty one.
     offs = torch.tensor([200, 13, 0, 301, 77, 150, 99, 184]).cumsum(0).to("cuda", torch.int32)
@@ -79,9 +82,16 @@ def test_grouped_glu_experts_matches_reference(glu_name, impl_name):
 
     leaves = (x, experts.w13, experts.w2, scores)
     actual = run(lambda x, w13, w2, s: experts(x, offs, s), *leaves)
-    eager = run(lambda *t: fge.reference_grouped_glu(*t[:3], offs, t[3], glu), *leaves)
+    eager = run(lambda *t: fge.reference_grouped_glu(*t[:3], offs, t[3], glu, chunked), *leaves)
     fp32 = [t.detach().float().requires_grad_() for t in leaves]
-    expected = run(lambda *t: fge.reference_grouped_glu(*t[:3], offs, t[3], glu), *fp32)
+
+    def fp32_reference(x, w13, w2, s):
+        # Check chunked weight/gradient order against the interleaved reference.
+        if chunked:
+            w13 = fge.interleave_gate_up(w13)
+        return fge.reference_grouped_glu(x, w13, w2, offs, s, glu)
+
+    expected = run(fp32_reference, *fp32)
     for name, a, e, ref in zip(("y", "dx", "dw13", "dw2", "dscores"), actual, eager, expected):
         rel = lambda t: ((t.float() - ref).norm() / ref.norm()).item()  # noqa: B023
         assert rel(a) <= 1.5 * rel(e) + 1e-3, f"{name}: flex {rel(a):.2e} vs eager {rel(e):.2e}"

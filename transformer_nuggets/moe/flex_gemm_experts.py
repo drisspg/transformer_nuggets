@@ -16,7 +16,12 @@ size, and E the number of experts. ``offs`` is int32 [E] cumulative end offsets:
 ``[2, 2, 5]`` assigns rows 0:2 to expert 0, no rows to expert 1, and rows 2:5 to expert 2.
 ``scores`` has one router weight per routed row.
 
-For each expert e's rows (``s = scores[:, None]`` below):
+By default, ``w13`` interleaves gate/up rows. Set ``chunked=True`` on the module and
+reference to use stacked ``[gate; up]`` rows instead: split h with ``chunk(2, -1)``
+and concatenate dh in the same order. This selects the weight interpretation, not a
+runtime conversion; all three versions use the same layout throughout.
+
+For each expert e's rows (``s = scores[:, None]``, default interleaved layout below):
 
     h   = x @ w13[e].T                 # [T, 2I]: gate_0, up_0, gate_1, up_1, ...
     act = glu(h[:, 0::2], h[:, 1::2])   # [T, I]
@@ -50,7 +55,7 @@ Given ``dy = dL/dy``, the common algebra is (omitting dtype conversions):
 
     g       = dy @ w2[e]             # [T, I], before applying the router score
     ds      = sum_i(act * g)         # [T], one scalar per routed row
-    dh      = GLU_vjp(h, s * g)      # [T, 2I], gate/up gradients interleaved
+    dh      = GLU_vjp(h, s * g)      # [T, 2I], gate/up gradients in w13's row order
     dx      = dh @ w13[e]            # [T, D]
     dw13[e] = dh_e.T @ x_e           # [2I, D], reduce over expert e's rows
     dw2[e]  = dy_e.T @ (s * act)_e    # [D, I]
@@ -69,9 +74,13 @@ fusing more work is an experiment, not a guarantee that the most fused version w
 
 Recorded timings
 ----------------
-Run ``python -m transformer_nuggets.moe.flex_gemm_experts`` for a fresh GPU-time table.
+Run ``python -m transformer_nuggets.moe.flex_gemm_experts`` for a fresh GPU-time table;
+add ``--chunked`` to run V1/V2/V3 and both baselines with stacked ``[gate; up]`` weights.
+The runner uses ``benchmark_cuda_function_in_microseconds``: profiler-based fwd+bwd
+GPU time, excluding dispatch/combine and compilation. Its default profiler path clears
+L2 before each measured step; the historical table below used a reused-buffer loop.
 The following measurements were recorded in commit c0ed3ef on GB200 (T=8192 routed
-tokens, D=2048, I=1408, E=8, bf16, ``autotune=True, fast_math=True``).
+tokens, D=2048, I=1408, E=8, bf16, interleaved, ``autotune=True, fast_math=True``).
 Fwd+bwd GPU kernel time per step, lower is better:
 
     impl                     SwiGLU    SiTU-GLU
@@ -84,7 +93,8 @@ Fwd+bwd GPU kernel time per step, lower is better:
 Requires an SM100 GPU and a PyTorch build with ``torch._higher_order_ops.flex_gemm``
 including pytorch/pytorch#201088 (``autotune`` kernel option); V3 also needs #201086 and
 #201087 (interleaved epilogue tensors), and fast SiTU-GLU epilogues need #201085
-(constant division as multiply).
+(constant division as multiply). Chunked V2/V3 additionally require the local PyTorch
+extensions for chunked saved-h auxiliaries and concatenated backward outputs.
 """
 
 import functools
@@ -92,7 +102,10 @@ from collections.abc import Callable
 
 import torch
 import torch.nn.functional as F
+import typer
 from torch import nn
+
+from transformer_nuggets.utils.benchmark import benchmark_cuda_function_in_microseconds
 
 Tensor = torch.Tensor
 Glu = Callable[[Tensor, Tensor], Tensor]
@@ -113,8 +126,10 @@ def interleave_gate_up(w1: Tensor) -> Tensor:
     return w1.view(num_experts, 2, two_i // 2, hidden).transpose(1, 2).reshape_as(w1)
 
 
-def gate_and_up(h: Tensor) -> tuple[Tensor, Tensor]:
-    """Split interleaved ``[T, 2I]`` pre-activations into fp32 gate and up ``[T, I]``."""
+def gate_and_up(h: Tensor, chunked: bool = False) -> tuple[Tensor, Tensor]:
+    """Split ``[T, 2I]`` pre-activations in w13's row order into fp32 gate and up."""
+    if chunked:
+        return h.float().chunk(2, dim=-1)
     pairs = h.float().view(h.shape[0], -1, 2)
     return pairs[..., 0], pairs[..., 1]
 
@@ -170,23 +185,27 @@ def input_and_weight_grads(x, w13, offs, dh, dy, scaled_act, opts):
 
 
 @torch.compile(fullgraph=True)
-def v1_forward(x, w13, w2, offs, scores, glu, opts):
+def v1_forward(x, w13, w2, offs, scores, glu, opts, chunked: bool = False):
     h = flex_grouped_gemm(x, w13.mT, offs, **opts)
-    act = glu(*gate_and_up(h)).to(x.dtype)
+    act = glu(*gate_and_up(h, chunked)).to(x.dtype)
     y = flex_grouped_gemm(act, w2.mT, offs, **opts)
     y = (y.float() * scores[:, None]).to(y.dtype)
     return y, h, act
 
 
 @torch.compile(fullgraph=True)
-def v1_backward(x, w13, w2, offs, scores, h, act, dy, glu, opts):
+def v1_backward(x, w13, w2, offs, scores, h, act, dy, glu, opts, chunked: bool = False):
     # g = dy @ w2; dL/dact = scores[:, None] * g. Keep g unscaled for d_scores.
     g = flex_grouped_gemm(dy, w2, offs, **opts).float()
     d_scores = (act.float() * g).sum(-1)
     # The VJP maps dL/dact to (dL/dgate, dL/dup), tracing ordinary PyTorch ops.
-    _, glu_vjp = torch.func.vjp(glu, *gate_and_up(h))
+    _, glu_vjp = torch.func.vjp(glu, *gate_and_up(h, chunked))
     d_gate, d_up = glu_vjp(g * scores[:, None])
-    dh = torch.stack([d_gate, d_up], dim=-1).view_as(h).to(h.dtype)
+    if chunked:
+        dh = torch.cat([d_gate, d_up], dim=-1)
+    else:
+        dh = torch.stack([d_gate, d_up], dim=-1).view_as(h)
+    dh = dh.to(h.dtype)
     scaled_act = (act.float() * scores[:, None]).to(act.dtype)
     dx, dw13, dw2 = input_and_weight_grads(x, w13, offs, dh, dy, scaled_act, opts)
     return dx, dw13, dw2, d_scores.to(scores.dtype)
@@ -194,19 +213,19 @@ def v1_backward(x, w13, w2, offs, scores, h, act, dy, glu, opts):
 
 class GroupedGLUV1(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, w13, w2, offs, scores, glu, opts):
-        y, h, act = v1_forward(x, w13, w2, offs, scores, glu, opts)
+    def forward(ctx, x, w13, w2, offs, scores, glu, opts, chunked: bool = False):
+        y, h, act = v1_forward(x, w13, w2, offs, scores, glu, opts, chunked)
         ctx.save_for_backward(x, w13, w2, offs, scores, h, act)
-        ctx.glu, ctx.opts = glu, opts
+        ctx.glu, ctx.opts, ctx.chunked = glu, opts, chunked
         return y
 
     @staticmethod
     def backward(ctx, dy):
         x, w13, w2, offs, scores, h, act = ctx.saved_tensors
         dx, dw13, dw2, d_scores = v1_backward(
-            x, w13, w2, offs, scores, h, act, dy.contiguous(), ctx.glu, ctx.opts
+            x, w13, w2, offs, scores, h, act, dy.contiguous(), ctx.glu, ctx.opts, ctx.chunked
         )
-        return dx, dw13, dw2, None, d_scores, None, None
+        return dx, dw13, dw2, None, d_scores, None, None, None
 
 
 # --------------------------------------------------------------------------------------
@@ -215,10 +234,10 @@ class GroupedGLUV1(torch.autograd.Function):
 
 
 @torch.compile(fullgraph=True)
-def v2_forward(x, w13, w2, offs, scores, glu, opts):
+def v2_forward(x, w13, w2, offs, scores, glu, opts, chunked: bool = False):
     def glu_and_keep_h(acc):
         # One kernel writes act [T, I] (the GLU of each gate/up pair) and h [T, 2I].
-        gate, up = gate_and_up(acc)
+        gate, up = gate_and_up(acc, chunked)
         return glu(gate, up).to(acc.dtype), acc
 
     act, h = flex_grouped_gemm(x, w13.mT, offs, glu_and_keep_h, **opts)
@@ -232,19 +251,19 @@ def v2_forward(x, w13, w2, offs, scores, glu, opts):
 
 class GroupedGLUV2(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, w13, w2, offs, scores, glu, opts):
-        y, h, act = v2_forward(x, w13, w2, offs, scores, glu, opts)
+    def forward(ctx, x, w13, w2, offs, scores, glu, opts, chunked: bool = False):
+        y, h, act = v2_forward(x, w13, w2, offs, scores, glu, opts, chunked)
         ctx.save_for_backward(x, w13, w2, offs, scores, h, act)
-        ctx.glu, ctx.opts = glu, opts
+        ctx.glu, ctx.opts, ctx.chunked = glu, opts, chunked
         return y
 
     @staticmethod
     def backward(ctx, dy):
         x, w13, w2, offs, scores, h, act = ctx.saved_tensors
         dx, dw13, dw2, d_scores = v1_backward(
-            x, w13, w2, offs, scores, h, act, dy.contiguous(), ctx.glu, ctx.opts
+            x, w13, w2, offs, scores, h, act, dy.contiguous(), ctx.glu, ctx.opts, ctx.chunked
         )
-        return dx, dw13, dw2, None, d_scores, None, None
+        return dx, dw13, dw2, None, d_scores, None, None, None
 
 
 # --------------------------------------------------------------------------------------
@@ -253,9 +272,9 @@ class GroupedGLUV2(torch.autograd.Function):
 
 
 @torch.compile(fullgraph=True)
-def v3_forward(x, w13, w2, offs, scores, glu, opts):
+def v3_forward(x, w13, w2, offs, scores, glu, opts, chunked: bool = False):
     def glu_and_keep_h(acc):
-        gate, up = gate_and_up(acc)
+        gate, up = gate_and_up(acc, chunked)
         return glu(gate, up).to(acc.dtype), acc
 
     act, h = flex_grouped_gemm(x, w13.mT, offs, glu_and_keep_h, **opts)
@@ -273,19 +292,29 @@ SCORE_GRAD_GROUP = 32
 
 
 @torch.compile(fullgraph=True)
-def v3_backward(x, w13, w2, offs, scores, h, dy, glu, opts):
+def v3_backward(x, w13, w2, offs, scores, h, dy, glu, opts, chunked: bool = False):
+    if chunked:
+        # Capture two strided [T, I] views; a full-width capture denotes interleaved lanes.
+        saved_gate, saved_up = h.chunk(2, dim=-1)
+
     def glu_backward(acc):
         # acc is g = dy @ w2[e]. The VJP also recomputes act from saved h.
         # One GEMM writes everything needed by the remaining backward:
-        #   dh          [T, 2I], interleaved gate/up gradients for dx and dw13
+        #   dh          [T, 2I], gate/up gradients in w13's row order for dx and dw13
         #   scaled_act  [T, I], the right operand of dw2
         #   partials    [T, I / SCORE_GRAD_GROUP], fp32 partial sums for d_scores
         # The epilogue reduces within column groups; the row sum runs after the GEMM.
-        gate, up = h.view(acc.shape[0], acc.shape[1], 2).unbind(-1)
+        if chunked:
+            gate, up = saved_gate, saved_up
+        else:
+            gate, up = h.view(acc.shape[0], acc.shape[1], 2).unbind(-1)
         act, glu_vjp = torch.func.vjp(glu, gate.float(), up.float())
         g = acc.float()
         d_gate, d_up = glu_vjp(g * scores[:, None])
-        dh = torch.stack([d_gate, d_up], dim=-1).view(acc.shape[0], 2 * acc.shape[1])
+        if chunked:
+            dh = torch.cat([d_gate, d_up], dim=-1)
+        else:
+            dh = torch.stack([d_gate, d_up], dim=-1).view(acc.shape[0], 2 * acc.shape[1])
         act = act.to(acc.dtype)  # the rounding the forward fed to the down-projection
         scaled_act = (act.float() * scores[:, None]).to(acc.dtype)
         partials = (act.float() * g).view(acc.shape[0], -1, SCORE_GRAD_GROUP).sum(-1)
@@ -299,19 +328,19 @@ def v3_backward(x, w13, w2, offs, scores, h, dy, glu, opts):
 
 class GroupedGLUV3(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, w13, w2, offs, scores, glu, opts):
-        y, h = v3_forward(x, w13, w2, offs, scores, glu, opts)
+    def forward(ctx, x, w13, w2, offs, scores, glu, opts, chunked: bool = False):
+        y, h = v3_forward(x, w13, w2, offs, scores, glu, opts, chunked)
         ctx.save_for_backward(x, w13, w2, offs, scores, h)
-        ctx.glu, ctx.opts = glu, opts
+        ctx.glu, ctx.opts, ctx.chunked = glu, opts, chunked
         return y
 
     @staticmethod
     def backward(ctx, dy):
         x, w13, w2, offs, scores, h = ctx.saved_tensors
         dx, dw13, dw2, d_scores = v3_backward(
-            x, w13, w2, offs, scores, h, dy.contiguous(), ctx.glu, ctx.opts
+            x, w13, w2, offs, scores, h, dy.contiguous(), ctx.glu, ctx.opts, ctx.chunked
         )
-        return dx, dw13, dw2, None, d_scores, None, None
+        return dx, dw13, dw2, None, d_scores, None, None, None
 
 
 # --------------------------------------------------------------------------------------
@@ -330,6 +359,7 @@ class GroupedGLUExperts(nn.Module):
         impl: ``GroupedGLUV1``, ``GroupedGLUV2`` or ``GroupedGLUV3``.
         autotune: Autotune each grouped GEMM's QuACK config.
         fast_math: Allow approximate transcendental math in GEMM epilogues.
+        chunked: Interpret w13 rows as ``[gate; up]`` instead of interleaved pairs.
     """
 
     def __init__(
@@ -341,34 +371,39 @@ class GroupedGLUExperts(nn.Module):
         impl: type[torch.autograd.Function] = GroupedGLUV3,
         autotune: bool = False,
         fast_math: bool = False,
+        chunked: bool = False,
     ):
         super().__init__()
-        # Gate/up rows interleaved: w13[e, 2i] is gate i, w13[e, 2i + 1] is up i.
+        # Gate/up rows are interleaved by default, or stacked [gate; up] when chunked.
         self.w13 = nn.Parameter(torch.empty(num_experts, 2 * intermediate_size, hidden_size))
         self.w2 = nn.Parameter(torch.empty(num_experts, hidden_size, intermediate_size))
         self.glu = glu
         self.impl = impl
+        self.chunked = chunked
         self.opts = {"autotune": autotune, "fast_math": fast_math}
         nn.init.normal_(self.w13, std=0.02)
         nn.init.normal_(self.w2, std=0.02)
 
     def forward(self, x: Tensor, offs: Tensor, scores: Tensor) -> Tensor:
         """x: [T, D] expert-sorted tokens; offs: int32 [E] end offsets; scores: [T]."""
-        return self.impl.apply(x, self.w13, self.w2, offs, scores, self.glu, self.opts)
+        return self.impl.apply(
+            x, self.w13, self.w2, offs, scores, self.glu, self.opts, self.chunked
+        )
 
 
-def reference_grouped_glu(x, w13, w2, offs, scores, glu: Glu = situ_glu) -> Tensor:
-    """Eager ``F.grouped_mm`` reference for ``GroupedGLUExperts`` (differentiable)."""
+def reference_grouped_glu(
+    x, w13, w2, offs, scores, glu: Glu = situ_glu, chunked: bool = False
+) -> Tensor:
+    """Eager differentiable reference; ``chunked`` selects the same w13 layout as the module."""
     h = F.grouped_mm(x, w13.mT, offs=offs)
-    act = glu(*gate_and_up(h)).to(x.dtype)
+    act = glu(*gate_and_up(h, chunked)).to(x.dtype)
     y = F.grouped_mm(act, w2.mT, offs=offs)
     return (y.float() * scores[:, None]).to(y.dtype)
 
 
-def main():
+def main(chunked: bool = False) -> None:
     from rich.console import Console
     from rich.table import Table
-    from torch.profiler import ProfilerActivity, profile
 
     torch.manual_seed(0)
     num_tokens, hidden, inter, num_experts, topk = 4096, 2048, 1408, 8, 2
@@ -383,38 +418,38 @@ def main():
     baselines = ("compiled", "eager")
     results: dict[tuple[str, str], float] = {}
     for glu in (swiglu, situ_glu):
+        # All implementations use the same inputs and weights.
+        experts = (
+            GroupedGLUExperts(
+                hidden, inter, num_experts, glu=glu, autotune=True, fast_math=True, chunked=chunked
+            )
+            .cuda()
+            .to(torch.bfloat16)
+        )
         for name in (*impls, *baselines):
-            experts = GroupedGLUExperts(
-                hidden, inter, num_experts, glu, impls.get(name, GroupedGLUV1),
-                autotune=True, fast_math=True,
-            ).cuda().to(torch.bfloat16)  # fmt: skip
             if name in baselines:
-                # "compiled" is the same F.grouped_mm reference under default torch.compile.
-                ref = functools.partial(reference_grouped_glu, glu=glu)
+                fn = functools.partial(
+                    reference_grouped_glu, x, experts.w13, experts.w2, offs, scores, glu, chunked
+                )
                 if name == "compiled":
-                    ref = torch.compile(ref, fullgraph=True)
-                fn = lambda e=experts, ref=ref: ref(x, e.w13, e.w2, offs, scores)
+                    fn = torch.compile(fn, fullgraph=True)
             else:
-                fn = lambda e=experts: e(x, offs, scores)
+                experts.impl = impls[name]
+                fn = functools.partial(experts, x, offs, scores)
 
-            def step(fn=fn, experts=experts):
+            def step():
                 x.grad = experts.w13.grad = experts.w2.grad = None
                 fn().backward(dy)
 
-            for _ in range(5):
-                step()
-            torch.cuda.synchronize()
-            steps = 20
-            with profile(activities=[ProfilerActivity.CUDA]) as prof:
-                for _ in range(steps):
-                    step()
-                torch.cuda.synchronize()
-            kernels = [e for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA]
-            results[glu.__name__, name] = sum(k.device_time for k in kernels) / steps
+            # Keep backward launches on the thread carrying the profiler range.
+            # The helper warms up the whole step before collecting device timings.
+            with torch.autograd.set_multithreading_enabled(False):
+                results[glu.__name__, name] = benchmark_cuda_function_in_microseconds(step)
 
     table = Table(
         title=f"Grouped GLU experts fwd+bwd: T={num_tokens}x{topk} D={hidden} "
-        f"I={inter} E={num_experts}, GPU kernel time (lower is better)"
+        f"I={inter} E={num_experts}, {'chunked' if chunked else 'interleaved'}, "
+        "GPU kernel time, L2 cleared per step (lower is better)"
     )
     for column in ("glu", "impl", "us/step", *(f"vs {base}" for base in baselines)):
         table.add_column(column, justify="left" if column in ("glu", "impl") else "right")
@@ -429,4 +464,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    typer.run(main)
