@@ -1,6 +1,7 @@
 """CPU tests for the tcgen05 benchmark variant table, CLI listing, and SASS hot-loop checks."""
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -18,6 +19,8 @@ from tcgen05_bench.variants import (
     select_variants,
 )
 from typer.testing import CliRunner
+
+BENCHMARKS = Path(tcgen05_throughput.__file__).resolve().parent
 
 
 def test_variant_names_are_unique():
@@ -54,15 +57,57 @@ def test_selection_filters_family_mode_and_regex():
     assert tmem and {v.op for v in tmem} == {"cp", "shift", "commit", "fence", "alloc"}
 
 
+def test_result_rows_are_strict_json(tmp_path):
+    # Undefined rates (e.g. effective MHz on a multi-wave grid) must not become bare NaN, which
+    # strict JSON readers such as jq reject.
+    path = tmp_path / "rows.jsonl"
+    tcgen05_throughput.append(path, {"name": "x", "grids": [{"effective_mhz": float("nan")}]})
+    row = json.loads(path.read_text(), parse_constant=pytest.fail)
+    assert row == {"name": "x", "grids": [{"effective_mhz": None}]}
+
+
+# Runs ``list`` in a fresh interpreter that refuses GPU-stack imports, so the CLI's CPU-only
+# contract holds regardless of what other tests already imported.
+LIST_WITHOUT_GPU_STACK = """
+import os, runpy, sys
+class Block:
+    def find_spec(self, name, path=None, target=None):
+        if name.split(".")[0] in ("cutlass", "torch"):
+            raise ImportError(f"blocked {name}")
+sys.meta_path.insert(0, Block())
+sys.argv = sys.argv[1:]
+sys.path.insert(0, os.path.dirname(sys.argv[0]))
+runpy.run_path(sys.argv[0], run_name="__main__")
+"""
+
+
 def test_list_cli_runs_without_gpu_dependencies():
-    result = CliRunner().invoke(
-        tcgen05_throughput.app,
-        ["list", "--arch", "sm_103", "--family", "mma", "--select", "cg2", "--json"],
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            LIST_WITHOUT_GPU_STACK,
+            str(BENCHMARKS / "tcgen05_throughput.py"),
+            *["list", "--arch", "sm_103", "--family", "mma", "--select", "cg2", "--json"],
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
     )
-    assert result.exit_code == 0, result.output
+    assert result.returncode == 0, result.stderr
     rows = json.loads(result.stdout)
     assert rows and all(row["cta_group"] == 2 for row in rows)
-    assert "cutlass" not in sys.modules
+    assert not any("_k64" in row["name"] or "_k128" in row["name"] for row in rows)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [["--arch", "sm_90"], ["--family", "wgmma"], ["--mode", "bandwidth"], ["--select", "("]],
+)
+def test_list_cli_rejects_invalid_selectors(args):
+    result = CliRunner().invoke(tcgen05_throughput.app, ["list", *args])
+    assert result.exit_code == 2
+    assert args[0] in result.output
 
 
 SASS = """

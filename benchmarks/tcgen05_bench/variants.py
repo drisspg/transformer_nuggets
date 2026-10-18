@@ -16,6 +16,8 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 ARCHES = ("sm_100", "sm_103", "sm_107")
+FAMILIES = ("mma", "tmem")
+MODES = ("throughput", "latency")
 ALL = ARCHES
 SM100_FAMILY = ("sm_100", "sm_103")
 
@@ -28,8 +30,8 @@ ENVELOPE_ROWS = 128
 ENVELOPE_COLUMNS = 256
 
 # Public dense-MMA peaks in FLOP (or integer OP) per clock per SM, derived from the documented
-# B200/B300 tensor-core rates. sm_107 is omitted on purpose; efficiency falls back to the best
-# measured rate of the same kind.
+# B200/B300 tensor-core rates. sm_107 has no public per-clock table, so its rows omit
+# ``peak_per_clk_sm`` and ``efficiency_vs_peak``.
 PEAK_OPS_PER_CLK_SM: dict[str, dict[str, int]] = {
     "sm_100": {
         "f16": 8192,
@@ -53,7 +55,13 @@ PEAK_OPS_PER_CLK_SM: dict[str, dict[str, int]] = {
 
 @dataclass(frozen=True)
 class MmaKind:
-    """One ``tcgen05.mma`` kind and dtype combination plus the CuTeDSL op that emits it."""
+    """One ``tcgen05.mma`` kind and dtype combination plus the CuTeDSL op that emits it.
+
+    ``k`` is the dense instruction K, ``arches`` where the op exists, and ``container_bits`` the
+    SMEM bits per element (8 for sub-byte types in ``kind::f8f6f4`` containers, 4 for packed FP4).
+    ``tier="full"`` sweeps every legal M/N/cta_group shape plus latency; ``"peak"`` measures
+    three representative shapes. ``ts`` adds TMEM-A (TS) variants.
+    """
 
     key: str
     kind: str
@@ -166,7 +174,8 @@ class MmaVariant:
     a_src: str = "smem"
     mode: str = "throughput"
     # Operand collector reuse (sm_107 ops): "b" keeps B for a second M panel, "a" keeps A for a
-    # second N panel; each K step issues the pair as collector fill then lastuse.
+    # second N panel; each K step issues the pair as collector fill then lastuse. Both
+    # instructions of a pair read the same SMEM A and B addresses and write separate accumulators.
     collector: str = ""
     # Structured 2:4 sparse A (tcgen05.mma.sp): K per instruction doubles at equal operand bytes.
     sparse: bool = False
@@ -443,8 +452,8 @@ def select_variants(
     variants: Iterable[Variant],
     *,
     arch: str | None = None,
-    families: Sequence[str] = ("mma", "tmem"),
-    modes: Sequence[str] = ("throughput", "latency"),
+    families: Sequence[str] = FAMILIES,
+    modes: Sequence[str] = MODES,
     pattern: str | None = None,
     exclude: str | None = None,
 ) -> list[Variant]:

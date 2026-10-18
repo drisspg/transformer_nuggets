@@ -83,6 +83,16 @@ CUTE intra-kernel profiling (writes a Perfetto trace):
 python -m transformer_nuggets.cute.profiler.example
 ```
 
+Measure tcgen05 MMA and TMEM instruction throughput and latency on sm_100/sm_103/sm_107
+(every MMA kind, K width, SS/TS, cta_group, 2:4 sparse, collector reuse). See
+[`benchmarks/tcgen05_bench/README.md`](benchmarks/tcgen05_bench/README.md) for the sweeps,
+result schema, and how to read the rows:
+
+```shell
+python benchmarks/tcgen05_throughput.py list --arch sm_100
+python benchmarks/tcgen05_throughput.py run --output agent_space/tcgen05.jsonl
+```
+
 ### Repo layout
 
 - **`transformer_nuggets/`**: Python package.

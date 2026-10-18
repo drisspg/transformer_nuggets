@@ -1,22 +1,24 @@
 """Measure tcgen05 instruction throughput and latency across instruction variants.
 
 The variant table (``tcgen05_bench/variants.py``) covers ``tcgen05.mma`` kinds (f16, tf32,
-f8f6f4, i8, mxf8f6f4, mxf4, mxf4nvf4, plus the sm_103 K=96 and sm_107 K=64/K=128 forms), SS and TS
-operand sources, cta_group 1 and 2, and M/N shape sweeps, and the non-MMA instructions
-``tcgen05.ld/st/cp/shift/commit/fence/alloc``.
+f8f6f4, i8, mxf8f6f4, mxf4, mxf4nvf4, plus the sm_103 K=96 and sm_107 K=64/K=128 forms), SS and
+TS operand sources, cta_group 1 and 2, M/N shape sweeps, 2:4 sparse A, sm_107 operand-collector
+reuse, and the non-MMA instructions ``tcgen05.ld/st/cp/shift/commit/fence/alloc``.
 
 Every MMA variant repeats a fixed per-CTA envelope (128 accumulator rows x 256 TMEM columns x 256
-SMEM bytes of K) built from one physical instruction shape, so time per repeat compares
-instruction forms at equal work. All operands are zero-filled once before the repeated region, so
-absolute rates are an optimistic low-switching roofline under normal DVFS; per-clock rates come
-from in-kernel ``clock64`` and do not depend on the clock. Latency variants issue one instruction
-followed by its completion wait per repeat from a single CTA.
+SMEM bytes of K; 384 B for K=96) built from one physical instruction shape, so time per repeat
+compares instruction forms at equal work. Collector-reuse variants are the exception: they issue
+fill/lastuse pairs over two accumulator panels. All operands are zero-filled once before the
+repeated region, so absolute rates are an optimistic low-switching roofline under normal DVFS;
+per-clock rates come from in-kernel ``clock64`` and do not depend on the clock. Latency variants
+issue one instruction followed by its completion wait per repeat from a single CTA.
 
 Variants that the architecture or CuTeDSL rejects are recorded as unsupported. Results stream to
-a JSONL file; ``--resume`` skips finished variants and records a variant that crashed the previous
-process, so a driver can rerun the same command after a fault.
+a JSONL file (row schema in ``tcgen05_bench/README.md``). Reruns resume by default: rows already
+in the file are skipped, and a variant that killed the previous process is recorded as crashed,
+so a driver can rerun the same command after a fault.
 
-Examples (CuTeDSL 4.8+ on sm_100/sm_103/sm_107):
+Examples (CuTeDSL 4.8+ on sm_100/sm_103/sm_107; run from the repository root):
 
     python benchmarks/tcgen05_throughput.py list --arch sm_100
     python benchmarks/tcgen05_throughput.py run --select 'mma\\.bf16_f32' --output agent_space/tc.jsonl
@@ -27,8 +29,11 @@ Examples (CuTeDSL 4.8+ on sm_100/sm_103/sm_107):
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
+import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -40,9 +45,13 @@ from typing import Annotated
 
 import typer
 from tcgen05_bench.variants import (
+    ARCHES,
+    FAMILIES,
+    MODES,
     MmaVariant,
     Variant,
     all_variants,
+    arch_from_capability,
     peak_ops_per_clk_sm,
     select_variants,
 )
@@ -110,12 +119,25 @@ def describe(variant: Variant) -> dict:
 
 
 def selected(arch, family, mode, select, exclude) -> list[Variant]:
-    """Apply CLI selectors to the full table."""
+    """Validate the CLI selectors and apply them to the full table."""
+    for flag, values, choices in (
+        ("--arch", [arch] if arch else [], ARCHES),
+        ("--family", family or [], FAMILIES),
+        ("--mode", mode or [], MODES),
+    ):
+        for value in values:
+            if value not in choices:
+                raise typer.BadParameter(f"{value!r} is not one of {choices}", param_hint=flag)
+    for flag, pattern in (("--select", select), ("--exclude", exclude)):
+        try:
+            re.compile(pattern or "")
+        except re.error as error:
+            raise typer.BadParameter(f"invalid regex: {error}", param_hint=flag) from error
     return select_variants(
         all_variants(),
         arch=arch,
-        families=family or ("mma", "tmem"),
-        modes=mode or ("throughput", "latency"),
+        families=family or FAMILIES,
+        modes=mode or MODES,
         pattern=select,
         exclude=exclude,
     )
@@ -147,7 +169,6 @@ def device_context() -> dict:
     """Return GPU, toolchain, and source provenance."""
     import cutlass
     import torch
-    from tcgen05_bench.variants import arch_from_capability
 
     properties = torch.cuda.get_device_properties(torch.cuda.current_device())
     commit = subprocess.run(
@@ -157,6 +178,14 @@ def device_context() -> dict:
         cwd=Path(__file__).parent,
         check=False,
     ).stdout.strip()
+    driver = None
+    if shutil.which("nvidia-smi"):
+        driver = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader", "--id=0"],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.strip()
     return {
         "date": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "commit": commit or os.environ.get("TCGEN05_BENCH_COMMIT", "unknown"),
@@ -167,7 +196,7 @@ def device_context() -> dict:
         "gpu": torch.cuda.get_device_name(),
         "arch": arch_from_capability(*torch.cuda.get_device_capability()),
         "num_sms": properties.multi_processor_count,
-        "driver": torch.cuda.driver_version() if hasattr(torch.cuda, "driver_version") else None,
+        "driver": driver or None,
     }
 
 
@@ -247,10 +276,21 @@ def load_done(path: Path) -> set[str]:
     return names
 
 
+def strict_json(value):
+    """Replace NaN/inf (undefined rates) with None so rows stay valid strict JSON."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {key: strict_json(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [strict_json(item) for item in value]
+    return value
+
+
 def append(path: Path, row: dict) -> None:
     """Append one JSON row and flush it to disk."""
     with path.open("a") as handle:
-        handle.write(json.dumps(row) + "\n")
+        handle.write(json.dumps(strict_json(row), allow_nan=False) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
 
@@ -262,11 +302,18 @@ def run(
     mode: ModeOption = None,
     select: SelectOption = None,
     exclude: ExcludeOption = None,
-    output: Annotated[Path, typer.Option()] = DEFAULT_OUTPUT,
-    rounds: Annotated[int, typer.Option(min=3)] = DEFAULT_ROUNDS,
+    output: Annotated[Path, typer.Option(help="JSONL results file (one row per variant)")] = (
+        DEFAULT_OUTPUT
+    ),
+    rounds: Annotated[int, typer.Option(min=3, help="timed replays per graph")] = DEFAULT_ROUNDS,
     warmup: Annotated[int, typer.Option(min=1)] = DEFAULT_WARMUP,
-    seed: Annotated[int, typer.Option(help="shuffle seed for variant order (trial id)")] = 0,
-    resume: Annotated[bool, typer.Option()] = True,
+    seed: Annotated[
+        int, typer.Option(help="shuffle seed for variant order; use one --output per trial")
+    ] = 0,
+    resume: Annotated[
+        bool,
+        typer.Option(help="skip variants with any row in OUTPUT; --no-resume overwrites OUTPUT"),
+    ] = True,
     sass_dir: Annotated[Path | None, typer.Option(help="keep cubins and check hot loops")] = None,
     variant_timeout: Annotated[
         float, typer.Option(help="seconds per variant before the process exits (hang guard)")
@@ -275,8 +322,8 @@ def run(
     """Compile, check, and measure the selected variants, streaming JSONL rows.
 
     A watchdog thread exits the process with status 124 when one variant exceeds
-    ``--variant-timeout`` (a hung kernel blocks the main thread inside CUDA); rerunning with
-    ``--resume`` records that variant as crashed and continues.
+    ``--variant-timeout`` (a hung kernel blocks the main thread inside CUDA); rerunning the same
+    command records that variant as crashed and continues.
     """
     if sass_dir is not None:
         os.environ["CUTE_DSL_KEEP_CUBIN"] = "1"
@@ -294,8 +341,11 @@ def run(
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         raise RuntimeError("tcgen05 probes require an sm_10x CUDA GPU")
     context = device_context()
-    arch = arch or context["arch"]
+    if arch not in (None, context["arch"]):
+        raise typer.BadParameter(f"the GPU is {context['arch']}", param_hint="--arch")
+    arch = context["arch"]
     variants = selected(arch, family, mode, select, exclude)
+    by_name = {variant.name: variant for variant in variants}
     random.Random(seed).shuffle(variants)
     output.parent.mkdir(parents=True, exist_ok=True)
     marker = output.with_suffix(output.suffix + ".inprogress")
@@ -305,7 +355,8 @@ def run(
     if marker.exists() and resume:
         crashed = marker.read_text().strip()
         if crashed and crashed not in done:
-            append(output, {"name": crashed, "status": "crashed", "context": context})
+            row = describe(by_name[crashed]) if crashed in by_name else {"name": crashed}
+            append(output, {**row, "status": "crashed", "context": context})
             done.add(crashed)
     marker.unlink(missing_ok=True)
 
@@ -405,7 +456,8 @@ def format_row(row: dict) -> str:
         )
         if "efficiency_vs_peak" in row:
             text += f"  {100 * row['efficiency_vs_peak']:5.1f}% peak"
-    text += f"  {row['effective_mhz']:.0f} MHz"
+    if row["effective_mhz"] is not None and math.isfinite(row["effective_mhz"]):
+        text += f"  {row['effective_mhz']:.0f} MHz"
     sass = row.get("sass")
     if sass is not None:
         text += "  sass=" + ("clean" if sass.get("clean") else "CHECK")
@@ -429,7 +481,6 @@ def sass(
     arch = arch or os.environ.get("CUTE_DSL_ARCH", "").rstrip("af") or None
     if arch is None:
         import torch
-        from tcgen05_bench.variants import arch_from_capability
 
         arch = arch_from_capability(*torch.cuda.get_device_capability())
     rows = []
