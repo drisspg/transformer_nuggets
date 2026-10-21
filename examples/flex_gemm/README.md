@@ -26,6 +26,7 @@ on `a @ b` under plain `torch.compile`, checks they agree, and prints both GPU t
 | `05_mx_quant.py` | GEMM writes MXFP8 data + blocked E8M0 scales for the next `F.scaled_mm` | 1.18x |
 | `06_backward.py` | `autograd.Function` whose backward GEMM runs `torch.func.vjp` in its epilogue | 1.19x |
 | `07_stochastic_rounding.py` | inline PTX: Philox RNG + stochastic bf16 rounding in the epilogue | 1.27x |
+| `08_func_transforms.py` | `torch.func` in the epilogue: f, f', f'' via nested `vjp`; forward-mode `jvp` | 1.25x |
 
 The full worked example is the MoE in
 [`transformer_nuggets/moe/flex_gemm_experts.py`](../../transformer_nuggets/moe/flex_gemm_experts.py):
@@ -84,7 +85,8 @@ stochastically rounds with `cvt.rs.satfinite.bf16x2.f32`, all in the epilogue.
   (`06`); for light ones the default tile is often as good.
 - `"fast_math": True` rewrites sigmoid/SiLU through tanh, uses tanh GELU, and allows approximate
   hardware math. Faster for nonlinear epilogues; check accuracy. The examples spell the SiLU
-  rewrite out (`_common.silu`) so both sides compute the same thing.
+  rewrite out (`_common.silu`) so both sides compute the same thing; the `jvp` case in
+  `08` uses `F.silu`, so there only the fused side gets the tanh form.
 
 ## Gotchas
 
@@ -95,6 +97,8 @@ stochastically rounds with `cvt.rs.satfinite.bf16x2.f32`, all in the epilogue.
 - Grouped reductions feeding the main output (and logsumexp) need group size <= 32.
 - Python int constants above 2**31 in int32 math crash compilation; write them as signed int32
   (`07`).
+- `aten.expand` is not lowered yet: `torch.func.grad` of a `.sum()`, and `jvp` through a Python
+  scalar multiply, fail. Use `vjp` with an explicit cotangent (`08`).
 
 ## Debugging
 
