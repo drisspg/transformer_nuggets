@@ -27,6 +27,7 @@ on `a @ b` under plain `torch.compile`, checks they agree, and prints both GPU t
 | `06_backward.py` | `autograd.Function` whose backward GEMM runs `torch.func.vjp` in its epilogue | 1.19x |
 | `07_stochastic_rounding.py` | inline PTX: Philox RNG + stochastic bf16 rounding in the epilogue | 1.27x |
 | `08_func_transforms.py` | `torch.func` in the epilogue: f, f', f'' via nested `vjp`; forward-mode `jvp` | 1.25x |
+| `09_autotune.py` | default tile vs autotune shortlist vs EXHAUSTIVE search, then pin the winner | 1.9x vs default |
 
 The full worked example is the MoE in
 [`transformer_nuggets/moe/flex_gemm_experts.py`](../../transformer_nuggets/moe/flex_gemm_experts.py):
@@ -82,7 +83,8 @@ stochastically rounds with `cvt.rs.satfinite.bf16x2.f32`, all in the epilogue.
   ordinary PyTorch (a cuBLAS GEMM plus a separate kernel): no fusion.
 - `"autotune": True` benchmarks a measured shortlist of legal tile configs (about a dozen;
   `TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_SEARCH_SPACE=EXHAUSTIVE` tries all). Heavy epilogues need it
-  (`06`); for light ones the default tile is often as good.
+  (`06`, `09`); for light ones the default tile is often as good. Pin a winner with
+  `"config": {...}` to skip tuning (`09`).
 - `"fast_math": True` rewrites sigmoid/SiLU through tanh, uses tanh GELU, and allows approximate
   hardware math. Faster for nonlinear epilogues; check accuracy. The examples spell the SiLU
   rewrite out (`_common.silu`) so both sides compute the same thing; the `jvp` case in
