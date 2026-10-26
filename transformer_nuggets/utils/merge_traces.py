@@ -27,8 +27,22 @@ def _get_min_ts(events: list[dict]) -> float:
     )
 
 
+_NATIVE_SUFFIXES = {".pftrace", ".perfetto-trace"}
+
+
 def _is_native_trace(path: str | Path) -> bool:
-    return Path(path).suffix in {".pftrace", ".perfetto-trace"}
+    return Path(path).suffix in _NATIVE_SUFFIXES
+
+
+def _is_native_input(path: str | Path) -> bool:
+    # Torch's Cuspy profiler writes gzipped native traces (``.pftrace.gz``).
+    path = Path(path)
+    return _is_native_trace(path.with_suffix("") if path.suffix == ".gz" else path)
+
+
+def _read_native_trace(path: str | Path) -> bytes:
+    data = Path(path).read_bytes()
+    return gzip.decompress(data) if data[:2] == b"\x1f\x8b" else data
 
 
 # TrackDescriptor.child_ordering value meaning "sort children by sibling_order_rank".
@@ -137,7 +151,7 @@ def _merge_native_traces(
     sources = []
     for path in input_paths:
         source = Trace()
-        source.ParseFromString(Path(path).read_bytes())
+        source.ParseFromString(_read_native_trace(path))
         sources.append(source)
     offsets = _clock_offsets(sources) if align_timestamps else [0] * len(sources)
     # Timestamps are unsigned and only relative time matters: express every
@@ -294,7 +308,7 @@ def merge_traces(
     rank 0's, cancelling host clock offsets between nodes; inputs without common
     collectives are aligned on their first event.
     """
-    native_inputs = [_is_native_trace(path) for path in input_paths]
+    native_inputs = [_is_native_input(path) for path in input_paths]
     if any(native_inputs):
         if not all(native_inputs):
             raise ValueError("cannot merge a mixture of native Perfetto and Chrome JSON traces")

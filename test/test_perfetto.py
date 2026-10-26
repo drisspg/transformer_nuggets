@@ -1059,7 +1059,10 @@ def test_merge_traces_writes_native_pftrace(tmp_path):
     assert {"op0", "op1"} <= slice_names
 
 
-def test_merge_traces_accepts_native_pftrace_inputs(tmp_path):
+@pytest.mark.parametrize("gzip_inputs", [False, True])
+def test_merge_traces_accepts_native_pftrace_inputs(tmp_path, gzip_inputs):
+    import gzip
+
     from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import Trace
 
     from transformer_nuggets.utils.merge_traces import merge_traces
@@ -1090,6 +1093,10 @@ def test_merge_traces_accepts_native_pftrace_inputs(tmp_path):
                 ]
             },
         )
+        if gzip_inputs:
+            gz_path = path.with_name(path.name + ".gz")
+            gz_path.write_bytes(gzip.compress(path.read_bytes()))
+            path = gz_path
         inputs.append(str(path))
 
     output = tmp_path / "merged.pftrace"
@@ -1133,6 +1140,9 @@ def test_merge_traces_rejects_native_input_with_json_output(tmp_path):
 
     with pytest.raises(ValueError, match="native Perfetto inputs require"):
         merge_traces([str(input_path)], str(tmp_path / "merged.json"))
+    # Native output is written uncompressed, so a gzip-named output is rejected.
+    with pytest.raises(ValueError, match="native Perfetto inputs require"):
+        merge_traces([str(input_path)], str(tmp_path / "merged.pftrace.gz"))
 
 
 def test_merge_traces_folds_each_rank_into_one_process(tmp_path):
