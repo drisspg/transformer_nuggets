@@ -1,5 +1,8 @@
 import pytest
+import torch
 from typer.testing import CliRunner
+
+from transformer_nuggets import roofline
 
 from transformer_nuggets.roofline import (
     RooflineSpec,
@@ -7,6 +10,7 @@ from transformer_nuggets.roofline import (
     app,
     decorate_trace_file,
     decorate_trace_roofline,
+    measure_roofline_spec,
     register_kernel_roofline_formula,
     register_roofline_formula,
 )
@@ -685,3 +689,21 @@ def test_varlen_attention_formulas_through_fx_capture():
     sliding = varlen_node([2, 0])
     assert sliding.model_kind == "generic_io"
     assert sliding.logical_flops is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required to measure")
+def test_measure_roofline_spec_calibrates_once_per_device(monkeypatch):
+    spec = measure_roofline_spec(use_cache=False)
+    measure_roofline_spec()  # populate the cache
+
+    def fail(*args, **kwargs):
+        raise AssertionError("cached spec should not re-measure")
+
+    monkeypatch.setattr(roofline, "_gemm_tflops", fail)
+    cached = measure_roofline_spec()
+
+    assert spec.name.startswith("measured ")
+    assert spec.peak_compute_tflops > 0
+    assert spec.peak_memory_gbps > 0
+    assert spec.launch_latency_us > 0
+    assert cached.name.startswith("measured ")

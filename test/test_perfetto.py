@@ -1332,3 +1332,30 @@ def test_track_event_conversion_chains_bound_flow_slices():
         "last": ((), (7,)),
         "unbound": ((), ()),
     }
+
+
+def test_track_event_conversion_colors_slices_by_color_key():
+    from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import Trace, TrackEvent
+
+    def box(name, **args):
+        return {"ph": "X", "name": name, "pid": 0, "tid": 1, "ts": 0, "dur": 2, "args": args}
+
+    trace = {
+        "traceEvents": [
+            box("finding", correlation=5, slice_color_key="roofline-high-3133"),
+            box("kernel", correlation=5),
+        ]
+    }
+
+    parsed = Trace()
+    parsed.ParseFromString(chrome_trace_to_track_event_trace(trace))
+    begins = {
+        packet.track_event.name: packet.track_event
+        for packet in parsed.packet
+        if packet.HasField("track_event")
+        and packet.track_event.type == TrackEvent.TYPE_SLICE_BEGIN
+    }
+
+    # Perfetto hashes the correlation ID to pick the fill color.
+    assert begins["finding"].correlation_id_str == "roofline-high-3133"
+    assert begins["kernel"].correlation_id == 5

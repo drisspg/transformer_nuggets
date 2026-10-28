@@ -24,7 +24,7 @@ import math
 from pathlib import Path
 import tempfile
 import traceback
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from torch.fx import GraphModule, Interpreter, Node
@@ -38,12 +38,15 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils.module_tracker import ModuleTracker
 
 from transformer_nuggets.roofline import (
+    SEVERITY_COLOR_KEYS,
+    SLICE_COLOR_KEY_ARG,
     RooflineFormulaContext,
     RooflineSpec,
     RooflineTensor,
     RooflineWork,
     _evaluate_formula,
     get_roofline_formula,
+    measure_roofline_spec,
     register_roofline_formula,
 )
 from transformer_nuggets.utils.perfetto import (
@@ -1064,7 +1067,8 @@ def _finding_explanation(
             f"; fused floor ≈ {metrics['fused_roofline_floor_us']:.1f} µs under "
             f"'{metrics['roofline_spec']}', so up to "
             f"{metrics['idealized_recoverable_us']:.1f} µs "
-            f"({metrics['idealized_fused_speedup_upper_bound']:.1f}× speedup upper bound) is recoverable"
+            f"({metrics['idealized_fused_speedup_upper_bound']:.1f}× speedup upper bound) "
+            "is recoverable"
         )
     why.append(timing + ".")
     short_ops = dict.fromkeys(op.removeprefix("aten.").split(".")[0] for op in region.op_names)
@@ -1621,6 +1625,7 @@ def add_fx_fusion_region_boxes(
                         segment_counts[region_id],
                     ),
                     FX_FUSION_MARKER: True,
+                    SLICE_COLOR_KEY_ARG: SEVERITY_COLOR_KEYS[severity],
                     "region_id": region.region_id,
                     "severity": severity,
                     "operations": list(region.op_names),
@@ -1664,14 +1669,17 @@ def add_fx_fusion_region_boxes(
             assessment["severity"],
             assessment.get("busy_roofline_percent"),
         )
+        color = {}
         if assessment["severity"] in ("high", "medium", "low"):
             annotation["cname"] = {"high": "terrible", "medium": "yellow", "low": "good"}[
                 assessment["severity"]
             ]
+            color = {SLICE_COLOR_KEY_ARG: SEVERITY_COLOR_KEYS[assessment["severity"]]}
         annotation["args"] = {
             "why": assessment.pop("why"),
             "suggested_fix": assessment.pop("suggested_fix"),
             **annotation.get("args", {}),
+            **color,
         }
         annotation["args"].update(
             {
@@ -2172,6 +2180,16 @@ def _cuda_device(values: Any) -> torch.device | None:
     return next(iter(devices), None)
 
 
+def _resolve_roofline_spec(
+    roofline_spec: RooflineSpec | Literal["measured"] | None,
+    cuda_device: torch.device | None,
+) -> RooflineSpec | None:
+    """Calibrate ``"measured"`` ceilings on the profiled GPU; CPU runs get none."""
+    if roofline_spec != "measured":
+        return roofline_spec
+    return None if cuda_device is None else measure_roofline_spec(cuda_device)
+
+
 def _write_annotated_trace(
     torch_profiler: Any,
     path: str | Path,
@@ -2212,13 +2230,15 @@ def profile_fx_fusion(
     *,
     functionalize: bool = True,
     trace_format: TraceFormat = "track_event",
-    roofline_spec: RooflineSpec | None = None,
+    roofline_spec: RooflineSpec | Literal["measured"] | None = "measured",
     cuda_graph: bool = False,
 ) -> FxFusionProfile:
     """Profile an FX graph eagerly and write an annotated Perfetto trace.
 
     The MVP accepts positional arguments with static shapes and profiles at most
     one CUDA device. It does not invoke Inductor or another code generator.
+    ``roofline_spec="measured"`` (default) calibrates ceilings on the profiled GPU
+    with :func:`measure_roofline_spec`; pass a spec to override or ``None`` to skip.
     """
     analysis = analyze_fx_fusion(function, args, functionalize=functionalize)
     module = function if isinstance(function, torch.nn.Module) else torch.nn.Module()
@@ -2231,6 +2251,7 @@ def profile_fx_fusion(
         else ((), ())
     )
     cuda_device = _cuda_device((args, module_state))
+    roofline_spec = _resolve_roofline_spec(roofline_spec, cuda_device)
     activities = [ProfilerActivity.CPU]
     if cuda_device is not None:
         activities.append(ProfilerActivity.CUDA)
@@ -2299,6 +2320,7 @@ class _AotGraphCapture:
         self.provenance_records = provenance_records
         self.provenance_state = {} if provenance_state is None else provenance_state
         self.analyses: list[FxFusionAnalysis] = []
+        self.cuda_graph_annotations = False
 
     def __call__(self, graph_module: GraphModule, example_inputs: Sequence[Any]) -> Callable:
         from torch._functorch._aot_autograd.utils import make_boxed_func
@@ -2332,7 +2354,17 @@ class _AotGraphCapture:
             region_prefix=f"{self.phase}{suffix}_region",
         )
         self.analyses.append(analysis)
-        return make_boxed_func(FxFusionInterpreter(graph_module).run)
+
+        def run(*args: Any) -> Any:
+            # Read the flag per call: the same compiled graphs run eagerly and during
+            # CUDA Graph capture, which needs mark_kernels instead of record_function.
+            interpreter = FxFusionInterpreter(
+                graph_module,
+                cuda_graph_annotations=self.cuda_graph_annotations,
+            )
+            return interpreter.run(*args)
+
+        return make_boxed_func(run)
 
 
 def _clear_gradients(module: torch.nn.Module, values: Any) -> None:
@@ -2440,7 +2472,11 @@ class _PreparedAotTraining:
 
     analysis: FxTrainingAnalysis
     run_loss: Callable[[], torch.Tensor]
+    run_loss_with: Callable[[tuple[Any, ...], Mapping[str, Any]], torch.Tensor]
     cuda_device: torch.device | None
+    loss_module: torch.nn.Module
+    runtime_values: Any
+    captures: tuple[_AotGraphCapture, ...]
 
 
 def _prepare_aot_training(
@@ -2530,7 +2566,11 @@ def _prepare_aot_training(
     return _PreparedAotTraining(
         analysis=analysis,
         run_loss=lambda: run_loss(args, runtime_kwargs),
+        run_loss_with=run_loss,
         cuda_device=cuda_device,
+        loss_module=loss_module,
+        runtime_values=runtime_values,
+        captures=(forward_capture, backward_capture),
     )
 
 
@@ -2549,6 +2589,51 @@ def analyze_aot_training(
     return prepared.analysis
 
 
+def _profile_training_cuda_graph(
+    prepared: _PreparedAotTraining,
+    activities: list[ProfilerActivity],
+) -> tuple[Any, Mapping[int, Sequence[Any]]]:
+    """Capture one forward/backward step as a CUDA Graph and profile one replay."""
+    from torch.cuda.graph_annotations import get_kernel_annotations
+
+    cuda_device = prepared.cuda_device
+    assert cuda_device is not None
+    module, values = prepared.loss_module, prepared.runtime_values
+    graph = torch.cuda.CUDAGraph()
+    capture_stream = torch.cuda.Stream(device=cuda_device)
+    capture_stream.wait_stream(torch.cuda.current_stream(cuda_device))
+    for capture in prepared.captures:
+        capture.cuda_graph_annotations = True
+    try:
+        with _preserve_runtime_state(module, values, cuda_device):
+            # Warm up on clones so in-place input mutations happen only in the replay.
+            warmup_args, warmup_kwargs = _clone_warmup_values(values)
+            with torch.cuda.stream(capture_stream):
+                for _ in range(3):
+                    _clear_gradients(module, (warmup_args, warmup_kwargs))
+                    prepared.run_loss_with(warmup_args, warmup_kwargs).backward()
+            capture_stream.synchronize()
+            # With gradients cleared, the captured backward allocates its gradients in
+            # the graph pool; each replay rewrites them with that step's values.
+            _clear_gradients(module, values)
+            with torch.cuda.graph(graph, stream=capture_stream, enable_annotations=True):
+                prepared.run_loss().backward()
+            step_gradients = {tensor: tensor.grad for tensor in _gradient_tensors(module, values)}
+    finally:
+        for capture in prepared.captures:
+            capture.cuda_graph_annotations = False
+
+    with profile(activities=activities, record_shapes=True) as torch_profiler:
+        graph.replay()
+        torch.cuda.synchronize(cuda_device)
+    for tensor, gradient in step_gradients.items():
+        if gradient is not None:
+            tensor.grad = gradient.clone() if tensor.grad is None else tensor.grad + gradient
+    # The registry is a live view that drops a graph's entries when the graph is
+    # destroyed, so snapshot it while ``graph`` is still alive.
+    return torch_profiler, dict(get_kernel_annotations())
+
+
 def profile_aot_training(
     loss_module: torch.nn.Module,
     args: tuple[Any, ...],
@@ -2557,7 +2642,8 @@ def profile_aot_training(
     kwargs: Mapping[str, Any] | None = None,
     loss_selector: Callable[[Any], torch.Tensor] | None = None,
     trace_format: TraceFormat = "track_event",
-    roofline_spec: RooflineSpec | None = None,
+    roofline_spec: RooflineSpec | Literal["measured"] | None = "measured",
+    cuda_graph: bool = False,
 ) -> FxTrainingProfile:
     """Profile eager AOTAutograd forward/backward graphs without Inductor.
 
@@ -2565,16 +2651,28 @@ def profile_aot_training(
     select one from its output. A warm-up iteration captures and caches the
     AOTAutograd graphs outside the profiler; the measured iteration then executes
     the captured FX graphs eagerly with node annotations. Optimizer execution is
-    intentionally outside this API.
+    intentionally outside this API. ``roofline_spec`` behaves as in
+    :func:`profile_fx_fusion`.
+
+    With ``cuda_graph=True`` the forward and backward step is captured into one CUDA
+    Graph and a single replay is profiled. Gradients from that replay accumulate into
+    existing ``.grad`` tensors exactly once, as in eager mode.
     """
     prepared = _prepare_aot_training(loss_module, args, kwargs, loss_selector)
+    roofline_spec = _resolve_roofline_spec(roofline_spec, prepared.cuda_device)
     activities = [ProfilerActivity.CPU]
     if prepared.cuda_device is not None:
         activities.append(ProfilerActivity.CUDA)
-    with profile(activities=activities, record_shapes=True) as torch_profiler:
-        prepared.run_loss().backward()
-        if prepared.cuda_device is not None:
-            torch.cuda.synchronize(prepared.cuda_device)
+    graph_annotations = None
+    if cuda_graph:
+        if prepared.cuda_device is None:
+            raise ValueError("CUDA Graph profiling requires CUDA tensors")
+        torch_profiler, graph_annotations = _profile_training_cuda_graph(prepared, activities)
+    else:
+        with profile(activities=activities, record_shapes=True) as torch_profiler:
+            prepared.run_loss().backward()
+            if prepared.cuda_device is not None:
+                torch.cuda.synchronize(prepared.cuda_device)
 
     trace_path, findings_path = _write_annotated_trace(
         torch_profiler,
@@ -2582,6 +2680,7 @@ def profile_aot_training(
         (*prepared.analysis.forward, *prepared.analysis.backward),
         trace_format,
         roofline_spec,
+        graph_annotations,
     )
     return FxTrainingProfile(
         analysis=prepared.analysis,

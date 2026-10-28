@@ -9,15 +9,19 @@ measurements rather than registered logical formulas.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import importlib
+import json
 import math
+import os
 from pathlib import Path
 import re
 from typing import Annotated, Any, Literal
 
 import torch
 import typer
+
+from transformer_nuggets.utils.track_event import SLICE_COLOR_KEY_ARG
 
 
 __all__ = [
@@ -29,6 +33,7 @@ __all__ = [
     "decorate_trace_roofline",
     "get_kernel_roofline_formula",
     "get_roofline_formula",
+    "measure_roofline_spec",
     "register_kernel_roofline_formula",
     "register_roofline_formula",
 ]
@@ -56,6 +61,20 @@ _SEVERITY_STYLE = {
     "healthy": ("🟢", "good"),
     "needs_measurement": ("🔵", "cq_build_running"),
     "unknown": ("⚪", "grey"),
+}
+
+# Perfetto colors a slice by hashing its correlation ID when one is set
+# (ui/src/plugins/dev.perfetto.TraceProcessorTrack/trace_processor_slice_track.ts).
+# These strings were brute-forced against Perfetto main's ui/src/base/hash.ts and
+# ui/src/components/colorizer.ts (Oct 2026) so that hash(key, 360) gives an HSLuv
+# hue of red 18 / amber 66 / green 117, hash(key + "x", 40) + 40 a readable
+# lightness, and hash(key, 18) the red / amber / green entries of the optional
+# consistent-color palette. Re-derive them if Perfetto changes its colorizer.
+SEVERITY_COLOR_KEYS = {
+    "high": "roofline-high-3133",
+    "medium": "roofline-medium-792",
+    "low": "roofline-low-1697",
+    "healthy": "roofline-low-1697",
 }
 
 
@@ -102,6 +121,154 @@ class RooflineTensor:
         """Return logical tensor bytes when the dtype is known."""
         size = self.element_size
         return None if size is None else self.numel * size
+
+
+def _roofline_cache_path() -> Path:
+    override = os.environ.get("TRANSFORMER_NUGGETS_ROOFLINE_CACHE")
+    if override:
+        return Path(override)
+    return Path.home() / ".cache" / "transformer_nuggets" / "roofline_specs.json"
+
+
+def _cuda_events_us(fn: Callable[[], Any], iters: int, warmup: int = 3) -> float:
+    """Return mean GPU microseconds per call after warmup."""
+    for _ in range(warmup):
+        fn()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    torch.cuda.synchronize()
+    start.record()
+    for _ in range(iters):
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) * 1e3 / iters
+
+
+def _half_duty_fast_us(fn: Callable[[], Any], samples: int = 100) -> float:
+    """Return the 10th-percentile GPU time of ``fn`` at about 50% duty cycle.
+
+    A GPU sleep kernel as long as ``fn`` precedes every call, so average power stays
+    below the cap's averaging window and clocks stay high. That matches eager
+    workloads, which leave the GPU idle between launches far more than benchmarks do.
+    """
+    busy_us = _cuda_events_us(fn, 5)
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    torch.cuda._sleep(1_000_000)
+    end.record()
+    torch.cuda.synchronize()
+    sleep_cycles = int(1_000_000 * busy_us / (start.elapsed_time(end) * 1e3))
+    events = [
+        (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+        for _ in range(samples)
+    ]
+    for call_start, call_end in events:
+        torch.cuda._sleep(sleep_cycles)
+        call_start.record()
+        fn()
+        call_end.record()
+    torch.cuda.synchronize()
+    times_us = sorted(
+        call_start.elapsed_time(call_end) * 1e3 for call_start, call_end in events[samples // 5 :]
+    )
+    # A fast-end percentile estimates attainable peak while ignoring outliers.
+    return times_us[len(times_us) // 10]
+
+
+def _gemm_tflops(size: int, device: torch.device) -> tuple[float, float]:
+    """Return (unthrottled, sustained) bf16 GEMM TFLOP/s on random data."""
+    generator = torch.Generator(device=device).manual_seed(0)
+    a = torch.randn(size, size, device=device, dtype=torch.bfloat16, generator=generator)
+    b = torch.randn(size, size, device=device, dtype=torch.bfloat16, generator=generator)
+    flops = 2 * size**3
+    unthrottled = flops / _half_duty_fast_us(lambda: a @ b) / 1e6
+    # About half a second of back-to-back GEMMs reaches the power-capped clock.
+    iters = max(20, int(0.5e6 / max(_cuda_events_us(lambda: a @ b, 3), 1.0)))
+    sustained = flops / _cuda_events_us(lambda: a @ b, iters) / 1e6
+    return unthrottled, sustained
+
+
+def _copy_gbps(device: torch.device) -> float:
+    """Return unthrottled read+write GB/s for a 256 MiB device-to-device ``copy_``."""
+    source = torch.empty(2**28, device=device, dtype=torch.uint8)
+    destination = torch.empty_like(source)
+    return 2 * source.numel() / _half_duty_fast_us(lambda: destination.copy_(source)) / 1e3
+
+
+def measure_roofline_spec(
+    device: torch.device | int | None = None,
+    *,
+    use_cache: bool = True,
+) -> RooflineSpec:
+    """Measure attainable bf16 GEMM, copy bandwidth, and launch spacing on one GPU.
+
+    Datasheet peaks assume maximum clocks, which a GPU may not hold: on GB200, random
+    bf16 GEMMs drop from ~1.7 PFLOP/s to ~1.3 PFLOP/s once back-to-back load hits the
+    power cap (zeros, which barely toggle bits, reach 2.3; measured Oct 2026 on driver
+    580.126, default clocks, 1120 W limit). Ceilings therefore use random-data GEMMs and
+    ``copy_`` at ~50% duty cycle, like eager workloads, and the spec name also reports
+    the power-capped sustained GEMM rate. Launch latency is the per-kernel spacing of
+    dependent eager launches, which includes host dispatch cost and is what fusing one
+    away saves in an eager step.
+
+    Results are cached per device, CUDA, and torch version in
+    ``~/.cache/transformer_nuggets/roofline_specs.json``; override the path with
+    ``TRANSFORMER_NUGGETS_ROOFLINE_CACHE``, or pass ``use_cache=False`` to re-measure
+    after changing clocks or power limits, or if the GPU was busy during calibration.
+    """
+    if device is None:
+        device = torch.cuda.current_device()
+    device = torch.device("cuda", device) if isinstance(device, int) else torch.device(device)
+    props = torch.cuda.get_device_properties(device)
+    key = (
+        f"{props.name}|sm{props.major}{props.minor}|{props.multi_processor_count}sm|"
+        f"cuda{torch.version.cuda}|torch{torch.__version__}"
+    )
+    cache_path = _roofline_cache_path()
+    cache: dict[str, Any] = {}
+    if use_cache and cache_path.exists():
+        try:
+            cache = json.loads(cache_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            cache = {}
+        try:
+            return RooflineSpec(**cache[key])
+        except (KeyError, TypeError, ValueError):
+            pass  # missing or stale entry: re-measure
+
+    with torch.cuda.device(device):
+        unthrottled_tflops, sustained_tflops = max(
+            _gemm_tflops(size, device) for size in (4096, 8192)
+        )
+        copy_gbps = _copy_gbps(device)
+        # Per-launch spacing of dependent one-element kernels: what fusing away one
+        # launch saves on the GPU timeline.
+        scalar = torch.zeros(1, device=device)
+        launch_us = _cuda_events_us(lambda: scalar.add_(1), 2000, warmup=100)
+
+    spec = RooflineSpec(
+        name=(
+            f"measured {props.name}: {unthrottled_tflops:.0f} TFLOP/s bf16 "
+            f"({sustained_tflops:.0f} power-capped), {copy_gbps / 1e3:.2f} TB/s copy, "
+            f"{launch_us:.1f} µs/eager launch"
+        ),
+        peak_compute_tflops=unthrottled_tflops,
+        peak_memory_gbps=copy_gbps,
+        launch_latency_us=launch_us,
+    )
+    if use_cache:
+        cache[key] = asdict(spec)
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            # Atomic replace so concurrent profilers never read a half-written file.
+            temporary = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.tmp")
+            temporary.write_text(json.dumps(cache, indent=2))
+            os.replace(temporary, cache_path)
+        except OSError:
+            pass  # caching is an optimization; an unwritable cache must not fail profiling
+    return spec
 
 
 @dataclass(frozen=True)
@@ -1051,6 +1218,11 @@ def decorate_trace_roofline(
                     "is_optimization_finding": is_slow,
                     "needs_measurement": needs_measurement,
                     "severity": severity,
+                    **(
+                        {SLICE_COLOR_KEY_ARG: SEVERITY_COLOR_KEYS[severity]}
+                        if severity in SEVERITY_COLOR_KEYS
+                        else {}
+                    ),
                     "kernel_name": event.get("name", ""),
                     "slow_kernel_threshold_us": slow_kernel_threshold_us,
                     "slow_roofline_percent": slow_roofline_percent,

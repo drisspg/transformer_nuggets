@@ -30,20 +30,21 @@ PYTHONPATH=$PWD <python> -c 'import transformer_nuggets; print(transformer_nugge
 ### Eager FX
 
 ```python
-from transformer_nuggets.fx_analysis import RooflineSpec, profile_fx_fusion
+from transformer_nuggets.fx_analysis import profile_fx_fusion
 
-result = profile_fx_fusion(
-    fn,
-    (x, scale),
-    "artifacts/run.pftrace",
-    roofline_spec=RooflineSpec(
-        "measured ceilings",
-        peak_compute_tflops=...,
-        peak_memory_gbps=...,
-        launch_latency_us=...,
-    ),
-)
+result = profile_fx_fusion(fn, (x, scale), "artifacts/run.pftrace")
 ```
+
+Ceilings default to `roofline_spec="measured"`: `measure_roofline_spec()` calibrates
+the profiled GPU once (about 1.5 s) and caches the result in
+`~/.cache/transformer_nuggets/roofline_specs.json`. It times random-data bf16 GEMMs
+and `copy_` at about 50% duty cycle, matching how eager steps leave the GPU partly
+idle, and also reports the power-capped sustained GEMM rate in the spec name.
+Datasheet peaks overstate attainable throughput when the GPU cannot hold its
+maximum clock: on GB200, back-to-back random GEMMs fall from about 1.7 to 1.3
+PFLOP/s under the power cap. Pass an explicit `RooflineSpec` to override, or
+`None` to skip roofline metrics. Re-measure with `use_cache=False` after changing
+clocks or power limits.
 
 Use `cuda_graph=True` only when CUDA Graph replay is the intended workload contract.
 
@@ -58,7 +59,6 @@ result = profile_aot_training(
     "artifacts/train.pftrace",
     kwargs={"labels": labels},
     loss_selector=lambda output: output.loss,
-    roofline_spec=spec,
 )
 ```
 
@@ -86,6 +86,13 @@ Custom formula modules must be imported before decoration. Unregistered ops reta
   - 🔵 low-confidence model; needs NCU/model work.
   - ⚪ unknown work; not an optimization finding.
 - `GPU annotations <stream>`: FX node and fusion-region annotations.
+  - Region and node findings carry `why` and `suggested_fix` arguments.
+  - Split regions are labeled `part i/n` and chained with flow arrows.
+
+Severity uses both an emoji in the name and a fill color. Find offenders with SQL,
+for example `select * from slice where name like '🔴%'`. Perfetto colors a slice by
+hashing its correlation ID, so findings set `slice_color_key` to a string that
+hashes to red, amber, or green (`SEVERITY_COLOR_KEYS` in `roofline.py`).
 
 Click a box to inspect formula confidence, parent op, work scope, FLOPs, read/write bytes, TFLOP/s, TB/s, floors, and bound classification.
 

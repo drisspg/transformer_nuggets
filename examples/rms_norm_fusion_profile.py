@@ -4,7 +4,7 @@ from pathlib import Path
 
 import torch
 
-from transformer_nuggets.fx_analysis import RooflineSpec, profile_fx_fusion
+from transformer_nuggets.fx_analysis import profile_fx_fusion
 from transformer_nuggets.utils.tracing import cuda_kernel_profiler
 
 
@@ -69,12 +69,6 @@ def main() -> None:
         compare_rms_norms,
         (x, x.clone(), weight),
         output_dir / "rms_norm_comparison.pftrace",
-        roofline_spec=RooflineSpec(
-            name="example ceilings: 100 TFLOP/s, 6.4 TB/s",
-            peak_compute_tflops=100.0,
-            peak_memory_gbps=6400.0,
-            launch_latency_us=3.0,
-        ),
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "rms_norm_fx_graph.txt").write_text(str(result.analysis.graph_module.graph))

@@ -368,6 +368,7 @@ def test_add_fx_fusion_region_boxes_combines_consecutive_region_kernels():
     )
     assert boxes[0]["cname"] == "yellow"
     assert boxes[0]["args"]["severity"] == "medium"
+    assert boxes[0]["args"]["slice_color_key"] == "roofline-medium-792"
     assert boxes[0]["args"]["why"].startswith(
         "Medium: 3 launches for one fusible region (medium threshold: "
     )
@@ -416,6 +417,7 @@ def test_add_fx_fusion_region_boxes_combines_consecutive_region_kernels():
     for node_box in node_boxes:
         assert node_box["name"].startswith("🔴 Node")
         assert node_box["cname"] == "terrible"
+        assert node_box["args"]["slice_color_key"] == "roofline-high-3133"
         assert node_box["args"]["why"].startswith("High (≥ 2% of step headroom")
         assert node_box["args"]["suggested_fix"].startswith("Memory-bound below peak")
     assert all(
@@ -934,3 +936,66 @@ def test_profile_fx_fusion_supports_cuda_graph_replay(tmp_path):
     assert report["summary"]["region_finding_count"] == 1
     assert report["summary"]["attributed_node_count"] == 4
     assert module.steps.item() == 1
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA is required for CUDA Graph profiling"
+)
+def test_profile_aot_training_cuda_graph_attributes_and_commits_one_step(tmp_path):
+    from torch.cuda.graph_annotations import is_available
+
+    if not is_available():
+        pytest.skip("CUDA Graph kernel annotations are unavailable")
+
+    class GatedLoss(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.randn(64, device="cuda"))
+
+        def forward(self, x):
+            product = x * self.weight
+            return (product * torch.sigmoid(product)).sum()
+
+    x = torch.randn(8, 64, device="cuda")
+    module = GatedLoss()
+    expected = copy.deepcopy(module)
+    expected(x).backward()
+    module.weight.grad = torch.ones_like(module.weight)
+
+    result = profile_aot_training(module, (x,), tmp_path / "graph.pftrace", cuda_graph=True)
+
+    report = json.loads(result.findings_path.read_text())
+    assert report["summary"]["attributed_node_count"] > 0
+    assert any(row["region_id"].startswith("backward_region") for row in report["regions"])
+    # Warmup and capture must not leak gradients; the one replay accumulates once.
+    torch.testing.assert_close(module.weight.grad, 1 + expected.weight.grad)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA is required for CUDA Graph profiling"
+)
+def test_profile_aot_training_cuda_graph_mutates_inputs_once(tmp_path):
+    from torch.cuda.graph_annotations import is_available
+
+    if not is_available():
+        pytest.skip("CUDA Graph kernel annotations are unavailable")
+
+    class CountingLoss(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.randn(16, device="cuda"))
+
+        def forward(self, x, counter):
+            counter.add_(1)
+            return (x * self.weight).sum()
+
+    counter = torch.zeros((), device="cuda")
+    profile_aot_training(
+        CountingLoss(),
+        (torch.randn(4, 16, device="cuda"), counter),
+        tmp_path / "graph.pftrace",
+        cuda_graph=True,
+    )
+
+    # Eager profiling mutates once; warmup and capture must not add more.
+    assert counter.item() == 1

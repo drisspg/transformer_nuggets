@@ -14,6 +14,10 @@ from typing import Any
 from collections.abc import Iterable
 from re import Pattern
 
+# Chrome event arg whose value becomes the TrackEvent correlation ID, which
+# Perfetto hashes to choose the slice fill color.
+SLICE_COLOR_KEY_ARG = "slice_color_key"
+
 
 TraceDict = dict[str, Any]
 """Loose Chrome/Perfetto JSON trace dictionary."""
@@ -892,7 +896,12 @@ def _emit_duration_markers(
             track_event.type = slice_begin
             track_event.name = str(event.get("name", "slice"))
             _copy_event_payload(track_event, event, event_args)
-            _add_correlation_id(track_event, event_args.get("correlation"))
+            # Perfetto colors slices by correlation ID; a severity color key wins over
+            # the profiler correlation so findings get red/amber/green fills.
+            _add_correlation_id(
+                track_event,
+                event_args.get(SLICE_COLOR_KEY_ARG, event_args.get("correlation")),
+            )
             track_event.flow_ids.extend(slc.flow_ids)
             track_event.terminating_flow_ids.extend(slc.terminating_flow_ids)
             if slc.flow_latencies_us:
