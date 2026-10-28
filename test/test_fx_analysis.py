@@ -402,13 +402,22 @@ def test_add_fx_fusion_region_boxes_combines_consecutive_region_kernels():
     assert boxes[0]["args"]["predicted_bound"] == "memory"
     assert boxes[0]["args"]["achieved_roofline_percent"] == pytest.approx(100 * 0.128 / 24)
     assert boxes[0]["args"]["fused_roofline_floor_us"] == 1
-    assert boxes[0]["args"]["idealized_recoverable_us"] == 23
-    assert boxes[0]["args"]["idealized_fused_speedup_upper_bound"] == 24
+    # 9 us busy + 2 removed launches x 1 us latency; the other 13 us idle is host stall.
+    assert boxes[0]["args"]["observed_launch_gap_us"] == 2
+    assert boxes[0]["args"]["observed_host_stall_us"] == 13
+    assert boxes[0]["args"]["idealized_recoverable_us"] == 10
+    assert boxes[0]["args"]["idealized_fused_speedup_upper_bound"] == 11
     assert all(kernel["args"]["fx_fusion_region_id"] == "region_000" for kernel in kernels)
     assert [kernel["args"]["fx_fusion_kernel_index"] for kernel in kernels] == [1, 2, 3]
     assert [kernel["args"]["fx_node_logical_flops"] for kernel in kernels] == [4, 4, 4]
     assert all(kernel["args"]["fx_node_achieved_logical_tbps"] > 0 for kernel in kernels)
     assert all("TF/s" in node_box["name"] for node_box in node_boxes)
+    # Each node takes ~12% of the 24 us step at ~2% of roofline: material headroom.
+    for node_box in node_boxes:
+        assert node_box["name"].startswith("🔴 Node")
+        assert node_box["cname"] == "terrible"
+        assert node_box["args"]["why"].startswith("High (≥ 2% of step headroom")
+        assert node_box["args"]["suggested_fix"].startswith("Memory-bound below peak")
     assert all(
         kernel["args"]["fx_fusion_region_predicted_bound"] == "memory" for kernel in kernels
     )
@@ -423,7 +432,7 @@ def test_add_fx_fusion_region_boxes_combines_consecutive_region_kernels():
         "attributed_node_count": 3,
     }
     assert report["regions"][0]["rank"] == 1
-    assert report["regions"][0]["priority_recoverable_us"] == 23
+    assert report["regions"][0]["priority_recoverable_us"] == 10
     assert report["regions"][0]["priority_basis"] == "supplied_roofline_fused_floor"
     assert report["nodes"][0]["rank"] == 1
     assert add_fx_fusion_region_boxes(processed, [region]) == processed
@@ -483,16 +492,80 @@ def test_add_fx_fusion_region_boxes_splits_on_unannotated_gpu_work():
         ]
     }
 
-    processed = add_fx_fusion_region_boxes(trace, [region])
+    processed = add_fx_fusion_region_boxes(
+        trace,
+        [region],
+        roofline_spec=RooflineSpec(
+            name="test-gpu", peak_compute_tflops=1.0, peak_memory_gbps=1.0, launch_latency_us=0.0
+        ),
+    )
     boxes = [
         event for event in processed["traceEvents"] if event.get("args", {}).get(FX_FUSION_MARKER)
     ]
 
+    # The unrelated kernel at ts=20 is not recoverable by fusing this region.
+    args = boxes[0]["args"]
+    assert args["observed_region_wall_us"] == 22
+    assert args["observed_interleaved_gpu_us"] == 2
+    assert args["observed_region_exclusive_us"] == 20
+    assert args["observed_inter_kernel_gap_us"] == 16
+    # With zero assumed launch latency, all 16 us of idle is host stall, not fusion headroom.
+    assert args["observed_host_stall_us"] == 16
+    assert args["idealized_recoverable_us"] == pytest.approx(4 - args["fused_roofline_floor_us"])
+    assert "2.0 µs of unrelated kernels in between excluded" in args["why"]
+    assert [box["name"].endswith(f"part {index}/2") for index, box in enumerate(boxes, 1)] == [
+        True,
+        True,
+    ]
+    assert "This box is part 2 of 2" in boxes[1]["args"]["why"]
+    # Perfetto draws an arrow from part 1 to part 2.
+    assert boxes[0]["bind_id"] == boxes[1]["bind_id"]
+    assert (boxes[0]["flow_out"], boxes[0]["flow_in"]) == (True, False)
+    assert (boxes[1]["flow_out"], boxes[1]["flow_in"]) == (False, True)
     assert [(box["ts"], box["dur"]) for box in boxes] == [(10, 2), (30, 2)]
     assert [box["args"]["segment_index"] for box in boxes] == [1, 2]
     assert all(box["args"]["segment_count"] == 2 for box in boxes)
     assert all(box["args"]["observed_gpu_launch_count"] == 2 for box in boxes)
     assert all(box["args"]["segment_gpu_launch_count"] == 1 for box in boxes)
+
+
+def test_cross_entropy_training_ops_have_formulas():
+    class EmbeddingLoss(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embedding = torch.nn.Embedding(16, 8)
+
+        def forward(self, tokens, labels):
+            return torch.nn.functional.cross_entropy(self.embedding(tokens), labels)
+
+    tokens = torch.randint(0, 16, (6,))
+    result = analyze_aot_training(EmbeddingLoss(), (tokens, torch.randint(0, 8, (6,))))
+    nodes = {
+        node.op_name: node
+        for analysis in (*result.forward, *result.backward)
+        for node in analysis.nodes
+    }
+
+    expected = {
+        "aten._log_softmax.default": ("log_softmax", 4 * 6 * 8, 2 * 6 * 8 * 4),
+        "aten._log_softmax_backward_data.default": (
+            "log_softmax_backward",
+            3 * 6 * 8,
+            3 * 6 * 8 * 4,
+        ),
+        "aten.nll_loss_forward.default": ("nll_loss", 6, 6 * 4 + 6 * 8 + 4),
+        "aten.nll_loss_backward.default": ("nll_loss_backward", 6, 4 + 6 * 8 + 6 * 8 * 4),
+        "aten.embedding_dense_backward.default": (
+            "embedding_backward",
+            6 * 8,
+            6 * 8 * 4 + 6 * 8 + 16 * 8 * 4,
+        ),
+    }
+    for op_name, (model_kind, flops, logical_bytes) in expected.items():
+        node = nodes[op_name]
+        assert (node.model_kind, node.model_confidence) == (model_kind, "medium"), op_name
+        assert node.logical_flops == flops, op_name
+        assert node.logical_bytes == logical_bytes, op_name
 
 
 def test_analyze_aot_training_captures_forward_and_backward():

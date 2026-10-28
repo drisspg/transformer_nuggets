@@ -653,3 +653,35 @@ def test_backward_stage_uses_cross_thread_fallback_and_interval_union():
     assert stage["args"]["stage_gpu_wall_us"] == 7
     assert stage["args"]["stage_gpu_busy_us"] == 7
     assert stage["args"]["stage_gpu_time_us"] == 10
+
+
+def test_varlen_attention_formulas_through_fx_capture():
+    import torch.nn.attention.varlen
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    from transformer_nuggets.fx_analysis import analyze_fx_graph
+
+    def attention(query, cu_seq, window_size):
+        # q is k is v (FX dedups the inputs) and cu_seq_k=None shift positional args.
+        return torch.ops.torch_attn._varlen_attn(
+            query, query, query, cu_seq, None, 4, 4, False, window_size=window_size
+        )[0]
+
+    def varlen_node(window_size):
+        with FakeTensorMode():
+            # Two packed documents of 4 tokens, 2 heads, head dim 8.
+            query = torch.randn(8, 2, 8, dtype=torch.bfloat16)
+            cu_seq = torch.tensor([0, 4, 8], dtype=torch.int32)
+            graph = make_fx(lambda q, cu: attention(q, cu, window_size))(query, cu_seq)
+        return next(node for node in analyze_fx_graph(graph).nodes if "varlen" in node.op_name)
+
+    causal = varlen_node([-1, 0])
+    causal_pairs = 2 * (4 * 5 // 2)
+    assert (causal.model_kind, causal.model_confidence) == ("varlen_attention", "medium")
+    assert causal.logical_flops == 2 * 2 * (8 + 8) * causal_pairs
+    assert causal.input_bytes == 3 * 256
+
+    sliding = varlen_node([2, 0])
+    assert sliding.model_kind == "generic_io"
+    assert sliding.logical_flops is None

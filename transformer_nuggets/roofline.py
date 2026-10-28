@@ -417,6 +417,162 @@ def _aten_copy_work(
     )
 
 
+def _varlen_attention_forward_flops(kwargs: Mapping[str, Any]) -> int:
+    """Count QK^T and PV FLOPs assuming every packed document has the maximum length.
+
+    Real document lengths live in ``cu_seq_q``/``cu_seq_k`` data, which shape-only
+    formulas cannot read. Because sum(Lq_i * Lk_i) <= T_q * max_k, this is exact for
+    uniform packing and an upper bound otherwise. Sliding windows and paged KV are
+    not modeled and raise, so the node falls back to an unknown model.
+    """
+    args = kwargs["_schema_args"]
+    tensors = kwargs["_tensor_args"]
+    if "block_table" in tensors or "seqused_k" in tensors:
+        raise ValueError("paged or seqused_k varlen attention is not modeled")
+    window = args.get("window_size")
+    is_causal = bool(args["is_causal"]) or list(window or ()) == [-1, 0]
+    if window is not None and list(window) not in ([-1, -1], [-1, 0]):
+        raise ValueError(f"sliding-window varlen attention {window} is not modeled")
+    query, value = tensors["query"], tensors["value"]
+    tokens, heads, head_dim = query.shape
+    max_q, max_k = args["max_q"], args["max_k"]
+    pairs = tokens * (max_q + 1) // 2 if is_causal and max_q == max_k else tokens * max_k
+    return 2 * heads * (head_dim + value.shape[-1]) * pairs
+
+
+@register_roofline_formula("torch_attn::_varlen_attn", trace_compatible=False)
+def _varlen_attn_work(
+    inputs: tuple[RooflineTensor, ...],
+    outputs: tuple[RooflineTensor, ...],
+    kwargs: Mapping[str, Any],
+) -> RooflineWork:
+    """Model packed variable-length attention forward."""
+    del inputs
+    tensors = kwargs["_tensor_args"]
+    return RooflineWork(
+        logical_flops=_varlen_attention_forward_flops(kwargs),
+        read_bytes=_sum_tensor_bytes([tensors[name] for name in ("query", "key", "value")]),
+        write_bytes=_sum_tensor_bytes(outputs[:2]),
+        model_kind="varlen_attention",
+        confidence="medium",
+    )
+
+
+@register_roofline_formula("torch_attn::_varlen_attn_backward", trace_compatible=False)
+def _varlen_attn_backward_work(
+    inputs: tuple[RooflineTensor, ...],
+    outputs: tuple[RooflineTensor, ...],
+    kwargs: Mapping[str, Any],
+) -> RooflineWork:
+    """Model packed variable-length attention backward as 2.5x forward matmul FLOPs."""
+    del inputs, outputs
+    tensors = kwargs["_tensor_args"]
+    reads = ("grad_out", "query", "key", "value", "out", "lse")
+    return RooflineWork(
+        logical_flops=5 * _varlen_attention_forward_flops(kwargs) // 2,
+        read_bytes=_sum_tensor_bytes([tensors[name] for name in reads]),
+        write_bytes=_sum_tensor_bytes([tensors[name] for name in ("query", "key", "value")]),
+        model_kind="varlen_attention_backward",
+        confidence="medium",
+    )
+
+
+@register_roofline_formula("aten::_log_softmax")
+def _log_softmax_work(
+    inputs: tuple[RooflineTensor, ...],
+    outputs: tuple[RooflineTensor, ...],
+    kwargs: Mapping[str, Any],
+) -> RooflineWork:
+    """Model one-pass log-softmax: max, subtract, exp, sum, and log-normalize."""
+    del kwargs
+    x = inputs[0]
+    return RooflineWork(
+        logical_flops=4 * x.numel,
+        read_bytes=x.nbytes,
+        write_bytes=outputs[0].nbytes if outputs else x.nbytes,
+        model_kind="log_softmax",
+        confidence="medium",
+    )
+
+
+@register_roofline_formula("aten::_log_softmax_backward_data")
+def _log_softmax_backward_work(
+    inputs: tuple[RooflineTensor, ...],
+    outputs: tuple[RooflineTensor, ...],
+    kwargs: Mapping[str, Any],
+) -> RooflineWork:
+    """Model grad - exp(output) * sum(grad)."""
+    del kwargs
+    grad, output = inputs[:2]
+    return RooflineWork(
+        logical_flops=3 * grad.numel,
+        read_bytes=_sum_tensor_bytes((grad, output)),
+        write_bytes=outputs[0].nbytes if outputs else grad.nbytes,
+        model_kind="log_softmax_backward",
+        confidence="medium",
+    )
+
+
+@register_roofline_formula("aten::nll_loss_forward")
+def _nll_loss_forward_work(
+    inputs: tuple[RooflineTensor, ...],
+    outputs: tuple[RooflineTensor, ...],
+    kwargs: Mapping[str, Any],
+) -> RooflineWork:
+    """Model a gather of one log-probability per target plus a reduction."""
+    del outputs, kwargs
+    log_probs, target = inputs[:2]
+    rows = target.numel
+    gathered = None if log_probs.element_size is None else rows * log_probs.element_size
+    target_bytes = target.nbytes
+    return RooflineWork(
+        logical_flops=rows,
+        read_bytes=None if None in (gathered, target_bytes) else gathered + target_bytes,
+        write_bytes=log_probs.element_size,
+        model_kind="nll_loss",
+        confidence="medium",
+    )
+
+
+@register_roofline_formula("aten::nll_loss_backward")
+def _nll_loss_backward_work(
+    inputs: tuple[RooflineTensor, ...],
+    outputs: tuple[RooflineTensor, ...],
+    kwargs: Mapping[str, Any],
+) -> RooflineWork:
+    """Model a dense zero-filled gradient with one scattered value per target."""
+    del outputs, kwargs
+    grad_output, log_probs, target = inputs[:3]
+    return RooflineWork(
+        logical_flops=target.numel,
+        read_bytes=_sum_tensor_bytes((grad_output, target)),
+        write_bytes=log_probs.nbytes,
+        model_kind="nll_loss_backward",
+        confidence="medium",
+    )
+
+
+@register_roofline_formula("aten::embedding_dense_backward", trace_compatible=False)
+def _embedding_dense_backward_work(
+    inputs: tuple[RooflineTensor, ...],
+    outputs: tuple[RooflineTensor, ...],
+    kwargs: Mapping[str, Any],
+) -> RooflineWork:
+    """Model a dense weight-gradient write plus one row accumulation per index."""
+    del outputs
+    grad_output, indices = inputs[:2]
+    num_weights = kwargs["_schema_args"]["num_weights"]
+    embedding_dim = grad_output.shape[-1]
+    element_size = grad_output.element_size
+    return RooflineWork(
+        logical_flops=grad_output.numel,
+        read_bytes=_sum_tensor_bytes((grad_output, indices)),
+        write_bytes=None if element_size is None else num_weights * embedding_dim * element_size,
+        model_kind="embedding_backward",
+        confidence="medium",
+    )
+
+
 def _rate(value: int | None, duration_us: float, scale: float) -> float | None:
     """Return a per-second logical rate scaled to the requested unit."""
     return None if value is None else value / max(duration_us, 1e-12) / scale

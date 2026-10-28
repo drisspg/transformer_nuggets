@@ -14,6 +14,7 @@ approved reuse; this implementation preserves that provenance.
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
@@ -41,6 +42,7 @@ from transformer_nuggets.roofline import (
     RooflineSpec,
     RooflineTensor,
     RooflineWork,
+    _evaluate_formula,
     get_roofline_formula,
     register_roofline_formula,
 )
@@ -549,11 +551,25 @@ def _fx_formula_context(node: Node) -> RooflineFormulaContext:
         for value in _pytree.tree_leaves(node.args)
         if not isinstance(value, Node | torch.Tensor)
     )
-    kwargs = {
+    kwargs: dict[str, Any] = {
         name: value
         for name, value in node.kwargs.items()
         if not isinstance(value, Node | torch.Tensor)
     }
+    if isinstance(node.target, torch._ops.OpOverload):
+        # Bind by schema name: FX deduplicates ``all_input_nodes`` (q is k is v drops
+        # two inputs) and pytree flattening shifts positions around optional args.
+        schema_args = node.target._schema.arguments
+        bound = dict(zip((arg.name for arg in schema_args), node.args)) | dict(node.kwargs)
+        kwargs["_schema_args"] = {
+            name: value for name, value in bound.items() if not isinstance(value, Node)
+        }
+        kwargs["_tensor_args"] = {
+            name: tensors[0]
+            for name, value in bound.items()
+            if isinstance(value, Node)
+            and len(tensors := _roofline_tensors(value.meta.get("val"))) == 1
+        }
     return RooflineFormulaContext(
         op_name=str(node.target),
         inputs=tuple(
@@ -592,13 +608,18 @@ def _build_node_roofline(node: Node, graph_id: str) -> FxNodeRoofline:
     input_bytes = _unique_node_nbytes(set(node.all_input_nodes))
     output_bytes = _node_nbytes(node)
     formula = get_roofline_formula(node.target)
+    work = None
     if formula is not None:
         context = _fx_formula_context(node)
-        work = formula(
+        # A formula that cannot model this call (unsupported variant, bad metadata)
+        # falls through to the generic models below instead of aborting analysis.
+        work, _ = _evaluate_formula(
+            formula,
             context.inputs,
             context.outputs,
             {**(context.kwargs or {}), "_concrete_inputs": context.concrete_inputs},
         )
+    if work is not None:
         model_kind = work.model_kind
         model_confidence = work.confidence
         logical_flops = work.logical_flops
@@ -980,6 +1001,8 @@ def _finding_explanation(
     region: FusionRegion,
     observed_launch_count: int,
     metrics: Mapping[str, Any],
+    segment_index: int = 1,
+    segment_count: int = 1,
 ) -> dict[str, str]:
     """Explain in plain language why a fusion region was flagged and what to do."""
     severity, rule = _classify_finding(region, observed_launch_count)
@@ -988,28 +1011,54 @@ def _finding_explanation(
     ideal_mib = region.ideal_bytes / mib
     reduction = region.eager_minimum_bytes / max(region.ideal_bytes, 1)
     already_fused = observed_launch_count <= 1
-    launches = (
-        "already run in 1 GPU launch, so intermediates may never reach memory"
-        if already_fused
-        else f"run in {observed_launch_count} GPU launches; each writes its intermediate to "
-        "memory and the next reads it back"
+    written_mib = region.avoidable_write_bytes / mib
+    reread_mib = region.avoidable_read_bytes / mib
+    if already_fused:
+        traffic = (
+            f"already run in 1 GPU launch, so intermediates may never reach memory "
+            f"({written_mib:.1f} MiB written + {reread_mib:.1f} MiB re-read if unfused)."
+        )
+    elif region.avoidable_write_bytes == 0:
+        traffic = (
+            f"run in {observed_launch_count} GPU launches. Their intermediates are also used "
+            "outside the region (e.g. saved for backward), so they are written either way; "
+            f"only the {reread_mib:.1f} MiB re-read is avoidable."
+        )
+    else:
+        traffic = (
+            f"run in {observed_launch_count} GPU launches; each writes its intermediate to "
+            f"memory and the next reads it back ({written_mib:.1f} MiB written + "
+            f"{reread_mib:.1f} MiB re-read)."
+        )
+    segments = (
+        []
+        if segment_count <= 1
+        else [
+            (
+                f"This box is part {segment_index} of {segment_count}: unrelated kernels split "
+                "the region, and all numbers below cover the whole region."
+            )
+        ]
     )
     why = [
         f"{severity.capitalize()}: {rule}.",
-        (
-            f"{len(region.op_names)} ops {launches} "
-            f"({region.avoidable_write_bytes / mib:.1f} MiB written + "
-            f"{region.avoidable_read_bytes / mib:.1f} MiB re-read"
-            f"{' if unfused' if already_fused else ''})."
-        ),
+        *segments,
+        f"{len(region.op_names)} ops {traffic}",
         (
             f"Eager moves ≥ {eager_mib:.1f} MiB; one fused kernel needs only "
             f"{ideal_mib:.1f} MiB ({reduction:.1f}× traffic reduction)."
         ),
     ]
-    wall_us = metrics["observed_region_wall_us"]
+    busy_us = metrics["observed_gpu_busy_us"]
     gap_us = metrics["observed_inter_kernel_gap_us"]
-    timing = f"Observed {wall_us:.1f} µs wall time ({gap_us:.1f} µs idle between kernels)"
+    timing = f"Region kernels ran {busy_us:.1f} µs plus {gap_us:.1f} µs idle between them"
+    if (interleaved_us := metrics["observed_interleaved_gpu_us"]) > 0:
+        timing += f" ({interleaved_us:.1f} µs of unrelated kernels in between excluded)"
+    if metrics.get("observed_host_stall_us", 0.0) > 0:
+        timing += (
+            f"; {metrics['observed_host_stall_us']:.1f} µs of that idle exceeds the assumed "
+            "launch latency (host-side stall) and is not credited to fusion"
+        )
     if "fused_roofline_floor_us" in metrics:
         timing += (
             f"; fused floor ≈ {metrics['fused_roofline_floor_us']:.1f} µs under "
@@ -1028,7 +1077,13 @@ def _finding_explanation(
     return {"why": " ".join(why), "suggested_fix": suggested_fix}
 
 
-def _finding_name(region: FusionRegion, observed_launch_count: int, severity: str) -> str:
+def _finding_name(
+    region: FusionRegion,
+    observed_launch_count: int,
+    severity: str,
+    segment_index: int = 1,
+    segment_count: int = 1,
+) -> str:
     """Build a compact severity-coded Perfetto label for a fusion candidate."""
     icon = {"high": "🔴", "medium": "🟡", "low": "🟢"}[severity]
     mib = region.minimum_avoidable_bytes / 2**20
@@ -1038,6 +1093,7 @@ def _finding_name(region: FusionRegion, observed_launch_count: int, severity: st
         f"{icon} {region.pattern_label}{owner} [{region.region_id}]: "
         f"{observed_launch_count}→1 launches · {mib:.1f} MiB saved · "
         f"{reduction:.0f}% traffic"
+        + (f" · part {segment_index}/{segment_count}" if segment_count > 1 else "")
     )
 
 
@@ -1047,9 +1103,16 @@ def _region_runtime_metrics(
     observed_busy_us: float,
     observed_launch_count: int,
     roofline_spec: RooflineSpec | None,
+    interleaved_busy_us: float = 0.0,
 ) -> dict[str, Any]:
-    """Derive logical achieved rates and optional hardware-relative roofline metrics."""
+    """Derive logical achieved rates and optional hardware-relative roofline metrics.
+
+    A region's kernels need not be adjacent: unrelated GPU work can run between them.
+    That interleaved work is not recoverable by fusing the region, so rates and floors
+    use the window minus interleaved work.
+    """
     current_bytes = region.eager_minimum_bytes
+    exclusive_us = max(observed_wall_us - interleaved_busy_us, observed_busy_us)
     metrics: dict[str, Any] = {
         "phase": region.phase,
         "module_fqn": region.module_fqn,
@@ -1058,14 +1121,16 @@ def _region_runtime_metrics(
         "logical_flops": region.logical_flops,
         "current_logical_bytes": current_bytes,
         "observed_region_wall_us": observed_wall_us,
+        "observed_region_exclusive_us": exclusive_us,
         "observed_gpu_busy_us": observed_busy_us,
-        "observed_inter_kernel_gap_us": max(observed_wall_us - observed_busy_us, 0.0),
+        "observed_interleaved_gpu_us": max(observed_wall_us - exclusive_us, 0.0),
+        "observed_inter_kernel_gap_us": exclusive_us - observed_busy_us,
         "current_arithmetic_intensity_flops_per_byte": region.logical_flops
         / max(current_bytes, 1),
         "fused_arithmetic_intensity_flops_per_byte": region.logical_flops
         / max(region.ideal_bytes, 1),
-        "achieved_logical_tflops": region.logical_flops / max(observed_wall_us, 1e-12) / 1e6,
-        "achieved_logical_gbps": current_bytes / max(observed_wall_us, 1e-12) / 1e3,
+        "achieved_logical_tflops": region.logical_flops / max(exclusive_us, 1e-12) / 1e6,
+        "achieved_logical_gbps": current_bytes / max(exclusive_us, 1e-12) / 1e3,
         "achieved_busy_logical_tflops": region.logical_flops / max(observed_busy_us, 1e-12) / 1e6,
         "achieved_busy_logical_gbps": current_bytes / max(observed_busy_us, 1e-12) / 1e3,
     }
@@ -1081,6 +1146,13 @@ def _region_runtime_metrics(
         fused_memory_floor_us,
         roofline_spec.launch_latency_us,
     )
+    # Fusion removes launches, not host-side stalls: credit idle time between region
+    # kernels only up to the assumed latency of each removed launch.
+    gap_us = metrics["observed_inter_kernel_gap_us"]
+    launch_gap_us = min(
+        gap_us, max(observed_launch_count - 1, 0) * roofline_spec.launch_latency_us
+    )
+    fusable_us = observed_busy_us + launch_gap_us
     metrics.update(
         {
             "roofline_spec": roofline_spec.name,
@@ -1095,11 +1167,13 @@ def _region_runtime_metrics(
             "current_roofline_floor_us": current_roofline_floor_us,
             "achieved_roofline_percent": 100
             * current_roofline_floor_us
-            / max(observed_wall_us, 1e-12),
+            / max(exclusive_us, 1e-12),
             "fused_memory_floor_us": fused_memory_floor_us,
             "fused_roofline_floor_us": fused_roofline_floor_us,
-            "idealized_recoverable_us": max(observed_wall_us - fused_roofline_floor_us, 0.0),
-            "idealized_fused_speedup_upper_bound": observed_wall_us
+            "observed_launch_gap_us": launch_gap_us,
+            "observed_host_stall_us": gap_us - launch_gap_us,
+            "idealized_recoverable_us": max(fusable_us - fused_roofline_floor_us, 0.0),
+            "idealized_fused_speedup_upper_bound": fusable_us
             / max(fused_roofline_floor_us, 1e-12),
             "current_launch_floor_us": observed_launch_count * roofline_spec.launch_latency_us,
         }
@@ -1191,16 +1265,144 @@ def _node_runtime_metrics(
     return metrics
 
 
-def _node_finding_name(node: FxNodeRoofline, metrics: Mapping[str, Any], launches: int) -> str:
+def _node_finding_name(
+    node: FxNodeRoofline,
+    metrics: Mapping[str, Any],
+    launches: int,
+    severity: str = "unmodeled",
+    roofline_percent: float | None = None,
+) -> str:
     """Build a compact node-level achieved-rate label."""
     tflops = metrics["achieved_logical_tflops"]
     tflops_label = "? TF/s" if tflops is None else f"{tflops:.2f} TF/s"
     owner = f" · {node.module_fqn}" if node.module_fqn else ""
+    icon = {"high": "🔴 ", "medium": "🟡 ", "low": "🟢 "}.get(severity, "")
+    roofline = "" if roofline_percent is None else f" · {roofline_percent:.0f}% roofline"
     return (
-        f"Node {node.pattern_label}{owner}: "
+        f"{icon}Node {node.pattern_label}{owner}: "
         f"{launches} launch{'es' if launches != 1 else ''} · "
-        f"{tflops_label} · {metrics['achieved_logical_tbps']:.2f} TB/s"
+        f"{tflops_label} · {metrics['achieved_logical_tbps']:.2f} TB/s{roofline}"
     )
+
+
+REGION_FLOW_ID_BASE = 1 << 52
+# Node advice thresholds: headroom (wall time minus roofline floor) as a share of the
+# step, and achieved percent of the applicable roofline.
+NODE_HIGH_HEADROOM_STEP_PERCENT = 2.0
+NODE_HIGH_MAX_ROOFLINE_PERCENT = 70.0
+NODE_MEDIUM_HEADROOM_STEP_PERCENT = 0.5
+NODE_MEDIUM_MAX_ROOFLINE_PERCENT = 85.0
+
+
+def _node_assessment(
+    node: FxNodeRoofline,
+    metrics: Mapping[str, Any],
+    step_wall_us: float,
+) -> dict[str, Any]:
+    """Classify one FX node by step-relative headroom to its roofline floor.
+
+    Uses kernel busy time: a multi-launch node's first-to-last span can include host
+    stalls that faster kernels would not remove.
+    """
+    wall_us = metrics["observed_node_gpu_busy_us"]
+    step_percent = 100 * wall_us / max(step_wall_us, 1e-12)
+    floor_us = metrics.get("roofline_floor_us")
+    if (
+        floor_us is None
+        or metrics.get("compute_floor_us") is None
+        or node.model_confidence not in ("high", "medium")
+    ):
+        return {
+            "severity": "unmodeled",
+            "why": (
+                f"Unmodeled: {wall_us:.1f} µs ({step_percent:.1f}% of the step), but no "
+                f"{node.model_confidence}-confidence FLOP/byte model or roofline spec exists "
+                "to judge it."
+            ),
+            "suggested_fix": "Register a roofline formula for this op, or profile it with NCU.",
+        }
+
+    roofline_percent = 100 * floor_us / max(wall_us, 1e-12)
+    headroom_us = max(wall_us - floor_us, 0.0)
+    headroom_percent = 100 * headroom_us / max(step_wall_us, 1e-12)
+    if (
+        headroom_percent >= NODE_HIGH_HEADROOM_STEP_PERCENT
+        and roofline_percent < NODE_HIGH_MAX_ROOFLINE_PERCENT
+    ):
+        severity = "high"
+        rule = (
+            f"≥ {NODE_HIGH_HEADROOM_STEP_PERCENT:g}% of step headroom and "
+            f"< {NODE_HIGH_MAX_ROOFLINE_PERCENT:g}% of roofline"
+        )
+    elif (
+        headroom_percent >= NODE_MEDIUM_HEADROOM_STEP_PERCENT
+        and roofline_percent < NODE_MEDIUM_MAX_ROOFLINE_PERCENT
+    ):
+        severity = "medium"
+        rule = (
+            f"≥ {NODE_MEDIUM_HEADROOM_STEP_PERCENT:g}% of step headroom and "
+            f"< {NODE_MEDIUM_MAX_ROOFLINE_PERCENT:g}% of roofline"
+        )
+    else:
+        severity = "low"
+        rule = "near roofline or too small a share of the step to matter"
+
+    if metrics["predicted_bound"] == "compute":
+        rate = (
+            f"{metrics['achieved_busy_logical_tflops']:.1f} of "
+            f"{metrics['peak_compute_tflops']:.0f} TFLOP/s, compute-bound"
+        )
+        fix = "Compute-bound below peak: check the kernel's tile config and precision with NCU."
+    else:
+        rate = (
+            f"{metrics['achieved_busy_logical_tbps']:.2f} of "
+            f"{metrics['peak_memory_gbps'] / 1e3:.2f} TB/s, memory-bound"
+        )
+        fix = (
+            "Memory-bound below peak bandwidth: check achieved DRAM throughput with NCU, or "
+            "remove the traffic by fusing with neighbouring ops or using lower precision."
+        )
+    return {
+        "severity": severity,
+        "why": (
+            f"{severity.capitalize()} ({rule}): kernels ran {wall_us:.1f} µs ({step_percent:.1f}% "
+            f"of the step) at {roofline_percent:.0f}% of roofline ({rate}). The floor under "
+            f"'{metrics['roofline_spec']}' is {floor_us:.1f} µs, so up to {headroom_us:.1f} µs "
+            f"({headroom_percent:.1f}% of the step) is headroom."
+        ),
+        "suggested_fix": fix if severity != "low" else "None.",
+        "busy_roofline_percent": roofline_percent,
+        "headroom_us": headroom_us,
+        "headroom_step_percent": headroom_percent,
+    }
+
+
+def _interleaved_busy_us(
+    sorted_work: Sequence[tuple[float, float, int]],
+    work_starts: Sequence[float],
+    own_indices: set[int],
+    start: float,
+    end: float,
+) -> float:
+    """Return the union of other GPU work inside ``[start, end]`` on one track.
+
+    ``sorted_work`` holds ``(start, end, event_index)`` sorted by start, and
+    ``work_starts`` its starts. Work on one stream is serialized, so only the
+    event just before ``start`` can straddle the window's left edge.
+    """
+    busy = 0.0
+    covered_until = start
+    for work_start, work_end, index in sorted_work[
+        max(bisect_left(work_starts, start) - 1, 0) : bisect_left(work_starts, end)
+    ]:
+        if index in own_indices:
+            continue
+        interval_start = max(work_start, covered_until)
+        interval_end = min(work_end, end)
+        if interval_end > interval_start:
+            busy += interval_end - interval_start
+            covered_until = interval_end
+    return busy
 
 
 def add_fx_fusion_region_boxes(
@@ -1335,6 +1537,18 @@ def add_fx_fusion_region_boxes(
         region_kernel_counts[region_id] += kernel_count
         region_launch_counts[region_id] += launch_count
     segment_indices: dict[str, int] = defaultdict(int)
+    work_intervals = [(start, end) for work in work_by_track.values() for _, start, end, _ in work]
+    step_wall_us = max((end for _, end in work_intervals), default=0.0) - min(
+        (start for start, _ in work_intervals), default=0.0
+    )
+    sorted_work = {
+        track: sorted((start, end, index) for index, start, end, _ in work_events)
+        for track, work_events in work_by_track.items()
+    }
+    work_starts = {track: [item[0] for item in work] for track, work in sorted_work.items()}
+    region_tracks: dict[str, set[tuple[Any, Any]]] = defaultdict(set)
+    for track, region_id, *_ in boxes:
+        region_tracks[region_id].add(track)
     runtime_metrics = {
         region_id: _region_runtime_metrics(
             regions_by_id[region_id],
@@ -1342,10 +1556,28 @@ def add_fx_fusion_region_boxes(
             region_busy_us[region_id],
             region_launch_counts[region_id],
             roofline_spec,
+            interleaved_busy_us=sum(
+                _interleaved_busy_us(
+                    sorted_work[track],
+                    work_starts[track],
+                    set(event_indices),
+                    region_starts[region_id],
+                    region_ends[region_id],
+                )
+                for track in region_tracks[region_id]
+            ),
         )
-        for region_id in region_event_indices
+        for region_id, event_indices in region_event_indices.items()
     }
 
+    # Chain the parts of a split region with Perfetto flow arrows. The base keeps these
+    # IDs clear of Kineto correlation flows yet exact as JavaScript doubles (< 2^53).
+    flow_ids = {
+        region_id: REGION_FLOW_ID_BASE + offset
+        for offset, region_id in enumerate(
+            sorted(region_id for region_id, count in segment_counts.items() if count > 1)
+        )
+    }
     generated = []
     for (pid, tid), region_id, start, end, segment_kernel_count, segment_launch_count in boxes:
         region = regions_by_id[region_id]
@@ -1360,14 +1592,33 @@ def add_fx_fusion_region_boxes(
                 "ph": "X",
                 "cat": "gpu_user_annotation",
                 "cname": {"high": "terrible", "medium": "yellow", "low": "good"}[severity],
-                "name": _finding_name(region, observed_launch_count, severity),
+                "name": _finding_name(
+                    region,
+                    observed_launch_count,
+                    severity,
+                    segment_indices[region_id],
+                    segment_counts[region_id],
+                ),
                 "pid": pid,
                 "tid": tid,
                 "ts": start,
                 "dur": end - start,
+                **(
+                    {
+                        "bind_id": flow_ids[region_id],
+                        "flow_in": segment_indices[region_id] > 1,
+                        "flow_out": segment_indices[region_id] < segment_counts[region_id],
+                    }
+                    if region_id in flow_ids
+                    else {}
+                ),
                 "args": {
                     **_finding_explanation(
-                        region, observed_launch_count, runtime_metrics[region_id]
+                        region,
+                        observed_launch_count,
+                        runtime_metrics[region_id],
+                        segment_indices[region_id],
+                        segment_counts[region_id],
                     ),
                     FX_FUSION_MARKER: True,
                     "region_id": region.region_id,
@@ -1405,13 +1656,26 @@ def add_fx_fusion_region_boxes(
         node = nodes_by_id[node_id]
         metrics = node_runtime_metrics[node_id]
         annotation = events[annotation_index]
+        assessment = _node_assessment(node, metrics, step_wall_us)
         annotation["name"] = _node_finding_name(
             node,
             metrics,
             node_launch_counts[node_id],
+            assessment["severity"],
+            assessment.get("busy_roofline_percent"),
         )
-        annotation.setdefault("args", {}).update(
+        if assessment["severity"] in ("high", "medium", "low"):
+            annotation["cname"] = {"high": "terrible", "medium": "yellow", "low": "good"}[
+                assessment["severity"]
+            ]
+        annotation["args"] = {
+            "why": assessment.pop("why"),
+            "suggested_fix": assessment.pop("suggested_fix"),
+            **annotation.get("args", {}),
+        }
+        annotation["args"].update(
             {
+                **assessment,
                 **metrics,
                 "observed_kernel_count": node_kernel_counts[node_id],
                 "observed_gpu_launch_count": node_launch_counts[node_id],
@@ -1550,7 +1814,9 @@ def rank_trace_findings(trace: Mapping[str, Any]) -> dict[str, Any]:
             if region_id in region_rows:
                 continue
             row = dict(args)
-            observed_wall_us = numeric(row.get("observed_region_wall_us"))
+            observed_wall_us = numeric(
+                row.get("observed_region_exclusive_us", row.get("observed_region_wall_us"))
+            )
             if "idealized_recoverable_us" in row:
                 recoverable_us = numeric(row.get("idealized_recoverable_us"))
                 priority_basis = "supplied_roofline_fused_floor"

@@ -566,6 +566,27 @@ def _paired_flow_ids_by_slice(
     return flow_ids_by_slice, terminating_flow_ids_by_slice, latencies_by_slice
 
 
+def _add_bound_flow_ids(
+    slices: list[DurationSlice],
+    flow_ids_by_slice: dict[int, set[int]],
+    terminating_flow_ids_by_slice: dict[int, set[int]],
+) -> None:
+    """Add Chrome flow-v2 bindings declared directly on ``X`` events.
+
+    ``bind_id`` with ``flow_out`` starts or continues a flow from that slice;
+    ``flow_in`` without ``flow_out`` terminates it. A middle slice with both flags
+    continues the chain.
+    """
+    for slc in slices:
+        flow_id = _flow_id(slc.event.get("bind_id"))
+        if flow_id is None:
+            continue
+        if slc.event.get("flow_out"):
+            flow_ids_by_slice.setdefault(slc.index, set()).add(flow_id)
+        elif slc.event.get("flow_in"):
+            terminating_flow_ids_by_slice.setdefault(slc.index, set()).add(flow_id)
+
+
 def assign_trackevent_lanes(
     parsed: ParsedChromeTrace,
     *,
@@ -596,6 +617,10 @@ def assign_trackevent_lanes(
         )
     else:
         flow_ids_by_slice, terminating_flow_ids_by_slice, latencies_by_slice = {}, {}, {}
+    if include_flows:
+        _add_bound_flow_ids(
+            parsed.duration_slices, flow_ids_by_slice, terminating_flow_ids_by_slice
+        )
 
     # Mutate the internal slice models in place instead of allocating a second
     # DurationSlice for every Chrome ``X`` event. These objects are converter

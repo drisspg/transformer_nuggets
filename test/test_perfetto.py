@@ -1296,3 +1296,39 @@ def test_merge_traces_aligns_native_inputs_without_collectives_on_first_event(tm
             starts_by_input[packet.trusted_packet_sequence_id] = packet.timestamp
     first, second = starts_by_input.values()
     assert first == second
+
+
+def test_track_event_conversion_chains_bound_flow_slices():
+    from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import Trace, TrackEvent
+
+    def part(name, ts, **flow):
+        return {"ph": "X", "name": name, "pid": 0, "tid": 1, "ts": ts, "dur": 2, **flow}
+
+    trace = {
+        "traceEvents": [
+            part("first", 0, bind_id=7, flow_out=True),
+            part("middle", 10, bind_id=7, flow_in=True, flow_out=True),
+            part("last", 20, bind_id=7, flow_in=True),
+            part("unbound", 30),
+        ]
+    }
+
+    parsed = Trace()
+    parsed.ParseFromString(chrome_trace_to_track_event_trace(trace))
+    begins = {
+        packet.track_event.name: packet.track_event
+        for packet in parsed.packet
+        if packet.HasField("track_event")
+        and packet.track_event.type == TrackEvent.TYPE_SLICE_BEGIN
+    }
+
+    flows = {
+        name: (tuple(event.flow_ids), tuple(event.terminating_flow_ids))
+        for name, event in begins.items()
+    }
+    assert flows == {
+        "first": ((7,), ()),
+        "middle": ((7,), ()),
+        "last": ((), (7,)),
+        "unbound": ((), ()),
+    }
