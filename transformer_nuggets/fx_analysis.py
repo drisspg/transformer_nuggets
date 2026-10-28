@@ -950,16 +950,82 @@ def _annotation_identity(event: Mapping[str, Any]) -> tuple[str, str | None] | N
     return None
 
 
+def _classify_finding(region: FusionRegion, observed_launch_count: int) -> tuple[str, str]:
+    """Return a finding's severity and the threshold rule that selected it."""
+    mib = region.minimum_avoidable_bytes / 2**20
+    reduction = region.minimum_avoidable_bytes / max(region.eager_minimum_bytes, 1)
+    if mib >= 64:
+        return "high", f"{mib:.1f} MiB of avoidable traffic (high threshold: ≥ 64 MiB)"
+    if observed_launch_count >= 4 and reduction >= 0.5:
+        return "high", (
+            f"{observed_launch_count} launches with {100 * reduction:.0f}% avoidable traffic "
+            "(high threshold: ≥ 4 launches and ≥ 50%)"
+        )
+    if mib >= 1:
+        return "medium", f"{mib:.1f} MiB of avoidable traffic (medium threshold: ≥ 1 MiB)"
+    if observed_launch_count >= 3:
+        return "medium", (
+            f"{observed_launch_count} launches for one fusible region "
+            "(medium threshold: ≥ 3 launches)"
+        )
+    return "low", "below all thresholds (< 1 MiB avoidable and < 3 launches)"
+
+
 def _finding_severity(region: FusionRegion, observed_launch_count: int) -> str:
     """Classify a finding by traffic reduction and GPU launch count."""
-    reduction = region.minimum_avoidable_bytes / max(region.eager_minimum_bytes, 1)
-    if region.minimum_avoidable_bytes >= 64 * 2**20 or (
-        observed_launch_count >= 4 and reduction >= 0.5
-    ):
-        return "high"
-    if region.minimum_avoidable_bytes >= 2**20 or observed_launch_count >= 3:
-        return "medium"
-    return "low"
+    return _classify_finding(region, observed_launch_count)[0]
+
+
+def _finding_explanation(
+    region: FusionRegion,
+    observed_launch_count: int,
+    metrics: Mapping[str, Any],
+) -> dict[str, str]:
+    """Explain in plain language why a fusion region was flagged and what to do."""
+    severity, rule = _classify_finding(region, observed_launch_count)
+    mib = 2**20
+    eager_mib = region.eager_minimum_bytes / mib
+    ideal_mib = region.ideal_bytes / mib
+    reduction = region.eager_minimum_bytes / max(region.ideal_bytes, 1)
+    already_fused = observed_launch_count <= 1
+    launches = (
+        "already run in 1 GPU launch, so intermediates may never reach memory"
+        if already_fused
+        else f"run in {observed_launch_count} GPU launches; each writes its intermediate to "
+        "memory and the next reads it back"
+    )
+    why = [
+        f"{severity.capitalize()}: {rule}.",
+        (
+            f"{len(region.op_names)} ops {launches} "
+            f"({region.avoidable_write_bytes / mib:.1f} MiB written + "
+            f"{region.avoidable_read_bytes / mib:.1f} MiB re-read"
+            f"{' if unfused' if already_fused else ''})."
+        ),
+        (
+            f"Eager moves ≥ {eager_mib:.1f} MiB; one fused kernel needs only "
+            f"{ideal_mib:.1f} MiB ({reduction:.1f}× traffic reduction)."
+        ),
+    ]
+    wall_us = metrics["observed_region_wall_us"]
+    gap_us = metrics["observed_inter_kernel_gap_us"]
+    timing = f"Observed {wall_us:.1f} µs wall time ({gap_us:.1f} µs idle between kernels)"
+    if "fused_roofline_floor_us" in metrics:
+        timing += (
+            f"; fused floor ≈ {metrics['fused_roofline_floor_us']:.1f} µs under "
+            f"'{metrics['roofline_spec']}', so up to "
+            f"{metrics['idealized_recoverable_us']:.1f} µs "
+            f"({metrics['idealized_fused_speedup_upper_bound']:.1f}× speedup upper bound) is recoverable"
+        )
+    why.append(timing + ".")
+    short_ops = dict.fromkeys(op.removeprefix("aten.").split(".")[0] for op in region.op_names)
+    suggested_fix = (
+        "None: the region already runs as one GPU launch."
+        if already_fused
+        else f"Fuse the {region.pattern_label} ops ({', '.join(short_ops)}) into one kernel: "
+        "use torch.compile on the region, or call an existing fused op for this pattern."
+    )
+    return {"why": " ".join(why), "suggested_fix": suggested_fix}
 
 
 def _finding_name(region: FusionRegion, observed_launch_count: int, severity: str) -> str:
@@ -1300,6 +1366,9 @@ def add_fx_fusion_region_boxes(
                 "ts": start,
                 "dur": end - start,
                 "args": {
+                    **_finding_explanation(
+                        region, observed_launch_count, runtime_metrics[region_id]
+                    ),
                     FX_FUSION_MARKER: True,
                     "region_id": region.region_id,
                     "severity": severity,

@@ -368,6 +368,14 @@ def test_add_fx_fusion_region_boxes_combines_consecutive_region_kernels():
     )
     assert boxes[0]["cname"] == "yellow"
     assert boxes[0]["args"]["severity"] == "medium"
+    assert boxes[0]["args"]["why"].startswith(
+        "Medium: 3 launches for one fusible region (medium threshold: "
+    )
+    assert "recoverable" in boxes[0]["args"]["why"]
+    assert boxes[0]["args"]["suggested_fix"] == (
+        "Fuse the gated activation ops (mul, sigmoid) into one kernel: use torch.compile "
+        "on the region, or call an existing fused op for this pattern."
+    )
     assert boxes[0]["args"]["operation_count"] == 3
     assert boxes[0]["args"]["observed_kernel_count"] == 3
     assert boxes[0]["args"]["observed_gpu_launch_count"] == 3
