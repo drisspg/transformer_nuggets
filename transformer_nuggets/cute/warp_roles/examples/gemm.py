@@ -1,0 +1,234 @@
+"""BF16 ``D = A @ B^T`` (``F.linear`` layout) on SM100, written with ``warp_roles``.
+
+One CTA per 128x256 output tile, K stage 64, tcgen05 MMA 128x256x16, three A/B SMEM stages;
+warps 0-3 epilogue, 4 TMA load, 5 MMA. TMA zero-fills out-of-bounds boxes, so ragged M, N, K
+need only the epilogue store predicate.
+"""
+
+from types import SimpleNamespace
+
+import cutlass
+import cutlass.utils.blackwell_helpers as sm100_utils
+import torch
+from cuda.bindings import driver as cuda
+from cutlass import cute
+from cutlass.cute.nvgpu import cpasync, tcgen05
+
+from transformer_nuggets.cute.cache import compile_tvm_ffi_and_cache
+from transformer_nuggets.cute.utils import make_fake_compact_tensor
+from transformer_nuggets.cute.warp_roles import (
+    Consumer,
+    Producer,
+    Ring,
+    Threads,
+    Tma,
+    Tmem,
+    TmemPlan,
+    Umma,
+    WarpSpecialized,
+    role,
+)
+
+TILE = (128, 256, 64)
+MMA_INST = (128, 256, 16)
+EPI_SUBTILES = 8  # 32 fp32 columns per tcgen05.ld 32x32b.x32
+
+
+class Gemm(WarpSpecialized):
+    def __init__(self, ab_stages: int = 3, acc_stages: int = 1, trace: bool = False):
+        self.dtype = cutlass.BFloat16
+        self.acc_stages = acc_stages
+        self.ab = Ring(ab_stages, Tma((TILE[0] + TILE[1]) * TILE[2] * 2), Umma)
+        self.acc = Ring(acc_stages, Umma, Threads)
+        self.tmem_plan = TmemPlan().region("acc", TILE[1], acc_stages)
+        self.trace_protocol = trace
+
+    def get_name(self) -> str:
+        return f"warp_roles_gemm_ab{self.ab.n}_acc{self.acc_stages}"
+
+    def get_key(self) -> str:
+        return self.get_name()
+
+    # ------------------------------------------------------------------ roles
+
+    @role(warps=4, regs=40)
+    @cute.jit
+    def load(self, ab: Producer, c):
+        for k in cutlass.range(c.num_k_tiles, unroll=1):
+            with ab.produce() as s:
+                cute.copy(c.tma_a, c.tAgA[None, k], c.tAsA[None, s.index], tma_bar_ptr=s.barrier)
+                cute.copy(c.tma_b, c.tBgB[None, k], c.tBsB[None, s.index], tma_bar_ptr=s.barrier)
+
+    @role(warps=5, regs=40)
+    @cute.jit
+    def mma(self, ab: Consumer, acc: Producer, tmem: Tmem, c):
+        tiled_mma = c.tiled_mma
+        tCtAcc = cute.make_tensor(tmem.ptr("acc"), c.acc_layout)
+        with acc.produce() as a:
+            tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+            for k in cutlass.range(c.num_k_tiles, unroll=1):
+                with ab.consume() as s:
+                    for kb in cutlass.range_constexpr(cute.size(c.tCrA, mode=[2])):
+                        cute.gemm(
+                            tiled_mma,
+                            tCtAcc[None, None, None, a.index],
+                            c.tCrA[None, None, kb, s.index],
+                            c.tCrB[None, None, kb, s.index],
+                            tCtAcc[None, None, None, a.index],
+                        )
+                        tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+
+    @role(warps=range(4), regs=160)
+    @cute.jit
+    def epilogue(self, acc: Consumer, tmem: Tmem, c):
+        tidx, _, _ = cute.arch.thread_idx()
+        t2r = tcgen05.make_tmem_copy(
+            cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition.x32), cutlass.Float32),
+            cute.zipped_divide(c.acc_fake, c.epi_tiler)[None, 0],
+        ).get_slice(tidx)
+        tDgC = t2r.partition_D(cute.zipped_divide(c.tCgC, c.epi_tiler))
+        tDcC = t2r.partition_D(cute.zipped_divide(c.tCcC, c.epi_tiler))
+        rAcc = cute.make_rmem_tensor(tDgC[None, None, 0].shape, cutlass.Float32)
+        rC = cute.make_rmem_tensor(tDgC[None, None, 0].shape, self.dtype)
+        tAcc = cute.make_tensor(tmem.ptr("acc"), c.acc_layout)
+        with acc.consume() as a:
+            tDtC = t2r.partition_S(
+                cute.zipped_divide(tAcc[None, None, None, a.index], c.epi_tiler)
+            )
+            for i in cutlass.range_constexpr(EPI_SUBTILES):
+                cute.copy(t2r, tDtC[None, None, i], rAcc)
+                rC.store(rAcc.load().to(self.dtype))
+                if c.full_tile:
+                    cute.autovec_copy(rC, tDgC[None, None, i])
+                else:
+                    g, crd = tDgC[None, None, i], tDcC[None, None, i]
+                    for j in cutlass.range_constexpr(cute.size(rC)):
+                        if cute.elem_less(crd[j], c.mC.shape):
+                            g[j] = rC[j]
+
+    # ----------------------------------------------------------------- kernel
+
+    @cute.kernel
+    def kernel(self, tiled_mma, tma_a, mA, tma_b, mB, mC, a_layout, b_layout):
+        smem = self.begin_roles()
+        bidx, bidy, _ = cute.arch.block_idx()
+        coord = (bidx, bidy, None)
+        sA = smem.allocate_tensor(self.dtype, a_layout.outer, 1024, a_layout.inner)
+        sB = smem.allocate_tensor(self.dtype, b_layout.outer, 1024, b_layout.inner)
+        thr_mma = tiled_mma.get_slice(0)
+        gA = cute.local_tile(mA, TILE, coord, proj=(1, None, 1))
+        gB = cute.local_tile(mB, TILE, coord, proj=(None, 1, 1))
+        tAsA, tAgA = cpasync.tma_partition(
+            tma_a,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sA, 0, 3),
+            cute.group_modes(thr_mma.partition_A(gA), 0, 3),
+        )
+        tBsB, tBgB = cpasync.tma_partition(
+            tma_b,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sB, 0, 3),
+            cute.group_modes(thr_mma.partition_B(gB), 0, 3),
+        )
+        acc_shape = tiled_mma.partition_shape_C(TILE[:2])
+        acc_fake = tiled_mma.make_fragment_C(acc_shape)
+        acc_staged = tiled_mma.make_fragment_C(cute.append(acc_shape, self.acc_stages))
+        cC = cute.make_identity_tensor(mC.shape)
+        m, n = mC.shape
+        ctx = SimpleNamespace(
+            tiled_mma=tiled_mma,
+            tma_a=tma_a,
+            tma_b=tma_b,
+            tAsA=tAsA,
+            tAgA=tAgA,
+            tBsB=tBsB,
+            tBgB=tBgB,
+            tCrA=tiled_mma.make_fragment_A(sA),
+            tCrB=tiled_mma.make_fragment_B(sB),
+            num_k_tiles=cute.size(gA, mode=[2]),
+            acc_fake=acc_fake,
+            acc_layout=acc_staged.layout,
+            epi_tiler=(
+                (
+                    cute.size(acc_fake, mode=[0, 0]),
+                    cute.size(acc_fake, mode=[0, 1]) // EPI_SUBTILES,
+                ),
+            ),
+            tCgC=thr_mma.partition_C(cute.local_tile(mC, TILE, coord, proj=(1, 1, None))),
+            tCcC=thr_mma.partition_C(cute.local_tile(cC, TILE, coord, proj=(1, 1, None))),
+            mC=mC,
+            full_tile=((bidx + 1) * TILE[0] <= m) & ((bidy + 1) * TILE[1] <= n),
+        )
+        self.run_roles(ctx)
+
+    # ------------------------------------------------------------------- host
+
+    @cute.jit
+    def __call__(self, a: cute.Tensor, b: cute.Tensor, c: cute.Tensor, stream: cuda.CUstream):
+        op = tcgen05.MmaF16BF16Op(
+            self.dtype,
+            cutlass.Float32,
+            MMA_INST,
+            tcgen05.CtaGroup.ONE,
+            tcgen05.OperandSource.SMEM,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
+        )
+        tiled_mma = cute.make_tiled_mma(op)
+        a_layout = sm100_utils.make_smem_layout_a(tiled_mma, TILE, self.dtype, self.ab.n)
+        b_layout = sm100_utils.make_smem_layout_b(tiled_mma, TILE, self.dtype, self.ab.n)
+        tma_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
+        tma_a, mA = cute.nvgpu.make_tiled_tma_atom_A(
+            tma_op, a, cute.select(a_layout, mode=[0, 1, 2]), TILE, tiled_mma
+        )
+        tma_b, mB = cute.nvgpu.make_tiled_tma_atom_B(
+            tma_op, b, cute.select(b_layout, mode=[0, 1, 2]), TILE, tiled_mma
+        )
+        grid = cute.ceil_div((*c.layout.shape, 1), TILE[:2])
+        self.kernel.set_name_prefix(self.get_name())
+        self.kernel(tiled_mma, tma_a, mA, tma_b, mB, c, a_layout, b_layout).launch(
+            grid=grid, block=(self.num_threads, 1, 1), stream=stream
+        )
+
+
+def compile_gemm(op: Gemm):
+    """Compile once with dynamic M, N, K (K and N multiples of 8 for 16-byte TMA strides)."""
+    m = cute.sym_int()
+    n, k = cute.sym_int(divisibility=8), cute.sym_int(divisibility=8)
+    bf16 = cutlass.BFloat16
+    return compile_tvm_ffi_and_cache(
+        op,
+        op.get_name(),
+        make_fake_compact_tensor(bf16, (m, k)),
+        make_fake_compact_tensor(bf16, (n, k)),
+        make_fake_compact_tensor(bf16, (m, n)),
+        name=op.get_name(),
+    )
+
+
+def gemm(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+    """``a @ b.T`` for row-major bf16 ``a: (M, K)``, ``b: (N, K)``."""
+    if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16:
+        raise TypeError("gemm expects bfloat16 operands")
+    if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[1]:
+        raise ValueError(f"incompatible shapes {tuple(a.shape)}, {tuple(b.shape)}")
+    if not (a.is_contiguous() and b.is_contiguous()) or a.data_ptr() % 16 or b.data_ptr() % 16:
+        raise ValueError("a and b must be contiguous and 16-byte aligned")
+    if a.shape[1] % 8 or b.shape[0] % 8:
+        raise ValueError("K and N must be multiples of 8 (16-byte TMA strides)")
+    if out is None:
+        out = a.new_empty(a.shape[0], b.shape[0])
+    compile_gemm(Gemm())(a, b, out)
+    return out
+
+
+if __name__ == "__main__":
+    for m, n, k in [(512, 512, 512), (300, 520, 136), (4097, 2056, 4104)]:
+        a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+        ref = torch.nn.functional.linear(a.float(), b.float())
+        err = (gemm(a, b).float() - ref).abs().max().item()
+        print(f"M={m} N={n} K={k}: max abs err {err:.4g}")
+    print(Gemm().describe())

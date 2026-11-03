@@ -1,0 +1,349 @@
+import math
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+pytest.importorskip("cutlass.cute")
+
+import cutlass
+from cuda.bindings import driver as cuda
+from cutlass import cute
+
+from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
+from transformer_nuggets.cute.warp_roles import (
+    Consumer,
+    Instance,
+    Producer,
+    ProtocolError,
+    Slots,
+    Threads,
+    Tma,
+    TmemPlan,
+    Turn,
+    Turnstile,
+    Umma,
+    WarpSpecialized,
+    role,
+)
+from transformer_nuggets.cute.warp_roles.examples.gemm import gemm
+
+
+@pytest.fixture
+def requires_blackwell() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("warp_roles examples require SM100-family tcgen05")
+
+
+# --------------------------------------------------------------------------- #
+# A two-role toy kernel: producer warp 0 -> consumer warp 1 over two fixed slots with a
+# layer-owned SMEM payload. ``mode`` injects protocol violations at trace time.
+# --------------------------------------------------------------------------- #
+
+
+class SlotsToy(WarpSpecialized):
+    def __init__(self, mode: str = "ok"):
+        self.mode = mode
+        self.ch = Slots(2, Threads, Threads, producer_role="prod", payload=(cutlass.Int32, (32,)))
+
+    def get_name(self) -> str:
+        return f"warp_roles_toy_{self.mode}"
+
+    @role(warps=0)
+    @cute.jit
+    def prod(self, ch: Producer, c):
+        lane = cute.arch.lane_idx()
+        if cutlass.const_expr(self.mode == "leak"):
+            ch.acquire(0)
+        if cutlass.const_expr(self.mode == "cross_region"):
+            early = ch.acquire(0)
+        for i in cutlass.range(c.n, unroll=1):
+            for j in cutlass.range_constexpr(2):
+                if cutlass.const_expr(self.mode == "cross_region" and j == 0):
+                    early.commit()
+                else:
+                    h = ch.acquire(j)
+                    h.data[lane] = (2 * i + j) * 32 + lane
+                    h.commit()
+                    if cutlass.const_expr(self.mode == "double"):
+                        h.commit()
+                    if cutlass.const_expr(self.mode == "wrong_side"):
+                        h.release()
+
+    @role(warps=1)
+    @cute.jit
+    def cons(self, ch: Consumer, c):
+        lane = cute.arch.lane_idx()
+        acc = cutlass.Int32(0)
+        for _ in cutlass.range(c.n, unroll=1):
+            for j in cutlass.range_constexpr(2):
+                with ch.consume(j) as h:
+                    acc = acc + h.data[lane]
+        c.out[lane] = acc
+
+    @cute.kernel
+    def kernel(self, out: cute.Tensor, n: cutlass.Int32):
+        self.begin_roles()
+        self.run_roles(SimpleNamespace(out=out, n=n))
+
+    @cute.jit
+    def __call__(self, out: cute.Tensor, n: cutlass.Int32, stream: cuda.CUstream):
+        self.kernel.set_name_prefix(self.get_name())
+        self.kernel(out, n).launch(grid=(1, 1, 1), block=(self.num_threads, 1, 1), stream=stream)
+
+
+class TurnToy(WarpSpecialized):
+    """Two instances of one role append their seat to a log, one turn at a time."""
+
+    def __init__(self, enabled: bool = True):
+        self.ts = Turnstile(enabled=enabled)
+
+    @role(warps=[range(1), range(1, 2)])
+    @cute.jit
+    def worker(self, seat: Instance, ts: Turn, c):
+        for _ in cutlass.range(c.n, unroll=1):
+            with ts.turn():
+                if cute.arch.lane_idx() == 0:
+                    pos = c.log[0]
+                    c.log[pos + 1] = seat
+                    c.log[0] = pos + 1
+                    cute.arch.fence_acq_rel_cta()
+
+    @cute.kernel
+    def kernel(self, log: cute.Tensor, n: cutlass.Int32):
+        self.begin_roles()
+        self.run_roles(SimpleNamespace(log=log, n=n))
+
+    @cute.jit
+    def __call__(self, log: cute.Tensor, n: cutlass.Int32, stream: cuda.CUstream):
+        self.kernel.set_name_prefix("warp_roles_turn_toy")
+        self.kernel(log, n).launch(grid=(1, 1, 1), block=(self.num_threads, 1, 1), stream=stream)
+
+
+class BoundToy(WarpSpecialized):
+    """Two producer instances, each bound to its own slot; one consumer reads both slots."""
+
+    def __init__(self, mode: str = "ok"):
+        self.mode = mode
+        self.ch = Slots(2, Threads, Threads, payload=(cutlass.Int32, (32,)))
+
+    @role(warps=[range(1), range(1, 2)])
+    @cute.jit
+    def prod(self, stage: Instance, ch: Producer[Instance], c):
+        slot = 1 - stage if cutlass.const_expr(self.mode == "wrong_slot") else stage
+        for i in cutlass.range(c.n, unroll=1):
+            with ch.produce(slot) as h:
+                h.data[cute.arch.lane_idx()] = (stage + 1) * (i + 1)
+
+    @role(warps=2)
+    @cute.jit
+    def cons(self, ch: Consumer, c):
+        lane = cute.arch.lane_idx()
+        for _ in cutlass.range(c.n, unroll=1):
+            for j in cutlass.range_constexpr(2):
+                with ch.consume(j) as h:
+                    c.out[lane + 32 * j] = c.out[lane + 32 * j] + h.data[lane]
+
+    @cute.kernel
+    def kernel(self, out: cute.Tensor, n: cutlass.Int32):
+        self.begin_roles()
+        self.run_roles(SimpleNamespace(out=out, n=n))
+
+    @cute.jit
+    def __call__(self, out: cute.Tensor, n: cutlass.Int32, stream: cuda.CUstream):
+        self.kernel.set_name_prefix("warp_roles_bound_toy")
+        self.kernel(out, n).launch(grid=(1, 1, 1), block=(self.num_threads, 1, 1), stream=stream)
+
+
+def compile_toy(op):
+    out = make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),), assumed_align=4)
+    return compile_tvm_ffi(op, out, cutlass.Int32(1), name="warp_roles_toy")
+
+
+@pytest.mark.parametrize("n", [1, 2, 7, 64])
+def test_slots_payload_round_trip(requires_blackwell, n):
+    out = torch.full((32,), -1, device="cuda", dtype=torch.int32)
+    compile_toy(SlotsToy())(out, n)
+    lane = torch.arange(32, device="cuda", dtype=torch.int32)
+    expected = sum((2 * i + j) * 32 for i in range(n) for j in range(2)) + 2 * n * lane
+    torch.testing.assert_close(out, expected.to(torch.int32))
+
+
+@pytest.mark.parametrize("n", [1, 5, 33])
+def test_turnstile_alternates_seats(requires_blackwell, n):
+    log = torch.zeros(2 * n + 1, device="cuda", dtype=torch.int32)
+    compile_toy(TurnToy())(log, n)
+    assert log[0].item() == 2 * n
+    assert log[1:].tolist() == [0, 1] * n
+
+
+@pytest.mark.parametrize("n", [1, 9])
+def test_bound_producers_fan_in(requires_blackwell, n):
+    out = torch.zeros(64, device="cuda", dtype=torch.int32)
+    compile_toy(BoundToy())(out, n)
+    tri = n * (n + 1) // 2
+    assert out[:32].tolist() == [tri] * 32 and out[32:].tolist() == [2 * tri] * 32
+
+
+def test_trace_time_wrong_slot(requires_blackwell):
+    with pytest.raises(Exception, match=r"bound to slot 0, but acquire\(1\)"):
+        compile_toy(BoundToy("wrong_slot"))
+
+
+@pytest.mark.parametrize(
+    "mode, message",
+    [
+        ("leak", r"handles never closed: ch\[0\] acquire opened at test_cute_warp_roles.py"),
+        ("double", r"ch\[[01]\] acquire closed twice: commit at .*, then commit at"),
+        ("cross_region", r"different dynamic region"),
+        ("wrong_side", r"release\(\) on a ch\[[01]\] acquire handle"),
+    ],
+)
+def test_trace_time_handle_errors(requires_blackwell, mode, message):
+    with pytest.raises(Exception, match=message) as info:
+        compile_toy(SlotsToy(mode))
+    assert "ProtocolError" in repr(info.value) or isinstance(info.value, ProtocolError)
+
+
+# --------------------------------------------------------------------------- #
+# Host-side declaration checks (no compile)
+# --------------------------------------------------------------------------- #
+
+
+class WrongRoleToy(SlotsToy):
+    def __init__(self):
+        self.mode = "ok"
+        self.ch = Slots(2, Threads, Threads, producer_role="cons")
+
+
+class BoundSlotsToy(WarpSpecialized):
+    """Two instances, each bound to its own slot of ``ch``; one consumer of both."""
+
+    def __init__(self, n=2, producer=Threads):
+        self.ch = Slots(n, producer, Threads)
+
+    @role(warps=[range(4), range(4, 8)])
+    @cute.jit
+    def prod(self, stage: Instance, ch: Producer[Instance], c):
+        pass
+
+    @role(warps=range(8, 12))
+    @cute.jit
+    def cons(self, ch: Consumer, c):
+        pass
+
+
+def test_wrong_role_on_channel():
+    with pytest.raises(ProtocolError, match="producer is declared as role 'cons'"):
+        WrongRoleToy().describe()
+
+
+def test_bound_slot_arrival_counts():
+    toy = BoundSlotsToy()
+    toy.describe()
+    assert toy.ch.slot_counts("producer") == [128, 128]
+    assert toy.ch.slot_counts("consumer") == [128, 128]
+    with pytest.raises(ProtocolError, match="slot 1 >= ch.n=1"):
+        BoundSlotsToy(n=1).describe()
+    with pytest.raises(ProtocolError, match="signals once"):
+        BoundSlotsToy(producer=Umma).describe()
+
+
+def test_declaration_errors():
+    with pytest.raises(ValueError, match="no commit to fence"):
+        Slots(2, Tma(1024), Umma, commit_fence="smem_async")
+    with pytest.raises(ValueError, match="exceeds S"):
+        TmemPlan().region("S", 128, 2).alias("P", of="S", offset=96, cols=64)
+    with pytest.raises(ValueError, match="needs 640 > 512"):
+        _ = TmemPlan().region("S", 128, 5).alloc_cols
+    plan = (
+        TmemPlan().region("S", 128, 2).region("O", 128, 2).alias("P", of="S", offset=64, cols=64)
+    )
+    assert [plan.col("P", j) for j in range(2)] == [64, 192]
+    assert [plan.col("O", j) for j in range(2)] == [256, 384]
+    assert plan.alloc_cols == 512
+
+
+# --------------------------------------------------------------------------- #
+# GEMM example
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "m, n, k", [(128, 256, 64), (512, 512, 512), (300, 520, 136), (1, 8, 8), (1000, 1000, 1000)]
+)
+def test_gemm(requires_blackwell, m, n, k):
+    torch.manual_seed(0)
+    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    ref = torch.nn.functional.linear(a.float(), b.float())
+    torch_err = (torch.nn.functional.linear(a, b).float() - ref).abs().max().item()
+    err = (gemm(a, b).float() - ref).abs().max().item()
+    assert err <= 2 * torch_err + 1e-3
+
+
+# --------------------------------------------------------------------------- #
+# FA4-style attention forward example
+# --------------------------------------------------------------------------- #
+
+
+def fa4_inputs(b, h, sq, sk, nonuniform):
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(b, s, h, 128, device="cuda") for s in (sq, sk, sk))
+    if nonuniform:
+        # Distinct magnitude per 128-row Q tile (slot/stage mixups), growing K blocks (forces
+        # O rescales), per-key-block V offsets, per-head scale.
+        q = q * (0.5 + 0.75 * (torch.arange(sq, device="cuda") // 128 % 4)).view(1, -1, 1, 1)
+        kblk = torch.arange(sk, device="cuda") // 128
+        k = k * (0.5 + 0.25 * kblk).view(1, -1, 1, 1)
+        v = v + 0.5 * kblk.view(1, -1, 1, 1)
+        q = q * (1 + torch.arange(h, device="cuda")).view(1, 1, -1, 1) ** 0.5
+    return tuple(x.to(torch.bfloat16) for x in (q, k, v))
+
+
+@pytest.mark.parametrize("turnstile", [False, True])
+@pytest.mark.parametrize("nonuniform", [False, True])
+@pytest.mark.parametrize(
+    "b, h, sq, sk", [(1, 1, 256, 128), (1, 1, 256, 1024), (2, 3, 640, 512), (1, 2, 384, 256)]
+)
+def test_fa4_fwd(requires_blackwell, b, h, sq, sk, nonuniform, turnstile):
+    pytest.importorskip("flash_attn.cute")
+    from transformer_nuggets.cute.warp_roles.examples.fa4_fwd import fa4_fwd
+
+    q, k, v = fa4_inputs(b, h, sq, sk, nonuniform)
+    o, lse = fa4_fwd(q, k, v, turnstile=turnstile)
+    qf, kf, vf = (x.float().transpose(1, 2) for x in (q, k, v))
+    ref = torch.nn.functional.scaled_dot_product_attention(qf, kf, vf).transpose(1, 2)
+    ref_lse = torch.logsumexp((qf @ kf.transpose(-1, -2)) / math.sqrt(128), dim=-1)
+    # bf16 output rounding bounds the error: half an ulp of the largest |O|, plus slack for
+    # bf16 P in the PV MMA.
+    tol = 2**-7 * ref.abs().max().item() + 4e-3
+    assert (o.float() - ref).abs().max().item() <= tol
+    torch.testing.assert_close(lse, ref_lse, atol=1e-3, rtol=1e-4)
+
+
+def test_fa4_declared_graph():
+    pytest.importorskip("flash_attn.cute")
+    from transformer_nuggets.cute.warp_roles.examples.fa4_fwd import FlashAttentionForward
+
+    op = FlashAttentionForward()
+    summary = op.describe()
+    # Fan-out/join: S_j is consumed by softmax[j] and correction, so its empty barrier waits
+    # for 128 + 128 thread arrivals; the producer side is one tcgen05.commit.
+    assert op.s.slot_counts("consumer") == [256, 256]
+    assert op.s.slot_counts("producer") == [1, 1]
+    assert op.stats.slot_counts("producer") == [128, 128]
+    assert op.num_threads == 512
+    assert "softmax[1]  warps  4-7" in summary
+
+
+def test_fa4_rejects_key_tail(requires_blackwell):
+    pytest.importorskip("flash_attn.cute")
+    from transformer_nuggets.cute.warp_roles.examples.fa4_fwd import fa4_fwd
+
+    q = torch.randn(1, 128, 1, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 200, 1, 128, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="multiple of 128"):
+        fa4_fwd(q, k, k)
