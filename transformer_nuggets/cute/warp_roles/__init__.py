@@ -9,7 +9,10 @@ by name and annotation (``Producer``, ``Consumer``, ``Consumer[Instance]``), the
 Ends are DSL values: dynamic loops carry their phases when the end is a local name that the
 loop body uses through a method call or reassignment. Helpers that take ends must return them
 and the caller must reassign (``s, stats = step(s, stats)``), as with any CuTeDSL value.
-See ``examples/`` for a GEMM and an FA4-style attention forward.
+Work scheduling (``scheduling.py``): declare ``self.tiles = TileStream(order=..., policy=...)``
+and give roles ``tiles: Tiles``; the policy (``OneShot``, ``StaticPersistent``,
+``DynamicPersistent``, ``Clc``) is a one-line switch. See ``examples/`` for a GEMM, a persistent
+GEMM, and an FA4-style attention forward.
 """
 
 from transformer_nuggets.cute.warp_roles.channels import (
@@ -32,19 +35,42 @@ from transformer_nuggets.cute.warp_roles.kernel import (
     role,
 )
 from transformer_nuggets.cute.warp_roles.protocol import ProtocolError, ProtocolLog
+from transformer_nuggets.cute.warp_roles.scheduling import (
+    Clc,
+    DynamicPersistent,
+    OneShot,
+    PdlWait,
+    Raster,
+    StaticPersistent,
+    TileCursor,
+    TileProblem,
+    Tiles,
+    TileStream,
+    WorkMapping,
+)
 from transformer_nuggets.cute.warp_roles.tmem import TmemPlan, TmemView
 
 __all__ = [
     "Channel",
+    "Clc",
     "Consumer",
+    "DynamicPersistent",
     "Handle",
     "Instance",
+    "OneShot",
+    "PdlWait",
     "Producer",
     "ProtocolError",
     "ProtocolLog",
+    "Raster",
     "Ring",
     "Slots",
+    "StaticPersistent",
     "Threads",
+    "TileCursor",
+    "TileProblem",
+    "TileStream",
+    "Tiles",
     "Tma",
     "Tmem",
     "TmemPlan",
@@ -53,5 +79,6 @@ __all__ = [
     "Turnstile",
     "Umma",
     "WarpSpecialized",
+    "WorkMapping",
     "role",
 ]

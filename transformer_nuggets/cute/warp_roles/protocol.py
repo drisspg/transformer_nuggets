@@ -77,6 +77,7 @@ class RoleTrace:
         self.role_name = role_name
         self.log = log
         self.open: list = []
+        self.checks: list = []  # end-of-role trace checks (e.g. tile cursors)
         self.root = current_block()
 
     def depth(self) -> int:
@@ -108,6 +109,8 @@ class RoleTrace:
         self.open.remove(handle)
 
     def finish(self):
+        for check in self.checks:
+            check()
         if self.open:
             items = "; ".join(f"{h.what} opened at {h.site}" for h in self.open)
             raise ProtocolError(f"{self.role_name}: handles never closed: {items}")

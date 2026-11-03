@@ -18,6 +18,13 @@ from transformer_nuggets.cute.warp_roles.channels import (
     Turnstile,
 )
 from transformer_nuggets.cute.warp_roles.protocol import ProtocolError, ProtocolLog, RoleTrace
+from transformer_nuggets.cute.warp_roles.scheduling import (
+    TileCursor,
+    Tiles,
+    TileStream,
+    _Fetch,
+    scheduler_role,
+)
 from transformer_nuggets.cute.warp_roles.tmem import TmemPlan, TmemView
 
 WARP_SIZE = 32
@@ -67,12 +74,21 @@ class Turn:
     """Annotation: the role receives its seat at the turnstile with the parameter's name."""
 
 
+class _SchedulerTiles:
+    """Internal annotation: the scheduler warp's own cursor (it decodes and publishes)."""
+
+
+class _SchedulerFetch:
+    """Internal annotation: the scheduler warp's private policy channels (both ends)."""
+
+
 _ANNOTATIONS = {
     "Producer": Producer,
     "Consumer": Consumer,
     "Tmem": Tmem,
     "Instance": Instance,
     "Turn": Turn,
+    "Tiles": Tiles,
 }
 
 
@@ -152,6 +168,17 @@ class WarpSpecialized:
             return
         chans = {k: v for k, v in vars(self).items() if isinstance(v, Channel)}
         turns = {k: v for k, v in vars(self).items() if isinstance(v, Turnstile)}
+        streams = {k: v for k, v in vars(self).items() if isinstance(v, TileStream)}
+        if len(streams) > 1:
+            raise ProtocolError(
+                f"one TileStream per kernel (every role starts at blockIdx.x), got {list(streams)}"
+            )
+        for name, st in streams.items():
+            st.name = name
+            if st.policy.broadcast:
+                chans[f"{name}_work"] = st.channel()
+                for k, ch in st.policy.fetch_channels().items():
+                    chans[f"{name}_{k}"] = ch
         for name, obj in (*chans.items(), *turns.items()):
             obj.name = name
             if isinstance(obj, Channel):
@@ -180,10 +207,58 @@ class WarpSpecialized:
                 ri.uses_tmem = any(a is Tmem for _, a in params)
                 roles.append(ri)
                 self._bind(ri, chans, turns)
+        for name, st in streams.items():
+            self._bind_stream(name, st, roles, chans)
         roles.sort(key=lambda r: r.first_warp)
         self._validate(chans, turns, roles)
         self._ws_chans, self._ws_turns, self._ws_roles = chans, turns, roles
+        self._ws_streams = streams
         self._ws_log = ProtocolLog() if self.trace_protocol else None
+
+    @staticmethod
+    def _bind_stream(name: str, st: TileStream, roles: list, chans: dict):
+        """Check stream users; for broadcast policies add the scheduler role and bind every
+        stream user (and the scheduler) as a consumer of the work ring."""
+        users = [r for r in roles if any(a is Tiles for _, a in r.params)]
+        st.roles = [r.name for r in sorted(users, key=lambda r: r.first_warp)]
+        for r in users:
+            for pname, ann in r.params:
+                if ann is Tiles and pname != name:
+                    raise ProtocolError(f"role {r.name}: no TileStream named {pname!r}")
+        if st.policy.persistent:
+            idle = sorted({r.role for r in roles} - {r.role for r in users})
+            if idle:
+                raise ProtocolError(
+                    f"{st.policy.describe()} runs several work items per CTA, but roles {idle} "
+                    f"do not take `{name}: Tiles`; every role must loop over the stream (a role "
+                    f"with no per-item work drains it: `while {name}.valid: {name}.advance()`)"
+                )
+        if not st.policy.broadcast:
+            return
+        owned = {w for r in roles for w in r.warps}
+        warp = st.scheduler_warp
+        if warp is None:
+            warp = next(w for w in range(max(owned, default=-1) + 2) if w not in owned)
+        elif warp in owned:
+            raise ValueError(f"TileStream {name}: scheduler_warp {warp} is claimed by a role")
+        group = range(warp // WARPGROUP * WARPGROUP, (warp // WARPGROUP + 1) * WARPGROUP)
+        budgets = {r.regs for r in roles if r.regs is not None and set(r.warps) & set(group)}
+        any_regs = [r.regs for r in roles if r.regs is not None]
+        regs = budgets.pop() if len(budgets) == 1 else (min(any_regs) if any_regs else None)
+        work = f"{name}_work"
+        fetch = [f"{name}_{k}" for k in st.policy.fetch_channels()]
+        params = [(work, Producer), (name, _SchedulerTiles), (name, _SchedulerFetch)]
+        sched = RoleInstance(
+            f"{name}.scheduler", f"{name}.scheduler", 0, warp, 1, regs, scheduler_role, params
+        )
+        roles.append(sched)
+        st.roles.append(sched.name)
+        chans[work].producers.append((sched, None))
+        for r in [*users, sched]:
+            chans[work].consumers.append((r, None))
+        for f in fetch:
+            chans[f].producers.append((sched, None))
+            chans[f].consumers.append((sched, None))
 
     @staticmethod
     def _bind(ri: RoleInstance, chans, turns):
@@ -300,6 +375,14 @@ class WarpSpecialized:
         for name, ts in self._ws_turns.items():
             seats = " -> ".join(r.name for r in ts.parties)
             lines.append(f"  turnstile {name}: {seats} (enabled={ts.enabled})")
+        for name, st in self._ws_streams.items():
+            sched = next((r for r in self._ws_roles if r.fn is scheduler_role), None)
+            dist = (
+                f"scheduler warp {sched.first_warp} broadcasts over {name}_work"
+                if sched
+                else "decoded locally in every role"
+            )
+            lines.append(f"  stream {name}: {st.describe()}; {dist}")
         if self.tmem_plan is not None:
             plan = self.tmem_plan
             lines.append(f"  tmem: {plan.used_cols} columns used, {plan.alloc_cols} allocated")
@@ -323,13 +406,22 @@ class WarpSpecialized:
 
     # ---- device-side ------------------------------------------------------- #
 
-    def begin_roles(self):
+    def begin_roles(self, **problems):
         """Allocate and initialize barriers and payload buffers; allocate TMEM.
+
+        ``problems``: the runtime ``TileProblem`` of each declared ``TileStream``, by name
+        (``self.begin_roles(tiles=work)``).
 
         Plain Python at trace time (the loops are over host-side declarations); only the
         barrier initialization is a device-side branch.
         """
         self._collect()
+        if set(problems) != set(self._ws_streams):
+            raise ProtocolError(
+                f"begin_roles needs a problem for each TileStream {sorted(self._ws_streams)}, "
+                f"got {sorted(problems)}"
+            )
+        self._ws_problems = problems
         smem = memory.SmemAllocator()
         plan, total = self._barrier_plan()
         bars = smem.allocate_array(cutlass.Int64, max(total, 1))
@@ -416,33 +508,36 @@ class WarpSpecialized:
         for pname, ann in r.params:
             side = ann.side if isinstance(ann, _Bound) else ann
             if side is Producer or side is Consumer:
-                chan = self._ws_chans[pname]
-                is_prod = side is Producer
-                if chan.fixed:
-                    # Producers start each slot at phase 1 (a fresh empty barrier passes).
-                    state = Int32((1 << chan.n) - 1 if is_prod else 0)
-                else:
-                    state = pipeline.make_pipeline_state(
-                        pipeline.PipelineUserType.Producer
-                        if is_prod
-                        else pipeline.PipelineUserType.Consumer,
-                        chan.n,
-                    )
-                cls = ProducerEnd if is_prod else ConsumerEnd
                 bound = r.index if isinstance(ann, _Bound) else None
-                args.append(
-                    cls(
-                        chan,
-                        self._ws_bars[pname],
-                        self._ws_payload.get(pname),
-                        trace,
-                        bound,
-                        state,
-                    )
-                )
+                args.append(self._make_end(pname, side is Producer, bound, trace))
             elif ann is Tmem:
                 base = self._ws_tmem.retrieve_ptr(cutlass.Float32)
                 args.append(TmemView(base, self.tmem_plan, r.name, self._ws_log))
+            elif ann is Tiles or ann is _SchedulerTiles:
+                st = self._ws_streams[pname]
+                end = None
+                if st.policy.broadcast:
+                    end = self._make_end(f"{pname}_work", False, None, trace)
+                args.append(
+                    TileCursor.create(
+                        st,
+                        self._ws_problems[pname],
+                        end,
+                        trace,
+                        scheduler=ann is _SchedulerTiles,
+                        slot=(st.roles.index(r.name), r.first_warp),
+                    )
+                )
+            elif ann is _SchedulerFetch:
+                st = self._ws_streams[pname]
+                ends = {
+                    k: (
+                        self._make_end(f"{pname}_{k}", True, None, trace),
+                        self._make_end(f"{pname}_{k}", False, None, trace),
+                    )
+                    for k in st.policy.fetch_channels()
+                }
+                args.append(_Fetch(st.policy, ends, self._ws_problems[pname]))
             elif ann is Instance:
                 args.append(r.index)
             elif ann is Turn:
@@ -454,6 +549,21 @@ class WarpSpecialized:
             else:
                 args.append(ctx)
         return args
+
+    def _make_end(self, pname: str, is_prod: bool, bound, trace):
+        chan = self._ws_chans[pname]
+        if chan.fixed:
+            # Producers start each slot at phase 1 (a fresh empty barrier passes).
+            state = Int32((1 << chan.n) - 1 if is_prod else 0)
+        else:
+            state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer
+                if is_prod
+                else pipeline.PipelineUserType.Consumer,
+                chan.n,
+            )
+        cls = ProducerEnd if is_prod else ConsumerEnd
+        return cls(chan, self._ws_bars[pname], self._ws_payload.get(pname), trace, bound, state)
 
 
 class RoleContext(SimpleNamespace):
