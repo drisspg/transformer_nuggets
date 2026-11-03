@@ -420,7 +420,7 @@ GEMM_SHAPES = [
 ]
 
 
-def _check_gemm(policy, m, n, k, max_ctas=None, reps=2):
+def _check_gemm(policy, m, n, k, max_ctas=None, reps=2, tile_n=256):
     from transformer_nuggets.cute.warp_roles.examples.persistent_gemm import persistent_gemm
 
     torch.manual_seed(0)
@@ -431,7 +431,7 @@ def _check_gemm(policy, m, n, k, max_ctas=None, reps=2):
     first = None
     for _ in range(reps):  # later launches reuse the (self-reset) dynamic counter
         out = torch.full((m, n), float("nan"), device="cuda", dtype=torch.bfloat16)
-        persistent_gemm(a, b, out, policy=policy, max_ctas=max_ctas, cluster=PAIR)
+        persistent_gemm(a, b, out, policy=policy, max_ctas=max_ctas, cluster=PAIR, tile_n=tile_n)
         err = (out.float() - ref).abs().max().item()
         assert err <= 2 * torch_err + 1e-3, (policy, (m, n, k), err, torch_err)
         if first is None:
@@ -445,6 +445,13 @@ def test_pair_gemm(requires_blackwell, policy, m, n, k):
     _check_gemm(POLICIES[policy], m, n, k)
 
 
+@pytest.mark.parametrize("tile_n", [224, 192, 128])
+@pytest.mark.parametrize("policy", ["static", "clc"])
+def test_pair_gemm_tile_n(requires_blackwell, policy, tile_n):
+    """Narrower MMA tiles: each CTA loads tile_n / 2 rows of B; ragged M and N edges."""
+    _check_gemm(POLICIES[policy], 3000, 1000, 520, tile_n=tile_n)
+
+
 @pytest.mark.parametrize("policy", ["static", "dynamic", "dynamic1", "clc1"])
 @pytest.mark.parametrize("max_ctas", [2, 3, 10])
 def test_pair_gemm_capped_grid(requires_blackwell, policy, max_ctas):
@@ -456,7 +463,7 @@ def test_pair_gemm_counter_resets(requires_blackwell):
     from transformer_nuggets.cute.warp_roles.examples.persistent_gemm import _OPS
 
     _check_gemm(POLICIES["dynamic"], 1500, 1800, 64, max_ctas=8, reps=3)
-    op = _OPS[(POLICIES["dynamic"], None, PAIR)]
+    op = _OPS[(POLICIES["dynamic"], None, PAIR, 256)]
     ws, _ = op.tiles.launch_args("cuda")
     torch.cuda.synchronize()
     assert ws[:2].tolist() == [0, 0]

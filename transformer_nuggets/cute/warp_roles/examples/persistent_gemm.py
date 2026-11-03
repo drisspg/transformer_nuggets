@@ -54,8 +54,8 @@ from transformer_nuggets.cute.warp_roles import (
     role,
 )
 
-CTA_TILE = (128, 256, 64)  # per-CTA output tile (M, N) and K step
-EPI_TILE = (128, 32)  # one TMA store box; 8 per CTA output tile
+CTA_TILE_M, TILE_K = 128, 64  # per-CTA output rows and K step; tile N is a constructor argument
+EPI_TILE = (128, 32)  # one TMA store box; tile_n // 32 per CTA output tile
 C_STAGES = 2  # SMEM staging buffers for the TMA-store epilogue
 EPI_BARRIER_ID = 3  # named barrier for the 4 epilogue warps (layer owns 1 and 2)
 
@@ -69,24 +69,31 @@ class PersistentGemm(WarpSpecialized):
         acc_stages: int = 2,
         trace: bool = False,
         cluster=None,
+        tile_n: int = 256,
     ):
         self.cluster = cluster or SingleCta()
         cs = self.cluster.size
+        if tile_n % EPI_TILE[1] or not 0 < tile_n <= 256 or tile_n // cs % 8:
+            raise ValueError(
+                f"tile_n must be a multiple of {EPI_TILE[1]} in (0, 256], got {tile_n}"
+            )
+        self.tile_n = tile_n
+        cta_tile = (CTA_TILE_M, tile_n, TILE_K)
         # The MMA tile spans the cluster along M; each CTA holds 128 rows of A and N / cs rows
         # of B per stage (2-CTA MMAs read B from both CTAs).
-        self.mma_tile = (CTA_TILE[0] * cs, CTA_TILE[1], CTA_TILE[2])
+        self.mma_tile = (cta_tile[0] * cs, cta_tile[1], cta_tile[2])
         self.dtype = cutlass.BFloat16
         # Attributes read by the CUTLASS epilogue partition helpers.
         self.c_dtype, self.acc_dtype = self.dtype, cutlass.Float32
-        self.cta_tile_shape_mnk = CTA_TILE
+        self.cta_tile_shape_mnk = cta_tile
         self.c_layout = LayoutEnum.ROW_MAJOR
         self.acc_stages = acc_stages
-        stage_bytes = (CTA_TILE[0] + CTA_TILE[1] // cs) * CTA_TILE[2] * 2  # this CTA's copies
+        stage_bytes = (cta_tile[0] + cta_tile[1] // cs) * cta_tile[2] * 2  # this CTA's copies
         if ab_stages is None:  # fill ~192 KB of SMEM (48 KB stages for 1 CTA, 32 KB for a pair)
             ab_stages = 192 * 1024 // stage_bytes
         self.ab = Ring(ab_stages, Tma(stage_bytes), Umma)
         self.acc = Ring(acc_stages, Umma, Threads)
-        self.tmem_plan = TmemPlan().region("acc", CTA_TILE[1], acc_stages)
+        self.tmem_plan = TmemPlan().region("acc", cta_tile[1], acc_stages)
         self.tiles = TileStream(
             order=order or Raster(swizzle=8), policy=policy or StaticPersistent()
         )
@@ -94,7 +101,8 @@ class PersistentGemm(WarpSpecialized):
 
     def get_name(self) -> str:
         return (
-            f"warp_roles_pgemm_{self.cluster.get_key()}_ab{self.ab.n}_acc{self.acc_stages}_"
+            f"warp_roles_pgemm_{self.cluster.get_key()}_n{self.tile_n}_ab{self.ab.n}_"
+            f"acc{self.acc_stages}_"
             f"{self.tiles.get_key()}"
         )
 
@@ -313,6 +321,7 @@ def persistent_gemm(
     order: Raster | None = None,
     max_ctas: int | None = None,
     cluster=None,
+    tile_n: int = 256,
 ) -> torch.Tensor:
     """``a @ b.T`` for row-major bf16 ``a: (M, K)``, ``b: (N, K)``. ``policy`` defaults to
     ``StaticPersistent()``; ``max_ctas`` caps the persistent grid in CTAs (default: the SM
@@ -331,10 +340,10 @@ def persistent_gemm(
         return out
     if a.shape[1] == 0:  # no K tiles: the MMA would publish an unwritten accumulator
         return out.zero_()
-    key = (policy, order, cluster)
+    key = (policy, order, cluster, tile_n)
     op = _OPS.get(key)
     if op is None:
-        op = _OPS[key] = PersistentGemm(policy=policy, order=order, cluster=cluster)
+        op = _OPS[key] = PersistentGemm(policy=policy, order=order, cluster=cluster, tile_n=tile_n)
     fn = compile_persistent_gemm(op)
     workspace, sms = op.tiles.launch_args(a.device)
     fn(a, b, out, workspace, max_ctas or sms)
