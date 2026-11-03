@@ -17,8 +17,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import cutlass
 from cutlass import Int32, cute
+from cutlass._mlir.dialects import nvvm as _nvvm
 
+from transformer_nuggets.cute.warp_roles.cluster import ALL, LEADER
 from transformer_nuggets.cute.warp_roles.protocol import ProtocolError, current_block, user_site
 
 
@@ -64,6 +67,13 @@ class Channel:
     a per-slot SMEM buffer exposed as ``handle.data``. ``commit_fence``/``release_fence`` say
     what the producer/consumer wrote before signalling ("tmem_store" or "smem_async"); the
     layer emits the matching fence before every arrive on that side.
+
+    ``remote_scope``: memory scope of thread arrivals on a pair-scoped channel's barriers in the
+    other CTA. ``"cta"`` (default without a payload; what CUTLASS and FA4 pipelines use) only
+    counts arrivals: right for TMEM/TMA/MMA handoffs ordered by their own fences and for
+    stage reuse. ``"cluster"`` (default with a layer payload) is a cluster-scope release, needed
+    when the signal publishes generic-memory data (SMEM via DSMEM, or global) read in the other
+    CTA. It is measurably slower on hot channels (FA4's S release: ~30%).
     """
 
     n: int
@@ -74,10 +84,14 @@ class Channel:
     payload: tuple | None = None
     commit_fence: str | None = None
     release_fence: str | None = None
+    remote_scope: str | None = None
     name: str = field(default="", init=False)
     fixed: bool = field(default=False, init=False)
     producers: list = field(default_factory=list, init=False)  # (RoleInstance, slot | None)
     consumers: list = field(default_factory=list, init=False)
+    # Derived by the layer from the kernel's cluster and role placement (cluster.derive_scope).
+    scope: object = field(default=None, init=False, repr=False)
+    cluster: object = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         if self.n <= 0:
@@ -86,6 +100,10 @@ class Channel:
             raise ValueError(f"fence kinds must be one of {FENCE_KINDS}")
         if isinstance(self.producer, Tma) and self.commit_fence is not None:
             raise ValueError("TMA producers do not arrive, so they have no commit to fence")
+        if self.remote_scope not in (None, "cta", "cluster"):
+            raise ValueError(f"remote_scope must be 'cta' or 'cluster', got {self.remote_scope!r}")
+        if self.remote_scope is None:
+            self.remote_scope = "cluster" if self.payload is not None else "cta"
 
     def slot_counts(self, side: str) -> list[int]:
         mech = self.producer if side == "producer" else self.consumer
@@ -176,6 +194,11 @@ class Handle:
         return self._end._full(self.index)
 
     @property
+    def empty_barrier(self):
+        """This stage's empty-barrier pointer (escape hatch for raw ``cute.arch`` signalling)."""
+        return self._end._empty(self.index)
+
+    @property
     def data(self):
         """This slot's view of the channel's ``payload`` buffer."""
         buf = self._end._payload
@@ -191,6 +214,12 @@ class Handle:
     def retire(self):
         """Producer: close without publishing, for a final acquire whose stage is never
         filled (for example the MMA's last S/P/O acquire, which only waits for P and O)."""
+        if self._end._chan.scope is not None and self._end._chan.scope.tail:
+            raise ProtocolError(
+                f"{self._end._trace.role_name}: retire() on {self.describe()}: producers of this "
+                "pair-scoped channel drain every stage before exit, and a retired stage is never "
+                "released; commit it instead"
+            )
         self._close(True, "retire")
 
     def release(self):
@@ -217,17 +246,31 @@ class Handle:
         return False
 
 
+@dataclass
+class _EndRecord:
+    """Trace-time record shared by loop-carried copies of one end: the fixed ``slots`` it used
+    (a tail drains only those)."""
+
+    slots: set = field(default_factory=set)
+
+
 class _End:
     """One role instance's end of a channel. A DSL value whose only runtime state is phases:
-    a ``PipelineState`` for rings, an Int32 phase-bit mask for slots."""
+    a ``PipelineState`` for rings, an Int32 phase-bit mask for slots.
 
-    def __init__(self, chan, bars, payload, trace, bound_slot, state):
+    ``cta``: the placement of the owning role (``"all"`` or ``"leader"``); with the channel's
+    derived scope it selects local or remote arrivals and who arms transaction barriers.
+    """
+
+    def __init__(self, chan, bars, payload, trace, bound_slot, state, cta=ALL, rec=None):
         self._chan = chan
         self._bars = bars  # full barriers at [0, n), empty barriers at [n, 2n)
         self._payload = payload
         self._trace = trace
         self._bound = bound_slot
         self._state = state
+        self._cta = cta
+        self._rec = rec if rec is not None else _EndRecord()
 
     def __extract_mlir_values__(self):
         if self._chan.fixed:
@@ -239,7 +282,16 @@ class _End:
             state = Int32(values[0])
         else:
             state = self._state.__new_from_mlir_values__(values)
-        return type(self)(self._chan, self._bars, self._payload, self._trace, self._bound, state)
+        return type(self)(
+            self._chan,
+            self._bars,
+            self._payload,
+            self._trace,
+            self._bound,
+            state,
+            self._cta,
+            self._rec,
+        )
 
     def _full(self, index):
         return self._bars + index
@@ -247,14 +299,46 @@ class _End:
     def _empty(self, index):
         return self._bars + (self._chan.n + index)
 
-    @staticmethod
-    def _arrive(mech, bar, fence):
+    # Escape hatches: everything the layer derived, for a role that drops to raw
+    # cute.arch / cutlass.pipeline calls on one edge. A raw signal must keep the derived counts.
+    full_barrier = _full  # this CTA's full barrier of a stage/slot (same offset in the peer)
+    empty_barrier = _empty
+
+    @property
+    def scope(self):
+        """The derived ``cluster.Scope``: barrier CTAs, per-CTA counts, masks, tx bytes, tail."""
+        return self._chan.scope
+
+    @property
+    def state(self):
+        """Ring: the ``PipelineState`` (index, phase); Slots: the Int32 phase-bit mask."""
+        return self._state
+
+    def _arrive(self, mech, bar, fence, targets):
+        """Signal ``bar`` in each CTA of ``targets`` (empty: this CTA only)."""
         _fence(fence)
+        cluster = self._chan.cluster
         if mech is Umma:
             with cute.arch.elect_one():
-                cute.nvgpu.tcgen05.commit(bar)
+                if cluster is None or cluster.size == 1:
+                    cute.nvgpu.tcgen05.commit(bar)
+                else:
+                    # Every tcgen05 op of a pair kernel is cta_group::2; the multicast mask
+                    # names the CTAs whose barrier (same offset) receives the arrival.
+                    mask = sum(1 << c for c in (targets or (0,)))
+                    cute.nvgpu.tcgen05.commit(bar, mask, cluster.cta_group)
         elif mech is Threads:
-            cute.arch.mbarrier_arrive(bar)
+            if not targets:
+                cute.arch.mbarrier_arrive(bar)
+                return
+            # See Channel.remote_scope: a cluster-scope release orders generic-memory data for
+            # the other CTA's waiter; "cta" (CUTLASS's default) only counts the arrival.
+            scope = _nvvm.MemScopeKind.CLUSTER if self._chan.remote_scope == "cluster" else None
+            for c in targets:
+                if c == 0 and self._cta == LEADER:
+                    cute.arch.mbarrier_arrive(bar, scope=scope)
+                else:
+                    cute.arch.mbarrier_arrive(bar, c, scope=scope)
         else:
             raise AssertionError(mech)
 
@@ -281,6 +365,7 @@ class _End:
             )
         phase = (self._state >> slot) & 1
         self._state = self._state ^ (1 << slot)
+        self._rec.slots.add(slot)
         return slot, phase, slot
 
 
@@ -291,18 +376,45 @@ class ProducerEnd(_End):
         self._trace.record(self._chan.name, "acquire", label)
         cute.arch.mbarrier_wait(self._empty(index), phase)
         if isinstance(self._chan.producer, Tma):
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(
-                    self._full(index), self._chan.producer.tx_bytes
-                )
+            self._arm(self._full(index))
         return Handle(self, index, label, True)
 
     produce = acquire  # ``with end.produce(...) as h:`` reads better for nested scopes
 
+    def _arm(self, full):
+        """Expect the stage's transaction bytes on every waited full barrier. In a pair-scoped
+        channel only the leader's producer arms (one arrival per barrier, the bytes of every
+        CTA's copies), as CUTLASS's ``PipelineTmaUmma`` does."""
+        scope = self._chan.scope
+        if not scope.pair:
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(full, scope.tx)
+        elif self._cta == LEADER:
+            _arm_targets(full, scope.tx, scope.full_ctas)
+        else:
+            _arm_if_leader(full, scope.tx, scope.full_ctas)
+
     def _signal(self, index):
         if isinstance(self._chan.producer, Tma):
             return  # completed by the TMA transaction count
-        self._arrive(self._chan.producer, self._full(index), self._chan.commit_fence)
+        scope = self._chan.scope
+        targets = scope.full_ctas if scope.pair else ()
+        self._arrive(self._chan.producer, self._full(index), self._chan.commit_fence, targets)
+
+    def tail(self):
+        """Wait until every stage this end filled has been released (layer-emitted at role
+        exit for pair-scoped channels whose consumer signals from another CTA)."""
+        self._trace.record(self._chan.name, "tail", None)
+        n = self._chan.n
+        if self._chan.fixed:
+            # Only slots this end acquired: another instance's slot keeps its own parity.
+            for j in sorted(self._rec.slots):
+                cute.arch.mbarrier_wait(self._empty(j), (self._state >> j) & 1)
+        else:
+            st = self._state.clone()
+            for _ in range(n):
+                cute.arch.mbarrier_wait(self._empty(st.index), st.phase)
+                st.advance()
 
 
 class ConsumerEnd(_End):
@@ -316,7 +428,28 @@ class ConsumerEnd(_End):
     consume = wait
 
     def _signal(self, index):
-        self._arrive(self._chan.consumer, self._empty(index), self._chan.release_fence)
+        scope = self._chan.scope
+        targets = scope.empty_ctas if scope.pair else ()
+        self._arrive(self._chan.consumer, self._empty(index), self._chan.release_fence, targets)
+
+
+def _arm_one(full, tx: int, cta: int):
+    if cta == 0:  # the leader arms its own barrier
+        cute.arch.mbarrier_arrive_and_expect_tx(full, tx)
+    else:
+        cute.arch.mbarrier_arrive_and_expect_tx(full, tx, cta)
+
+
+def _arm_targets(full, tx: int, targets):
+    with cute.arch.elect_one():
+        for c in targets:
+            _arm_one(full, tx, c)
+
+
+@cute.jit
+def _arm_if_leader(full, tx: cutlass.Constexpr, targets: cutlass.Constexpr):
+    if cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == 0:
+        _arm_targets(full, tx, targets)
 
 
 class TurnEnd:

@@ -78,6 +78,7 @@ class RoleTrace:
         self.log = log
         self.open: list = []
         self.checks: list = []  # end-of-role trace checks (e.g. tile cursors)
+        self.tails: list = []  # producer ends the layer drains at role exit (pair channels)
         self.root = current_block()
 
     def depth(self) -> int:

@@ -11,7 +11,9 @@ loop body uses through a method call or reassignment. Helpers that take ends mus
 and the caller must reassign (``s, stats = step(s, stats)``), as with any CuTeDSL value.
 Work scheduling (``scheduling.py``): declare ``self.tiles = TileStream(order=..., policy=...)``
 and give roles ``tiles: Tiles``; the policy (``OneShot``, ``StaticPersistent``,
-``DynamicPersistent``, ``Clc``) is a one-line switch. See ``examples/`` for a GEMM, a persistent
+``DynamicPersistent``, ``Clc``) is a one-line switch. Clusters (``cluster.py``): declare
+``self.cluster = CtaPair()`` and pin the MMA role with ``@role(..., cta="leader")``; the layer
+derives every cross-CTA barrier, arrival count, multicast mask, and teardown step. See ``examples/`` for a GEMM, a persistent
 GEMM, and an FA4-style attention forward.
 """
 
@@ -25,6 +27,7 @@ from transformer_nuggets.cute.warp_roles.channels import (
     Turnstile,
     Umma,
 )
+from transformer_nuggets.cute.warp_roles.cluster import CtaPair, SingleCta
 from transformer_nuggets.cute.warp_roles.kernel import (
     Consumer,
     Instance,
@@ -54,6 +57,7 @@ __all__ = [
     "Channel",
     "Clc",
     "Consumer",
+    "CtaPair",
     "DynamicPersistent",
     "Handle",
     "Instance",
@@ -64,6 +68,7 @@ __all__ = [
     "ProtocolLog",
     "Raster",
     "Ring",
+    "SingleCta",
     "Slots",
     "StaticPersistent",
     "Threads",

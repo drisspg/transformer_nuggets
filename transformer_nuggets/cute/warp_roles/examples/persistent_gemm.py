@@ -4,12 +4,19 @@ The roles of ``gemm.py`` wrapped in a tile loop: warps 0-3 epilogue, 4 TMA load,
 (for the broadcast policies) the layer's scheduler warp in padding warp 6. Two TMEM accumulator
 stages (2 x 256 columns) let the MMA warp run tile i+1's mainloop while the epilogue drains
 tile i; the epilogue stores through SMEM with TMA, which also clips ragged edges. The scheduling
-policy is one constructor argument::
+policy and the cluster are constructor arguments::
 
     PersistentGemm(policy=StaticPersistent())      # or OneShot(), DynamicPersistent(), Clc()
+    PersistentGemm(cluster=CtaPair())              # 2-CTA: 256x256 MMA tiles, CtaGroup.TWO
+
+With ``CtaPair`` the MMA tile is 256x256x64: each CTA of the pair loads its 128 rows of A and
+its 128 rows of B, the leader's MMA warp issues 2-CTA MMAs reading both CTAs' SMEM, and each
+CTA's epilogue stores its 128x256 half from its own TMEM. The only source differences are the
+``self.cluster`` declaration, ``cta="leader"`` on the MMA role (a no-op for one CTA), and the tile
+shapes derived from ``self.cluster.size``; the layer derives every cross-CTA barrier.
 
 One compile serves every M, N, K: tile counts, the persistent grid cap, and the dynamic counter
-are runtime values; policy, order, and stage counts are compile-time.
+are runtime values; policy, order, cluster, and stage counts are compile-time.
 """
 
 from types import SimpleNamespace
@@ -34,6 +41,7 @@ from transformer_nuggets.cute.warp_roles import (
     Producer,
     Raster,
     Ring,
+    SingleCta,
     StaticPersistent,
     Threads,
     Tiles,
@@ -46,9 +54,8 @@ from transformer_nuggets.cute.warp_roles import (
     role,
 )
 
-TILE = (128, 256, 64)
-MMA_INST = (128, 256, 16)
-EPI_TILE = (128, 32)  # one TMA store box; 8 per output tile
+CTA_TILE = (128, 256, 64)  # per-CTA output tile (M, N) and K step
+EPI_TILE = (128, 32)  # one TMA store box; 8 per CTA output tile
 C_STAGES = 2  # SMEM staging buffers for the TMA-store epilogue
 EPI_BARRIER_ID = 3  # named barrier for the 4 epilogue warps (layer owns 1 and 2)
 
@@ -58,25 +65,38 @@ class PersistentGemm(WarpSpecialized):
         self,
         policy=None,
         order: Raster | None = None,
-        ab_stages: int = 4,
+        ab_stages: int | None = None,
         acc_stages: int = 2,
         trace: bool = False,
+        cluster=None,
     ):
+        self.cluster = cluster or SingleCta()
+        cs = self.cluster.size
+        # The MMA tile spans the cluster along M; each CTA holds 128 rows of A and N / cs rows
+        # of B per stage (2-CTA MMAs read B from both CTAs).
+        self.mma_tile = (CTA_TILE[0] * cs, CTA_TILE[1], CTA_TILE[2])
         self.dtype = cutlass.BFloat16
         # Attributes read by the CUTLASS epilogue partition helpers.
-        self.c_dtype, self.acc_dtype, self.cta_tile_shape_mnk = self.dtype, cutlass.Float32, TILE
+        self.c_dtype, self.acc_dtype = self.dtype, cutlass.Float32
+        self.cta_tile_shape_mnk = CTA_TILE
         self.c_layout = LayoutEnum.ROW_MAJOR
         self.acc_stages = acc_stages
-        self.ab = Ring(ab_stages, Tma((TILE[0] + TILE[1]) * TILE[2] * 2), Umma)
+        stage_bytes = (CTA_TILE[0] + CTA_TILE[1] // cs) * CTA_TILE[2] * 2  # this CTA's copies
+        if ab_stages is None:  # fill ~192 KB of SMEM (48 KB stages for 1 CTA, 32 KB for a pair)
+            ab_stages = 192 * 1024 // stage_bytes
+        self.ab = Ring(ab_stages, Tma(stage_bytes), Umma)
         self.acc = Ring(acc_stages, Umma, Threads)
-        self.tmem_plan = TmemPlan().region("acc", TILE[1], acc_stages)
+        self.tmem_plan = TmemPlan().region("acc", CTA_TILE[1], acc_stages)
         self.tiles = TileStream(
             order=order or Raster(swizzle=8), policy=policy or StaticPersistent()
         )
         self.trace_protocol = trace
 
     def get_name(self) -> str:
-        return f"warp_roles_pgemm_ab{self.ab.n}_acc{self.acc_stages}_{self.tiles.get_key()}"
+        return (
+            f"warp_roles_pgemm_{self.cluster.get_key()}_ab{self.ab.n}_acc{self.acc_stages}_"
+            f"{self.tiles.get_key()}"
+        )
 
     def get_key(self) -> str:
         return self.get_name()
@@ -96,7 +116,7 @@ class PersistentGemm(WarpSpecialized):
                     cute.copy(c.tma_b, tBgB[None, k], c.tBsB[None, s.index], tma_bar_ptr=s.barrier)
             tiles.advance()
 
-    @role(warps=5, regs=40)
+    @role(warps=5, regs=40, cta="leader")
     @cute.jit
     def mma(self, ab: Consumer, acc: Producer, tiles: Tiles, tmem: Tmem, c):
         tiled_mma = c.tiled_mma
@@ -124,17 +144,17 @@ class PersistentGemm(WarpSpecialized):
         ``C_STAGES`` SMEM buffers. TMA clips the ragged edges, so partial tiles cost the same."""
         tidx, _, _ = cute.arch.thread_idx()
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        thr_mma = c.tiled_mma.get_slice(0)
+        thr_mma = c.tiled_mma.get_slice(self.cluster.rank())  # this CTA's rows of the tile
         tAcc = transform_partitioned_tensor_layout(cute.make_tensor(tmem.ptr("acc"), c.acc_layout))
         # (MMA, MMA_M, MMA_N, m_tiles, n_tiles) -> ((M), (N), m_tiles, n_tiles)
         gC = transform_partitioned_tensor_layout(
             thr_mma.partition_C(
-                cute.local_tile(c.mC_tma, TILE, (None, None, None), proj=(1, 1, None))
+                cute.local_tile(c.mC_tma, self.mma_tile, (None, None, None), proj=(1, 1, None))
             )
         )
         gC_l = cute.make_tensor(gC.iterator, cute.append(gC.layout, cute.make_layout(1)))
         t2r, tTR_tAcc, tTR_rAcc = epilogue_tmem_copy_and_partition(
-            self, tidx, tAcc, gC_l, c.epi_tile, False
+            self, tidx, tAcc, gC_l, c.epi_tile, self.cluster.size > 1
         )
         tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.dtype)
         r2s, tRS_rC, tRS_sC = epilogue_smem_copy_and_partition(self, t2r, tTR_rC, tidx, c.sC)
@@ -179,10 +199,11 @@ class PersistentGemm(WarpSpecialized):
         sA = smem.allocate_tensor(self.dtype, a_layout.outer, 1024, a_layout.inner)
         sB = smem.allocate_tensor(self.dtype, b_layout.outer, 1024, b_layout.inner)
         sC = smem.allocate_tensor(self.dtype, c_layout.outer, 128, c_layout.inner)
-        thr_mma = tiled_mma.get_slice(0)
+        # This CTA's slice of the (possibly 2-CTA) MMA: its rows of A and of B.
+        thr_mma = tiled_mma.get_slice(self.cluster.rank())
         # Whole-problem tile views: (BM, BK, m_tiles, k_tiles) and (BN, BK, n_tiles, k_tiles).
-        gA = cute.local_tile(mA, TILE, (None, None, None), proj=(1, None, 1))
-        gB = cute.local_tile(mB, TILE, (None, None, None), proj=(None, 1, 1))
+        gA = cute.local_tile(mA, self.mma_tile, (None, None, None), proj=(1, None, 1))
+        gB = cute.local_tile(mB, self.mma_tile, (None, None, None), proj=(None, 1, 1))
         tAsA, tAgA = cpasync.tma_partition(
             tma_a,
             0,
@@ -197,7 +218,7 @@ class PersistentGemm(WarpSpecialized):
             cute.group_modes(sB, 0, 3),
             cute.group_modes(thr_mma.partition_B(gB), 0, 3),
         )
-        acc_shape = tiled_mma.partition_shape_C(TILE[:2])
+        acc_shape = tiled_mma.partition_shape_C(self.mma_tile[:2])
         acc_staged = tiled_mma.make_fragment_C(cute.append(acc_shape, self.acc_stages))
         ctx = SimpleNamespace(
             tiled_mma=tiled_mma,
@@ -230,35 +251,38 @@ class PersistentGemm(WarpSpecialized):
         max_ctas: Int32,
         stream: cuda.CUstream,
     ):
+        tile, group = self.mma_tile, self.cluster.cta_group
         op = tcgen05.MmaF16BF16Op(
             self.dtype,
             cutlass.Float32,
-            MMA_INST,
-            tcgen05.CtaGroup.ONE,
+            (tile[0], tile[1], 16),
+            group,
             tcgen05.OperandSource.SMEM,
             cute.nvgpu.OperandMajorMode.K,
             cute.nvgpu.OperandMajorMode.K,
         )
         tiled_mma = cute.make_tiled_mma(op)
-        a_layout = sm100_utils.make_smem_layout_a(tiled_mma, TILE, self.dtype, self.ab.n)
-        b_layout = sm100_utils.make_smem_layout_b(tiled_mma, TILE, self.dtype, self.ab.n)
-        tma_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
+        a_layout = sm100_utils.make_smem_layout_a(tiled_mma, tile, self.dtype, self.ab.n)
+        b_layout = sm100_utils.make_smem_layout_b(tiled_mma, tile, self.dtype, self.ab.n)
+        # 2-CTA loads (CtaGroup.TWO) signal the leader's full barrier from both CTAs.
+        tma_op = cpasync.CopyBulkTensorTileG2SOp(group)
+        vmnk = self.cluster.layout_vmnk().shape
         tma_a, mA = cute.nvgpu.make_tiled_tma_atom_A(
-            tma_op, a, cute.select(a_layout, mode=[0, 1, 2]), TILE, tiled_mma
+            tma_op, a, cute.select(a_layout, mode=[0, 1, 2]), tile, tiled_mma, vmnk
         )
         tma_b, mB = cute.nvgpu.make_tiled_tma_atom_B(
-            tma_op, b, cute.select(b_layout, mode=[0, 1, 2]), TILE, tiled_mma
+            tma_op, b, cute.select(b_layout, mode=[0, 1, 2]), tile, tiled_mma, vmnk
         )
         c_layout = sm100_utils.make_smem_layout_epi(self.dtype, self.c_layout, EPI_TILE, C_STAGES)
         tma_c, mC_tma = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileS2GOp(), c, cute.select(c_layout, mode=[0, 1]), EPI_TILE
         )
-        m_tiles, n_tiles = cute.ceil_div(c.layout.shape, TILE[:2])
+        m_tiles, n_tiles = cute.ceil_div(c.layout.shape, self.mma_tile[:2])
         work = self.tiles.problem((m_tiles, n_tiles, 1), workspace, max_ctas)
         self.kernel.set_name_prefix(self.get_name())
         self.kernel(
             tiled_mma, tma_a, mA, tma_b, mB, tma_c, mC_tma, a_layout, b_layout, c_layout, work
-        ).launch(grid=work.grid(), block=(self.num_threads, 1, 1), stream=stream)
+        ).launch(**self.launch_config(work), stream=stream)
 
 
 def compile_persistent_gemm(op: PersistentGemm):
@@ -288,9 +312,11 @@ def persistent_gemm(
     policy=None,
     order: Raster | None = None,
     max_ctas: int | None = None,
+    cluster=None,
 ) -> torch.Tensor:
     """``a @ b.T`` for row-major bf16 ``a: (M, K)``, ``b: (N, K)``. ``policy`` defaults to
-    ``StaticPersistent()``; ``max_ctas`` caps the persistent grid (default: the SM count)."""
+    ``StaticPersistent()``; ``max_ctas`` caps the persistent grid in CTAs (default: the SM
+    count); ``cluster=CtaPair()`` runs 2-CTA 256x256 tiles."""
     if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16:
         raise TypeError("persistent_gemm expects bfloat16 operands")
     if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[1]:
@@ -305,10 +331,10 @@ def persistent_gemm(
         return out
     if a.shape[1] == 0:  # no K tiles: the MMA would publish an unwritten accumulator
         return out.zero_()
-    key = (policy, order)
+    key = (policy, order, cluster)
     op = _OPS.get(key)
     if op is None:
-        op = _OPS[key] = PersistentGemm(policy=policy, order=order)
+        op = _OPS[key] = PersistentGemm(policy=policy, order=order, cluster=cluster)
     fn = compile_persistent_gemm(op)
     workspace, sms = op.tiles.launch_args(a.device)
     fn(a, b, out, workspace, max_ctas or sms)
@@ -316,13 +342,15 @@ def persistent_gemm(
 
 
 if __name__ == "__main__":
-    from transformer_nuggets.cute.warp_roles import Clc, DynamicPersistent, OneShot
+    from transformer_nuggets.cute.warp_roles import Clc, CtaPair, DynamicPersistent, OneShot
 
-    for policy in (OneShot(), StaticPersistent(), DynamicPersistent(), Clc()):
-        for m, n, k in [(512, 512, 512), (300, 520, 136), (4097, 2056, 4104)]:
-            a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-            b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
-            ref = torch.nn.functional.linear(a.float(), b.float())
-            err = (persistent_gemm(a, b, policy=policy).float() - ref).abs().max().item()
-            print(f"{policy.describe():<28} M={m} N={n} K={k}: max abs err {err:.4g}")
-    print(PersistentGemm(policy=Clc()).describe())
+    for cluster in (None, CtaPair()):
+        for policy in (OneShot(), StaticPersistent(), DynamicPersistent(), Clc()):
+            for m, n, k in [(512, 512, 512), (300, 520, 136), (4097, 2056, 4104)]:
+                a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+                b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+                ref = torch.nn.functional.linear(a.float(), b.float())
+                out = persistent_gemm(a, b, policy=policy, cluster=cluster)
+                err = (out.float() - ref).abs().max().item()
+                print(f"{cluster} {policy.describe():<28} M={m} N={n} K={k}: err {err:.4g}")
+    print(PersistentGemm(policy=Clc(), cluster=CtaPair()).describe())

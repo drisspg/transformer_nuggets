@@ -38,6 +38,13 @@ take ``tiles: Tiles`` and loop::
         ...
         tiles.advance()
 
+Clusters (``CtaPair``): a work item belongs to a cluster. Indices count clusters (``blockIdx.x //
+2``, ``gridDim.x // 2``), the launch grid is two CTAs per cluster, local policies compute the same
+sequence in both CTAs, and broadcast policies claim on the leader only: its scheduler warp
+publishes each decoded item into the work-ring slot of both CTAs with ``st.async`` (the bytes
+complete each CTA's full barrier), and the consumers of both CTAs release the leader's empty
+barrier. CLC cancels whole clusters, so its response decodes to ``ctaid.x // 2``.
+
 Counter lifetime (``DynamicPersistent``): the workspace holds ``[claims, finished]``. Each CTA's
 scheduler reports once after its last claim and the last CTA to report zeroes both words, so
 launches ordered on one stream (including CUDA-graph replays) reuse one workspace with no host
@@ -203,14 +210,17 @@ class PdlWait:
 
 
 class _Policy:
-    """``broadcast``: indices are claimed by one scheduler warp and broadcast to every role."""
+    """``broadcast``: indices are claimed by one scheduler warp and broadcast to every role.
+
+    Indices, ``grid_size``, and the cap count work units: CTAs, or clusters of a ``CtaPair``.
+    """
 
     broadcast = False
     persistent = True
     stages = 0
 
-    def grid_size(self, total, max_ctas):
-        return cutlass.max(cutlass.min(total, max_ctas), 1)
+    def grid_size(self, total, max_units):
+        return cutlass.max(cutlass.min(total, max_units), 1)
 
     def describe(self) -> str:
         return type(self).__name__ + (f"(stages={self.stages})" if self.broadcast else "()")
@@ -226,7 +236,7 @@ class OneShot(_Policy):
 
     persistent = False
 
-    def grid_size(self, total, max_ctas):
+    def grid_size(self, total, max_units):
         return cutlass.max(total, 1)
 
     def step(self, index, problem):
@@ -238,19 +248,19 @@ class StaticPersistent(_Policy):
     """``min(total, max_ctas)`` CTAs; CTA ``b`` runs ``b, b + grid, b + 2 grid, ...``."""
 
     def step(self, index, problem):
-        return index + cute.arch.grid_dim()[0]
+        return index + problem.units()
 
 
 @cute.jit
-def _claim_atomic(workspace):
+def _claim_atomic(workspace, units):
     old = Int32(0)
     if cute.arch.lane_idx() == 0:
         old = cute.arch.atomic_add(workspace.iterator, Int32(1), scope="gpu")
-    return cute.arch.shuffle_sync(old, 0) + cute.arch.grid_dim()[0]
+    return cute.arch.shuffle_sync(old, 0) + units
 
 
 @cute.jit
-def _report_finished(workspace):
+def _report_finished(workspace, units):
     # The same lane made every claim of this CTA. The first fence orders those claims before
     # the report; the last reporter's fence orders all reports before its reset, so the reset
     # is coherence-ordered after every claim of this launch.
@@ -258,7 +268,7 @@ def _report_finished(workspace):
         claims = workspace.iterator
         cute.arch.fence_acq_rel_gpu()
         done = cute.arch.atomic_add(claims + 1, Int32(1), scope="gpu")
-        grid = cute.arch.grid_dim()[0]
+        grid = units  # one reporting scheduler per work unit (CTA or cluster leader)
         if done == grid - 1:
             cute.arch.fence_acq_rel_gpu()
             cute.arch.atomic_exch(claims, Int32(0), scope="gpu")
@@ -277,10 +287,10 @@ class DynamicPersistent(_Policy):
     broadcast = True
 
     def claim(self, fetch, problem):
-        return _claim_atomic(problem.workspace)
+        return _claim_atomic(problem.workspace, problem.units())
 
     def finish(self, fetch, problem):
-        _report_finished(problem.workspace)
+        _report_finished(problem.workspace, problem.units())
 
 
 @dataclass(frozen=True)
@@ -288,12 +298,13 @@ class Clc(_Policy):
     """Blackwell cluster launch control: ``grid = total``; a running CTA cancels a not-yet-
     launched CTA with ``clusterlaunchcontrol.try_cancel`` and runs its item instead. The hardware
     balances load and yields SMs to other kernels, with no counter to manage. ``stages``: decoded
-    items buffered ahead of the slowest role. 1-CTA clusters only (see REPORT.md)."""
+    items buffered ahead of the slowest role. In a ``CtaPair`` the leader cancels whole
+    clusters (the response is not multicast; the decoded item is published to both CTAs)."""
 
     stages: int = 2
     broadcast = True
 
-    def grid_size(self, total, max_ctas):
+    def grid_size(self, total, max_units):
         return cutlass.max(total, 1)
 
     def fetch_channels(self) -> dict:
@@ -313,6 +324,8 @@ class Clc(_Policy):
         r = cons.wait(0)
         x, _, _, ok = cute.arch.clc_response(r.data.iterator)
         r.release()
+        if cutlass.const_expr(problem.cs > 1):
+            x = x // problem.cs  # first CTA of the canceled cluster -> cluster index
         return x * ok + problem.total * (1 - ok)
 
     def finish(self, fetch, problem):
@@ -344,6 +357,8 @@ class TileStream:
     record: int = 0
     name: str = field(default="", init=False)
     roles: list = field(default_factory=list, init=False)  # recording order (set by the layer)
+    # The declaring kernel (set on attribute assignment); its cluster fixes CTAs per work unit.
+    owner: object = field(default=None, init=False, repr=False, compare=False)
     _workspaces: dict = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self):
@@ -351,12 +366,24 @@ class TileStream:
             raise ValueError("work items need at least one word")
 
     @property
+    def cluster_size(self) -> int:
+        """CTAs per work unit: 2 when the owning kernel declares ``CtaPair``."""
+        return 1 if self.owner is None else self.owner.cluster.size
+
+    @property
     def payload_words(self) -> int:
         """Broadcast payload per stage: ``[index, item words]`` padded to 16 bytes."""
         return -(-(1 + self.order.words) // 4) * 4
 
     def channel(self) -> Ring:
-        return Ring(self.policy.stages, Threads, Threads, payload=(Int32, (self.payload_words,)))
+        """The broadcast ring. In a pair the leader's scheduler fills both CTAs' slots with
+        ``st.async`` (TMA-like: one armed arrival plus payload bytes per CTA)."""
+        payload = (Int32, (self.payload_words,))
+        if self.cluster_size == 1:
+            return Ring(self.policy.stages, Threads, Threads, payload=payload)
+        ring = Ring(self.policy.stages, Tma(4 * self.payload_words), Threads, payload=payload)
+        ring.internal = True  # leader-only producer filling consumer CTAs (no multicast TMA)
+        return ring
 
     def describe(self) -> str:
         ready = f", ready={type(self.ready).__name__}" if self.ready else ""
@@ -384,7 +411,8 @@ class TileStream:
     def launch_args(self, device, max_ctas: int | None = None):
         """``(workspace, max_ctas)`` for the compiled entry point. One cached workspace per
         (device, current stream): launches on one stream run in order, so they may share it.
-        With ``record``, ``max_ctas`` must cover the launch grid (CLC/OneShot: the item count)."""
+        With ``record``, ``max_ctas`` must cover the launch grid in CTAs (CLC/OneShot: the item
+        count times the cluster size); it is rounded up to whole clusters."""
         import torch
 
         device = torch.device(device)
@@ -396,7 +424,9 @@ class TileStream:
                     "TileStream(record=...) sizes its log by role count: compile the kernel "
                     "(or call describe()) before launch_args()"
                 )
-            words += len(self.roles) * (max_ctas or sms) * self.record * 2
+            cs = self.cluster_size
+            ctas = -(-(max_ctas or sms) // cs) * cs  # the grid launches whole clusters
+            words += len(self.roles) * ctas * self.record * 2
         stream = torch.cuda.current_stream(device).cuda_stream
         ws = self._workspaces.get((device, stream))
         if ws is None or ws.numel() < words:
@@ -439,6 +469,17 @@ class TileProblem:
     def __init__(self, stream: TileStream, space, workspace, max_ctas):
         self.stream, self.space, self.workspace, self.max_ctas = stream, space, workspace, max_ctas
         self.total = stream.order.size(space)
+        self.cs = stream.cluster_size  # CTAs per work unit
+
+    def units(self):
+        """Device-side: launched work units (CTAs, or clusters of a pair)."""
+        grid = cute.arch.grid_dim()[0]
+        return grid if self.cs == 1 else grid // self.cs
+
+    def first_unit(self):
+        """Device-side: this CTA's work unit (the cluster index of a pair)."""
+        bidx, _, _ = cute.arch.block_idx()
+        return bidx if self.cs == 1 else bidx // self.cs
 
     def _uses_workspace(self) -> bool:
         return isinstance(self.stream.policy, DynamicPersistent) or bool(self.stream.record)
@@ -459,12 +500,16 @@ class TileProblem:
         return TileProblem(self.stream, space, ws, None)
 
     def grid(self):
-        """Launch grid for this policy: ``(ctas, 1, 1)``."""
+        """Launch grid for this policy: ``(ctas, 1, 1)``; ``max_ctas`` caps CTAs, so a pair
+        launches at most ``max_ctas // 2`` clusters."""
         policy = self.stream.policy
         uses_cap = isinstance(policy, (StaticPersistent, DynamicPersistent))
         if uses_cap and self.max_ctas is None:
             raise ValueError(f"{policy.describe()} needs max_ctas")
-        return (policy.grid_size(self.total, self.max_ctas), 1, 1)
+        cap = self.max_ctas
+        if uses_cap and self.cs > 1:
+            cap = cutlass.max(cap // self.cs, 1)
+        return (policy.grid_size(self.total, cap) * self.cs, 1, 1)
 
 
 # --------------------------------------------------------------------------- #
@@ -560,9 +605,8 @@ class TileCursor:
         (which publishes it in ``scheduler_role``)."""
         rec = _CursorRecord(trace.role_name, current_block())
         trace.checks.append(rec.check)
-        bidx, _, _ = cute.arch.block_idx()
         count = Int32(0) if stream.record else None
-        cur = TileCursor(stream, problem, end, Int32(bidx), [], rec, count, slot)
+        cur = TileCursor(stream, problem, end, Int32(problem.first_unit()), [], rec, count, slot)
         if end is None:
             if stream.ready is not None:
                 stream.ready.wait()
@@ -669,13 +713,35 @@ class _Fetch:
         self._policy.finish(self._ends, self._problem)
 
 
-@cute.jit
 def _publish(h, index, words, total):
+    chan = h._end._chan
+    if isinstance(chan.producer, Tma):  # a cluster's ring: the bytes complete each full barrier
+        targets = chan.scope.full_ctas if chan.scope.pair else (0,)  # local: leader-only users
+        _publish_pair(h.data.iterator, h.barrier, [index, *words], targets)
+    else:
+        _publish_local(h, index, words, total)
+
+
+@cute.jit
+def _publish_local(h, index, words, total):
     with cute.arch.elect_one():
         h.data[0] = index
         if index < total:
             for i in cutlass.range_constexpr(len(words)):
                 h.data[1 + i] = words[i]
+
+
+@cute.jit
+def _publish_pair(slot_ptr, full, values, targets: cutlass.Constexpr):
+    """Leader: ``st.async`` the item into the slot of every consumer CTA; the stores complete
+    the bytes the producer armed on each CTA's full barrier (``Tma(16 * chunks)``)."""
+    words = list(values) + [Int32(0)] * (-len(values) % 4)
+    base = slot_ptr.toint()
+    with cute.arch.elect_one():
+        for c in cutlass.range_constexpr(len(targets)):
+            for q in cutlass.range_constexpr(len(words) // 4):
+                dst = cute.make_ptr(Int32, base + 16 * q, cute.AddressSpace.smem, assumed_align=16)
+                cute.arch.store_async_dsmem(dst, tuple(words[4 * q : 4 * q + 4]), full, targets[c])
 
 
 @cute.jit

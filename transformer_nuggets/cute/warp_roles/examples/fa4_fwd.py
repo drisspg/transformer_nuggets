@@ -25,6 +25,14 @@ Dependency graph (channels, all mbarriers; slot j = Q tile j):
 
 TMEM (512 columns): S0 [0,128), S1 [128,256), O0 [256,384), O1 [384,512); P_j is bf16 packed
 two per column into the upper half of S_j ([64,128) of each S slot).
+
+2-CTA (``cluster=CtaPair()``, FA4's default schedule): a work item is 512 query rows. Q tile j of
+the item is one 256-row MMA tile split across the pair (each CTA holds 128 rows, as FA4's
+``work_q_block``), K and V tiles are split along the MMA's N (each CTA loads 64 keys of K and 64
+head dims of V, so 6 KV stages fit in the same SMEM), and the leader's MMA warp issues
+``CtaGroup.TWO`` MMAs. The roles are unchanged; the layer derives the pair-scoped q/kv/s channels
+(leader-armed TMA bytes of both CTAs, multicast S commits, S releases from both CTAs joining on
+the leader's barrier) and keeps stats/epi/turnstile CTA-local.
 """
 
 import math
@@ -49,6 +57,7 @@ from transformer_nuggets.cute.warp_roles import (
     Producer,
     Raster,
     Ring,
+    SingleCta,
     Slots,
     Threads,
     Tiles,
@@ -73,21 +82,36 @@ LOG2_E = math.log2(math.e)
 LN2 = math.log(2.0)
 
 
-def umma(tiled_mma, acc, a, b, accumulate):
-    """Issue one tile MMA as K-block tcgen05.mma instructions; ``accumulate`` may be dynamic."""
+def umma(tiled_mma, acc, a, b, accumulate, ks=None):
+    """Issue one tile MMA as K-block tcgen05.mma instructions; ``accumulate`` may be dynamic.
+    ``ks``: the K-block range to issue (default: all)."""
     atom = cute.make_mma_atom(tiled_mma.op)
-    for k in range(cute.size(a.shape[2])):
-        atom.set(tcgen05.Field.ACCUMULATE, accumulate if k == 0 else True)
+    ks = range(cute.size(a.shape[2])) if ks is None else ks
+    for k in ks:
+        atom.set(tcgen05.Field.ACCUMULATE, accumulate if k == ks[0] else True)
         cute.gemm(atom, acc, a[None, None, k], b[None, None, k], acc)
+
+
+SPLIT_P = 3  # FA4 split_P_arrive: S/P/O is released after 3 of the 4 P stores (96 of 128 keys)
 
 
 class FlashAttentionForward(WarpSpecialized):
     def __init__(
-        self, kv_stages: int = 3, turnstile: bool = False, trace: bool = False, policy=None
+        self,
+        kv_stages: int | None = None,
+        turnstile: bool = False,
+        trace: bool = False,
+        policy=None,
+        cluster=None,
+        split_p: bool = False,
     ):
-        self.kv_stages = kv_stages
+        self.cluster = cluster or SingleCta()
+        self.split_p = split_p
+        cs = self.cluster.size
+        # Each CTA holds 1/cs of every K/V tile (2-CTA MMAs split B along N): cs x the stages.
+        self.kv_stages = kv_stages or 3 * cs
         self.q = Slots(Q_STAGE, Tma(TILE_BYTES), Umma, producer_role="load")
-        self.kv = Ring(kv_stages, Tma(TILE_BYTES), Umma)
+        self.kv = Ring(self.kv_stages, Tma(TILE_BYTES // cs), Umma)
         self.s = Slots(
             Q_STAGE,
             Umma,
@@ -96,6 +120,10 @@ class FlashAttentionForward(WarpSpecialized):
             consumer_roles=("softmax", "correction"),
             release_fence="tmem_store",  # P (softmax) and rescaled O (correction) via tcgen05.st
         )
+        # Split-P arrive (FA4): softmax releases s after the first 3/4 of P, so the MMA starts
+        # PV_j on those keys while the last quarter is stored; p_last carries the last quarter.
+        # Declared either way so the role signatures are fixed; unused when split_p is off.
+        self.p_last = Slots(Q_STAGE, Threads, Umma, commit_fence="tmem_store")
         self.stats = Slots(Q_STAGE, Threads, Threads, payload=(Float32, (M_BLOCK, 2)))
         self.epi = Slots(Q_STAGE, Threads, Threads, commit_fence="smem_async")
         self.mufu = Turnstile(enabled=turnstile)
@@ -111,8 +139,11 @@ class FlashAttentionForward(WarpSpecialized):
         self.trace_protocol = trace
 
     def get_name(self) -> str:
-        ts = "_ts" if self.mufu.enabled else ""
-        return f"warp_roles_fa4_fwd_kv{self.kv_stages}{ts}_{self.tiles.get_key()}"
+        ts = ("_ts" if self.mufu.enabled else "") + ("_splitp" if self.split_p else "")
+        return (
+            f"warp_roles_fa4_fwd_{self.cluster.get_key()}_kv{self.kv_stages}{ts}_"
+            f"{self.tiles.get_key()}"
+        )
 
     def get_key(self) -> str:
         return self.get_name()
@@ -122,13 +153,15 @@ class FlashAttentionForward(WarpSpecialized):
     @role(warps=14, regs=48)
     @cute.jit
     def load(self, q: Producer, kv: Producer, tiles: Tiles, c):
-        thr_qk, thr_pv = c.mma_qk.get_slice(0), c.mma_pv.get_slice(0)
+        rank = self.cluster.rank()  # this CTA's rows of Q, keys of K, head dims of V
+        thr_qk, thr_pv = c.mma_qk.get_slice(rank), c.mma_pv.get_slice(rank)
+        mma_m = M_BLOCK * self.cluster.size
         while tiles.valid:
             m_blk, head, batch = tiles.work
             gQ = cute.local_tile(
-                c.mQ[None, None, head, batch], (Q_STAGE * M_BLOCK, HEAD_DIM), (m_blk, 0)
+                c.mQ[None, None, head, batch], (Q_STAGE * mma_m, HEAD_DIM), (m_blk, 0)
             )
-            gQ = layout_utils.select(cute.flat_divide(gQ, (M_BLOCK,)), mode=[0, 2, 1])
+            gQ = layout_utils.select(cute.flat_divide(gQ, (mma_m,)), mode=[0, 2, 1])
             load_q, _, _ = copy_utils.tma_get_copy_fn(
                 c.tma_q, 0, cute.make_layout(1), thr_qk.partition_A(gQ), c.sQ
             )
@@ -163,9 +196,11 @@ class FlashAttentionForward(WarpSpecialized):
                     cute.copy(c.tma_v, tVgV[None, i], tVsV[None, h.index], tma_bar_ptr=h.barrier)
             tiles.advance()
 
-    @role(warps=12, regs=48)
+    @role(warps=12, regs=48, cta="leader")
     @cute.jit
-    def mma(self, q: Consumer, kv: Consumer, s: Producer, tiles: Tiles, tmem: Tmem, c):
+    def mma(
+        self, q: Consumer, kv: Consumer, s: Producer, p_last: Consumer, tiles: Tiles, tmem: Tmem, c
+    ):
         thr_qk, thr_pv = c.mma_qk.get_slice(0), c.mma_pv.get_slice(0)
         tSrQ, tSrK = thr_qk.make_fragment_A(c.sQ), thr_qk.make_fragment_B(c.sK)
         tOrV = thr_pv.make_fragment_B(c.sV)
@@ -201,7 +236,9 @@ class FlashAttentionForward(WarpSpecialized):
                 v = kv.wait()
                 for j in cutlass.range_constexpr(Q_STAGE):
                     sl = s.acquire(j)  # P_j written and O_j rescaled (softmax[j], correction)
-                    umma(c.mma_pv, tO[j], tOrP[j], tOrV[None, None, None, v.index], i > 0)
+                    p_last = self.pv(
+                        p_last, j, tO[j], tOrP[j], tOrV[None, None, None, v.index], i > 0, c
+                    )
                     if cutlass.const_expr(j == 0):
                         k = kv.wait()
                     if cutlass.const_expr(j == Q_STAGE - 1):
@@ -229,15 +266,30 @@ class FlashAttentionForward(WarpSpecialized):
             v_last = kv.wait()
             for j in cutlass.range_constexpr(Q_STAGE):
                 with s.produce(j):
-                    umma(
-                        c.mma_pv,
+                    p_last = self.pv(
+                        p_last,
+                        j,
                         tO[j],
                         tOrP[j],
                         tOrV[None, None, None, v_last.index],
                         c.n_blocks > 1,
+                        c,
                     )
             v_last.release()
             tiles.advance()
+
+    def pv(self, p_last, j, tO, tOrP, tOrV, accumulate, c):
+        """O_j (+)= P_j V. With split-P the last quarter of the K blocks waits for p_last[j]
+        (plain Python: inlined; returns the end so loops carry its phase)."""
+        if cutlass.const_expr(not self.split_p):
+            umma(c.mma_pv, tO, tOrP, tOrV, accumulate)
+            return p_last
+        n = cute.size(tOrP.shape[2])
+        first = n * SPLIT_P // 4
+        umma(c.mma_pv, tO, tOrP, tOrV, accumulate, range(first))
+        with p_last.consume(j):  # release = commit: this PV has read the last quarter
+            umma(c.mma_pv, tO, tOrP, tOrV, True, range(first, n))
+        return p_last
 
     @role(warps=[range(4), range(4, 8)], regs=192)
     @cute.jit
@@ -245,6 +297,7 @@ class FlashAttentionForward(WarpSpecialized):
         self,
         stage: Instance,
         s: Consumer[Instance],
+        p_last: Producer[Instance],
         stats: Producer[Instance],
         mufu: Turn,
         tiles: Tiles,
@@ -252,15 +305,14 @@ class FlashAttentionForward(WarpSpecialized):
         c,
     ):
         tidx = cute.arch.thread_idx()[0] % 128
-        thr_qk = c.mma_qk.get_slice(0)
+        thr_qk = c.mma_qk.get_slice(self.cluster.rank())
         tSAcc = cute.make_tensor(tmem.ptr("S", stage), c.s_layout)[(None, None), 0, 0]
         tStP = cute.make_tensor(
             tmem.ptr("P", stage),
             cute.composition(tSAcc.layout, cute.make_layout((M_BLOCK, N_BLOCK // 2))),
         )
-        tScS = thr_qk.partition_C(cute.make_identity_tensor((M_BLOCK, N_BLOCK)))[
-            (None, None), 0, 0
-        ]
+        mma_m = M_BLOCK * self.cluster.size
+        tScS = thr_qk.partition_C(cute.make_identity_tensor((mma_m, N_BLOCK)))[(None, None), 0, 0]
         ld_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), Float32
         )
@@ -281,9 +333,11 @@ class FlashAttentionForward(WarpSpecialized):
         while tiles.valid:
             sm = SoftmaxSm100.create(c.scale_log2, rescale_threshold=RESCALE_THRESHOLD)
             sm.reset()
-            s, stats, mufu = self.softmax_step(stage, s, stats, mufu, sm, t, True)
+            s, p_last, stats, mufu = self.softmax_step(stage, s, p_last, stats, mufu, sm, t, True)
             for _ in cutlass.range(c.n_blocks - 1, unroll=1):
-                s, stats, mufu = self.softmax_step(stage, s, stats, mufu, sm, t, False)
+                s, p_last, stats, mufu = self.softmax_step(
+                    stage, s, p_last, stats, mufu, sm, t, False
+                )
             with stats.produce(stage) as st:
                 st.data[tidx, 0] = sm.row_sum[0]
                 st.data[tidx, 1] = sm.row_max[0]
@@ -291,7 +345,7 @@ class FlashAttentionForward(WarpSpecialized):
                 pass
             tiles.advance()
 
-    def softmax_step(self, stage, s, stats, mufu, sm, t, is_first):
+    def softmax_step(self, stage, s, p_last, stats, mufu, sm, t, is_first):
         """One KV block for one Q tile (plain Python: inlined into the role at trace time).
 
         Returns the ends so the caller's loop carries their phases.
@@ -307,17 +361,24 @@ class FlashAttentionForward(WarpSpecialized):
         rP = cute.make_tensor(cute.recast_ptr(rP32.iterator, dtype=cutlass.BFloat16), rS.layout)
         with mufu.turn():
             sm.apply_exp2_convert(rS, rP)
-        for i in range(cute.size(t.tStP.shape[2])):  # plain Python: no preprocessor here
+        n_st = cute.size(t.tStP.shape[2])
+        split = n_st * SPLIT_P // 4 if self.split_p else n_st
+        for i in range(split):  # plain Python: no preprocessor here
             cute.copy(t.thr_st, rP32[None, None, i], t.tStP[None, None, i])
         sh.release()  # layer fences the tcgen05.st of P before arriving
+        if cutlass.const_expr(self.split_p):
+            with p_last.produce(stage):  # layer fences the last quarter's tcgen05.st
+                for i in range(split, n_st):
+                    cute.copy(t.thr_st, rP32[None, None, i], t.tStP[None, None, i])
         sm.update_row_sum(rS.load(), acc_scale, is_first)
-        return s, stats, mufu
+        return s, p_last, stats, mufu
 
     @role(warps=range(8, 12), regs=80)
     @cute.jit
     def correction(self, s: Consumer, stats: Consumer, epi: Producer, tiles: Tiles, tmem: Tmem, c):
         tidx = cute.arch.thread_idx()[0] % 128
-        thr_pv = c.mma_pv.get_slice(0)
+        rank = self.cluster.rank()
+        thr_pv = c.mma_pv.get_slice(rank)
         tO = [cute.make_tensor(tmem.ptr("O", j), c.o_layout) for j in range(Q_STAGE)]
         while tiles.valid:
             m_blk, head, batch = tiles.work
@@ -337,8 +398,9 @@ class FlashAttentionForward(WarpSpecialized):
                 empty_row = row_sum == 0.0 or row_sum != row_sum  # noqa: PLR0124 (NaN)
                 inv_sum = cute.arch.rcp_approx(row_sum if not empty_row else 1.0)
                 with s.consume(j), epi.produce(j):  # final S_j commit: O_j holds the last PV
-                    self.store_o_smem(thr_pv, tO[j], tidx, inv_sum, c.sO[None, None, j])
-                row = (m_blk * Q_STAGE + j) * M_BLOCK + tidx
+                    self.store_o_smem(c.mma_pv, thr_pv, tO[j], tidx, inv_sum, c.sO[None, None, j])
+                # FA4 work_q_block: Q tile j of the item, this CTA's 128 rows of it.
+                row = ((m_blk * Q_STAGE + j) * self.cluster.size + rank) * M_BLOCK + tidx
                 if row < c.seqlen_q:
                     lse = (row_max * c.scale_log2 + cute.math.log2(row_sum, fastmath=True)) * LN2
                     c.mLSE[batch, head, row] = lse if not empty_row else -Float32.inf
@@ -348,7 +410,8 @@ class FlashAttentionForward(WarpSpecialized):
     def rescale_o(self, thr_pv, tO, tidx, scale):
         """O_j *= scale for this thread's row, 16 columns at a time (FA4 correction_rescale)."""
         cols = 16
-        tOcO = thr_pv.partition_C(cute.make_identity_tensor((M_BLOCK, HEAD_DIM)))
+        mma_m = M_BLOCK * self.cluster.size
+        tOcO = thr_pv.partition_C(cute.make_identity_tensor((mma_m, HEAD_DIM)))
         ld = cute.make_copy_atom(tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(cols)), Float32)
         st = cute.make_copy_atom(tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(cols)), Float32)
         tO_i = cute.composition(tO, cute.make_layout((M_BLOCK, cols)))
@@ -366,21 +429,23 @@ class FlashAttentionForward(WarpSpecialized):
             cute.copy(thr_st, r, cute.make_tensor(tOtO_r2t.iterator + i * cols, tOtO_r2t.layout))
 
     @cute.jit
-    def store_o_smem(self, thr_pv, tO, tidx, scale, sO):
+    def store_o_smem(self, mma_pv, thr_pv, tO, tidx, scale, sO):
         """sO = bf16(O_j * scale) (FA4 correction_epilogue, TMA-O path)."""
         cols = 16
-        tOsO = thr_pv.partition_C(sO)
-        tOcO = thr_pv.partition_C(cute.make_identity_tensor((M_BLOCK, HEAD_DIM)))
+        cs = self.cluster.size
+        # sO is per-CTA sized: partition it with slice 0 of the MMA (FA4 does the same).
+        tOsO = mma_pv.get_slice(0).partition_C(sO)
+        tOcO = thr_pv.partition_C(cute.make_identity_tensor((M_BLOCK * cs, HEAD_DIM)))
         tO_i = cute.logical_divide(tO, cute.make_layout((M_BLOCK, cols)))
         tOcO_i = cute.logical_divide(tOcO, cute.make_layout((M_BLOCK, cols)))
         tOsO_i = cute.logical_divide(tOsO, cute.make_layout((M_BLOCK, cols)))
         ld_atom = sm100_utils.get_tmem_load_op(
-            (M_BLOCK, HEAD_DIM, N_BLOCK),
+            (M_BLOCK * cs, HEAD_DIM, N_BLOCK),
             LayoutEnum.ROW_MAJOR,
             cutlass.BFloat16,
             Float32,
             (M_BLOCK, cols),
-            use_2cta_instrs=False,
+            use_2cta_instrs=cs > 1,
         )
         tiled_ld = tcgen05.make_tmem_copy(ld_atom, tO_i[(None, None), 0])
         thr_ld = tiled_ld.get_slice(tidx)
@@ -401,12 +466,16 @@ class FlashAttentionForward(WarpSpecialized):
     @role(warps=13, regs=48)
     @cute.jit
     def epilogue(self, epi: Consumer, tiles: Tiles, c):
+        rank = self.cluster.rank()
+        mma_m = M_BLOCK * self.cluster.size
         while tiles.valid:
             m_blk, head, batch = tiles.work
             gO = cute.local_tile(
-                c.mO[None, None, head, batch], (Q_STAGE * M_BLOCK, HEAD_DIM), (m_blk, 0)
+                c.mO[None, None, head, batch], (Q_STAGE * mma_m, HEAD_DIM), (m_blk, 0)
             )
-            gO = layout_utils.select(cute.flat_divide(gO, (M_BLOCK,)), mode=[0, 2, 1])
+            gO = layout_utils.select(cute.flat_divide(gO, (mma_m,)), mode=[0, 2, 1])
+            if cutlass.const_expr(self.cluster.size > 1):  # this CTA's 128 rows of each tile
+                gO = cute.flat_divide(gO, (M_BLOCK,))[None, rank, None, None]
             store_o, _, _ = copy_utils.tma_get_copy_fn(c.tma_o, 0, cute.make_layout(1), c.sO, gO)
             eh = []
             for j in cutlass.range_constexpr(Q_STAGE):
@@ -448,7 +517,9 @@ class FlashAttentionForward(WarpSpecialized):
         sK = smem.allocate_tensor(cutlass.BFloat16, sK_layout.outer, 1024, sK_layout.inner)
         # K and V stages share one buffer (same stage size at head_dim 128).
         sV = cute.make_tensor(cute.recast_ptr(sK.iterator, sV_layout.inner), sV_layout.outer)
-        thr_qk, thr_pv = mma_qk.get_slice(0), mma_pv.get_slice(0)
+        rank = self.cluster.rank()
+        thr_qk, thr_pv = mma_qk.get_slice(rank), mma_pv.get_slice(rank)
+        mma_m = M_BLOCK * self.cluster.size
         ctx = SimpleNamespace(
             mma_qk=mma_qk,
             mma_pv=mma_pv,
@@ -467,8 +538,8 @@ class FlashAttentionForward(WarpSpecialized):
             sO=sO,
             p_layout=p_layout,
             scale_log2=scale_log2,
-            s_layout=thr_qk.make_fragment_C(thr_qk.partition_shape_C((M_BLOCK, N_BLOCK))).layout,
-            o_layout=thr_pv.make_fragment_C(thr_pv.partition_shape_C((M_BLOCK, HEAD_DIM))).layout,
+            s_layout=thr_qk.make_fragment_C(thr_qk.partition_shape_C((mma_m, N_BLOCK))).layout,
+            o_layout=thr_pv.make_fragment_C(thr_pv.partition_shape_C((mma_m, HEAD_DIM))).layout,
             n_blocks=mK.shape[0] // N_BLOCK,
             seqlen_q=mQ.shape[0],
         )
@@ -497,8 +568,9 @@ class FlashAttentionForward(WarpSpecialized):
         )
         mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=[1, 0, 2, 3]))
         major = cute.nvgpu.OperandMajorMode
+        group, mma_m = self.cluster.cta_group, M_BLOCK * self.cluster.size
         mma_qk = sm100_utils.make_trivial_tiled_mma(
-            bf16, bf16, major.K, major.K, Float32, tcgen05.CtaGroup.ONE, (M_BLOCK, N_BLOCK)
+            bf16, bf16, major.K, major.K, Float32, group, (mma_m, N_BLOCK)
         )
         mma_pv = sm100_utils.make_trivial_tiled_mma(
             bf16,
@@ -506,11 +578,11 @@ class FlashAttentionForward(WarpSpecialized):
             major.K,
             major.MN,
             Float32,
-            tcgen05.CtaGroup.ONE,
-            (M_BLOCK, HEAD_DIM),
+            group,
+            (mma_m, HEAD_DIM),
             tcgen05.OperandSource.TMEM,
         )
-        tiler_qk, tiler_pv = (M_BLOCK, N_BLOCK, HEAD_DIM), (M_BLOCK, HEAD_DIM, N_BLOCK)
+        tiler_qk, tiler_pv = (mma_m, N_BLOCK, HEAD_DIM), (mma_m, HEAD_DIM, N_BLOCK)
         sQ_layout = sm100_utils.make_smem_layout_a(mma_qk, tiler_qk, bf16, Q_STAGE)
         sK_layout = sm100_utils.make_smem_layout_b(mma_qk, tiler_qk, bf16, self.kv_stages)
         p_layout = sm100_utils.make_smem_layout_a(mma_pv, tiler_pv, bf16, Q_STAGE)
@@ -518,15 +590,16 @@ class FlashAttentionForward(WarpSpecialized):
         sO_layout = sm100_utils.make_smem_layout_epi(
             bf16, LayoutEnum.ROW_MAJOR, (M_BLOCK, HEAD_DIM), Q_STAGE
         )
-        load_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
+        load_op = cpasync.CopyBulkTensorTileG2SOp(group)
+        vmnk = self.cluster.layout_vmnk().shape
         tma_q, mQ_t = cute.nvgpu.make_tiled_tma_atom_A(
-            load_op, mQ, cute.select(sQ_layout, mode=[0, 1, 2]), tiler_qk, mma_qk
+            load_op, mQ, cute.select(sQ_layout, mode=[0, 1, 2]), tiler_qk, mma_qk, vmnk
         )
         tma_k, mK_t = cute.nvgpu.make_tiled_tma_atom_B(
-            load_op, mK, cute.select(sK_layout, mode=[0, 1, 2]), tiler_qk, mma_qk
+            load_op, mK, cute.select(sK_layout, mode=[0, 1, 2]), tiler_qk, mma_qk, vmnk
         )
         tma_v, mV_t = cute.nvgpu.make_tiled_tma_atom_B(
-            load_op, mV, cute.select(sV_layout, mode=[0, 1, 2]), tiler_pv, mma_pv
+            load_op, mV, cute.select(sV_layout, mode=[0, 1, 2]), tiler_pv, mma_pv, vmnk
         )
         tma_o, mO_t = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileS2GOp(),
@@ -534,7 +607,7 @@ class FlashAttentionForward(WarpSpecialized):
             cute.select(sO_layout, mode=[0, 1]),
             (M_BLOCK, HEAD_DIM),
         )
-        m_blocks = cute.ceil_div(mQ.shape[0], Q_STAGE * M_BLOCK)
+        m_blocks = cute.ceil_div(mQ.shape[0], Q_STAGE * mma_m)
         work = self.tiles.problem((m_blocks, mQ.shape[2], mQ.shape[3]), workspace, max_ctas)
         self.kernel.set_name_prefix(self.get_name())
         self.kernel(
@@ -556,9 +629,7 @@ class FlashAttentionForward(WarpSpecialized):
             p_layout,
             sO_layout,
             work,
-        ).launch(
-            grid=work.grid(), block=(self.num_threads, 1, 1), stream=stream, min_blocks_per_mp=1
-        )
+        ).launch(**self.launch_config(work), stream=stream, min_blocks_per_mp=1)
 
 
 def compile_fa4_fwd(op: FlashAttentionForward):
@@ -589,17 +660,20 @@ def fa4_fwd(
     v: torch.Tensor,
     softmax_scale: float | None = None,
     *,
-    kv_stages: int = 3,
+    kv_stages: int | None = None,
     turnstile: bool = False,
     policy=None,
     max_ctas: int | None = None,
+    cluster=None,
+    split_p: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Attention forward for ``(batch, seqlen, heads, 128)`` bf16 tensors; returns (O, LSE).
 
     ``LSE`` is ``(batch, heads, seqlen_q)`` fp32 (natural log), as in FA4. ``policy``: work
     scheduling (default ``OneShot()``; ``StaticPersistent()``, ``DynamicPersistent()``,
     ``Clc()`` run several (Q block, head, batch) items per CTA). ``max_ctas`` caps the
-    static/dynamic persistent grid (default: the SM count).
+    static/dynamic persistent grid in CTAs (default: the SM count). ``cluster=CtaPair()``
+    runs FA4's default 2-CTA schedule (512-row work items, 6 KV stages by default).
     """
     if any(t.dtype != torch.bfloat16 for t in (q, k, v)):
         raise TypeError("fa4_fwd expects bfloat16 q, k, v")
@@ -614,10 +688,12 @@ def fa4_fwd(
     scale = softmax_scale if softmax_scale is not None else HEAD_DIM**-0.5
     out = torch.empty_like(q)
     lse = torch.empty(q.shape[0], q.shape[2], q.shape[1], device=q.device, dtype=torch.float32)
-    key = (kv_stages, turnstile, policy)
+    key = (kv_stages, turnstile, policy, cluster, split_p)
     op = _OPS.get(key)
     if op is None:
-        op = _OPS[key] = FlashAttentionForward(kv_stages, turnstile, policy=policy)
+        op = _OPS[key] = FlashAttentionForward(
+            kv_stages, turnstile, policy=policy, cluster=cluster, split_p=split_p
+        )
     fn = compile_fa4_fwd(op)
     workspace, sms = op.tiles.launch_args(q.device)
     fn(q, k, v, out, lse, scale * LOG2_E, workspace, max_ctas or sms)
