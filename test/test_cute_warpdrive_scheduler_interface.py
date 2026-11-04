@@ -42,6 +42,7 @@ from transformer_nuggets.cute.warpdrive import (
     Fa4Mapping,
     IndexSchedule,
     OneShot,
+    PdlWait,
     ProtocolError,
     Raster,
     Readiness,
@@ -52,6 +53,7 @@ from transformer_nuggets.cute.warpdrive import (
     WorkStream,
     role,
 )
+from transformer_nuggets.cute.warpdrive.examples.packed_work import PackedWork
 
 # The vendored CUTLASS oracle still creates V1 fast-divmod divisors (the adapter does not).
 pytestmark = pytest.mark.filterwarnings(
@@ -642,3 +644,163 @@ def test_persistent_gemm_swaps_schedules(requires_blackwell, case, cluster):
         (1100, 1032, 200, 5),
     ]:
         _check_gemm(schedule, m, n, k, max_ctas=max_ctas, mapping=mapping, cluster=cluster)
+
+
+# --------------------------------------------------------------------------- #
+# A device-built work list consumed under programmatic dependent launch
+# --------------------------------------------------------------------------- #
+
+
+def _packed_keep(m, n, li):
+    return (m + 2 * n + 3 * li) % 3 != 0
+
+
+class PackedToy(WarpSpecialized):
+    """``produce`` (one CTA) lets its dependents launch, waits ``delay`` ns, then compacts the
+    items ``(m, n, l)`` of an ``em x en x el`` grid that ``_packed_keep`` accepts into
+    ``table``/``length`` (atomics: the row order varies) and stamps its finish time. The
+    consumer is launched with PDL right behind it on the same stream; its stream waits with
+    ``PdlWait`` and maps rows through ``PackedWork``. Roles ``a`` (warp 0) and ``b`` (warps 1-2)
+    count each item in ``hits[role, item]``; each consumer CTA stamps its entry time."""
+
+    PRODUCER_THREADS = 128
+
+    def __init__(self, schedule, cluster=None):
+        self.cluster = cluster or SingleCta()
+        self.work = WorkStream(mapping=PackedWork(), schedule=schedule, ready=PdlWait())
+
+    def get_name(self) -> str:
+        return f"warpdrive_packed_toy_{self.work.get_key()}_cs{self.cluster.size}"
+
+    @cute.jit
+    def _hit(self, r: int, item, ctx):
+        m, n, li = item
+        if cute.arch.lane_idx() == 0 and cute.arch.warp_idx() == r:
+            tile = (li * ctx.en + n) * ctx.em + m
+            cute.arch.atomic_add(ctx.hits.iterator + (r * ctx.hits.shape[1] + tile), Int32(1))
+
+    @role(warps=0)
+    @cute.jit
+    def a(self, work: WorkCursor, ctx):
+        while work.valid:
+            self._hit(0, work.item, ctx)
+            work.advance()
+        return work
+
+    @role(warps=range(1, 3))
+    @cute.jit
+    def b(self, work: WorkCursor, ctx):
+        while work.valid:
+            self._hit(1, work.item, ctx)
+            work.advance()
+        return work
+
+    @cute.kernel
+    def produce(
+        self, table: cute.Tensor, length: cute.Tensor, stamp: cute.Tensor, em, en, el, delay
+    ):
+        cute.arch.griddepcontrol_launch_dependents()
+        tidx, _, _ = cute.arch.thread_idx()
+        start = cute.arch.globaltimer_lo()
+        while cute.arch.globaltimer_lo() - start < delay:
+            pass
+        for i in cutlass.range(tidx, em * en * el, self.PRODUCER_THREADS, unroll=1):
+            li = i // (em * en)
+            n = (i - li * em * en) // em
+            m = i - li * em * en - n * em
+            if _packed_keep(m, n, li):
+                row = cute.arch.atomic_add(length.iterator, Int32(1), scope="gpu")
+                table[row, 0] = m
+                table[row, 1] = n
+                table[row, 2] = li
+        cute.arch.sync_threads()
+        if tidx == 0:
+            stamp[0] = cute.arch.globaltimer_lo()
+
+    @cute.kernel
+    def kernel(self, hits: cute.Tensor, entry: cute.Tensor, em: Int32, en: Int32, bound):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        if tidx == 0:
+            entry[bidx] = cute.arch.globaltimer_lo()
+        self.begin_roles(work=bound)
+        self.run_roles(SimpleNamespace(hits=hits, em=em, en=en))
+
+    @cute.jit
+    def __call__(
+        self,
+        table: cute.Tensor,
+        length: cute.Tensor,
+        stamp: cute.Tensor,
+        hits: cute.Tensor,
+        entry: cute.Tensor,
+        workspace: cute.Tensor,
+        em: Int32,
+        en: Int32,
+        el: Int32,
+        delay: Int32,
+        max_ctas: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.produce.set_name_prefix(self.get_name() + "_produce")
+        self.produce(table, length, stamp, em, en, el, delay).launch(
+            grid=(1, 1, 1), block=(self.PRODUCER_THREADS, 1, 1), stream=stream
+        )
+        bound = self.work.bind((table, length), workspace, max_ctas)
+        self.kernel.set_name_prefix(self.get_name())
+        self.kernel(hits, entry, em, en, bound).launch(
+            **self.launch_config(bound), stream=stream, use_pdl=True
+        )
+
+
+@pytest.mark.parametrize("cluster", [SingleCta(), CtaPair()], ids=["single", "pair"])
+@pytest.mark.parametrize("schedule", ["oneshot", "static", "atomic", "clc"])
+def test_device_built_list_under_pdl(requires_blackwell, schedule, cluster):
+    """The consumer launches before the producer finishes (PDL), waits in ``PdlWait``, and runs
+    exactly the rows the producer wrote: every kept item once per CTA of its unit, in both
+    roles, nothing past the device-side length (the table has spare capacity, prefilled with
+    rows that would hit item 0)."""
+    schedules = {
+        "oneshot": OneShot(),
+        "static": StaticPersistent(),
+        "atomic": AtomicPersistent(stages=2),
+        "clc": ClusterLaunchControl(stages=2),
+    }
+    op = PackedToy(schedules[schedule], cluster)
+    i32 = cutlass.Int32
+    fn = compile_tvm_ffi(
+        op,
+        make_fake_compact_tensor(i32, (cute.sym_int(), 3)),
+        *(make_fake_compact_tensor(i32, (cute.sym_int(),)) for _ in range(2)),
+        make_fake_compact_tensor(i32, (2, cute.sym_int())),
+        *(make_fake_compact_tensor(i32, (cute.sym_int(),)) for _ in range(2)),
+        *(Int32(1) for _ in range(5)),
+    )
+    em, en, el = 7, 5, 3
+    total = em * en * el
+    capacity = total + 23
+    want = torch.tensor(
+        [
+            cluster.size if _packed_keep(m, n, li) else 0
+            for li in range(el)
+            for n in range(en)
+            for m in range(em)
+        ],
+        dtype=torch.int32,
+    )
+    ws, _ = op.work.launch_args("cuda")
+    for max_ctas in (148, 6):
+        table = torch.zeros(capacity, 3, dtype=torch.int32, device="cuda")
+        length = torch.zeros(1, dtype=torch.int32, device="cuda")
+        stamp = torch.zeros(1, dtype=torch.int32, device="cuda")
+        hits = torch.zeros(2, total, dtype=torch.int32, device="cuda")
+        entry = torch.zeros(capacity * cluster.size, dtype=torch.int32, device="cuda")
+        fn(table, length, stamp, hits, entry, ws, em, en, el, 200_000, max_ctas)
+        torch.cuda.synchronize()
+        assert int(length) == int((want > 0).sum())
+        assert torch.equal(hits[0].cpu(), want) and torch.equal(hits[1].cpu(), want), max_ctas
+        assert ws[:2].tolist() == [0, 0]
+        # Some consumer CTA entered before the producer's last write: the dependency was real.
+        launched = entry[entry != 0].cpu().long()
+        early = ((launched - int(stamp)) + 2**31) % 2**32 - 2**31 < 0
+        assert early.any(), "the consumer did not overlap the producer; PDL not exercised"
