@@ -208,8 +208,25 @@ def compile_gemm(op: Gemm):
     )
 
 
-def gemm(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
-    """``a @ b.T`` for row-major bf16 ``a: (M, K)``, ``b: (N, K)``."""
+def _byte_span(t: torch.Tensor) -> tuple[int, int]:
+    """``[start, stop)`` of the bytes ``t`` addresses (empty for zero elements)."""
+    if t.numel() == 0:
+        return 0, 0
+    extent = 1 + sum((size - 1) * stride for size, stride in zip(t.shape, t.stride()))
+    return t.data_ptr(), t.data_ptr() + extent * t.element_size()
+
+
+def _overlaps(x: torch.Tensor, y: torch.Tensor) -> bool:
+    (x0, x1), (y0, y1) = _byte_span(x), _byte_span(y)
+    return x0 < y1 and y0 < x1
+
+
+def check_gemm_args(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor | None) -> torch.Tensor:
+    """Check the operands of ``a @ b.T`` and return ``out`` (allocated when ``None``).
+
+    ``out`` must not share memory with ``a`` or ``b``: one tile's TMA store can overwrite
+    operand rows that another tile (another CTA, or a later persistent iteration) still loads.
+    """
     if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16:
         raise TypeError("gemm expects bfloat16 operands")
     if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[1]:
@@ -218,8 +235,27 @@ def gemm(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor | None = None) -> t
         raise ValueError("a and b must be contiguous and 16-byte aligned")
     if a.shape[1] % 8 or b.shape[0] % 8:
         raise ValueError("K and N must be multiples of 8 (16-byte TMA strides)")
+    if b.device != a.device:
+        raise ValueError(f"a and b must be on one device, got {a.device} and {b.device}")
+    shape = (a.shape[0], b.shape[0])
     if out is None:
-        out = a.new_empty(a.shape[0], b.shape[0])
+        return a.new_empty(shape)
+    if out.dtype != torch.bfloat16:
+        raise TypeError(f"out must be bfloat16, got {out.dtype}")
+    if out.shape != shape or out.device != a.device:
+        raise ValueError(
+            f"out must have shape {shape} on {a.device}, got {tuple(out.shape)} on {out.device}"
+        )
+    if not out.is_contiguous() or out.data_ptr() % 16:
+        raise ValueError("out must be contiguous and 16-byte aligned")
+    if _overlaps(out, a) or _overlaps(out, b):
+        raise ValueError("out must not overlap a or b")
+    return out
+
+
+def gemm(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+    """``a @ b.T`` for row-major bf16 ``a: (M, K)``, ``b: (N, K)``."""
+    out = check_gemm_args(a, b, out)
     compile_gemm(Gemm())(a, b, out)
     return out
 

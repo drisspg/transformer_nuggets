@@ -28,6 +28,7 @@ from transformer_nuggets.cute.warp_roles import (
     role,
 )
 from transformer_nuggets.cute.warp_roles.examples.gemm import gemm
+from transformer_nuggets.cute.warp_roles.examples.persistent_gemm import persistent_gemm
 
 
 @pytest.fixture
@@ -383,6 +384,57 @@ def test_gemm(requires_blackwell, m, n, k):
     torch_err = (torch.nn.functional.linear(a, b).float() - ref).abs().max().item()
     err = (gemm(a, b).float() - ref).abs().max().item()
     assert err <= 2 * torch_err + 1e-3
+
+
+GEMMS = pytest.mark.parametrize("fn", [gemm, persistent_gemm], ids=lambda f: f.__name__)
+
+
+def _out_view(buf: torch.Tensor, offset: int, m: int, n: int) -> torch.Tensor:
+    return buf[offset : offset + m * n].view(m, n)
+
+
+@GEMMS
+@pytest.mark.parametrize("alias", ["out_is_a", "out_is_b", "out_overlaps_half_of_a"])
+def test_gemm_rejects_out_overlapping_operands(requires_blackwell, fn, alias):
+    """512^3 has 8 output tiles: a tile's store would overwrite rows another tile still loads."""
+    size = 512
+    buf = torch.randn(3 * size * size, device="cuda", dtype=torch.bfloat16)
+    a = _out_view(buf, 0, size, size)
+    b = _out_view(buf, 2 * size * size, size, size)
+    out = {"out_is_a": a, "out_is_b": b, "out_overlaps_half_of_a": None}[alias]
+    if out is None:
+        out = _out_view(buf, size * size // 2, size, size)
+    with pytest.raises(ValueError, match="out must not overlap a or b"):
+        fn(a, b, out)
+
+
+@GEMMS
+def test_gemm_accepts_out_adjacent_to_operands(requires_blackwell, fn):
+    size = 512
+    buf = torch.randn(3 * size * size, device="cuda", dtype=torch.bfloat16)
+    a, out, b = (_out_view(buf, i * size * size, size, size) for i in range(3))
+    ref = torch.nn.functional.linear(a.float(), b.float())
+    fn(a, b, out)
+    assert (out.float() - ref).abs().max().item() < 0.05 * ref.abs().max().item()
+
+
+@GEMMS
+@pytest.mark.parametrize(
+    "m, n, k, out, error",
+    [
+        (2, 8, 0, torch.ones(1), TypeError),  # float32 out for an empty-K problem
+        (2, 8, 0, torch.ones(1, dtype=torch.bfloat16), ValueError),  # wrong shape, empty K
+        (0, 8, 16, torch.empty(3, 8, dtype=torch.bfloat16), ValueError),  # wrong shape, M = 0
+        (4, 8, 0, torch.empty(8, 4, dtype=torch.bfloat16).t(), ValueError),  # transposed out
+    ],
+    ids=["dtype_empty_k", "shape_empty_k", "shape_empty_m", "layout"],
+)
+def test_gemm_checks_out_before_zero_work_returns(fn, m, n, k, out, error):
+    """Zero-work problems return before dispatch; ``out`` still has to fit the contract."""
+    a = torch.zeros(m, k, dtype=torch.bfloat16)
+    b = torch.zeros(n, k, dtype=torch.bfloat16)
+    with pytest.raises(error, match="out must"):
+        fn(a, b, out)
 
 
 # --------------------------------------------------------------------------- #

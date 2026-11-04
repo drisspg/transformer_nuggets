@@ -53,6 +53,7 @@ from transformer_nuggets.cute.warp_roles import (
     WarpSpecialized,
     role,
 )
+from transformer_nuggets.cute.warp_roles.examples.gemm import check_gemm_args
 
 CTA_TILE_M, TILE_K = 128, 64  # per-CTA output rows and K step; tile N is a constructor argument
 EPI_TILE = (128, 32)  # one TMA store box; tile_n // 32 per CTA output tile
@@ -326,16 +327,7 @@ def persistent_gemm(
     """``a @ b.T`` for row-major bf16 ``a: (M, K)``, ``b: (N, K)``. ``policy`` defaults to
     ``StaticPersistent()``; ``max_ctas`` caps the persistent grid in CTAs (default: the SM
     count); ``cluster=CtaPair()`` runs 2-CTA 256x256 tiles."""
-    if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16:
-        raise TypeError("persistent_gemm expects bfloat16 operands")
-    if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[1]:
-        raise ValueError(f"incompatible shapes {tuple(a.shape)}, {tuple(b.shape)}")
-    if not (a.is_contiguous() and b.is_contiguous()) or a.data_ptr() % 16 or b.data_ptr() % 16:
-        raise ValueError("a and b must be contiguous and 16-byte aligned")
-    if a.shape[1] % 8 or b.shape[0] % 8:
-        raise ValueError("K and N must be multiples of 8 (16-byte TMA strides)")
-    if out is None:
-        out = a.new_empty(a.shape[0], b.shape[0])
+    out = check_gemm_args(a, b, out)
     if out.numel() == 0:
         return out
     if a.shape[1] == 0:  # no K tiles: the MMA would publish an unwritten accumulator
