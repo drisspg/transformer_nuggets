@@ -130,7 +130,7 @@ class StreamSpec:
     @property
     def total(self) -> int:
         em, en, el = self.extents
-        return em * en * el
+        return em * en * el if min(self.extents) > 0 else 0  # R17: any extent <= 0 is empty
 
     @property
     def plain_raster(self) -> bool:
@@ -586,10 +586,13 @@ def generate(
             extents = (rng.randint(1, 12), rng.randint(1, 12), rng.randint(1, 3))
             if rng.random() < 0.15:
                 extents = (1, 1, 1)
-        if empty:
+        if empty:  # at least one extent is zero or negative (R17: both mean an empty space)
             zero_axis = rng.randrange(3)
             extents = tuple(
-                0 if i == zero_axis or rng.random() < 0.2 else e for i, e in enumerate(extents)
+                (0 if rng.random() < 0.75 else -rng.randint(1, 3))
+                if i == zero_axis or rng.random() < 0.2
+                else e
+                for i, e in enumerate(extents)
             )
         stream_spec = StreamSpec(
             policy=policy,

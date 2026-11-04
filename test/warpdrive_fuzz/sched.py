@@ -82,7 +82,7 @@ def check_grid(s: gen.StreamSpec, cs: int) -> list[str]:
     }[s.policy]
     stream = TileStream(order=raster_of(s), policy=policy)
     stream.owner = SimpleNamespace(cluster=CtaPair() if cs == 2 else SingleCta())
-    got = tuple(TileProblem(stream, s.extents, None, s.max_ctas).grid())
+    got = tuple(TileProblem(stream, stream.order.bind(s.extents), None, s.max_ctas).grid())
     want = oracle.expected_grid(SimpleNamespace(cs=cs, stream=s, units=1))
     return (
         []

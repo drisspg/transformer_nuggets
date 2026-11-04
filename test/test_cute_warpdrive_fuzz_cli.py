@@ -111,8 +111,11 @@ def test_known_failure_is_not_a_success(monkeypatch, tmp_path):
     assert fuzz_warpdrive.runtime_campaign(campaign_args(tmp_path, seeds="0")) == 1
 
 
-def test_empty_corpus_always_has_a_zero_extent():
+def test_empty_corpus_always_has_an_empty_extent():
+    seen_negative = False
     for seed in range(100):
         spec = gen.generate(seed, empty=True)
         assert spec.stream is not None
-        assert 0 in spec.stream.extents, (seed, spec.stream.extents)
+        assert min(spec.stream.extents) <= 0, (seed, spec.stream.extents)
+        seen_negative |= min(spec.stream.extents) < 0
+    assert seen_negative  # negative extents also mean an empty space (R17)

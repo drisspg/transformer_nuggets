@@ -16,6 +16,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from dataclasses import asdict, dataclass, field
@@ -28,7 +29,7 @@ PASS, FAIL, HANG, CRASH, REJECT, ERROR = "pass", "fail", "hang", "crash", "rejec
 TOOL = "tool"  # a wrapper (compute-sanitizer --error-exitcode) reported a finding
 
 
-# Confirmed findings (agent_space/warpdrive/fuzz/FINDINGS.md, section A): a non-passing case
+# Confirmed findings (test/warpdrive_fuzz/FINDINGS.md, runtime section): a non-passing case
 # whose status and detail match is reported under the finding's id instead of as new.
 KNOWN = {
     "F-A1": (REJECT, re.compile(r"mixed register budgets \{[^}]*tiles\.scheduler")),
@@ -229,6 +230,8 @@ def _launch_and_check(spec, op, fn, device, srcs, tag: str):
 
 
 PHASE = "@@phase "
+PHASE_COMPILED = (PHASE + "compiled").encode()
+COMPILE_BUDGET_S = 900.0  # compile/startup allowance before the hang timer starts
 
 
 def _phase(name: str):
@@ -277,16 +280,29 @@ def run_isolated(
         stderr=subprocess.STDOUT,
         start_new_session=True,
     )
-    try:
-        output, _ = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
+    # The hang timer starts once the child reports "compiled": a slow compile (file cache off,
+    # loaded host) is not a hang, and must not turn a detected mutant into a harness error.
+    chunks: list[bytes] = []
+    reader = threading.Thread(target=lambda: chunks.extend(iter(proc.stdout.readline, b"")))
+    reader.start()
+    started, compiled_at = time.monotonic(), None
+    while proc.poll() is None:
+        now = time.monotonic()
+        if compiled_at is None and PHASE_COMPILED in b"".join(chunks):
+            compiled_at = now
+        deadline = (compiled_at + timeout) if compiled_at else (started + COMPILE_BUDGET_S)
+        if now > deadline:
+            break
+        time.sleep(0.05)
+    if proc.poll() is None:
         os.killpg(proc.pid, signal.SIGTERM)
         try:
-            output, _ = proc.communicate(timeout=10)
+            proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             os.killpg(proc.pid, signal.SIGKILL)
-            output, _ = proc.communicate()
-        text = output.decode(errors="replace")
+            proc.wait()
+        reader.join()
+        text = b"".join(chunks).decode(errors="replace")
         phase = last_phase(text)
         status = HANG if phase.startswith("launch ") else ERROR
         return CaseResult(
@@ -296,7 +312,8 @@ def run_isolated(
             detail=f"no exit in {timeout}s during {phase!r}\n{text[-2000:]}",
             source=str(workdir / f"{gen.kernel_name(spec)}.py"),
         )
-    text = output.decode(errors="replace")
+    reader.join()
+    text = b"".join(chunks).decode(errors="replace")
     if out_path.exists():
         data = json.loads(out_path.read_text())
         out_path.unlink()

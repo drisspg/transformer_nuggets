@@ -176,6 +176,10 @@ class Raster(WorkMapping):
     def bind(self, space):
         if len(space) != 3:
             raise ValueError(f"Raster space is (m_tiles, n_tiles, l), got {space!r}")
+        if all(isinstance(e, int) for e in space):  # static extents: the same rule on the host
+            if min(space) <= 0:
+                return (1, 1, 0)
+            return tuple(min(e, INT32_MAX) for e in space)
         em, en, el = (Int32(e) for e in space)
         # INT32_MAX when every extent is positive, else 0 (clamping the space to (1, 1, 0)).
         cap = cutlass.max(cutlass.min(cutlass.min(cutlass.min(em, en), el), 1), 0) * INT32_MAX

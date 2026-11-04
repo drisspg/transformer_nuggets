@@ -141,7 +141,7 @@ def test_declared_scopes_match_independent_model(tmp_path_factory, chunk):
 
 
 # --------------------------------------------------------------------------- #
-# Minimized regressions of runtime-fuzzer findings (FINDINGS.md, section A)
+# Minimized regressions of runtime-fuzzer findings (test/warpdrive_fuzz/FINDINGS.md)
 # --------------------------------------------------------------------------- #
 
 

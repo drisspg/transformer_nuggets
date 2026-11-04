@@ -1,7 +1,7 @@
 """Compile-only source mutations of locally valid channel and tile-loop templates.
 
-No compiled callable is ever invoked. Source files are retained under agent_space so a
-finding is independently reproducible; an isolated process should bound long campaigns.
+No compiled callable is ever invoked. Source files are kept in ``MUTATIONS_DIR`` so a finding
+is independently reproducible; an isolated process should bound long campaigns.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import importlib.util
 import os
 import random
 import sys
+import tempfile
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,10 @@ from test.warpdrive_fuzz.mutate_tma import TmaMutation, compile_tma_mutation
 from test.warpdrive_fuzz.static import Finding, FuzzReport
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import ProtocolError
+
+# Generated mutation sources (CuTeDSL needs source files); override with
+# WARPDRIVE_FUZZ_MUTATIONS_DIR to keep them, e.g. under agent_space/.
+MUTATIONS_DIR = Path(tempfile.gettempdir()) / "warpdrive_fuzz_mutations"
 
 
 @dataclass(frozen=True)
@@ -357,16 +362,17 @@ def source_for(mutation: Mutation, seed: int, depth: int = 2) -> str:
 
 def compile_mutation(mutation: Mutation, seed: int, depth: int = 2):
     """Compile fresh source without a runtime tensor, device query, or launch invocation."""
-    os.environ.setdefault("CUTE_DSL_ARCH", "sm_100a")
     if mutation.tma is not None:
         return compile_tma_mutation(mutation.tma)
     source = source_for(mutation, seed, depth)
     digest = hashlib.sha256(source.encode()).hexdigest()[:16]
-    root = Path(__file__).resolve().parents[2] / "agent_space" / "warpdrive" / "fuzz" / "mutations"
+    root = Path(os.environ.get("WARPDRIVE_FUZZ_MUTATIONS_DIR", MUTATIONS_DIR))
     root.mkdir(parents=True, exist_ok=True)
     source_file = root / f"mutation_{digest}.py"
-    if not source_file.exists():
-        source_file.write_text(source)
+    if not source_file.exists():  # atomic: concurrent workers may write the same digest
+        tmp = root / f".mutation_{digest}.{os.getpid()}.tmp"
+        tmp.write_text(source)
+        os.replace(tmp, source_file)
     module_name = f"warpdrive_mutation_{digest}"
     spec = importlib.util.spec_from_file_location(module_name, source_file)
     module = importlib.util.module_from_spec(spec)

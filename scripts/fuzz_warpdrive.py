@@ -7,7 +7,7 @@ Run under a GPU reservation for the runtime fuzzer::
 
 Each runtime case runs in its own interpreter with ``--timeout`` seconds before it counts as a
 hang. Results stream to ``<out>/results.jsonl``; failing cases keep their spec JSON and source in
-``<out>/cases``. ``static`` and ``mutate`` run agent B's host/compile-only corpora (no GPU needed
+``<out>/cases``. ``static`` and ``mutate`` run the host/compile-only corpora (no GPU needed
 with ``CUTE_DSL_ARCH=sm_100a``)::
 
     python scripts/fuzz_warpdrive.py static --seed 0 --budget 1000
@@ -148,7 +148,7 @@ def main() -> int:
     )
     rt.add_argument("--quiet", action="store_true", help="print only non-passing cases")
     for name in ("static", "mutate"):
-        p = sub.add_parser(name, help=f"agent B's {name} corpus (compile-only)")
+        p = sub.add_parser(name, help=f"{name} corpus (compile-only)")
         p.add_argument("--seed", type=int, default=0)
         p.add_argument("--budget", type=int, default=1000)
     args = parser.parse_args()

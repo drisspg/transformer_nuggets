@@ -270,7 +270,7 @@ recognized group/byte accounting, not descriptor legality, disjoint writes or as
 | E98 | Two attributes reference the same channel/turnstile/barrier/stream object, or a generated scheduler name overwrites an attribute | ProtocolError / kernel.py |
 | E99 | scheduler_warp not None or int in [0,32); record not a nonnegative int; broadcast stages not positive int | ValueError / scheduling.py |
 | E100 | Tile-loop yielded condition is not exactly the cursor's valid SSA value | ProtocolError / scheduling.py |
-| E101 | tiles.work read after advance in the same iteration's block or descendant block | ProtocolError / scheduling.py |
+| E101 | tiles.work read after advance in the same iteration's block or descendant block (this also rejects lookahead reads of the next item; read it on the next iteration instead) | ProtocolError / scheduling.py |
 | E102 | Space whose `policy.reach` exceeds Int32 (R18), launched through `launch_config(work)`/`work.grid()` | CUDA launch error (`CUDA_LAUNCH_INVALID_CONFIG`; zero-wide grid, raised at the call) / scheduling.py |
 
 E102 is a runtime rejection: extents are only known inside the compiled entry point, which
@@ -353,7 +353,7 @@ as documented obligations; they are never launched.
 Declaration/compile campaign: seeds **0–49**, **9,200 host probes + 2,850 compile mutations**,
 no unexpected outcomes after hardening. Of the compile mutations, 2,150 rejected as required,
 400 valid templates accepted and 300 documented-obligation/unverified controls accepted.
-The full warpdrive suite including these regressions/quick checks passed **494 tests**.
+The full warpdrive suite including these regressions/quick checks passed (494 tests then; 642 with the runtime fuzzer and the G6 tests).
 The three examples' normalized SASS was unchanged by rejection-only hardening.
 
 **Runtime fuzz results** (`test/warpdrive_fuzz/{gen,oracle,runtime}.py`, GB300, November 2026):
@@ -363,7 +363,7 @@ all four tile policies with skips, caps, the 65535 fallback, runtime-shape relau
 graphs, and CtaPair) are checked for progress (process timeout), exact per-handle epochs and
 counts, placement, per-unit item sequences and coverage, and bitwise determinism.
 
-- About 12,800 kernels before the G6 fix and 2,545 after it (plus 500 zero-work spaces) passed.
+- About 12,800 kernels before the G6 fix and 2,545 after it (plus zero-work spaces from the `--empty` corpus) passed.
 - One bug found and fixed: F-A1, the inserted scheduler warp took the smallest declared budget
   instead of its warpgroup's `regs=None` (`test_scheduler_takes_its_warpgroups_default_budget`).
 - compute-sanitizer racecheck/synccheck/memcheck and CUTracer random delays (5k-100k ns) on 56
