@@ -45,8 +45,9 @@ def runtime_campaign(args) -> int:
     out = Path(args.out)
     cases = out / "cases"
     out.mkdir(parents=True, exist_ok=True)
-    log = (out / "results.jsonl").open("a")
     counts: dict[str, int] = {}
+    failed = False
+    deadline_reached = False
     start = time.time()
 
     def one(seed: int):
@@ -63,10 +64,13 @@ def runtime_campaign(args) -> int:
         return spec, runtime.run_isolated(spec, cases, timeout=args.timeout, wrapper=wrapper)
 
     seeds = _seeds(args.seeds)
-    with ThreadPoolExecutor(args.jobs) as pool:
-        futures = [pool.submit(one, s) for s in seeds]
+    with (out / "results.jsonl").open("a") as log, ThreadPoolExecutor(args.jobs) as pool:
+        futures = {pool.submit(one, seed): seed for seed in seeds}
         for fut in as_completed(futures):
+            if fut.cancelled():
+                continue  # recorded when cancelled at the campaign deadline
             spec, res = fut.result()
+            failed |= res.status != runtime.PASS
             known = runtime.known_finding(res)
             label = f"known:{known}" if known else res.status
             counts[label] = counts.get(label, 0) + 1
@@ -75,7 +79,7 @@ def runtime_campaign(args) -> int:
             row["known"], row["features"] = known, sorted(gen.features(spec))
             log.write(json.dumps(row) + "\n")
             log.flush()
-            if res.status != runtime.PASS and not known:
+            if res.status != runtime.PASS:
                 print(
                     f"seed {res.seed} {res.key} {res.status}: "
                     f"{(res.failures or [res.detail])[0][:300]}",
@@ -87,12 +91,26 @@ def runtime_campaign(args) -> int:
                     f"{res.run_s:.2f}s run)",
                     flush=True,
                 )
-            if args.hours and time.time() - start > args.hours * 3600:
-                for f in futures:
-                    f.cancel()
-                break
+            if not deadline_reached and args.hours and time.time() - start > args.hours * 3600:
+                deadline_reached = True
+                for pending, seed in futures.items():
+                    if pending.cancel():
+                        counts["cancelled"] = counts.get("cancelled", 0) + 1
+                        log.write(
+                            json.dumps(
+                                {
+                                    "seed": seed,
+                                    "status": "cancelled",
+                                    "reason": "campaign deadline",
+                                }
+                            )
+                            + "\n"
+                        )
+                log.flush()
+                # Running jobs cannot be cancelled. Keep draining their verdicts: a late
+                # failure must still fail the campaign, even if it matches a known finding.
     print(json.dumps({"elapsed_s": round(time.time() - start), **counts}))
-    return 0 if all(k == runtime.PASS or k.startswith("known:") for k in counts) else 1
+    return int(failed)
 
 
 def peer_campaign(args) -> int:
@@ -114,7 +132,12 @@ def main() -> int:
     rt.add_argument("--jobs", type=int, default=6, help="cases compiled/run concurrently")
     rt.add_argument("--timeout", type=float, default=120.0, help="seconds before a case hangs")
     rt.add_argument("--out", default="agent_space/warpdrive/fuzz/campaign")
-    rt.add_argument("--hours", type=float, default=0.0, help="stop after this long (0: all)")
+    rt.add_argument(
+        "--hours",
+        type=float,
+        default=0.0,
+        help="cancel queued jobs after this long; collect running jobs (0: all)",
+    )
     rt.add_argument("--pair", type=lambda s: s == "1", default=None, help="force CtaPair (1/0)")
     rt.add_argument("--stream", type=lambda s: s == "1", default=None, help="force a TileStream")
     rt.add_argument("--empty", action="store_true", help="zero-work boundary corpus (G6)")

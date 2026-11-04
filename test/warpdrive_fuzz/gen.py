@@ -587,9 +587,9 @@ def generate(
             if rng.random() < 0.15:
                 extents = (1, 1, 1)
         if empty:
+            zero_axis = rng.randrange(3)
             extents = tuple(
-                0 if i == rng.randrange(3) or rng.random() < 0.2 else e
-                for i, e in enumerate(extents)
+                0 if i == zero_axis or rng.random() < 0.2 else e for i, e in enumerate(extents)
             )
         stream_spec = StreamSpec(
             policy=policy,
