@@ -53,6 +53,8 @@ def expected_grid(spec: KernelSpec) -> tuple[int, int, int]:
     if s is None:
         return (spec.units * cs, 1, 1)
     em, en, el = s.extents
+    if min(s.extents) <= 0 and not s.launch_1d:  # R17: an empty space launches one work unit
+        return (cs, 1, 1)
     if s.launch_1d:
         return (max(s.total, 1) * cs, 1, 1)
     if s.tile_grid:

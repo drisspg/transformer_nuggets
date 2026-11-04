@@ -95,6 +95,10 @@ def check_tile_grid_dims(space: tuple[int, int, int], cs: int) -> list[str]:
     from transformer_nuggets.cute.warpdrive.scheduling import tile_grid_dims
 
     em, en, el = space
+    if min(space) <= 0:  # R17: an empty space launches one work unit
+        want = (cs, 1, 1)
+        got = tuple(tile_grid_dims(space, cs))
+        return [] if got == want else [f"tile_grid_dims({space}, {cs}) = {got}, want {want}"]
     fits = en <= oracle.GRID_YZ_LIMIT and el <= oracle.GRID_YZ_LIMIT
     want = (max(em, 1) * cs, max(en, 1), max(el, 1)) if fits else (max(em * en * el, 1) * cs, 1, 1)
     got = tuple(tile_grid_dims(space, cs))

@@ -121,7 +121,8 @@ class WorkMapping:
         raise NotImplementedError
 
     def size64(self, space):
-        return Int64(self.size(space))
+        size = self.size(space)
+        return size if isinstance(size, int) else Int64(size)
 
     def decode(self, index, space):
         raise NotImplementedError
@@ -188,6 +189,8 @@ class Raster(WorkMapping):
         # Saturates at 2**31 so neither this nor the launch check's arithmetic wraps Int64.
         em, en, el = space
         limit = INT32_MAX + 1
+        if all(isinstance(e, int) for e in space):  # static extents: plain host arithmetic
+            return min(min(em * en, limit) * el, limit)
         return cutlass.min(cutlass.min(Int64(em) * en, limit) * el, limit)
 
     def decode(self, index, space):
@@ -607,7 +610,10 @@ class TileProblem:
         # Every grid extent and index must fit Int32. Past that the grid is zero-wide, so CUDA
         # rejects the launch instead of the kernel covering a wrapped space. This is host code
         # in the jit entry point: kernels pay nothing for the check.
-        reach = policy.reach(self.stream.order.size64(self.space), Int64(units), self.cs)
+        size = self.stream.order.size64(self.space)
+        if isinstance(size, int) and isinstance(units, int):  # static extents: plain host ints
+            return (x if policy.reach(size, units, self.cs) <= INT32_MAX else 0), y, z
+        reach = policy.reach(size, Int64(units), self.cs)
         return Int32(cutlass.select_(reach <= INT32_MAX, x, Int32(0))), y, z
 
 
