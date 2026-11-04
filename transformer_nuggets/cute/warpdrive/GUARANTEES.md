@@ -19,9 +19,10 @@ unseeded wait cycle, and terminating user work. Specifically:
   CTA/cluster code; every participating thread reaches initialization and exit. Named barrier
   IDs **1 and 2** are reserved. Initialize `Barriers(counts=None)` before `run_roles`.
 - Carry ends, cursors and turnstile state through loops/helpers: return and reassign them.
-  Managed roles explicitly return their final tile cursor and tailed producer ends (one object
-  or a tuple). Local names and tuple order do not matter; returning a stale snapshot is not
-  detected and violates the state-carry obligation.
+  Managed roles return every stateful argument: producer/consumer endpoints, tile cursors and
+  turnstile seats (one object or a tuple). Self, params, instance indices, TMEM views and raw
+  barrier pointers are input-only. Local names and tuple order do not matter; a stale snapshot
+  is not detected and violates the state-carry obligation.
 - `Threads` means every thread of every bound role; `Tma`/`Umma` mean one single-warp role
   per side. Use matching dynamic counts/predicates across roles, slots and relevant CTAs.
 - Close each handle once in its opening dynamic region. Use storage only during its owned
@@ -225,7 +226,7 @@ body at `describe()` time.
 | E72 | Cursor has more than one traced advance site | ProtocolError |
 | E73 | Advance is not directly in the body of the while whose condition reads valid | ProtocolError |
 | E74 | Managed role does not return its final tile cursor (IKET on or off) | ProtocolError |
-| E75 | Managed role does not return the producer end needed for a channel tail | ProtocolError |
+| E75 | Managed role does not return a producer/consumer endpoint or turnstile seat | ProtocolError |
 | E103 | Managed role returns an unsupported value, state from another role, or duplicate endpoint/cursor state | ProtocolError |
 | E76 | Unknown unchecked check (allowed: unclosed/cross_region/tma) | ValueError |
 | E77 | unchecked reason not a nonblank string | ValueError |

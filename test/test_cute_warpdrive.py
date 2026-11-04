@@ -89,6 +89,7 @@ class SlotsToy(WarpSpecialized):
                 with ch.consume(j) as h:
                     acc = acc + h.data[lane]
         ctx.out[lane] = acc
+        return ch
 
     @cute.kernel
     def kernel(self, out: cute.Tensor, n: cutlass.Int32):
@@ -117,6 +118,7 @@ class TurnToy(WarpSpecialized):
                     ctx.log[pos + 1] = seat
                     ctx.log[0] = pos + 1
                     cute.arch.fence_acq_rel_cta()
+        return ts
 
     @cute.kernel
     def kernel(self, log: cute.Tensor, n: cutlass.Int32):
@@ -153,6 +155,7 @@ class BoundToy(WarpSpecialized):
             for j in cutlass.range_constexpr(2):
                 with ch.consume(j) as h:
                     ctx.out[lane + 32 * j] = ctx.out[lane + 32 * j] + h.data[lane]
+        return ch
 
     @cute.kernel
     def kernel(self, out: cute.Tensor, n: cutlass.Int32):
@@ -193,6 +196,7 @@ class HoleToy(WarpSpecialized):
                 acc = acc + h.data[lane]
         if cute.arch.warp_idx() == 4:
             ctx.out[lane] = acc
+        return ch
 
     @role(warps=range(8, 12), regs=56)
     @cute.jit
@@ -360,6 +364,7 @@ class TypedCtxToy(WarpSpecialized):
                 acc = acc + h.data[lane]
         if ctx.n > 0:
             ctx.out[lane] = acc
+        return ch
 
     @cute.kernel
     def kernel(self, out: cute.Tensor, n: cutlass.Int32):
@@ -405,6 +410,7 @@ class NamespaceCtxToy(TypedCtxToy):
                 acc = acc + h.data[lane]
         if ctx.n > 0:
             ctx.out[lane] = acc
+        return ch
 
 
 @pytest.mark.parametrize(
@@ -534,7 +540,7 @@ class BoundSlotsToy(WarpSpecialized):
     @role(warps=range(8, 12))
     @cute.jit
     def cons(self, ch: Consumer, ctx):
-        pass
+        return ch
 
 
 def test_wrong_role_on_channel():
@@ -567,7 +573,7 @@ class WideRolesToy(WarpSpecialized):
     @role(warps=range(4, 8))
     @cute.jit
     def cons(self, ch: Consumer, ctx):
-        pass
+        return ch
 
 
 @pytest.mark.parametrize(

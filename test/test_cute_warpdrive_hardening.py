@@ -38,7 +38,7 @@ from transformer_nuggets.cute.warpdrive import (
     role,
     unchecked,
 )
-from transformer_nuggets.cute.warpdrive.examples.gemm import TILE, Gemm, GemmCtx
+from transformer_nuggets.cute.warpdrive.examples.gemm import TILE, Gemm, GemmParams
 
 TILE_ROWS = 64  # one 64x64 bf16 TMA tile per stage
 TILE_BYTES = TILE_ROWS * 64 * 2
@@ -170,6 +170,7 @@ class _TmaToyAll(_TmaToy):
     @cute.jit
     def use(self, ld: Consumer, ctx):
         ld = self.consume(ld, ctx)
+        return ld
 
 
 class _TmaToyLeader(_TmaToy):
@@ -179,6 +180,7 @@ class _TmaToyLeader(_TmaToy):
     @cute.jit
     def use(self, ld: Consumer, ctx):
         ld = self.consume(ld, ctx)
+        return ld
 
 
 def make_tma_toy(cluster, consumer_cta="all", group="ONE", tx=TILE_BYTES, mode="plain"):
@@ -331,6 +333,7 @@ class RawStateToy(WarpSpecialized):
                 ctx.out[4 * i + 2] = h.index
                 ctx.out[4 * i + 3] = h.phase
             h.release()
+        return ch
 
     @cute.kernel
     def kernel(self, out: cute.Tensor, n: cutlass.Int32):
@@ -387,7 +390,7 @@ class OptOutToy(WarpSpecialized):
     @role(warps=1)
     @cute.jit
     def cons(self, ch: Consumer, ctx):
-        pass
+        return ch
 
     @cute.kernel
     def kernel(self, out: cute.Tensor, n: cutlass.Int32):
@@ -486,12 +489,12 @@ class _Overrides(WarpSpecialized):
     @role(warps=1)
     @cute.jit
     def mma(self, ab: Consumer, acc: Producer, ctx):
-        return acc
+        return ab, acc
 
     @role(warps=range(4, 8))
     @cute.jit
     def epi(self, acc: Consumer, ctx):
-        pass
+        return acc
 
 
 def test_overrides_are_shown_against_derived_values():
@@ -525,7 +528,7 @@ class _PairMasks(WarpSpecialized):
     @role(warps=1)
     @cute.jit
     def sink(self, back: Consumer, ctx):
-        pass
+        return back
 
 
 def test_pair_mask_override_wins():
@@ -545,9 +548,9 @@ def test_pair_mask_override_wins():
 
 
 @dataclass(frozen=True)
-class MixedGemmCtx(GemmCtx):
-    """Gemm's context plus the user-built accumulator pipeline; Gemm's load role still takes
-    ``ctx: GemmCtx``, a base of this type."""
+class MixedGemmParams(GemmParams):
+    """Gemm's parameters plus the user-built accumulator pipeline; Gemm's load role still takes
+    ``params: GemmParams``, a base of this type."""
 
     acc_pipe: pipeline.PipelineUmmaAsync
 
@@ -566,7 +569,7 @@ class MixedGemm(Gemm):
 
     @role(warps=5, regs=40)
     @cute.jit
-    def mma(self, ab: Consumer, tmem: Tmem, ctx: MixedGemmCtx):
+    def mma(self, ab: Consumer, tmem: Tmem, ctx: MixedGemmParams):
         tiled_mma = ctx.tiled_mma
         tCtAcc = cute.make_tensor(tmem.ptr("acc"), ctx.acc_layout)
         acc_producer, _ = ctx.acc_pipe.make_participants()
@@ -587,10 +590,11 @@ class MixedGemm(Gemm):
                 tcgen05.commit(s.empty_barrier)
             s.release(signal=False)
         a.commit()
+        return ab
 
     @role(warps=range(4), regs=160, raw=True)
     @cute.jit
-    def epilogue(self, tmem: Tmem, ctx: MixedGemmCtx):
+    def epilogue(self, tmem: Tmem, ctx: MixedGemmParams):
         tidx, _, _ = cute.arch.thread_idx()
         t2r = tcgen05.make_tmem_copy(
             cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition.x32), cutlass.Float32),
@@ -627,7 +631,7 @@ class MixedGemm(Gemm):
             defer_sync=True,
         )
         values = {f.name: getattr(ctx, f.name) for f in fields(ctx)}
-        super().run_roles(MixedGemmCtx(**values, acc_pipe=acc_pipe))
+        super().run_roles(MixedGemmParams(**values, acc_pipe=acc_pipe))
 
 
 _MIXED = MixedGemm()

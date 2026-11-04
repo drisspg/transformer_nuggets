@@ -842,9 +842,9 @@ class WarpSpecialized:
                         cute.arch.mbarrier_init(bars + i, leader[i] + (peer[i] - leader[i]) * rank)
 
     @cute.jit
-    def run_roles(self, ctx):
-        """CTA sync (barrier init + TMEM address), role dispatch, TMEM teardown."""
-        ctx = self._role_context(ctx)
+    def run_roles(self, params):
+        """Dispatch roles with the kernel-specific input params, then perform teardown."""
+        params = self._role_context(params)
         pair = self.cluster.size > 1
         if cutlass.const_expr(not pair):
             # Fences mbarrier.init and syncs the CTA; the same bar.sync publishes the TMEM base
@@ -873,7 +873,7 @@ class WarpSpecialized:
         groups = self._ws_budget_groups
         for gi in cutlass.range_constexpr(len(groups)):
             if _in_warpgroups(warp_idx, groups[gi][1]):
-                self._dispatch_group(groups[gi], ctx, tmem_threads, warp_idx, rank)
+                self._dispatch_group(groups[gi], params, tmem_threads, warp_idx, rank)
         if cutlass.const_expr(pair):
             # Remote arrivals into a CTA must land before it exits: every thread-issued remote
             # arrive precedes its thread's cluster arrive (release), and producers whose stages
@@ -959,26 +959,20 @@ class WarpSpecialized:
             push(r.name)
         result = r.fn(self, *args)
         if not r.raw:
-            final = _returned_state(r.name, result, args)
-            for pname, arg in zip((p for p, _ in r.params), args):
-                if isinstance(arg, TileCursor):
-                    cur = final.get(id(arg._rec))
-                    if cur is None:
-                        raise ProtocolError(
-                            f"{r.name}: return the final tile cursor for {pname} from the role "
-                            f"(for example, return {pname}); roles with Tiles must return it "
-                            "even when IKET is disabled"
-                        )
-                    if self.iket:
+            state_args = [
+                (pname, arg)
+                for (pname, _), arg in zip(r.params, args)
+                if isinstance(arg, _ROLE_STATE_TYPES)
+            ]
+            final = _returned_state(r.name, result, state_args)
+            if self.iket:
+                for _, arg in state_args:
+                    if isinstance(arg, TileCursor):
+                        cur = final[_state_identity(arg)]
                         pop_if(cur.index < cur._problem.total)
-            for pname, rec in trace.tails:
-                end = final.get(id(rec))
-                if end is None:
-                    raise ProtocolError(
-                        f"{r.name}: return the final producer end for {pname} from the role "
-                        f"(for example, return {pname}); its channel needs a tail at role exit"
-                    )
-                end.tail()
+            for _, arg in state_args:
+                if isinstance(arg, ProducerEnd) and arg.scope.tail:
+                    final[_state_identity(arg)].tail()
         if whole_range:
             pop()
         if not r.raw:
@@ -1074,8 +1068,6 @@ class WarpSpecialized:
         end = cls(
             chan, self._ws_bars[pname], self._ws_payload.get(pname), trace, bound, state, cta
         )
-        if is_prod and chan.scope.tail:
-            trace.tails.append((pname, end._rec))
         return end
 
 
@@ -1098,30 +1090,44 @@ class RoleContext(SimpleNamespace):
         return self
 
 
-def _returned_state(role_name: str, result, args: list) -> dict:
-    """Match explicitly returned endpoints/cursors to their input identities, not local names.
+_ROLE_STATE_TYPES = (ProducerEnd, ConsumerEnd, TileCursor, TurnEnd)
 
-    Loop-carried reconstructions share a record, so returning a renamed or helper-updated end
-    still identifies its channel. Which version is current remains an explicit dataflow
-    obligation: returning an old snapshot cannot be made safe by inspecting Python names.
+
+def _state_identity(state):
+    if isinstance(state, TurnEnd):
+        return id(state._trace), id(state._ts), state._seat
+    return id(state._rec)
+
+
+def _returned_state(role_name: str, result, state_args: list[tuple[str, object]]) -> dict:
+    """Match explicit state results to inputs, independent of names and tuple order.
+
+    Reconstructed endpoints/cursors share a record; turnstile copies share a role, turnstile
+    and seat. This checks ownership, not freshness: the author must return loop-carried state
+    rather than a snapshot saved before the loop.
     """
     values = () if result is None else result if isinstance(result, tuple) else (result,)
-    owned = {id(arg._rec) for arg in args if isinstance(arg, (ProducerEnd, TileCursor))}
+    owned = {_state_identity(arg) for _, arg in state_args}
     final = {}
     for value in values:
-        if not isinstance(value, (ProducerEnd, TileCursor)):
+        if not isinstance(value, _ROLE_STATE_TYPES):
             raise ProtocolError(
-                f"{role_name}: return final producer ends and tile cursors (a single value or "
-                f"a tuple), not {type(value).__name__}"
+                f"{role_name}: return channel endpoints, tile cursors and turnstile seats "
+                f"(a single value or tuple), not {type(value).__name__}"
             )
-        key = id(value._rec)
+        key = _state_identity(value)
         if key not in owned:
             raise ProtocolError(f"{role_name}: returned state does not belong to this role")
         if key in final:
-            raise ProtocolError(
-                f"{role_name}: returned the same endpoint or cursor more than once"
-            )
+            raise ProtocolError(f"{role_name}: returned the same state argument more than once")
         final[key] = value
+    missing = [name for name, arg in state_args if _state_identity(arg) not in final]
+    if missing:
+        names = ", ".join(name for name, _ in state_args)
+        raise ProtocolError(
+            f"{role_name}: return all warpdrive state arguments; missing {', '.join(missing)} "
+            f"(for example, return {names})"
+        )
     return final
 
 

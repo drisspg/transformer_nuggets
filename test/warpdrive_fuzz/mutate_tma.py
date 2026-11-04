@@ -66,6 +66,7 @@ class TmaProbe(WarpSpecialized):
     @cute.jit
     def cons(self, ch: Consumer, ctx):
         ch = self.use(ch, ctx)
+        return ch
 
     @cute.kernel
     def kernel(self, tma, tg, n: cutlass.Int32, layout):
@@ -95,6 +96,7 @@ class TmaLeaderProbe(TmaProbe):
     @cute.jit
     def cons(self, ch: Consumer, ctx):
         ch = self.use(ch, ctx)
+        return ch
 
 
 def compile_tma_mutation(config: TmaMutation):

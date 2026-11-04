@@ -38,7 +38,7 @@ EPI_SUBTILES = 8  # 32 fp32 columns per tcgen05.ld 32x32b.x32
 
 
 @dataclass(frozen=True)
-class GemmCtx:
+class GemmParams:
     """Kernel-prologue values the roles read; built once in ``Gemm.kernel``."""
 
     tiled_mma: cute.TiledMma
@@ -81,21 +81,21 @@ class Gemm(WarpSpecialized):
 
     @role(warps=4, regs=40)
     @cute.jit
-    def load(self, ab: Producer, tiles: Tiles, ctx: GemmCtx):
+    def load(self, params: GemmParams, ab: Producer, tiles: Tiles):
         while tiles.valid:
             m, n, _ = tiles.work
-            for k in cutlass.range(ctx.num_k_tiles, unroll=1):
+            for k in cutlass.range(params.num_k_tiles, unroll=1):
                 with ab.produce() as s:
                     cute.copy(
-                        ctx.tma_a,
-                        ctx.tAgA[None, m, k],
-                        ctx.tAsA[None, s.index],
+                        params.tma_a,
+                        params.tAgA[None, m, k],
+                        params.tAsA[None, s.index],
                         tma_bar_ptr=s.barrier,
                     )
                     cute.copy(
-                        ctx.tma_b,
-                        ctx.tBgB[None, n, k],
-                        ctx.tBsB[None, s.index],
+                        params.tma_b,
+                        params.tBgB[None, n, k],
+                        params.tBsB[None, s.index],
                         tma_bar_ptr=s.barrier,
                     )
             tiles.advance()
@@ -103,49 +103,49 @@ class Gemm(WarpSpecialized):
 
     @role(warps=5, regs=40)
     @cute.jit
-    def mma(self, ab: Consumer, acc: Producer, tiles: Tiles, tmem: Tmem, ctx: GemmCtx):
-        tiled_mma = ctx.tiled_mma
-        tCtAcc = cute.make_tensor(tmem.ptr("acc"), ctx.acc_layout)
+    def mma(self, params: GemmParams, ab: Consumer, acc: Producer, tiles: Tiles, tmem: Tmem):
+        tiled_mma = params.tiled_mma
+        tCtAcc = cute.make_tensor(tmem.ptr("acc"), params.acc_layout)
         while tiles.valid:
             with acc.produce() as a:
                 tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-                for k in cutlass.range(ctx.num_k_tiles, unroll=1):
+                for k in cutlass.range(params.num_k_tiles, unroll=1):
                     with ab.consume() as s:
-                        for kb in cutlass.range_constexpr(cute.size(ctx.tCrA, mode=[2])):
+                        for kb in cutlass.range_constexpr(cute.size(params.tCrA, mode=[2])):
                             cute.gemm(
                                 tiled_mma,
                                 tCtAcc[None, None, None, a.index],
-                                ctx.tCrA[None, None, kb, s.index],
-                                ctx.tCrB[None, None, kb, s.index],
+                                params.tCrA[None, None, kb, s.index],
+                                params.tCrB[None, None, kb, s.index],
                                 tCtAcc[None, None, None, a.index],
                             )
                             tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
             tiles.advance()
-        return acc, tiles
+        return ab, acc, tiles
 
     @role(warps=range(4), regs=160)
     @cute.jit
-    def epilogue(self, acc: Consumer, tiles: Tiles, tmem: Tmem, ctx: GemmCtx):
+    def epilogue(self, params: GemmParams, acc: Consumer, tiles: Tiles, tmem: Tmem):
         tidx, _, _ = cute.arch.thread_idx()
         t2r = tcgen05.make_tmem_copy(
             cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition.x32), cutlass.Float32),
-            cute.zipped_divide(ctx.acc_fake, ctx.epi_tiler)[None, 0],
+            cute.zipped_divide(params.acc_fake, params.epi_tiler)[None, 0],
         ).get_slice(tidx)
-        tAcc = cute.make_tensor(tmem.ptr("acc"), ctx.acc_layout)
-        rows, cols = ctx.mC.shape
+        tAcc = cute.make_tensor(tmem.ptr("acc"), params.acc_layout)
+        rows, cols = params.mC.shape
         while tiles.valid:
             m, n, _ = tiles.work
-            tCgC = ctx.tCgC[None, None, None, m, n]
-            tDgC = t2r.partition_D(cute.zipped_divide(tCgC, ctx.epi_tiler))
+            tCgC = params.tCgC[None, None, None, m, n]
+            tDgC = t2r.partition_D(cute.zipped_divide(tCgC, params.epi_tiler))
             tDcC = t2r.partition_D(
-                cute.zipped_divide(ctx.tCcC[None, None, None, m, n], ctx.epi_tiler)
+                cute.zipped_divide(params.tCcC[None, None, None, m, n], params.epi_tiler)
             )
             rAcc = cute.make_rmem_tensor(tDgC[None, None, 0].shape, cutlass.Float32)
             rC = cute.make_rmem_tensor(tDgC[None, None, 0].shape, self.dtype)
             full_tile = ((m + 1) * TILE[0] <= rows) & ((n + 1) * TILE[1] <= cols)
             with acc.consume() as a:
                 tDtC = t2r.partition_S(
-                    cute.zipped_divide(tAcc[None, None, None, a.index], ctx.epi_tiler)
+                    cute.zipped_divide(tAcc[None, None, None, a.index], params.epi_tiler)
                 )
                 for i in cutlass.range_constexpr(EPI_SUBTILES):
                     cute.copy(t2r, tDtC[None, None, i], rAcc)
@@ -155,10 +155,10 @@ class Gemm(WarpSpecialized):
                     else:
                         g, crd = tDgC[None, None, i], tDcC[None, None, i]
                         for j in cutlass.range_constexpr(cute.size(rC)):
-                            if cute.elem_less(crd[j], ctx.mC.shape):
+                            if cute.elem_less(crd[j], params.mC.shape):
                                 g[j] = rC[j]
             tiles.advance()
-        return tiles
+        return acc, tiles
 
     # ----------------------------------------------------------------- kernel
 
@@ -189,7 +189,7 @@ class Gemm(WarpSpecialized):
         acc_fake = tiled_mma.make_fragment_C(acc_shape)
         acc_staged = tiled_mma.make_fragment_C(cute.append(acc_shape, self.acc_stages))
         cC = cute.make_identity_tensor(mC.shape)
-        ctx = GemmCtx(
+        params = GemmParams(
             tiled_mma=tiled_mma,
             tma_a=tma_a,
             tma_b=tma_b,
@@ -216,7 +216,7 @@ class Gemm(WarpSpecialized):
             ),
             mC=mC,
         )
-        self.run_roles(ctx)
+        self.run_roles(params)
 
     # ------------------------------------------------------------------- host
 

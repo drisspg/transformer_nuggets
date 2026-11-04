@@ -80,6 +80,7 @@ class ConfiguredCopy(WarpSpecialized):
             with data.consume() as h:
                 value += h.data[lane]
         ctx.out[cute.arch.thread_idx()[0]] = value
+        return data
 
     @cute.kernel
     def kernel(self, out: cute.Tensor, iterations: cutlass.Int32):
@@ -113,7 +114,7 @@ class FixedCopy(ConfiguredCopy):
     @role(warps=range(4, 8), regs=160)
     @cute.jit
     def consume(self, data: Consumer, ctx: CopyCtx):
-        pass
+        return data
 
 
 def test_config_matches_shorthand_and_normalizes_warps():
@@ -172,7 +173,7 @@ def test_callable_object_and_lambda_instances(selector):
         @role(warps=2)
         @cute.jit
         def consume(self, data: Consumer, ctx):
-            pass
+            return data
 
     op = Instanced()
     op.describe()

@@ -70,6 +70,7 @@ PRODUCER_BODY
         for i in cutlass.range(ctx.n, unroll=1):
             h = ch.wait(SLOT)
             h.release()
+        return ch
 
     @cute.kernel
     def kernel(self, out: cute.Tensor, n: cutlass.Int32):

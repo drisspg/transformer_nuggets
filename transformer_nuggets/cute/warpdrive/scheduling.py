@@ -1001,4 +1001,4 @@ def scheduler_role(kernel, work, tiles: TileCursor, fetch: _Fetch):
             _publish(h, index, _decode(stream, index, problem), problem.total)
         tiles.advance()
     fetch.finish()
-    return tiles
+    return work, tiles

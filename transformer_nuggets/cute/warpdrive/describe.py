@@ -99,7 +99,7 @@ def _header(kernel) -> str:
     ctx = kernel._ws_ctx_type
     rows = [
         ["cluster", kernel.cluster.describe()],
-        ["context", ctx.__name__ if ctx is not None else "unannotated (any object)"],
+        ["params", ctx.__name__ if ctx is not None else "unannotated (any object)"],
     ]
     return "\n".join(lines + _table(rows))
 

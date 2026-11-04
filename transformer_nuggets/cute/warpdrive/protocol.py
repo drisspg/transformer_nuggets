@@ -160,7 +160,6 @@ class RoleTrace:
         self.item_block = None  # the work-item loop body (set by the TileCursor's advance())
         self.open: list = []
         self.checks: list = []  # end-of-role trace checks (e.g. tile cursors)
-        self.tails: list = []  # producer ends the layer drains at role exit (pair channels)
         self.tma_bars: list = []  # TMA-channel full-barrier pointers handed out (tma.py)
         self.root = current_block()
 

@@ -102,7 +102,7 @@ class PairToy(WarpSpecialized):
             pass
         if cute.arch.lane_idx() == 0:
             ctx.out[2] = 2 * ctx.n + 1
-        return back
+        return ch, back
 
     @role(warps=3)
     @cute.jit
@@ -114,6 +114,7 @@ class PairToy(WarpSpecialized):
         rank = self.cluster.rank()  # warp-uniform: not inside the lane-0 branch
         if cute.arch.lane_idx() == 0:
             ctx.out[rank] = count
+        return back
 
     @cute.kernel
     def kernel(self, out: cute.Tensor, n: cutlass.Int32):
@@ -187,7 +188,7 @@ class _Unpinned(WarpSpecialized):
     @role(warps=1)  # issues tcgen05 commits but runs in both CTAs
     @cute.jit
     def mma(self, ch: Consumer, ctx):
-        pass
+        return ch
 
 
 class _LeaderTmaToBoth(WarpSpecialized):
@@ -203,7 +204,7 @@ class _LeaderTmaToBoth(WarpSpecialized):
     @role(warps=1)
     @cute.jit
     def use(self, ch: Consumer, ctx):
-        pass
+        return ch
 
 
 class _BothTmaToMixed(WarpSpecialized):
@@ -219,12 +220,12 @@ class _BothTmaToMixed(WarpSpecialized):
     @role(warps=[range(1, 2), range(2, 3)])
     @cute.jit
     def use(self, ch: Consumer, ctx):
-        pass
+        return ch
 
     @role(warps=3, cta="leader")
     @cute.jit
     def lead(self, ch: Consumer, ctx):
-        pass
+        return ch
 
 
 class _LeaderOnlyTmem(WarpSpecialized):
@@ -251,7 +252,7 @@ class _PairPayload(WarpSpecialized):
     @role(warps=1)
     @cute.jit
     def use(self, ch: Consumer, ctx):
-        pass
+        return ch
 
 
 def test_pair_placement_errors():

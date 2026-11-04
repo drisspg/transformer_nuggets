@@ -32,7 +32,7 @@ from transformer_nuggets.cute.warpdrive import (
 )
 
 @dataclass(frozen=True)
-class PersistentGemmCtx:  # prologue values every role reads
+class PersistentGemmParams:  # prologue values every role reads
     tma_a: cute.CopyAtom
     tAgA: cute.Tensor   # (TMA, m_tiles, k_tiles)
     tAsA: cute.Tensor   # (TMA, stage)
@@ -48,60 +48,60 @@ class PersistentGemm(WarpSpecialized):  # abridged: the real one sizes stages pe
 
     @role(warps=4, regs=40)
     @cute.jit
-    def load(self, ab: Producer, tiles: Tiles, ctx: PersistentGemmCtx):
+    def load(self, params: PersistentGemmParams, ab: Producer, tiles: Tiles):
         while tiles.valid:
             m, n, _ = tiles.work
-            for k in cutlass.range(ctx.num_k_tiles, unroll=1):
+            for k in cutlass.range(params.num_k_tiles, unroll=1):
                 with ab.produce() as s:
-                    cute.copy(ctx.tma_a, ctx.tAgA[None, m, k], ctx.tAsA[None, s.index],
+                    cute.copy(params.tma_a, params.tAgA[None, m, k], params.tAsA[None, s.index],
                               tma_bar_ptr=s.barrier)
-                    cute.copy(ctx.tma_b, ctx.tBgB[None, n, k], ctx.tBsB[None, s.index],
+                    cute.copy(params.tma_b, params.tBgB[None, n, k], params.tBsB[None, s.index],
                               tma_bar_ptr=s.barrier)
             tiles.advance()
         return ab, tiles
 
     @role(warps=5, regs=40, cta="leader")  # leader-only in a CTA pair
     @cute.jit
-    def mma(self, ab: Consumer, acc: Producer, tiles: Tiles, tmem: Tmem, ctx: PersistentGemmCtx):
-        tAcc = cute.make_tensor(tmem.ptr("acc"), ctx.acc_layout)
+    def mma(self, params: PersistentGemmParams, ab: Consumer, acc: Producer, tiles: Tiles, tmem: Tmem):
+        tAcc = cute.make_tensor(tmem.ptr("acc"), params.acc_layout)
         while tiles.valid:
             with acc.produce() as a:
-                for k in cutlass.range(ctx.num_k_tiles, unroll=1):
+                for k in cutlass.range(params.num_k_tiles, unroll=1):
                     with ab.consume() as s:
                         ...  # cute.gemm into tAcc[..., a.index], reading A/B stage s.index
             tiles.advance()
-        return acc, tiles
+        return ab, acc, tiles
 
     @role(warps=range(4), regs=160)
     @cute.jit
-    def epilogue(self, acc: Consumer, tiles: Tiles, tmem: Tmem, ctx: PersistentGemmCtx):
+    def epilogue(self, params: PersistentGemmParams, acc: Consumer, tiles: Tiles, tmem: Tmem):
         while tiles.valid:
             m, n, _ = tiles.work
             with acc.consume() as a:
                 ...  # TMEM -> registers -> SMEM -> TMA store of tile (m, n)
             tiles.advance()
-        return tiles
+        return acc, tiles
 
     @cute.kernel
     def kernel(self, tiled_mma, tma_a, mA, tma_b, mB, tma_c, mC, ..., work):
         smem = self.begin_roles(tiles=work)
         ...  # allocate SMEM tiles, TMA-partition them, build the context
-        ctx = PersistentGemmCtx(tma_a=tma_a, tAgA=tAgA, tAsA=tAsA, num_k_tiles=..., ...)
-        self.run_roles(ctx)
+        params = PersistentGemmParams(tma_a=tma_a, tAgA=tAgA, tAsA=tAsA, num_k_tiles=..., ...)
+        self.run_roles(params)
 ```
 
-`ctx` is what you build in the kernel prologue: TMA atoms, partitioned tensors, layouts, loop
-counts. The examples declare it as a frozen dataclass and annotate each role's `ctx` parameter
+`params` is what you build in the kernel prologue: TMA atoms, partitioned tensors, layouts, loop
+counts. The examples declare it as a frozen dataclass and annotate each role's `params` parameter
 with it, so editors know every field's type and the object reaches the roles as itself. Frozen
 means read-only: write into the tensors it holds, but its fields can't be rebound. A
-`SimpleNamespace` still works too, with an unannotated `ctx`.
+`SimpleNamespace` still works too, with an unannotated `params`.
 
 Swapping the schedule is the `policy=` argument: `OneShot()`, `StaticPersistent()`,
 `DynamicPersistent()` or `Clc()`; the role code doesn't change. The accumulator ring has two
 stages so the epilogue of one tile overlaps the mainloop of the next.
 
 `begin_roles()` allocates and initializes barriers and payloads, and returns the
-`SmemAllocator` for your own storage. `run_roles(ctx)` synchronizes, dispatches the roles and
+`SmemAllocator` for your own storage. `run_roles(params)` synchronizes, dispatches the roles and
 frees TMEM after its users finish. Single-CTA TMEM allocation happens in `begin_roles`; CTA pairs
 allocate after the cluster sync in `run_roles`.
 
@@ -128,9 +128,9 @@ Arguments come from annotations. Named dependencies match attributes on the kern
 | `tiles: Tiles` | the `self.tiles` work cursor |
 | `mufu: Turn` | a seat in `self.mufu`, a `Turnstile` |
 | `bars: Barriers` | the base pointer of `self.bars` |
-| `ctx: GemmCtx`, or the one unannotated parameter | the object passed to `run_roles` |
+| `params: GemmParams`, or the one unannotated parameter | the object passed to `run_roles` |
 
-A parameter receives `ctx` when it is annotated with the context's type (or a base class of it)
+A parameter receives `params` when it is annotated with the context's type (or a base class of it)
 or is the role's only unannotated parameter. Anything else raises `ProtocolError` naming the
 parameter: a missing channel name, an annotation that doesn't resolve (`ab: "Consumr"`), a layer
 class used as an annotation (`tiles: TileStream`, which suggests `Tiles`), two context
@@ -162,7 +162,7 @@ class Attention(WarpSpecialized):
 
     @role(config=lambda kernel: kernel.roles.softmax)
     @cute.jit
-    def softmax(self, stage: Instance, ctx): ...
+    def softmax(self, params, stage: Instance): ...
 ```
 
 The selector is an ordinary host callable receiving the kernel and returning a `RoleConfig`.
@@ -212,37 +212,37 @@ out, lse = fa4_fwd(q, k, v, roles=roles)
 Changing the warp layout can also require changes to your tensor partitions; deriving barrier
 counts does not rewrite the math's thread-to-data mapping.
 
-### Returning final state
+### Params in, state back out
 
-A managed role returns the state that the layer needs after its body:
+Use `self, params, ...state` in role signatures. `params` is the kernel-specific frozen
+input dataclass; the rest includes the warpdrive objects the role uses.
 
-- Its final tile cursor, whenever it takes `Tiles` (with or without IKET).
-- Its final producer endpoints for channels that require an exit tail, such as pair-scoped
-  operands consumed by UMMA. Returning other producer endpoints is also allowed, so the same
-  role can support both single-CTA and pair configurations.
-
-Return one object or a tuple, not a new wrapper or binding list:
+**Return every stateful argument:** producer endpoints, consumer endpoints, tile cursors and
+turnstile seats. This is the same rule for every configuration, including IKET on/off and
+single-/two-CTA kernels. No need to work out which endpoints need cleanup:
 
 ```python
-@role(warps=4, regs=40)
+@role(warps=5, regs=40)
 @cute.jit
-def load(self, ab: Producer, tiles: Tiles, ctx):
+def mma(self, params: GemmParams, ab: Consumer, acc: Producer, tiles: Tiles, tmem: Tmem):
     while tiles.valid:
-        ...  # acquire and fill operand stages
+        ...  # use params, ab, acc, tiles and tmem
         tiles.advance()
-    return ab, tiles
+    return ab, acc, tiles
 ```
 
-The layer matches returned objects to their inputs, drains the producers that need it, and
-closes any remaining IKET work-item range using the returned cursor. Missing, duplicate or
-foreign state is an error. Tuple order and local variable names don't matter; execution state
-is not recovered from Python frames. Roles without required final state may return nothing. Raw role
-results are ignored.
+`self` and `params` are input-only. The injected instance index, TMEM view and raw barrier
+pointer are also inputs, not loop-carried state, so they are not returned. Stage handles must
+be committed/released inside the role; they are not endpoint state to return.
 
-Return the **current loop-carried value**, not a snapshot saved before the loop. Helpers still
+Return one object or a tuple. Tuple order and local names do not matter: `return tiles, acc, ab`
+is equivalent. Missing, duplicate, unsupported or foreign state is an error. The layer uses the
+returned state for the cleanup that applies (producer tails and remaining IKET work ranges),
+without recovering execution state from Python frames. Raw role results are ignored.
+
+Return the current loop-carried values, not snapshots saved before the loop. Helpers still
 return updated state to their callers (`ab = helper(ab, ...)`). The layer checks ownership and
-presence, not whether an old snapshot is stale. Stage handles are different: commit/release
-those inside the role; don't return them as endpoint state.
+presence, not whether an old snapshot is stale.
 
 ## Channels
 
@@ -360,7 +360,7 @@ self.tiles = TileStream(order=Raster(swizzle=8), policy=Clc(stages=2))
 
 @role(warps=4, regs=40)
 @cute.jit
-def load(self, ab: Producer, tiles: Tiles, ctx: PersistentGemmCtx):
+def load(self, params: PersistentGemmParams, ab: Producer, tiles: Tiles):
     while tiles.valid:
         m, n, _ = tiles.work
         ...
@@ -448,7 +448,7 @@ print(op.describe())
 ```text
 PersistentGemm: 8 warps, 256 threads
   cluster  CTA pair (2, 1, 1), tcgen05 CtaGroup.TWO, leader = rank 0
-  context  PersistentGemmCtx
+  params   PersistentGemmParams
 
 Roles
   warps  role             regs  cta     raw
@@ -528,7 +528,7 @@ self.acc_bars = Barriers(2)  # user initializes between begin_roles/run_roles
 
 @role(warps=range(4), regs=160, raw=True)
 @cute.jit
-def epilogue(self, acc_bars: Barriers, tmem: Tmem, ctx):
+def epilogue(self, params, acc_bars: Barriers, tmem: Tmem):
     # acc_bars is a pointer; user code drives the barriers
     ...
 ```
