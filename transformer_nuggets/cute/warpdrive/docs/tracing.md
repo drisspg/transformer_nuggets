@@ -17,6 +17,67 @@ compile_persistent_gemm(op)
 print(op.describe())
 ```
 
+For the 2-CTA persistent GEMM with CLC, after the compile (output at `2491252`; print yours for the
+current version):
+
+```
+PersistentGemm: 8 warps, 256 threads
+  cluster  CTA pair (2, 1, 1), tcgen05 CtaGroup.TWO, leader = rank 0
+  params   PersistentGemmParams
+
+Roles
+  warps  role            regs  cta     raw
+  0-3    epilogue         160  all
+  4      load              40  all
+  5      mma               40  leader
+  6      work.scheduler    40  leader
+  7      (padding)         40
+
+Channels
+  ab         Ring(6)  load -> mma
+             signal    Tma(32768 B) -> Umma
+             full      leader 1 x6, tx 65536 B (leader-armed)
+             empty     leader 1 x6, peer 1 x6
+             scope     pair-scoped, release_mask 0b11, tail
+             storage   buffer A, B
+             tma       verified CtaGroup.TWO, 32768 B/stage per CTA @ persistent_gemm.py:156,157
+  acc        Ring(2)  mma -> epilogue
+             signal    Umma -> Threads
+             full      leader 1 x2, peer 1 x2
+             empty     leader 256 x2
+             scope     pair-scoped, commit_mask 0b11, remote_scope cta
+  work_ring  Ring(2)  work.scheduler -> epilogue, load, mma, work.scheduler
+             signal    Tma(16 B) -> Threads
+             full      leader 1 x2, peer 1 x2, tx 16 B (leader-armed)
+             empty     leader 384 x2
+             scope     pair-scoped, remote_scope cluster
+             storage   payload Int32(4,)
+  work_clc   Slots(1) work.scheduler -> work.scheduler
+             signal    Tma(16 B) -> Threads
+             full      1, tx 16 B
+             empty     32
+             scope     CTA-local
+             storage   payload Int32(4,), release_fence smem_async
+
+Streams
+  work  ClusterLaunchControl(stages=2), Raster(along=m, swizzle=8)
+        scheduler warp 6 broadcasts over work_ring
+        roles: epilogue, load, mma
+
+TMEM: 512 columns used, 512 allocated
+  tmem acc [0, 256), [256, 512)
+
+SMEM plan: 212992 B per CTA in 3 buffer(s), plus alignment padding
+  A  BFloat16  98304 B  6 stages (mode -1)  align 1024  -> ab
+  B  BFloat16  98304 B  6 stages (mode -1)  align 1024  -> ab
+  C  BFloat16  16384 B                      align 128
+```
+
+Reading it: `ab` is pair-scoped, so the leader arms 64 KiB for both CTAs' TMA halves and the
+MMA's release multicasts to both (`release_mask 0b11`). `acc`'s empty barrier lives on the
+leader and expects 256 epilogue threads from the two CTAs. The scheduler warp sits in the padding
+warpgroup and broadcasts each CLC claim through `work_ring` to every role in both CTAs.
+
 `describe()` returns a string with roles, warp placement, register budgets, channels,
 per-CTA counts and TMEM regions. Before compilation it checks declarations. After a fresh
 compile it also has the recognized TMA copies and any traced diagnostics. It is not a runtime

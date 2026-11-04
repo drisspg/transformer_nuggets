@@ -111,6 +111,10 @@ Allocate your tensors there, or declare a `SmemPlan` and bind its buffers to cha
 `buffer=`. `run_roles(params)` synchronizes, runs the roles and frees TMEM after its users
 finish. [Storage](docs/storage.md) shows how a handle selects its own buffer stage.
 
+`print(op.describe())` shows what warpdrive worked out for a kernel: roles, warps, register
+budgets, every channel's per-CTA arrival counts, masks and TMA bytes, the scheduler and TMEM.
+[Tracing](docs/tracing.md#inspect-the-kernel) has the full output for the 2-CTA persistent GEMM.
+
 ## More examples and details
 
 - [Roles](docs/roles.md): placement, params, returned state and register budgets.
