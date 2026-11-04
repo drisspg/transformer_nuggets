@@ -80,6 +80,7 @@ and which on the device, and what each must guarantee. ``adapters.py`` wraps ext
 
 from __future__ import annotations
 
+import functools
 import re
 from dataclasses import dataclass, field, fields, is_dataclass
 
@@ -680,12 +681,15 @@ class WorkStream:
     def launch_args(self, device, max_ctas: int | None = None):
         """``(workspace, max_ctas)`` for the compiled entry point. One cached workspace per
         (device, current stream): launches on one stream run in order, so they may share it.
-        With ``record``, ``max_ctas`` must cover the launch grid in CTAs (CLC/OneShot: the item
-        count times the cluster size); it is rounded up to whole clusters."""
+        ``max_ctas`` defaults to the CTAs of every cluster that can be resident at once (the SM
+        count for one CTA; fewer for clusters that do not tile the GPCs), so a persistent grid
+        runs in one wave. With ``record``, ``max_ctas`` must cover the launch grid in CTAs
+        (CLC/OneShot: the item count times the cluster size); it is rounded up to whole
+        clusters."""
         import torch
 
         device = torch.device(device)
-        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        sms = resident_ctas(device, self.cluster_size)
         words = 4
         if self.record:
             if not self.roles:
@@ -962,6 +966,21 @@ def _is_while_body(block, cond_block) -> bool:
 
 
 MAX_GRID_YZ = 65535  # gridDim.y and gridDim.z limit
+
+
+@functools.cache
+def resident_ctas(device, cs: int) -> int:
+    """CTAs of the ``cs``-CTA clusters that fit on ``device`` at once, one CTA per SM."""
+    import torch
+
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    if cs == 1:
+        return sms
+    from cutlass.utils import HardwareInfo
+
+    with torch.cuda.device(device):
+        torch.cuda.synchronize()  # makes the device's primary context current for the query
+        return HardwareInfo().get_max_active_clusters(cs) * cs
 
 
 def tile_grid_dims(space, cs: int = 1):
