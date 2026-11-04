@@ -35,6 +35,10 @@ class Tma:
 
     tx_bytes: int
 
+    def __post_init__(self):
+        if type(self.tx_bytes) is not int or self.tx_bytes <= 0:
+            raise ValueError(f"Tma.tx_bytes must be a positive int, got {self.tx_bytes!r}")
+
 
 class Umma:
     """Side signalled by one elected ``tcgen05.commit``."""
@@ -114,8 +118,17 @@ class Channel:
     internal: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self):
+        if type(self.n) is not int:
+            raise ValueError(f"channel stages must be a positive int, got {self.n!r}")
         if self.n <= 0:
             raise ValueError("channels need at least one stage")
+        for side, mech in (("producer", self.producer), ("consumer", self.consumer)):
+            if mech is not Threads and mech is not Umma and not isinstance(mech, Tma):
+                raise ValueError(
+                    f"channel {side} mechanism must be Threads, Umma, or Tma(bytes), got {mech!r}"
+                )
+        if isinstance(self.consumer, Tma):
+            raise ValueError("TMA is a producer mechanism")  # noqa: TRY004
         if self.commit_fence not in FENCE_KINDS or self.release_fence not in FENCE_KINDS:
             raise ValueError(f"fence kinds must be one of {FENCE_KINDS}")
         if isinstance(self.producer, Tma) and self.commit_fence is not None:
@@ -186,12 +199,16 @@ class Barriers:
     name: str = field(default="", init=False)
 
     def __post_init__(self):
+        if type(self.n) is not int:
+            raise ValueError(f"Barriers.n must be a positive int, got {self.n!r}")
         if self.n <= 0:
             raise ValueError("Barriers needs at least one mbarrier")
-        if isinstance(self.counts, int):
+        if type(self.counts) is int:
             self.counts = [self.counts] * self.n
         if self.counts is not None and (
-            len(self.counts) != self.n or any(c <= 0 for c in self.counts)
+            not isinstance(self.counts, (list, tuple))
+            or len(self.counts) != self.n
+            or any(type(c) is not int or c <= 0 for c in self.counts)
         ):
             raise ValueError(f"Barriers counts must be {self.n} positive ints, got {self.counts}")
 
