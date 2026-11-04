@@ -134,6 +134,7 @@ EMPTY_SPACES = [
     (-2, -3, 1),  # two negative extents multiply to a positive count
     (-1, 4, 2),
     (3, -5, -1),
+    (65536, 65536, 0),  # m * n wraps to 0 in Int32: decode must not divide by it
 ]
 
 
@@ -146,6 +147,15 @@ def test_bound_empty_space_has_no_items_and_decodes(order, space):
     assert int(order.size(bound)) == 0
     for index in range(4):
         order.decode(Int32(index), bound)
+
+
+@pytest.mark.parametrize(
+    "space", [(5, 3, 2), (2**31 - 1, 1, 1), (65537, 65537, 1), (2**31 - 1, 2**31 - 1, 4)]
+)
+def test_size64_is_exact_within_int32_and_never_wraps(space):
+    exact = space[0] * space[1] * space[2]
+    size = int(Raster().size64(Raster().bind(space)))
+    assert size == exact if exact <= 2**31 - 1 else size > 2**31 - 1
 
 
 @pytest.mark.parametrize("ext", EXTENTS)
@@ -473,7 +483,11 @@ COUNT_CASES = {
     "static": (StaticPersistent(), SWIZZLED),
     "dynamic": (DynamicPersistent(stages=2), SWIZZLED),
     "clc": (Clc(stages=2), SWIZZLED),
+    # Skip hooks: local skipping, and the scheduler publishing the first item itself.
+    "static_skip": (StaticPersistent(), SkipOdd(swizzle=2)),
+    "clc_skip": (Clc(stages=2), SkipOdd(swizzle=2)),
 }
+PAIR_IDS = ["single", "pair"]
 
 
 def _count_items(fn, ws, space, max_ctas):
@@ -483,7 +497,21 @@ def _count_items(fn, ws, space, max_ctas):
     return count.tolist()
 
 
-@pytest.mark.parametrize("cluster", [SingleCta(), CtaPair()], ids=["single", "pair"])
+def _check_valid_launch(op, fn, ws):
+    """30 items over a capped grid (persistent units run several each): every role in every
+    CTA of a unit counts each kept item, and the dynamic counter is zeroed again."""
+    space = (5, 3, 2)
+    order = op.tiles.order
+    kept = sum(
+        not (order.skips and order.skip(item, space))
+        for item in itertools.product(*(range(e) for e in space))
+    )
+    want = kept * op.cluster.size
+    assert _count_items(fn, ws, space, 4) == [want, want]
+    assert ws[:2].tolist() == [0, 0]
+
+
+@pytest.mark.parametrize("cluster", [SingleCta(), CtaPair()], ids=PAIR_IDS)
 @pytest.mark.parametrize("case", list(COUNT_CASES))
 def test_empty_space_runs_no_items(requires_blackwell, case, cluster):
     """An empty (or negative) space launches one work unit, every role sees no item, and the
@@ -491,33 +519,38 @@ def test_empty_space_runs_no_items(requires_blackwell, case, cluster):
     op = CountToy(*COUNT_CASES[case], cluster)
     fn = compile_count_toy(op)
     ws, _ = op.tiles.launch_args("cuda")
-    cs = cluster.size
     for space in EMPTY_SPACES:
         for max_ctas in (148, 1):
             assert _count_items(fn, ws, space, max_ctas) == [0, 0], (space, max_ctas)
             assert ws[:2].tolist() == [0, 0], (space, max_ctas)
-    # 30 items over a capped grid: persistent units run several items each.
-    assert _count_items(fn, ws, (5, 3, 2), 4) == [30 * cs, 30 * cs]
-    assert ws[:2].tolist() == [0, 0]
+    _check_valid_launch(op, fn, ws)
 
 
+OVERFLOWING_SPACES = [
+    (65537, 65537, 1),  # 2**32 + 131073 items wrap to 131073 in Int32
+    (2**17, 65535, 1),  # n and l fit gridDim.y/z, so OneShot selects the tile grid
+    (2**31 - 1, 2**31 - 1, 4),  # the exact count also wraps Int64
+    (2**21, 2**21, 2**22 - 1),  # wraps to 0 in Int32: would run as an empty space
+]
+
+
+@pytest.mark.parametrize("cluster", [SingleCta(), CtaPair()], ids=PAIR_IDS)
 @pytest.mark.parametrize("case", list(COUNT_CASES))
-def test_space_overflowing_int32_is_rejected(requires_blackwell, case):
-    """An item count, grid, or persistent overshoot index past Int32 makes the launch fail
-    (no partial or wrapped coverage), and the next valid launch is unaffected."""
+def test_space_overflowing_int32_is_rejected(requires_blackwell, case, cluster):
+    """An item count, grid, or persistent terminal index past Int32 makes the launch fail (no
+    partial or wrapped coverage), and the next valid launch is unaffected."""
     policy, order = COUNT_CASES[case]
-    op = CountToy(policy, order, SingleCta())
+    op = CountToy(policy, order, cluster)
     fn = compile_count_toy(op)
     ws, _ = op.tiles.launch_args("cuda")
-    spaces = [(65537, 65537, 1)]  # 2**32 + 131073 items wrap to 131073 in Int32
+    spaces = list(OVERFLOWING_SPACES)
     if isinstance(policy, (StaticPersistent, DynamicPersistent)):
         # Fits Int32, but the last unit's terminal index (total - 1 + units) does not.
-        spaces.append((2**31 - 100, 1, 1))
+        spaces.append((2**31 - 50, 1, 1))
     for space in spaces:
-        with pytest.raises(Exception, match="launch"):
+        with pytest.raises(Exception, match="CUDA launch failed"):
             _count_items(fn, ws, space, 148)
-    assert _count_items(fn, ws, (5, 3, 2), 4) == [30, 30]
-    assert ws[:2].tolist() == [0, 0]
+    _check_valid_launch(op, fn, ws)
 
 
 def test_record_needs_a_bound_stream(requires_blackwell):

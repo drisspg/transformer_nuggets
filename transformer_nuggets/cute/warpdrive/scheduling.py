@@ -79,6 +79,7 @@ from transformer_nuggets.cute.warpdrive.protocol import ProtocolError, current_b
 from transformer_nuggets.cute.warpdrive.tracing import pop, push_if
 
 AXES = ("m", "n", "l")
+INT32_MAX = 2**31 - 1
 
 
 class Tiles:
@@ -100,9 +101,9 @@ class WorkMapping:
     """Protocol for ``order=``. ``words``: Int32 words per item. ``bind(space)`` normalizes the
     runtime space (a DSL value), ``size(space)`` counts items, ``decode(index, space)`` returns
     ``words`` Int32 values, and ``item(words)`` builds what ``tiles.work`` returns.
-    ``size64(space)`` is the item count without Int32 wraparound, for the launch's range check
-    (``TileProblem.grid``); the default widens ``size``, so a mapping whose count can exceed
-    Int32 overrides it.
+    ``size64(space)`` is the Int64 item count for the launch's range check
+    (``TileProblem.grid``): exact up to ``2**31``, and it may saturate there but must not wrap.
+    The default widens ``size``, so a mapping whose count can exceed Int32 overrides it.
 
     ``decode`` and ``size`` receive the bound space. ``decode`` may be called with
     ``index >= size`` (its result is then ignored), including on an empty space, and must not
@@ -150,9 +151,9 @@ class Raster(WorkMapping):
     device ``Int32`` values alike. Its intermediates are bounded by the item count, so any space
     whose count fits Int32 decodes without overflow.
 
-    ``bind`` treats a negative extent as zero and maps an empty space to
-    ``(max(m, 1), max(n, 1), 0)``: no items, and no zero divisor in ``decode``. It runs in the
-    host part of the jit entry point, so kernels pay nothing for it.
+    ``bind`` treats a negative extent as zero and maps an empty space to ``(1, 1, 0)``: no
+    items, and every divisor in ``decode`` is 1. It runs in the host part of the jit entry
+    point, so kernels pay nothing for it.
     """
 
     along: str = "m"
@@ -175,16 +176,19 @@ class Raster(WorkMapping):
         if len(space) != 3:
             raise ValueError(f"Raster space is (m_tiles, n_tiles, l), got {space!r}")
         em, en, el = (Int32(e) for e in space)
-        nonempty = cutlass.max(cutlass.min(cutlass.min(em, en), 1), 0)  # 1 if m, n > 0 else 0
-        return cutlass.max(em, 1), cutlass.max(en, 1), cutlass.max(el, 0) * nonempty
+        # INT32_MAX when every extent is positive, else 0 (clamping the space to (1, 1, 0)).
+        cap = cutlass.max(cutlass.min(cutlass.min(cutlass.min(em, en), el), 1), 0) * INT32_MAX
+        return tuple(cutlass.max(cutlass.min(e, cap), lo) for e, lo in ((em, 1), (en, 1), (el, 0)))
 
     def size(self, space):
         em, en, el = space
         return em * en * el
 
     def size64(self, space):
+        # Saturates at 2**31 so neither this nor the launch check's arithmetic wraps Int64.
         em, en, el = space
-        return Int64(em) * en * el
+        limit = INT32_MAX + 1
+        return cutlass.min(cutlass.min(Int64(em) * en, limit) * el, limit)
 
     def decode(self, index, space):
         em, en, el = space
@@ -698,7 +702,6 @@ def _is_while_body(block, cond_block) -> bool:
 
 
 MAX_GRID_YZ = 65535  # gridDim.y and gridDim.z limit
-INT32_MAX = 2**31 - 1
 
 
 def tile_grid_dims(space, cs: int = 1):

@@ -59,8 +59,8 @@ These are conditional guarantees relative to that program, not a theorem about a
 | R14 | Skip runs only for valid indices. Broadcast schedulers acquire a free work slot before claiming, bounding lookahead by stages. CLC waits every response and issues none after failure. Dynamic schedulers report once at exit; the last report fences and zeros `[claims,finished]` for sequential launches/graph replay. |
 | R15 | Generated synchronization must implement the finite, live abstract protocol without extra waits, premature reuse, lost publications or added deadlock. Compilation alone does not establish that precondition; a timeout is a candidate failure requiring attribution, not proof of a layer bug. |
 | R16 | `describe()` reports derived/effective structure, not runtime correctness. Protocol logs are static traced sites, not execution histories. IKET off emits no IKET ops; cache keys must include IKET/protocol trace choices. Exported plans are per-CTA, work-item-granular approximations, not deadlock proofs. |
-| R17 | A space with any Raster extent <= 0 is empty: `bind` stores `(max(m,1),max(n,1),0)` (what the kernel's `work.space` reads), `work.grid()` launches one work unit under every policy, single CTA or pair, every role's first `valid` is false, no decode divides by zero (host or device), and the dynamic workspace is left zeroed for the next launch. The check is host code in the jit entry point; kernels pay nothing. |
-| R18 | `work.grid()` admits a space only when `policy.reach` fits Int32: `total*cs` for OneShot/Clc (the 1-D grid; terminal index `total`), `total + units - 1` for Static/Dynamic (the last unit's terminal index). Within it, no grid extent, index, claim or CLC result wraps. |
+| R17 | A space with any Raster extent <= 0 is empty: `bind` stores `(1,1,0)` (what the kernel's `work.space` reads), `work.grid()` launches one work unit under every policy, single CTA or pair, every role's first `valid` is false, no decode divides by zero (host or device), and the dynamic workspace is left zeroed for the next launch. The check is host code in the jit entry point; kernels pay nothing. |
+| R18 | `work.grid()` admits a space only when `policy.reach` of Raster's saturating Int64 count fits Int32: `total*cs` for OneShot/Clc (the 1-D grid; terminal index `total`), `total + units - 1` for Static/Dynamic (the last unit's terminal index). Within it, no grid extent, index, claim or CLC result wraps. |
 
 ### Pair placement rules (R11)
 
@@ -98,7 +98,8 @@ With U launched work units, initial item is unit b. Subsequent indices are:
 
 Static/dynamic launch at least one unit, capped by total and the supplied capacity; a pair
 capacity below two CTAs still launches one cluster. OneShot/CLC launch at least one unit or
-the OneShot tile grid. An empty space launches exactly one unit, which receives no work (R17). Dynamic/CLC add the lowest free scheduler warp unless explicitly set.
+the OneShot tile grid. An empty space launches exactly one unit, which receives no work
+(R17). Dynamic/CLC add the lowest free scheduler warp unless explicitly set.
 Work-ring consumers release on **receipt**, not after computing the item; everyone receives
 the terminal marker, which is not work.
 
