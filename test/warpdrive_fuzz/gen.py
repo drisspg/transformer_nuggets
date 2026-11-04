@@ -28,6 +28,7 @@ Validity (the contract's "valid managed program", section 1) is by construction:
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import hashlib
 import json
@@ -163,6 +164,11 @@ class KernelSpec:
     turn_cap: int = 64
     launches: int = 2
     trace: bool = False  # trace_protocol: must not change results (R16)
+    # Further launches of the same compiled kernel with other runtime values:
+    # ((m_tiles, n_tiles, l), max_ctas, iterations) each. Extents, caps and counts are runtime
+    # arguments, so one binary must serve them all.
+    variants: tuple[tuple[tuple[int, int, int], int, int], ...] = ()
+    graph: bool = False  # also capture one launch in a CUDA graph and replay it twice
 
     @property
     def cs(self) -> int:
@@ -719,7 +725,34 @@ def generate(
         item_cap=1 if big_grid else 64,
         turn_cap=2 if big_grid else 64,
         trace=rng.random() < 0.15,
+        variants=_variants(rng, stream_spec, big_grid or any(r["jitter"] for r in roles)),
+        graph=rng.random() < 0.2 and not (stream_spec is not None and stream_spec.record),
     )
+
+
+def _variants(rng: random.Random, s: StreamSpec | None, small_only: bool) -> tuple:
+    """Runtime-shape variants: other extents (both sides of the tile-grid y/z limit when the
+    base allows a large grid), caps and iteration counts."""
+    out = []
+    for _ in range(rng.choice([0, 0, 1, 2])):
+        extents = (rng.randint(1, 16), rng.randint(1, 16), rng.randint(1, 3))
+        if rng.random() < 0.1:
+            extents = (1, 1, 1)
+        if s is not None and s.tile_grid and not small_only and rng.random() < 0.15:
+            extents = (1, 65535 + rng.randint(0, 1), 1)
+        out.append((extents, rng.choice([1, 2, 3, 5, 8, 37, SMS]), rng.choice([0, 1, 2, 7, 33])))
+    return tuple(out)
+
+
+def variant_specs(spec: KernelSpec) -> list[KernelSpec]:
+    """The spec itself, then one spec per runtime variant (same compiled kernel)."""
+    out = [spec]
+    for extents, max_ctas, iters in spec.variants:
+        stream = spec.stream
+        if stream is not None:
+            stream = dataclasses.replace(stream, extents=extents, max_ctas=max_ctas)
+        out.append(dataclasses.replace(spec, stream=stream, iters=iters, variants=()))
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -1193,6 +1226,10 @@ def features(spec: KernelSpec) -> set[str]:
         out.add("one_cta_per_sm")
     if spec.trace:
         out.add("trace_protocol")
+    if spec.variants:
+        out.add("runtime_shape_variants")
+    if spec.graph:
+        out.add("cuda_graph_replay")
     if s is not None and s.launch_1d:
         out.add("oneshot_1d_launch")
     if s is not None and s.record:

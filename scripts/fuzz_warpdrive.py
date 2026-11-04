@@ -46,7 +46,6 @@ def runtime_campaign(args) -> int:
     cases = out / "cases"
     out.mkdir(parents=True, exist_ok=True)
     log = (out / "results.jsonl").open("a")
-    wrapper = args.wrapper.split() if args.wrapper else None
     counts: dict[str, int] = {}
     start = time.time()
 
@@ -59,6 +58,8 @@ def runtime_campaign(args) -> int:
         if args.empty:
             force["empty"] = True
         spec = gen.generate(seed, **force)
+        # "{seed}" in the wrapper names per-case tool outputs (CUTracer delay dumps).
+        wrapper = args.wrapper.replace("{seed}", str(seed)).split() if args.wrapper else None
         return spec, runtime.run_isolated(spec, cases, timeout=args.timeout, wrapper=wrapper)
 
     seeds = _seeds(args.seeds)
@@ -117,7 +118,11 @@ def main() -> int:
     rt.add_argument("--pair", type=lambda s: s == "1", default=None, help="force CtaPair (1/0)")
     rt.add_argument("--stream", type=lambda s: s == "1", default=None, help="force a TileStream")
     rt.add_argument("--empty", action="store_true", help="zero-work boundary corpus (G6)")
-    rt.add_argument("--wrapper", default="", help="command prefix, e.g. compute-sanitizer ...")
+    rt.add_argument(
+        "--wrapper",
+        default="",
+        help="command prefix, e.g. 'compute-sanitizer --tool racecheck'; {seed} expands",
+    )
     rt.add_argument("--quiet", action="store_true", help="print only non-passing cases")
     for name in ("static", "mutate"):
         p = sub.add_parser(name, help=f"agent B's {name} corpus (compile-only)")

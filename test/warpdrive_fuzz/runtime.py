@@ -122,11 +122,11 @@ def tma_source(ch, device):
 
 
 def run_case(spec, workdir: Path) -> CaseResult:
-    """Compile, launch and check in this process (a hang hangs the caller)."""
-    import numpy as np
+    """Compile once, then launch the spec and each runtime-shape variant with the same binary,
+    checking every launch (a hang hangs the caller)."""
     import torch
 
-    from test.warpdrive_fuzz import gen, oracle
+    from test.warpdrive_fuzz import gen
     from transformer_nuggets.cute.warpdrive import ProtocolError
 
     result = CaseResult(spec.seed, spec.key(), PASS)
@@ -142,6 +142,30 @@ def run_case(spec, workdir: Path) -> CaseResult:
         return result
     result.compile_s = time.perf_counter() - t0
     _phase("compiled")
+    srcs = [tma_source(ch, device) for ch in spec.channels if ch.producer == "tma"]
+    failures, checked = [], 0
+    t1 = time.perf_counter()
+    for v, view in enumerate(gen.variant_specs(spec)):
+        rep = _launch_and_check(view, op, fn, device, srcs, f"variant {v}" if v else "")
+        failures += rep.failures
+        checked += rep.checked
+    result.run_s = time.perf_counter() - t1
+    if spec.trace and "Traced protocol" not in op.describe():
+        failures.append("trace_protocol=True compiled, but describe() lists no traced protocol")
+    if failures:
+        result.status = FAIL
+        result.failures = failures[:50]
+    result.detail = f"{checked} checks"
+    return result
+
+
+def _launch_and_check(spec, op, fn, device, srcs, tag: str):
+    """Launch ``spec`` (its runtime extents, cap and iterations) ``spec.launches`` times, plus
+    two CUDA-graph replays when ``spec.graph``; check each against the model."""
+    import numpy as np
+    import torch
+
+    from test.warpdrive_fuzz import gen, oracle
 
     lay = gen.Layout.of(spec)
     ncta = len(oracle.ctas(spec))
@@ -149,50 +173,59 @@ def run_case(spec, workdir: Path) -> CaseResult:
     s = spec.stream
     total = s.total if s is not None else 0
     n_inst = sum(r.instances for r in spec.roles)
-    hits = torch.zeros(max(n_inst * spec.cs * total, 1) + 64, dtype=torch.int32, device=device)
+    hits_len = max(n_inst * spec.cs * total, 1)
+    hits = torch.zeros(hits_len + 64, dtype=torch.int32, device=device)
     if s is not None:
         ws, _ = op.tiles.launch_args(device)
         extents, max_ctas = s.extents, s.max_ctas
     else:
         ws = torch.zeros(4, dtype=torch.int32, device=device)
         extents, max_ctas = (1, 1, 1), 1
-    srcs = [tma_source(ch, device) for ch in spec.channels if ch.producer == "tma"]
     init = torch.from_numpy(oracle.initial_clog(spec, rows).reshape(-1)).to(device)
     clog = torch.empty_like(init)
-    runs = []
-    t1 = time.perf_counter()
     gx = oracle.expected_grid(spec)[0]
+    prefix = f"{tag} " if tag else ""
+
+    def collect():
+        return oracle.Launch(
+            clog.cpu().numpy().reshape(rows, lay.per_cta).copy(),
+            hits.cpu().numpy().copy(),
+            ws.cpu().numpy().copy(),
+            op.tiles.timeline(ws, gx) if s is not None and s.record else None,
+        )
+
+    def launch():
+        clog.copy_(init)
+        hits.zero_()
+        fn(clog, hits, ws, spec.iters, *extents, max_ctas, *srcs)
+
+    runs = []
     for k in range(spec.launches):
         if s is not None and s.record:  # refills the log with -1; [claims, finished] stay
             ws, _ = op.tiles.launch_args(device, max_ctas=gx)
-        clog.copy_(init)
-        hits.zero_()
         torch.cuda.synchronize()
-        _phase(f"launch {k}")
-        fn(clog, hits, ws, spec.iters, *extents, max_ctas, *srcs)
+        _phase(f"launch {prefix}{k}")
+        launch()
         torch.cuda.synchronize()
-        _phase(f"launched {k}")
-        runs.append(
-            oracle.Launch(
-                clog.cpu().numpy().reshape(rows, lay.per_cta).copy(),
-                hits.cpu().numpy().copy(),
-                ws.cpu().numpy().copy(),
-                op.tiles.timeline(ws, gx) if s is not None and s.record else None,
-            )
-        )
-    result.run_s = time.perf_counter() - t1
-    _phase("checking")
+        _phase(f"launched {prefix}{k}")
+        runs.append(collect())
+    if spec.graph:  # R14: ordered graph replays reuse the self-resetting workspace
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launch()
+        for k in range(2):
+            _phase(f"launch {prefix}graph {k}")
+            graph.replay()
+            torch.cuda.synchronize()
+            _phase(f"launched {prefix}graph {k}")
+            runs.append(collect())
+    _phase(f"checking {prefix}")
     rep = oracle.check(spec, runs)
-    if spec.trace and "Traced protocol" not in op.describe():
-        rep.fail("trace_protocol=True compiled, but describe() lists no traced protocol")
-    extra = hits.cpu().numpy()[max(n_inst * spec.cs * total, 1) :]
-    if np.any(extra != 0):
+    if np.any(hits.cpu().numpy()[hits_len:] != 0):
         rep.fail("hits written past the item range")
-    if rep.failures:
-        result.status = FAIL
-        result.failures = rep.failures
-    result.detail = f"{rep.checked} checks"
-    return result
+    if tag:
+        rep.failures = [f"{tag} {extents}/{max_ctas}/{spec.iters}: {f}" for f in rep.failures]
+    return rep
 
 
 PHASE = "@@phase "
