@@ -26,9 +26,9 @@ What carries over and what does not:
 * Indices count warpdrive work units, so a ``CtaPair`` maps one item per cluster: tiles are
   work-unit tiles (FA4's params use a ``(1, 1)`` cluster shape).
 * Empty spaces (an extent <= 0) have no items. FA4's params are then built over one tile (and
-  an empty KV as one key), so no external arithmetic divides by zero, and the item count is
-  forced to 0.
-* Both adapters have an exact Int64 count (``size64``), so a space past ``2**31`` items is
+  an empty KV as one key), so no external arithmetic divides by zero; the item count comes from
+  the normalized extents and is 0.
+* Both adapters have an exact Int64 count (``count64``), so a space past ``2**31`` items is
   rejected at launch like a ``Raster`` space.
 """
 
@@ -48,13 +48,11 @@ def _at_least_one(value):
 
 
 def _bind_extents(space):
-    """``(extents, external, has_items)`` for a ``(m, n, l)`` space: the ``Raster``-normalized
-    extents (an empty space is ``(1, 1, 0)``), the same with ``l`` at least 1 (an empty space
-    becomes one tile, so no external arithmetic divides by zero), and 1 or 0 to scale the
-    external item count."""
+    """``(extents, external)`` for a ``(m, n, l)`` space: the ``Raster``-normalized extents (an
+    empty space is ``(1, 1, 0)``), and the same with ``l`` at least 1 (an empty space becomes one
+    tile, so no external arithmetic divides by zero)."""
     em, en, el = Raster().bind(space)
-    has_items = min(el, 1) if isinstance(el, int) else cutlass.min(el, 1)
-    return (em, en, el), (em, en, _at_least_one(el)), has_items
+    return (em, en, el), (em, en, _at_least_one(el))
 
 
 def _round_up(extent, multiple: int):
@@ -109,17 +107,13 @@ class CutlassRaster(WorkMap):
     def bind(self, space):
         extents = Raster().bind(space)
         s = self.swizzle
-        # Int32 like CUTLASS: it wraps only for spaces size64 rejects at launch.
+        # Int32 like CUTLASS: it wraps only for spaces whose count64 the launch rejects.
         padded = extents if s == 1 else self._pad(extents, lambda e: (e + s - 1) // s * s)
         return padded, extents
 
-    def size(self, space):
-        padded, _ = space
-        return Raster().size(padded)
-
-    def size64(self, space):
+    def count64(self, space):
         _, extents = space
-        return Raster().size64(self._pad(extents, lambda e: _round_up(e, self.swizzle)))
+        return Raster().count64(self._pad(extents, lambda e: _round_up(e, self.swizzle)))
 
     def decode(self, index, space):
         padded, _ = space
@@ -193,7 +187,7 @@ class Fa4Mapping(WorkMap):
         if len(space) != rank:
             what = "(num_block, num_head, num_batch" + ("" if rank == 3 else ", seqlen_k") + ")"
             raise ValueError(f"{self.describe()} space is {what}, got {space!r}")
-        extents, (num_block, num_head, num_batch), has_items = _bind_extents(space[:3])
+        extents, (num_block, num_head, num_batch) = _bind_extents(space[:3])
         # FA4 divides by the K/V bytes per head: an empty KV sizes its sections as one key.
         seqlen_k = Int32(0) if self._persistent else _at_least_one(Int32(space[3]))
         args = _fa4_tile_scheduler().TileSchedulerArguments(
@@ -210,21 +204,17 @@ class Fa4Mapping(WorkMap):
             lpt=self.lpt,
             lpt_global=self.lpt_global,
         )
-        return self.scheduler.to_underlying_arguments(args), extents, has_items
+        return self.scheduler.to_underlying_arguments(args), extents
 
-    def size(self, space):
-        params, _, has_items = space
-        count = params.total_blocks_cluster if self._persistent else params.total_blocks
-        return count * has_items
-
-    def size64(self, space):
-        # With a (1, 1) cluster and no splits both FA4 counts are num_block * num_head *
-        # num_batch, the Raster count, which is exact in Int64.
-        _, extents, _ = space
-        return Raster().size64(extents)
+    def count64(self, space):
+        # With a (1, 1) cluster and no splits both FA4 counts (``total_blocks_cluster``,
+        # ``total_blocks``) are num_block * num_head * num_batch: the Raster count of the
+        # normalized extents, exact in Int64 and 0 for an empty space.
+        _, extents = space
+        return Raster().count64(extents)
 
     def decode(self, index, space):
-        params, _, _ = space
+        params, _ = space
         if self._persistent:
             scheduler = self.scheduler(params, Int32(index))
         else:

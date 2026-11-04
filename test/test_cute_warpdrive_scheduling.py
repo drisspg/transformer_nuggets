@@ -144,7 +144,7 @@ def test_bound_empty_space_has_no_items_and_decodes(mapping, space):
     """Host Int32 arithmetic folds like the device's (and raises on division by zero): a bound
     empty space counts no items, and decode, which runs past the end, never divides by zero."""
     bound = mapping.bind(space)
-    assert int(mapping.size(bound)) == 0
+    assert int(mapping.count64(bound)) == 0
     for index in range(4):
         mapping.decode(Int32(index), bound)
 
@@ -152,9 +152,9 @@ def test_bound_empty_space_has_no_items_and_decodes(mapping, space):
 @pytest.mark.parametrize(
     "space", [(5, 3, 2), (2**31 - 1, 1, 1), (65537, 65537, 1), (2**31 - 1, 2**31 - 1, 4)]
 )
-def test_size64_is_exact_within_int32_and_never_wraps(space):
+def test_count64_is_exact_within_int32_and_never_wraps(space):
     exact = space[0] * space[1] * space[2]
-    size = int(Raster().size64(Raster().bind(space)))
+    size = int(Raster().count64(Raster().bind(space)))
     assert size == exact if exact <= 2**31 - 1 else size > 2**31 - 1
 
 
@@ -174,7 +174,7 @@ def test_launch_admits_spaces_exactly_up_to_int32(schedule, units, cs, largest, 
     """The largest admitted space leaves every index and grid extent at most INT32_MAX; one
     more item would not."""
     for space, admitted in [(largest, True), (too_large, False)]:
-        count = Raster().size64(Raster().bind(space))
+        count = Raster().count64(Raster().bind(space))
         assert (int(schedule.index_limit(count, units, cs)) <= 2**31 - 1) == admitted, space
 
 

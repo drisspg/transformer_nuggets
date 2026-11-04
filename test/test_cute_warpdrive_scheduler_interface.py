@@ -491,7 +491,7 @@ def count_cases():
 def test_swapped_schedules_cover_empty_and_overflowing_spaces(requires_blackwell, case, cluster):
     """Every CTA of a unit sees each item; empty spaces (and an empty KV) run nothing or never
     divide by zero in the entry point; spaces past Int32 are rejected at launch (custom
-    ``index_limit`` default and the adapters' Int64 ``size64``)."""
+    ``index_limit`` default and the adapters' Int64 ``count64``)."""
     toy, schedule, mapping = count_cases()[case]
     op = toy(schedule, mapping, cluster)
     fn = compile_count_toy(op)

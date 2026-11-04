@@ -67,7 +67,9 @@ def slots_shared_phase():
 
 def static_stride():
     """StaticPersistent strides one unit too far: items are skipped."""
-    scheduling.StaticPersistent.next_index = lambda self, index, problem: index + problem.units() + 1
+    scheduling.StaticPersistent.next_index = (
+        lambda self, index, problem: index + problem.units() + 1
+    )
 
 
 @cute.jit

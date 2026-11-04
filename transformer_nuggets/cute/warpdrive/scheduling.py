@@ -126,13 +126,14 @@ class WorkMap:
       (``extract_mlir_values`` must work on it: tuples of ``Int32``, tensors, CuTeDSL params
       objects). It is passed to the kernel and to every method below. ``bind`` must make an
       empty space safe (``Raster`` stores ``(1, 1, 0)``).
-    * ``size(space)``, host and device: the item count, Int32. Items are indices
-      ``[0, size)``.
-    * ``size64(space)``, host: the Int64 count for the launch's range check
-      (``BoundWork.grid``): exact up to ``2**31``, it may saturate there but must not wrap.
-      The default widens ``size``, so a mapping whose count can exceed Int32 overrides it.
+    * ``count64(space)``, host: the item count as an Int64 (or a Python int for static spaces);
+      items are indices ``[0, count)``. Exact up to ``2**31``; it may saturate there but must
+      not wrap. The layer calls it once, in the entry point, and narrows it to the Int32
+      ``BoundWork.total`` the kernel receives; a count the launch cannot index in Int32 is
+      rejected at launch (``BoundWork.grid``), so the narrowing never truncates a launched
+      count. An empty space counts 0 and runs no items.
     * ``decode(index, space)``, device: ``words`` Int32-convertible values. It may be called with
-      ``index >= size`` (the result is then ignored), including on an empty space, and must not
+      ``index >= count`` (the result is then ignored), including on an empty space, and must not
       fault or divide by zero there.
     * ``unpack(words)``, device: what ``work.item`` returns (default: the tuple of words).
     * ``skips`` and ``skip(item, space)`` (optional), device: with ``skips = True``, items whose
@@ -153,12 +154,8 @@ class WorkMap:
     def bind(self, space):
         return space
 
-    def size(self, space):
+    def count64(self, space):
         raise NotImplementedError
-
-    def size64(self, space):
-        size = self.size(space)
-        return size if isinstance(size, int) else Int64(size)
 
     def decode(self, index, space):
         raise NotImplementedError
@@ -221,11 +218,7 @@ class Raster(WorkMap):
         cap = cutlass.max(cutlass.min(cutlass.min(cutlass.min(em, en), el), 1), 0) * INT32_MAX
         return tuple(cutlass.max(cutlass.min(e, cap), lo) for e, lo in ((em, 1), (en, 1), (el, 0)))
 
-    def size(self, space):
-        em, en, el = space
-        return em * en * el
-
-    def size64(self, space):
+    def count64(self, space):
         # Saturates at 2**31 so neither this nor the launch check's arithmetic wraps Int64.
         em, en, el = space
         limit = INT32_MAX + 1
@@ -339,7 +332,7 @@ class IndexSchedule:
     * ``launch_units(total, max_units)``: launched work units; at least 1. ``max_units`` is the
       cap in work units, or ``None`` without ``uses_max_ctas``.
     * ``index_limit(total, units, cs)``: the largest grid x extent or index the launch computes,
-      from the Int64 ``total`` (``WorkMap.size64``); ``BoundWork.grid`` launches a zero-wide
+      from the Int64 ``total`` (``WorkMap.count64``); ``BoundWork.grid`` launches a zero-wide
       grid (which CUDA rejects) when it exceeds Int32. Override it when the default
       (``total + units - 1``, a strided terminal index) does not bound your schedule.
     * ``get_key()``: compile-key fragment naming every compile-time field, in lowercase letters,
@@ -713,12 +706,15 @@ class WorkStream:
 
 class BoundWork:
     """A stream bound to its runtime work space (``WorkStream.bind``), passed to the kernel as a
-    DSL value: the mapping's space and, for ``AtomicPersistent``, the workspace. ``max_ctas``
-    stays on the host."""
+    DSL value: the mapping's space, the Int32 item count ``total`` and, for ``AtomicPersistent``,
+    the workspace. ``count64`` (the mapping's Int64 count) and ``max_ctas`` stay on the host."""
 
-    def __init__(self, stream: WorkStream, space, workspace, max_ctas):
+    def __init__(self, stream: WorkStream, space, workspace, max_ctas, total=None):
         self.stream, self.space, self.workspace, self.max_ctas = stream, space, workspace, max_ctas
-        self.total = stream.mapping.size(space)
+        if total is None:  # host: count once; the kernel's copies carry the narrowed count
+            self.count64 = stream.mapping.count64(space)
+            total = _narrow(self.count64)
+        self.total = total
         self.cs = stream.cluster_size  # CTAs per work unit
 
     def units(self):
@@ -757,6 +753,8 @@ class BoundWork:
     def __extract_mlir_values__(self):
         values = cutlass.extract_mlir_values(self.space)
         self._n_space = len(values)
+        if not isinstance(self.total, int):  # a static total stays a constant
+            values += cutlass.extract_mlir_values(self.total)
         if self._uses_workspace():
             values += cutlass.extract_mlir_values(self.workspace)
         return values
@@ -764,10 +762,13 @@ class BoundWork:
     def __new_from_mlir_values__(self, values):
         n = getattr(self, "_n_space", len(cutlass.extract_mlir_values(self.space)))
         space = cutlass.new_from_mlir_values(self.space, values[:n])
+        total = self.total
+        if not isinstance(total, int):
+            total, n = Int32(values[n]), n + 1
         ws = None
         if self._uses_workspace():
             ws = cutlass.new_from_mlir_values(self.workspace, values[n:])
-        new = BoundWork(self.stream, space, ws, None)
+        new = BoundWork(self.stream, space, ws, None, total)
         # Prologue values (begin_roles) dominate every later region, so they carry as is.
         new.first_words = getattr(self, "first_words", None)
         return new
@@ -792,16 +793,24 @@ class BoundWork:
         # Every grid extent and index must fit Int32. Past that the grid is zero-wide, so CUDA
         # rejects the launch instead of the kernel covering a wrapped space. This is host code
         # in the jit entry point: kernels pay nothing for the check.
-        size = self.stream.mapping.size64(self.space)
-        if isinstance(size, int) and isinstance(units, int):  # static extents: plain host ints
-            return (x if schedule.index_limit(size, units, self.cs) <= INT32_MAX else 0), y, z
-        limit = schedule.index_limit(size, Int64(units), self.cs)
+        count = self.count64
+        if isinstance(count, int) and isinstance(units, int):  # static extents: plain host ints
+            return (x if schedule.index_limit(count, units, self.cs) <= INT32_MAX else 0), y, z
+        limit = schedule.index_limit(Int64(count), Int64(units), self.cs)
         return Int32(cutlass.select_(limit <= INT32_MAX, x, Int32(0))), y, z
 
 
 # --------------------------------------------------------------------------- #
 # Device side: decoding, the per-role cursor, and the scheduler role
 # --------------------------------------------------------------------------- #
+
+
+def _narrow(count):
+    """The Int32 item count from ``count64``. A count past ``INT32_MAX`` saturates; the launch
+    rejects such a space (``BoundWork.grid``), so no launched kernel sees a truncated count."""
+    if isinstance(count, int):
+        return min(count, INT32_MAX)
+    return Int32(cutlass.min(Int64(count), Int64(INT32_MAX)))
 
 
 def _decode(stream, index, problem):
