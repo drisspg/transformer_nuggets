@@ -175,7 +175,6 @@ def main():
             f"port {min(t_port, t_portb):.2f}",
             flush=True,
         )
-    print(sorted(k_fa4), sorted(k_port))
 
 
 if __name__ == "__main__":

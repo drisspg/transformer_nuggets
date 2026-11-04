@@ -19,7 +19,9 @@ Two declaration options change how a channel synchronizes:
 * ``round_robin=True`` (``Ring`` only): the role instances on a side take the epochs in turn.
   With ``k`` instances, instance ``j`` handles epochs ``j, j + k, j + 2k, ...``, and each epoch's
   arrival count is one instance's contribution, not the join of all of them. FA4's decode
-  kernel uses it for two softmax warpgroups that alternate KV blocks.
+  kernel uses it for two softmax warpgroups that alternate KV blocks. On an mbarrier ring ``k``
+  must divide the stage count: a parity wait is only exact when the waiter itself saw the
+  stage's previous epoch, and with ``n % k != 0`` another instance did.
 * ``sync="named"`` (``Threads`` on both sides): each slot is a pair of CTA named barriers
   (``bar.sync``/``bar.arrive``, unaligned) instead of mbarriers. A named barrier has no phase:
   it completes when the producer's and the consumer's threads have all arrived, so its count is
@@ -493,6 +495,7 @@ class Handle:
             raise ProtocolError("commit(wait=True) signals the full barrier; drop signal=False")
         self._close(True, "commit" if signal else "commit(raw signal)")
         if wait:
+            _fence(self._end._chan.commit_fence)
             self._end._named_wait(self._end._chan.named_ids[0], self.index, "commit")
         elif signal:
             self._end._signal(self.index)
@@ -785,8 +788,7 @@ class _End:
             if slot is not None:
                 raise ProtocolError(f"{who}: ring {chan.name}.{op}() takes no slot")
             index, phase = self._state.index, self._state.phase
-            for _ in range(self._stride):
-                self._state.advance()
+            self._state.advance(self._stride)
             return index, phase, "i"
         if not isinstance(slot, int):
             raise ProtocolError(

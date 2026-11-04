@@ -1,9 +1,8 @@
 """Round-robin rings, named-barrier channels, and the FA4 swap-AB decode port built on them.
 
-The toy kernel checks each feature on its own: three role instances take a two-stage mbarrier
-ring's epochs in turn (3 does not divide 2: the phases tell the instances apart), forward them
-through a three-stage named ring (one stage per instance), and through a one-stage named mailbox
-that a turnstile serializes. The decode tests compare the port with an fp32 reference and, when
+The toy kernel checks each feature on its own: three role instances take a three-stage mbarrier
+ring's epochs in turn, forward them through a three-stage named ring (one stage per instance),
+and through a one-stage named mailbox that a turnstile serializes. The decode tests compare the port with an fp32 reference and, when
 ``flash_attn.cute`` is installed, with FA4's split partials bit for bit.
 """
 
@@ -19,6 +18,7 @@ import cutlass
 from cutlass import cute
 
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
+from transformer_nuggets.cute.warpdrive.channels import ConsumerEnd
 from transformer_nuggets.cute.warpdrive import (
     Consumer,
     CtaPair,
@@ -63,7 +63,8 @@ class RoundRobinToy(WarpSpecialized):
     def __init__(self, mode: str = "ok"):
         self.mode = mode
         payload = (cutlass.Int32, (32,))
-        self.rr = Ring(2, Threads, Threads, round_robin=True, payload=payload)
+        rr_stages = 2 if mode == "short_ring" else K_MID
+        self.rr = Ring(rr_stages, Threads, Threads, round_robin=True, payload=payload)
         self.nr = Ring(K_MID, Threads, Threads, sync="named", round_robin=True, payload=payload)
         turnstile = None if mode == "no_turnstile" else "turn"
         self.mail = Ring(
@@ -143,7 +144,7 @@ def compile_toy(op):
 
 @pytest.mark.parametrize("n", [1, 2, 7, 13])
 def test_round_robin_and_named_channels_deliver_every_epoch(requires_blackwell, n):
-    """Instance j gets epochs j, j + 3, ... of a ring whose stage count 3 does not divide; the
+    """Instance j gets epochs j, j + 3, ... of the round-robin ring, across ring wraps; the
     named ring and the turn-taking mailbox deliver them to the sink in epoch order."""
     op = RoundRobinToy()
     out = torch.full((n * 32, 3), -1, device="cuda", dtype=torch.int32)
@@ -158,8 +159,8 @@ def test_round_robin_and_named_channels_deliver_every_epoch(requires_blackwell, 
 def test_round_robin_and_named_describe():
     text = RoundRobinToy().describe()
     # One instance's arrivals per epoch: 32, not the 96 of a three-instance join.
-    assert "rr    Ring(2)  src -> mid[0], mid[1], mid[2]" in text
-    assert "empty     32 x2" in text
+    assert "rr    Ring(3)  src -> mid[0], mid[1], mid[2]" in text
+    assert "empty     32 x3" in text
     assert "consumers round-robin: instance j of 3 takes epochs j, j+3, ..." in text
     # Named barriers count both sides; IDs come from the top, below the layer's 1 and 2.
     assert "named     full ids [10, 11, 12], empty ids [13, 14, 15], 64 x3 threads" in text
@@ -176,6 +177,7 @@ def test_round_robin_and_named_describe():
         ("no_turnstile", r"3 round-robin producers share the barriers of 1 named stage"),
         ("outside_turn", r"mail\.acquire\(\) at .* outside `with turn\.turn\(\):`"),
         ("id_collision", r"named_barrier\(8\) at .* uses a barrier ID owned by channel mail"),
+        ("short_ring", r"3 round-robin consumers need a multiple of 3 stages, got 2"),
         ("wait_mbarrier", r"commit\(wait=True\) on rr\[i\] acquire: only a named-barrier"),
     ],
 )
@@ -281,15 +283,65 @@ def test_named_channels_need_free_ids_and_one_cta():
     op.cluster = CtaPair()
     _raises_protocol("named barriers are per CTA", op.describe)
 
+    @role(warps=[range(1, 2), range(2, 3)])
+    @cute.jit
+    def pair_cons(self, ctx, *, a: Consumer):
+        return a
+
+    op = _kernel(
+        {"a": lambda: Ring(2, Threads, Threads, round_robin=True)},
+        {"lead": lead, "pair_cons": pair_cons},
+    )
+    op.cluster = CtaPair()
+    _raises_protocol("round_robin is CTA-local", op.describe)
+
+
+def test_named_turnstile_must_seat_the_round_robin_instances():
+    @role(warps=[range(0, 1), range(1, 2)])
+    @cute.jit
+    def prod(self, ctx, *, a: Producer):
+        return a
+
+    @role(warps=[range(2, 3), range(3, 4)])
+    @cute.jit
+    def other(self, ctx, *, t: Turn):
+        return t
+
+    @role(warps=4)
+    @cute.jit
+    def cons(self, ctx, *, a: Consumer):
+        return a
+
+    channels = {
+        "a": lambda: Ring(1, Threads, Threads, sync="named", round_robin=True, turnstile="t"),
+        "t": Turnstile,
+    }
+    op = _kernel(channels, {"prod": prod, "other": other, "cons": cons})
+    _raises_protocol(
+        r"declare an enabled Turnstile over \['prod\[0\]', 'prod\[1\]'\]", op.describe
+    )
+
+
+def test_named_channel_has_no_mbarrier_accessors():
+    chan = Ring(1, Threads, Threads, sync="named")
+    chan.name = "a"
+    cons = ConsumerEnd(chan, None, {}, SimpleNamespace(role_name="r"), None, None)
+    _raises_protocol("named-barrier channel and has no mbarriers", lambda: cons.full_barrier(0))
+    _raises_protocol("named-barrier channel and has no mbarriers", lambda: cons.empty_barrier(0))
+
 
 # --------------------------------------------------------------------------- #
 # The FA4 swap-AB decode port
 # --------------------------------------------------------------------------- #
 
-decode = pytest.importorskip("transformer_nuggets.cute.warpdrive.examples.fa4_decode_swapab")
+
+@pytest.fixture
+def decode():
+    """The example imports flash_attn.cute and quack; only its tests need them."""
+    return pytest.importorskip("transformer_nuggets.cute.warpdrive.examples.fa4_decode_swapab")
 
 
-def reference_partials(q, k, v, splits, used, counts):
+def reference_partials(decode, q, k, v, splits, used, counts):
     """fp32 split partials of FA4's split rule; (O, LSE, owned mask)."""
     b, _, h, d = q.shape
     qpk = h // k.shape[2]
@@ -326,7 +378,7 @@ DECODE_CASES = [
 
 
 @pytest.mark.parametrize("case", DECODE_CASES)
-def test_decode_matches_fp32_reference(requires_blackwell, case):
+def test_decode_matches_fp32_reference(requires_blackwell, decode, case):
     b, s, h, hkv, splits, used, counts = case
     torch.manual_seed(0)
     q = torch.randn(b, 1, h, 128, device="cuda", dtype=torch.bfloat16)
@@ -335,7 +387,9 @@ def test_decode_matches_fp32_reference(requires_blackwell, case):
     used_t = None if used is None else torch.tensor(used, device="cuda", dtype=torch.int32)
     counts_t = None if counts is None else torch.tensor(counts, device="cuda", dtype=torch.int32)
     o, lse = decode.decode_partials(q, k, v, splits, seqused_k=used_t, splits_per_seq=counts_t)
-    ro, rl, owned = reference_partials(q, k, v, splits, used or [s] * b, counts or [splits] * b)
+    ro, rl, owned = reference_partials(
+        decode, q, k, v, splits, used or [s] * b, counts or [splits] * b
+    )
     o, lse = o[:, :, 0], lse[..., 0]
     torch.testing.assert_close(o[owned], ro[owned], atol=3e-3, rtol=0)
     assert torch.equal(torch.isneginf(lse[owned]), torch.isneginf(rl[owned]))
@@ -345,7 +399,7 @@ def test_decode_matches_fp32_reference(requires_blackwell, case):
     assert torch.count_nonzero(o[empty]) == 0, "an empty split must write O = 0"
 
 
-def test_decode_matches_fa4_partials_bitwise(requires_blackwell, monkeypatch):
+def test_decode_matches_fa4_partials_bitwise(requires_blackwell, decode, monkeypatch):
     """Same split partials as FA4's swap-AB decode (per-sequence split counts from FA4's prepare
     kernel, then FA4's combine) bit for bit, and the same combined output."""
     interface = pytest.importorskip("flash_attn.cute.interface")

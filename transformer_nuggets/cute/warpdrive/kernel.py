@@ -656,6 +656,15 @@ class WarpSpecialized:
                 )
             if chan.named:
                 _check_named_turns(name, chan, turns)
+            else:
+                for side in ("producer", "consumer"):
+                    k = chan.turns(side)
+                    if k > 1 and chan.n % k:
+                        raise ProtocolError(
+                            f"channel {name}: {k} round-robin {side}s need a multiple of {k} "
+                            f"stages, got {chan.n}: an instance's parity wait is only exact when "
+                            "it saw the stage's previous epoch itself"
+                        )
         for name, ts in turns.items():
             if len(ts.parties) < 2 or len({r.role for r in ts.parties}) != 1:
                 raise ProtocolError(f"turnstile {name} needs >= 2 instances of one role")
@@ -1216,8 +1225,8 @@ class WarpSpecialized:
                 else pipeline.PipelineUserType.Consumer,
                 chan.n,
             )
-            for _ in range(turn):
-                state.advance()
+            if turn:
+                state.advance(turn)
         cls = ProducerEnd if is_prod else ConsumerEnd
         end = cls(
             chan,

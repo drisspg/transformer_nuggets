@@ -149,8 +149,10 @@ def named_barrier(barrier_id: int, number_of_threads: int):
     """``cute.arch.barrier(...)``, visible to the diagnostic. Only a barrier over every thread
     of the calling role (``number_of_threads == 32 * warps``) orders the role's warps."""
     cute.arch.barrier(barrier_id=barrier_id, number_of_threads=number_of_threads)
-    # The id lets the kernel reject a collision with a named-barrier channel's IDs.
-    _record("barrier", threads=number_of_threads, id=barrier_id)
+    # A Python int id lets the kernel reject a collision with a named-barrier channel's IDs.
+    _record(
+        "barrier", threads=number_of_threads, id=barrier_id if type(barrier_id) is int else None
+    )
 
 
 # --------------------------------------------------------------------------- #

@@ -180,7 +180,8 @@ correction warpgroup. What it needed from the layer:
 - Work items `(split, kv_head, batch)` from a `SplitKV` mapping. With per-sequence counts it
   reads the table after `PdlWait()` and drops the splits past each count.
 - `round_robin` rings for S, P and the row-max/row-sum mailboxes, so softmax[i] takes blocks
-  i, i+2, ... with one warpgroup's counts.
+  i, i+2, ... with one warpgroup's counts. The schedule stays `OneShot`: with an odd block
+  count a second item would start on softmax[1]'s epochs.
 - Named-barrier channels for the thread mailboxes and done flags, with a turnstile around the
   shared row-max exchange.
 - P in a 4-stage SMEM ring read as the PV MMA's B operand; no TMEM alias.
@@ -207,15 +208,15 @@ shared GPUs.
 
 | batch x kv_len, heads/kv_heads | splits | FA4 decode | port | ratio | graph FA4 / port |
 |---|---|---:|---:|---:|---:|
-| 1x8192, 8/1 | 16 | 4.32 | 4.77 | 1.104 | 17.01 / 18.19 |
-| 1x32768, 32/1 | 32 | 7.07 | 8.00 | 1.131 | 19.66 / 20.86 |
-| 4x16384, 32/8 | 4 | 39.84 | 41.14 | 1.033 | 48.80 / 50.53 |
-| 8x32768, 32/8 | 2 | 152.08 | 149.57 | 0.983 | 160.42 / 157.41 |
-| 8x65536 ragged, 8/1 | per-seq <= 32 | 26.40 | 27.98 | 1.060 | 38.21 / 38.30 |
-| 16x32768 ragged, 64/8 | per-seq <= 10 | 179.82 | 180.50 | 1.004 | 190.11 / 190.14 |
-| 2x131072 ragged, 16/1 | per-seq <= 32 | 9.31 | 9.57 | 1.028 | 21.92 / 20.56 |
+| 1x8192, 8/1 | 16 | 4.22 | 4.70 | 1.114 | 16.40 / 16.69 |
+| 1x32768, 32/1 | 32 | 7.04 | 7.90 | 1.123 | 19.39 / 19.18 |
+| 4x16384, 32/8 | 4 | 39.81 | 41.18 | 1.035 | 49.02 / 49.09 |
+| 8x32768, 32/8 | 2 | 151.10 | 149.70 | 0.991 | 159.41 / 157.63 |
+| 8x65536 ragged, 8/1 | per-seq <= 32 | 26.24 | 28.18 | 1.074 | 36.80 / 36.80 |
+| 16x32768 ragged, 64/8 | per-seq <= 10 | 180.38 | 180.37 | 1.000 | 190.30 / 190.11 |
+| 2x131072 ragged, 16/1 | per-seq <= 32 | 9.28 | 9.47 | 1.021 | 21.41 / 21.38 |
 
-Long splits run at parity. Short ones pay about 0.5-0.9 us more per CTA. Under NCU (1x8192,
+Long splits run at parity; short ones are 2-12% (0.2-1.9 us) slower. Under NCU (1x8192,
 cold caches) the port issues 5% more instructions and spends more stall cycles on long and short
 scoreboards. Its other resources match FA4's: 68 registers, no spills, 512 threads.
 Changes measured and ruled out as the cause, each within noise: allocating TMEM from warp 1 as

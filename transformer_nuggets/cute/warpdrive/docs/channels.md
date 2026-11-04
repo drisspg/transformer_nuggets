@@ -88,7 +88,9 @@ handles epochs j, j + k, j + 2k, ..., so softmax[1] above starts at the second s
 softmax[0]'s. Each epoch's count is one instance's arrivals: 128 here, not the 256 of a join.
 `describe()` prints the rotation and the per-epoch count. The instances must be one role with
 the same width, and their loops must visit their own epochs; nothing checks that the trip counts
-add up. The stage count doesn't have to be a multiple of k: the phases tell the instances apart.
+add up. On an mbarrier ring the stage count must be a multiple of k. A parity wait is exact only
+when the waiter saw the stage's previous epoch itself; with 3 instances on 2 stages, instance 2's
+first wait would pass on a barrier nobody has filled.
 The [decode example](../examples/fa4_decode_swapab.py) alternates KV blocks this way.
 
 ## Named-barrier channels
