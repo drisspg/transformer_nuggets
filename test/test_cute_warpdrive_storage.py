@@ -19,6 +19,7 @@ from transformer_nuggets.cute.warpdrive import (
     Ring,
     SmemPlan,
     StageView,
+    StaticPersistent,
     Threads,
     WarpSpecialized,
     role,
@@ -183,3 +184,29 @@ def test_buffer_keeps_remote_scope_and_pair_channels():
     text = PersistentGemm(cluster=CtaPair()).describe()
     ab = text[text.index("  ab ") : text.index("  acc ")]
     assert "pair-scoped" in ab and "storage   buffer A, B" in ab
+
+
+def test_fa4_o_over_q_runs_correctly(requires_blackwell):
+    """FA4 with sO placed over sQ (one work item per CTA) matches the reference."""
+    pytest.importorskip("flash_attn.cute")
+    from transformer_nuggets.cute.warpdrive.examples.fa4_fwd import (
+        LOG2_E,
+        FlashAttentionForward,
+        compile_fa4_fwd,
+    )
+
+    torch.manual_seed(0)
+    b, h, sq, sk = 2, 3, 640, 512
+    q, k, v = (
+        torch.randn(b, s, h, 128, device="cuda", dtype=torch.bfloat16) for s in (sq, sk, sk)
+    )
+    op = FlashAttentionForward(overlap_o_q=True)
+    out, lse = torch.empty_like(q), torch.empty(b, h, sq, device="cuda", dtype=torch.float32)
+    workspace, sms = op.work.launch_args(q.device)
+    compile_fa4_fwd(op)(q, k, v, out, lse, 128**-0.5 * LOG2_E, workspace, sms)
+    qf, kf, vf = (x.float().transpose(1, 2) for x in (q, k, v))
+    ref = torch.nn.functional.scaled_dot_product_attention(qf, kf, vf).transpose(1, 2)
+    assert (out.float() - ref).abs().max().item() <= 2**-7 * ref.abs().max().item() + 4e-3
+    assert "O  BFloat16  65536 B  2 stages (mode -1)  overlaps Q" in op.describe()
+    with pytest.raises(ValueError, match="overlap_o_q needs one work item per CTA"):
+        FlashAttentionForward(overlap_o_q=True, schedule=StaticPersistent())

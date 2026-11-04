@@ -159,9 +159,10 @@ def allocate(smem, buf: SmemBuffer, layout, resolved: dict) -> ResolvedBuffer:
         raise ProtocolError(
             f"SMEM buffer {buf.name}: stage_axis {buf.stage_axis} is outside its rank-{rank} layout"
         )
-    stages, stride = outer.shape[axis], outer.stride[axis]
+    stages = cute.size(outer, mode=[axis])
+    stride = _stage_stride(outer.shape[axis], outer.stride[axis])
     out = ResolvedBuffer(buf, tensor, outer, nbytes, stages if isinstance(stages, int) else None)
-    if nbytes is not None and isinstance(stages, int) and isinstance(stride, int):
+    if nbytes is not None and isinstance(stages, int) and stride is not None:
         out.stage_stride = stride * width // 8
         out.stage_bytes = nbytes - (stages - 1) * out.stage_stride
     if buf.overlaps is not None:
@@ -172,6 +173,23 @@ def allocate(smem, buf: SmemBuffer, layout, resolved: dict) -> ResolvedBuffer:
                 f"{root.nbytes} B"
             )
     return out
+
+
+def _leaves(value):
+    if isinstance(value, tuple):
+        for v in value:
+            yield from _leaves(v)
+    else:
+        yield value
+
+
+def _stage_stride(shape, stride) -> int | None:
+    """The element stride between stages of a (possibly nested) stage mode: the stride of its
+    only non-unit sub-mode (CUTLASS's epilogue layouts write a stage mode as ``(1, n)``)."""
+    live = [d for n, d in zip(_leaves(shape), _leaves(stride)) if n != 1]
+    if len(live) != 1 or not isinstance(live[0], int):
+        return None
+    return live[0]
 
 
 def stage_extent(tensor, axis: int, what: str) -> int:

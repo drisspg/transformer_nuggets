@@ -847,7 +847,9 @@ See the [pipeline profiler](../profiler/README.md#declarative-pipeline-analysis)
 - [persistent_gemm.py](examples/persistent_gemm.py): all four schedules, any `mapping=`,
   double-buffered accumulators, TMA stores, `CtaPair()` and configurable `tile_n`.
 - [fa4_fwd.py](examples/fa4_fwd.py): FA4-style forward, two softmax instances, correction, slots,
-  fan-out/join, turnstile, S/P aliasing, split-P, persistence, `mapping=` and CTA pairs.
+  fan-out/join, turnstile, S/P aliasing, split-P, persistence, `mapping=` and CTA pairs;
+  channel storage with V over K and optional O over Q (`overlap_o_q=True`, one work item per
+  CTA).
 - [packed_work.py](examples/packed_work.py): `PackedWork`, a work list built on the device
   (capacity on the host, length read in `decode`).
 
