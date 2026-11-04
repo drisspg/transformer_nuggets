@@ -177,7 +177,11 @@ class ScheduleToy(WarpSpecialized):
         while tiles.valid:
             self._visit(0, tiles, count, c)
             count += 1
-            tiles.advance()
+            if cutlass.const_expr(self.mode == "conditional_advance"):
+                if count < self.MAX_ITEMS:  # a runtime predicate: some iterations skip it
+                    tiles.advance()
+            else:
+                tiles.advance()
             if cutlass.const_expr(self.mode == "double_advance"):
                 tiles.advance()
 
@@ -354,6 +358,7 @@ def test_describe_places_scheduler_and_counts(requires_blackwell):
     [
         ("no_advance", "never calls advance"),
         ("double_advance", "advance\\(\\) traced 2 times"),
+        ("conditional_advance", "not under a nested branch"),
     ],
 )
 def test_cursor_protocol_errors(requires_blackwell, mode, message):

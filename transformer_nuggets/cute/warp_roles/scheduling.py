@@ -38,6 +38,10 @@ take ``tiles: Tiles`` and loop::
         ...
         tiles.advance()
 
+Tracing checks that each role calls ``advance()`` exactly once, directly in the body of a
+``while tiles.valid:`` loop (not under a branch or nested loop), so every role steps through
+the same sequence.
+
 Clusters (``CtaPair``): a work item belongs to a cluster. Indices count clusters (``blockIdx.x //
 2``, ``gridDim.x // 2``), the launch grid is two CTAs per cluster, local policies compute the same
 sequence in both CTAs, and broadcast policies claim on the leader only: its scheduler warp
@@ -558,9 +562,8 @@ class _CursorRecord:
     """Trace-time record shared by loop-carried copies of one cursor."""
 
     role: str
-    root: object
     advances: list = field(default_factory=list)  # (site, block)
-    read_valid: bool = False
+    valid_blocks: list = field(default_factory=list)  # blocks that read ``valid``
 
     def check(self):
         if not self.advances:
@@ -575,10 +578,23 @@ class _CursorRecord:
                 "exactly once, unconditionally, at the end of the tile loop body"
             )
         site, block = self.advances[0]
-        if block == self.root or not self.read_valid:
+        if not any(_is_while_body(block, cond) for cond in self.valid_blocks):
             raise ProtocolError(
-                f"{self.role}: advance() at {site} is not inside a `while tiles.valid:` loop"
+                f"{self.role}: advance() at {site} must run once per iteration of a "
+                "`while tiles.valid:` loop: call it directly in that loop's body, not under a "
+                "nested branch or loop"
             )
+
+
+def _is_while_body(block, cond_block) -> bool:
+    """``block`` is the body (after region) of the ``scf.while`` whose condition (before
+    region) is ``cond_block``."""
+    op = block.owner
+    return (
+        op.name == "scf.while"
+        and block == op.regions[1].blocks[0]
+        and cond_block == op.regions[0].blocks[0]
+    )
 
 
 def _hooked(stream) -> bool:
@@ -603,7 +619,7 @@ class TileCursor:
         """Local mode: run the hooks and decode here. Broadcast mode: start at ``blockIdx.x``
         decoded locally, or, when hooks may move the first item, receive it from the scheduler
         (which publishes it in ``scheduler_role``)."""
-        rec = _CursorRecord(trace.role_name, current_block())
+        rec = _CursorRecord(trace.role_name)
         trace.checks.append(rec.check)
         count = Int32(0) if stream.record else None
         cur = TileCursor(stream, problem, end, Int32(problem.first_unit()), [], rec, count, slot)
@@ -657,7 +673,7 @@ class TileCursor:
 
     @property
     def valid(self):
-        self._rec.read_valid = True
+        self._rec.valid_blocks.append(current_block())
         return self.index < self._problem.total
 
     @property
