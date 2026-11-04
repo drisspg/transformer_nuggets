@@ -434,9 +434,9 @@ def persistent_gemm(
     tile_n: int = 256,
 ) -> torch.Tensor:
     """``a @ b.T`` for row-major bf16 ``a: (M, K)``, ``b: (N, K)``. ``schedule`` defaults to
-    ``StaticPersistent()``; ``max_ctas`` caps the persistent grid in CTAs (default: the SM
-    count); ``cluster=CtaPair()`` runs 2-CTA 256x256 tiles, ``Cluster(2, 2, pair=True)`` two such
-    pairs sharing A."""
+    ``StaticPersistent()``; ``max_ctas`` caps the persistent grid in CTAs (default: the CTAs of
+    the clusters that fit at once, the SM count for one CTA or a pair); ``cluster=CtaPair()``
+    runs 2-CTA 256x256 tiles, ``Cluster(2, 2, pair=True)`` two such pairs sharing A."""
     out = check_gemm_args(a, b, out)
     if out.numel() == 0:
         return out

@@ -588,24 +588,34 @@ class WarpSpecialized:
         """Cluster checks on role placement, then derive every channel's scope."""
         cluster = self.cluster
         leaders = set(cluster.ctas(LEADER))
-        if cluster.pair:
+        if cluster.size > 1:
             for name, ch in chans.items():
                 for side, mech, bound in (
                     ("producer", ch.producer, ch.producers),
                     ("consumer", ch.consumer, ch.consumers),
                 ):
-                    other = ch.consumers if side == "producer" else ch.producers
-                    served = {cluster.group(c)[0] for ri, _ in other for c in cluster.ctas(ri.cta)}
+                    if mech is not Umma:
+                        continue
+                    # Each CTA's data is read or written by its own pair leader's MMAs (its own
+                    # MMAs without pairs), so every leader the other side needs must commit.
+                    # Without pairs a commit that only releases other CTAs' stages is accepted.
+                    if side == "consumer" and not cluster.pair:
+                        served = set()
+                    else:
+                        other = ch.consumers if side == "producer" else ch.producers
+                        served = {
+                            cluster.group(c)[0] for ri, _ in other for c in cluster.ctas(ri.cta)
+                        }
                     for ri, _ in bound:
                         ctas = set(cluster.ctas(ri.cta))
-                        if mech is Umma and ctas <= leaders and not served <= ctas:
+                        if ctas <= leaders and not served <= ctas:
                             raise ProtocolError(
                                 f"role {ri.name} signals channel {name} ({side} side) with "
                                 f"tcgen05.commit from CTAs {sorted(ctas)}, but the other side "
-                                f"runs in the MMA pairs led by {sorted(served)}; their MMAs "
-                                "need a leader of their own: use cta='leader'"
+                                f"needs the MMAs of CTAs {sorted(served)} (pair leaders); each "
+                                "needs its own commit: use cta='leader'"
                             )
-                        if mech is Umma and not ctas <= leaders:
+                        if cluster.pair and not ctas <= leaders:
                             raise ProtocolError(
                                 f"role {ri.name} signals channel {name} ({side} side) with "
                                 f"tcgen05.commit, so it issues the MMAs; in a "
@@ -631,8 +641,9 @@ class WarpSpecialized:
             if ch.scope.pair and (ch.named or ch.round_robin):
                 what = "named barriers are per CTA" if ch.named else "round_robin is CTA-local"
                 raise ProtocolError(
-                    f"channel {name}: its roles run in different CTAs of the pair, but {what}; "
-                    "give both sides the same placement"
+                    f"channel {name}: it crosses CTAs (its roles run in different CTAs, or its "
+                    f"copies are multicast), but {what}; give both sides the same placement "
+                    "without multicast"
                 )
 
     def _validate(self, chans, turns, roles):

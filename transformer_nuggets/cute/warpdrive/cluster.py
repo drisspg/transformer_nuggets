@@ -306,15 +306,11 @@ class Scope:
     def describe(self) -> str:
         if not self.pair:
             return "local"
-        names = len(set(self.full_ctas) | set(self.empty_ctas) | {0, 1}) <= 2
 
         def ctas(cs):
-            if names:
-                return "+".join("leader" if c == 0 else "peer" for c in cs)
             return "+".join(f"rank {c}" for c in cs)
 
-        kind = "pair" if names else "cluster"
-        return f"{kind}: full in {ctas(self.full_ctas)}, empty in {ctas(self.empty_ctas)}"
+        return f"cross-CTA: full in {ctas(self.full_ctas)}, empty in {ctas(self.empty_ctas)}"
 
 
 def _masks(targets: dict) -> int | dict:
@@ -416,7 +412,7 @@ def derive_scope(chan, cluster, *, internal: bool = False) -> Scope:
             tx_ctas = cluster.pair_size
             tx *= tx_ctas
             full_targets = {p: (p,) for p in full_ctas}
-        elif set(empty_ctas) <= set(leaders) and len(empty_ctas) < len(ranks):
+        elif cluster.pair and set(empty_ctas) <= set(leaders):
             raise ProtocolError(
                 f"channel {chan.name}: a leader-only TMA producer feeding consumers in other "
                 "CTAs would need multicast TMA into the peer CTA, armed there by the leader, "

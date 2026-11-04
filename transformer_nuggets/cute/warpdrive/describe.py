@@ -181,9 +181,9 @@ def _channels(kernel) -> str:
         pair = is_pair(kernel.cluster)
         full = fmt_per_cta(sc.full_counts, full_ranks, by_rank=sc.pair, pair=pair)
         if sc.tx is not None:
-            # Leaders arm for their pair, or rank 0's scheduler for every CTA.
+            # Leaders arm for both CTAs of their pair, or rank 0's scheduler for every CTA.
             armers = [r for r, targets in sc.full_targets.items() if targets]
-            armed = sc.pair and (kernel.cluster.pair or armers == [0])
+            armed = sc.pair and (sc.tx_ctas > 1 or armers == [0])
             full += f", tx {sc.tx} B" + (" (leader-armed)" if armed else "")
         details.append(("signal", f"{_mech(ch.producer)} -> {_mech(ch.consumer)}"))
         if ch.named:

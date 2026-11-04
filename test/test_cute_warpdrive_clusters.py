@@ -251,9 +251,17 @@ def test_cluster_placement_errors():
     with pytest.raises(ProtocolError, match="can only feed leader-only consumers"):
         _AllToRank0Tma()._collect()
     # Ranks 2 and 3 would read an accumulator no MMA of their pair wrote.
-    with pytest.raises(ProtocolError, match="led by \\[0, 2\\].*use cta='leader'"):
+    with pytest.raises(ProtocolError, match="needs the MMAs of CTAs \\[0, 2\\].*cta='leader'"):
         _Rank0Mma()._collect()
     _FlatLeaderTmem()._collect()  # without pairs every CTA is a leader, so it allocates
+
+    class FlatRank0Mma(_Rank0Mma):  # rank 1's epilogue would read TMEM no MMA of its own wrote
+        def __init__(self):
+            super().__init__()
+            self.cluster = Cluster(1, 2)
+
+    with pytest.raises(ProtocolError, match="needs the MMAs of CTAs \\[0, 1\\]"):
+        FlatRank0Mma()._collect()
 
 
 def test_fa4_rejects_clusters_beyond_a_pair():

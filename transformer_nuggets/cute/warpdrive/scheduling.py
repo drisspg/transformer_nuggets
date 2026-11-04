@@ -689,7 +689,8 @@ class WorkStream:
         import torch
 
         device = torch.device(device)
-        sms = resident_ctas(device, self.cluster_size)
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        sms = resident_ctas(index, self.cluster_size)
         words = 4
         if self.record:
             if not self.roles:
@@ -969,18 +970,19 @@ MAX_GRID_YZ = 65535  # gridDim.y and gridDim.z limit
 
 
 @functools.cache
-def resident_ctas(device, cs: int) -> int:
-    """CTAs of the ``cs``-CTA clusters that fit on ``device`` at once, one CTA per SM. One CTA
-    and CTA pairs use the SM count; larger clusters ask the occupancy calculator, because
-    they need not tile the GPCs (a 152-SM GB300 fits 36 4-CTA clusters, not 38)."""
+def resident_ctas(index: int, cs: int) -> int:
+    """CTAs of the ``cs``-CTA clusters that fit on CUDA device ``index`` at once, one CTA per
+    SM. One CTA and CTA pairs use the SM count; larger clusters ask the occupancy calculator
+    (``HardwareInfo``, which compiles and loads a probe kernel on first use: call
+    ``launch_args`` once before graph capture), because they need not tile the GPCs (a 152-SM
+    GB300 fits 36 4-CTA clusters, not 38)."""
     import torch
 
-    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    sms = torch.cuda.get_device_properties(index).multi_processor_count
     if cs <= 2:
         return sms
     from cutlass.utils import HardwareInfo
 
-    index = device.index if device.index is not None else torch.cuda.current_device()
     with torch.cuda.device(index):
         if not torch.cuda.is_current_stream_capturing():
             torch.cuda.synchronize()  # makes the device's primary context current

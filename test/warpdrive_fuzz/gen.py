@@ -620,20 +620,22 @@ def generate(
                 ):
                     for rname, _ in ch["consumers"]:
                         roles[int(rname[1:])]["cta"] = "leader"
-            # A rank-0 tcgen05.commit side can only serve rank 0's pair: the other side's
-            # MMA pairs each need their own leader. Promote until stable.
-            changed = True
-            while changed:
-                changed = False
-                for ch in channels:
-                    for side, other in (("producers", "consumers"), ("consumers", "producers")):
-                        if ch["producer" if side == "producers" else "consumer"] != "umma":
-                            continue
-                        served = {geom.group(c)[0] for cs in placed_ctas(ch[other]) for c in cs}
-                        for rname, _ in ch[side]:
-                            r = roles[int(rname[1:])]
-                            if r["cta"] == "rank0" and served - {0}:
-                                r["cta"], changed = "leader", True
+        # A rank-0 tcgen05.commit side can only serve rank 0's pair (without pairs, a
+        # producer only rank 0): the other side's MMA pairs each need their own leader.
+        # Promote until stable.
+        sides = (("producers", "consumers"), ("consumers", "producers"))
+        changed = True
+        while changed:
+            changed = False
+            for ch in channels:
+                for side, other in sides if pair else sides[:1]:
+                    if ch["producer" if side == "producers" else "consumer"] != "umma":
+                        continue
+                    served = {geom.group(c)[0] for cs in placed_ctas(ch[other]) for c in cs}
+                    for rname, _ in ch[side]:
+                        r = roles[int(rname[1:])]
+                        if r["cta"] == "rank0" and served - {0}:
+                            r["cta"], changed = "leader", True
         for ch in channels:
             if ch["producer"] == "tma":
                 prod, cons = placed_ctas(ch["producers"]), placed_ctas(ch["consumers"])

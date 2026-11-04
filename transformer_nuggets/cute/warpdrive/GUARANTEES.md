@@ -169,7 +169,10 @@ coordinates except along each declared mode (`Cluster.line`).
   have placeholder count 1 and no promised waiter. In a `CtaPair` the unit is the cluster, so
   these are the pair rules: targets are the union of consumer (producer) CTAs.
 - Masks have one bit per target: one int when every signalling CTA's mask agrees, else per
-  rank. UMMA signalers must be leader-only when the cluster has pairs, and use group TWO.
+  rank. UMMA signalers must be leader-only when the cluster has pairs, and use group TWO. A
+  UMMA side must run in the leader of every pair the other side runs in: each CTA's operands
+  and accumulator belong to its own leader's MMAs. Without pairs this applies to a UMMA
+  producer (each CTA's accumulator is its own MMAs'); a UMMA consumer may release other CTAs.
 - Ordinary cross-CTA TMA producers in every CTA feed only the pair leaders. Each leader arms
   `2 * Tma.tx_bytes` (both CTAs' SMEM) and only leaders arm; each CTA's copies deliver the
   declared per-CTA bytes using group TWO, multicast or not. A leader-only producer feeding
@@ -312,7 +315,7 @@ body at `describe()` time.
 | E34 | Slots.n >31 | ValueError |
 | E35 | Barriers.n not a positive Python int | ValueError |
 | E36 | Raw counts not a positive Python int or n positive integer entries | ValueError |
-| E37 | UMMA signaler not leader-only in a cluster with pairs, or missing the leader of a pair the other side runs in | ProtocolError |
+| E37 | UMMA signaler not leader-only in a cluster with pairs, or missing the leader of a pair the other side runs in (without pairs: a UMMA producer missing a consumer CTA) | ProtocolError |
 | E38 | Pair turnstile seats have different placements | ProtocolError |
 | E39 | Cluster has TMEM users but none runs in every CTA | ProtocolError |
 | E40 | User pair-scoped channel has a layer-owned payload | ProtocolError |
@@ -396,7 +399,7 @@ same dynamic branch is locally accepted; another participant's matching branch i
 | E116 | `alias_check` other than warn/strict/off; `"strict"` with a potential hazard | ValueError; ProtocolError / kernel.py, alias.py |
 | E117 | Non-bool `round_robin`; `round_robin` on `Slots`; `sync` other than mbarrier/named; a named channel with a non-Threads side or an `override`; `turnstile=` without a named round-robin channel | ValueError / channels.py |
 | E118 | `round_robin` with no side holding several instances; round-robin instances of different roles or widths; `k` round-robin instances on an mbarrier ring whose stage count is not a multiple of `k` | ProtocolError / kernel.py |
-| E119 | A named or round-robin channel whose roles make it pair-scoped | ProtocolError / kernel.py |
+| E119 | A named or round-robin channel that crosses CTAs (mixed placement or multicast) | ProtocolError / kernel.py |
 | E120 | Named channels needing more barrier IDs than 3-15 provide | ProtocolError / kernel.py |
 | E121 | Named round-robin instances sharing stage barriers without an enabled `turnstile` over exactly them; an acquire/wait on that side outside its turn | ProtocolError / kernel.py, channels.py (trace) |
 | E122 | `alias.named_barrier(id, ...)` using a layer or named-channel ID | ProtocolError / kernel.py (trace) |
@@ -547,7 +550,8 @@ counts, placement, per-unit item sequences and coverage, and bitwise determinism
   overrides, `unchecked`, IKET, concurrent launches sharing a workspace, real PDL.
 - Larger clusters (`--cluster 2x2p` and friends): roles in all CTAs, pair leaders or rank 0,
   2-CTA and multicast TMA channels, the rank-0 scheduler, whole-cluster grids. 640 generated
-  declarations (8 shapes x seeds 0-79) matched the independent scope model; 300 kernels passed
+  declarations (8 shapes x seeds 0-79) matched the fuzzer's scope model (a restatement of the
+  R11 rules, so it checks the implementation against the rules, not the rules themselves); 300 kernels passed
   at runtime (2x2 pairs 140, flat 2x2 60, 4x1 pairs 40, 4x2 pairs 30, flat 2x4 30) plus 14
   multicast seeds. The short-join, counter-reset and turnstile mutants are caught on 2x2.
   Multicast is about 10% of cluster specs and never along both modes in one channel.

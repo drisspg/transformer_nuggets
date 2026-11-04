@@ -789,8 +789,11 @@ class _End:
             # Without pairs a commit to this CTA's own barrier needs no mask. Every tcgen05 op of
             # a pair kernel is cta_group::2; the multicast mask names the CTAs whose barrier
             # (same offset) receives the arrival.
+            key = "full_mask" if isinstance(self, ProducerEnd) else "empty_mask"
             multicast = cluster is not None and (
-                cluster.pair or any(cs != (r,) for r, cs in targets.items())
+                cluster.pair
+                or any(cs != (r,) for r, cs in targets.items())
+                or key in (self._chan.override or {})
             )
             if multicast and isinstance(mask, dict):
                 mask = rank_value({r: mask[r] for r in self.ctas}, cluster_rank)
