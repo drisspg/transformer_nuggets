@@ -10,8 +10,15 @@ from __future__ import annotations
 
 from cutlass import Int32, cute
 
-from transformer_nuggets.cute.warpdrive import channels, scheduling
-from transformer_nuggets.cute.warpdrive.channels import Channel, ConsumerEnd, Handle, Threads, _End
+from transformer_nuggets.cute.warpdrive import channels, cluster, kernel, scheduling
+from transformer_nuggets.cute.warpdrive.channels import (
+    Channel,
+    ConsumerEnd,
+    Handle,
+    ProducerEnd,
+    Threads,
+    _End,
+)
 from transformer_nuggets.cute.warpdrive.tracing import wait_range
 
 
@@ -96,6 +103,31 @@ def receive_early_release():
     scheduling.TileCursor._receive = _receive
 
 
+def pair_join_short():
+    """Pair-scoped Threads joins expect one warp fewer on the leader's barrier."""
+    orig = cluster.derive_scope
+
+    def derive_scope(chan, clu, *, internal=False):
+        scope = orig(chan, clu, internal=internal)
+        if scope.pair and not internal:
+            for counts, mech in (
+                (scope.full_counts, chan.producer),
+                (scope.empty_counts, chan.consumer),
+            ):
+                if mech is Threads:
+                    for rank in counts:
+                        counts[rank] = [c - 32 if c > 32 else c for c in counts[rank]]
+        return scope
+
+    cluster.derive_scope = derive_scope
+    kernel.derive_scope = derive_scope
+
+
+def no_pair_tail():
+    """Producers of pair channels released by a remote tcgen05.commit do not drain at exit."""
+    ProducerEnd.tail = lambda self: None
+
+
 MUTANTS = {
     "join_short": (join_short, "join"),
     "ring_wait_phase": (ring_wait_phase, "payload"),
@@ -104,6 +136,8 @@ MUTANTS = {
     "dynamic_no_reset": (dynamic_no_reset, "policy_dynamic"),
     "turn_no_wait": (turn_no_wait, "turnstile"),
     "receive_early_release": (receive_early_release, "policy_dynamic"),
+    "pair_join_short": (pair_join_short, "pair_scoped"),
+    "no_pair_tail": (no_pair_tail, "pair_scoped"),
 }
 
 

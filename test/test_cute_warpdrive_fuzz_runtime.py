@@ -80,10 +80,12 @@ def test_generated_kernel_matches_model(requires_blackwell, tmp_path_factory, se
     assert res.status == runtime.PASS, _explain(spec, res)
 
 
-# Mutants the oracle must catch, with the seeds (exercising the mutated feature) to try. The
-# early-release work-ring mutant is excluded: its read-after-release window is too narrow to
-# hit without device-side delay inside the layer (a known blind spot of value-based oracles).
-DETECTABLE = [m for m in runtime_mutants.MUTANTS if m != "receive_early_release"]
+# Mutants the oracle must catch, with the seeds (exercising the mutated feature) to try. Known
+# blind spots of a value-based oracle are excluded: the early-release work-ring mutant (its
+# read-after-release window is too narrow to hit without delays inside the layer) and dropped
+# pair tails (a late remote tcgen05.commit into an exited CTA changes no logged value).
+BLIND_SPOTS = ("receive_early_release", "no_pair_tail")
+DETECTABLE = [m for m in runtime_mutants.MUTANTS if m not in BLIND_SPOTS]
 
 
 @pytest.mark.parametrize("mutant", DETECTABLE)
