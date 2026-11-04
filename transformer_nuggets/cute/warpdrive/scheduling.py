@@ -613,7 +613,7 @@ class _CursorRecord:
 
     role: str
     advances: list = field(default_factory=list)  # (site, block)
-    valid_blocks: list = field(default_factory=list)  # blocks that read ``valid``
+    valid_reads: list = field(default_factory=list)  # (block, valid SSA value identity)
     trace: object = None
 
     def check(self):
@@ -629,11 +629,19 @@ class _CursorRecord:
                 "exactly once, unconditionally, at the end of the tile loop body"
             )
         site, block = self.advances[0]
-        if not any(_is_while_body(block, cond) for cond in self.valid_blocks):
+        conditions = [
+            (cond, value) for cond, value in self.valid_reads if _is_while_body(block, cond)
+        ]
+        if not conditions:
             raise ProtocolError(
                 f"{self.role}: advance() at {site} must run once per iteration of a "
                 "`while tiles.valid:` loop: call it directly in that loop's body, not under a "
                 "nested branch or loop"
+            )
+        if not any(hash(cond.operations[-1].operands[0]) == value for cond, value in conditions):
+            raise ProtocolError(
+                f"{self.role}: the tile-loop condition must be exactly tiles.valid; "
+                "an extra condition can leave the stream undrained"
             )
 
 
@@ -796,12 +804,24 @@ class TileCursor:
 
     @property
     def valid(self):
-        self._rec.valid_blocks.append(current_block())
-        return self.index < self._problem.total
+        valid = self.index < self._problem.total
+        # Keep SSA identity opaque: a raw Value in a shared dataclass becomes loop-carried
+        # state during CuTeDSL serialization, rather than trace-only bookkeeping.
+        self._rec.valid_reads.append((current_block(), hash(valid.ir_value())))
+        return valid
 
     @property
     def work(self):
         """The current work item (``Raster``: ``(m, n, l)`` tile coordinates)."""
+        block = current_block()
+        while block is not None:
+            if any(block == advanced for _, advanced in self._rec.advances):
+                raise ProtocolError(
+                    f"{self._rec.role}: tiles.work read after advance() in the same iteration "
+                    f"at {user_site()}; read the current item before advancing"
+                )
+            owner = block.owner
+            block = owner.operation.block if owner.name != "builtin.module" else None
         return self._stream.order.item(self._words)
 
     def advance(self):

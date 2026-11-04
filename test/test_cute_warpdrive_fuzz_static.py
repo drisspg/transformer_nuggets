@@ -4,7 +4,13 @@ import pytest
 
 pytest.importorskip("cutlass.cute")
 
-from test.warpdrive_fuzz.static import collect_pair, collect_roles, declaration_role
+from test.warpdrive_fuzz.mutate import compile_mutation, mutations, run_mutation_fuzz
+from test.warpdrive_fuzz.static import (
+    collect_pair,
+    collect_roles,
+    declaration_role,
+    run_static_fuzz,
+)
 from transformer_nuggets.cute.warpdrive import (
     Barriers,
     Clc,
@@ -146,3 +152,31 @@ def test_shared_channel_attributes_are_rejected_before_binding():
             {"worker": declaration_role(params=(("a", Producer), ("b", Consumer)))},
             {"a": ch, "b": ch},
         )
+
+
+@pytest.mark.parametrize(
+    "name,message", [("compound_condition", "condition"), ("advance_before_work", "after advance")]
+)
+@pytest.mark.parametrize("seed", range(4), ids=["oneshot", "static", "dynamic", "clc"])
+def test_tile_cursor_rejects_undrained_condition_and_next_item_reads(name, message, seed):
+    mutation = next(m for m in mutations() if m.name == name)
+    with pytest.raises(Exception, match=message) as info:
+        compile_mutation(mutation, seed=seed)
+    assert "ProtocolError" in repr(info.value)
+
+
+@pytest.mark.fuzz
+@pytest.mark.parametrize("seed", [0, 7, 19])
+def test_declaration_fuzz_quick(seed):
+    report = run_static_fuzz(seed, budget=128)
+    assert not report.findings, report.findings
+    assert report.cases == report.accepted + report.rejected == 128
+    assert report.accepted > 0 and report.rejected > 0
+
+
+@pytest.mark.fuzz
+@pytest.mark.parametrize("seed", [0, 7, 19])
+def test_mutation_fuzz_quick(seed):
+    report = run_mutation_fuzz(seed, budget=12)
+    assert not report.findings, report.findings
+    assert report.cases == report.accepted + report.rejected + report.obligations == 12
