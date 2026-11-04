@@ -271,7 +271,8 @@ class WarpSpecialized:
         streams = {k: v for k, v in vars(self).items() if isinstance(v, TileStream)}
         if len(streams) > 1:
             raise ProtocolError(
-                f"one TileStream per kernel (every role starts at this CTA's first item), got {list(streams)}"
+                "one TileStream per kernel (every role starts at this CTA's first item), got "
+                f"{list(streams)}"
             )
         cluster = self.cluster
         for name, st in streams.items():

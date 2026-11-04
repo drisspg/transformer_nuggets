@@ -24,11 +24,11 @@ Three independent, compile-time choices:
   x), and reads the item from ``blockIdx`` with no division. A launch whose ``n_tiles`` or ``l``
   exceeds the 65535 limit of ``gridDim.y``/``z`` falls back to the 1-D grid; the kernel sees a
   1-D launch (``gridDim.y = gridDim.z = 1`` with more than one ``(n, l)`` pair) and decodes the
-  index in a skipped branch of the prologue (about 25-50 ns on 512^3 to 2048^2 GEMMs, measured against reading
-  ``blockIdx`` unconditionally; the 1-D decode on every launch cost about 200 ns; GB300,
-  CuTeDSL 4.8.0, CUDA-graph replay of examples/gemm.py). A hand-built ``(total, 1, 1)`` grid is
-  also correct, just not division-free. Every other
-  combination launches a 1-D grid and decodes the index.
+  index in a branch of the prologue that tile-grid launches skip. The branch costs about
+  25-50 ns on 512^3 to 2048^2 GEMMs against reading ``blockIdx`` unconditionally; decoding on
+  every launch cost about 200 ns (GB300, CuTeDSL 4.8.0, CUDA-graph replay of
+  examples/gemm.py). A hand-built ``(total, 1, 1)`` grid is also correct, just not
+  division-free. Every other combination launches a 1-D grid and decodes the index.
 * **distribution**, derived by the layer from the policy. Index sequences every role can compute
   (``OneShot``, ``StaticPersistent``) are decoded locally in each role with no synchronization.
   Claimed indices (``DynamicPersistent``, ``Clc``) are claimed by a layer-owned scheduler warp,
