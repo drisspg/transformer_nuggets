@@ -104,7 +104,7 @@ class PersistentGemm(WarpSpecialized):
         return (
             f"warp_roles_pgemm_{self.cluster.get_key()}_n{self.tile_n}_ab{self.ab.n}_"
             f"acc{self.acc_stages}_"
-            f"{self.tiles.get_key()}"
+            f"{self.tiles.get_key()}{self.iket_key()}"
         )
 
     def get_key(self) -> str:

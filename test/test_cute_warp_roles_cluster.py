@@ -109,8 +109,9 @@ class PairToy(WarpSpecialized):
         for _ in cutlass.range(2 * c.n + 1, unroll=1):
             with back.consume():
                 count = count + 1
+        rank = self.cluster.rank()  # warp-uniform: not inside the lane-0 branch
         if cute.arch.lane_idx() == 0:
-            c.out[self.cluster.rank()] = count
+            c.out[rank] = count
 
     @cute.kernel
     def kernel(self, out: cute.Tensor, n: cutlass.Int32):

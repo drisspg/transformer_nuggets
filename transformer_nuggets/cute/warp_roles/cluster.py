@@ -22,6 +22,7 @@ placement the layer derives each channel's *scope*:
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 
 from cutlass import cute
@@ -32,6 +33,8 @@ from transformer_nuggets.cute.warp_roles.protocol import ProtocolError
 ALL = "all"
 LEADER = "leader"
 PLACEMENTS = (ALL, LEADER)
+# Derived ``Scope`` fields a channel may override (``Channel(override={...})``).
+SCOPE_OVERRIDES = ("full_counts", "empty_counts", "tx", "full_mask", "empty_mask")
 
 
 @dataclass(frozen=True)
@@ -77,6 +80,9 @@ class CtaPair(SingleCta):
         return cute.tiled_divide(cute.make_layout(self.shape), (2,))
 
     def rank(self):
+        """This CTA's rank (``block_idx_in_cluster``, hinted warp-uniform). Call it from
+        converged code (for example at the top of a role): the uniform hint is a warp-wide
+        operation, so calling it inside a lane-predicated branch hangs the warp."""
         return cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
 
     def is_leader(self):
@@ -102,9 +108,11 @@ class Scope:
     """Where one channel's barriers live and how each side signals them.
 
     ``full_ctas`` are the CTAs with a consumer (they wait on full barriers); ``empty_ctas`` the
-    CTAs with a producer. Counts are per CTA rank, per slot. ``tx``: bytes the leader arms on each
-    full barrier for a TMA-like producer. ``tail``: producers drain the empty barriers before
-    exit, because the consumer signals them asynchronously from another CTA (``tcgen05.commit``
+    CTAs with a producer. Counts are per CTA rank, per slot. ``tx``: bytes armed on each full
+    barrier for a TMA-like producer (in a pair, by the leader, for every CTA's copies).
+    ``full_mask``/``empty_mask``: multicast masks (bit = CTA rank) of a ``tcgen05.commit``
+    signalling the full/empty barriers. ``tail``: producers drain the empty barriers before exit,
+    because the consumer signals them asynchronously from another CTA (``tcgen05.commit``
     multicast), and a CTA must not exit with such arrivals in flight.
     """
 
@@ -115,16 +123,8 @@ class Scope:
     empty_counts: dict
     tx: int | None = None
     tail: bool = False
-
-    @property
-    def full_mask(self) -> int:
-        """Multicast mask (bit = CTA rank) of a ``tcgen05.commit`` signalling full barriers."""
-        return sum(1 << c for c in self.full_ctas) if self.pair else 1
-
-    @property
-    def empty_mask(self) -> int:
-        """Multicast mask of a ``tcgen05.commit`` releasing empty barriers."""
-        return sum(1 << c for c in self.empty_ctas) if self.pair else 1
+    full_mask: int = 1
+    empty_mask: int = 1
 
     def describe(self) -> str:
         if not self.pair:
@@ -210,7 +210,66 @@ def derive_scope(chan, cluster, *, internal: bool = False) -> Scope:
         counts(chan.consumer, chan.consumers, empty_ctas),
         tx,
         tail=tail,
+        full_mask=sum(1 << c for c in full_ctas),
+        empty_mask=sum(1 << c for c in empty_ctas),
     )
+
+
+def apply_overrides(chan, scope: Scope, cluster) -> Scope:
+    """``scope`` with the channel's ``override`` values (user values win)."""
+    if not chan.override:
+        return scope
+    changes = {}
+    for key, value in chan.override.items():
+        if key in ("full_counts", "empty_counts"):
+            changes[key] = _per_rank_counts(chan, key, value, cluster)
+        elif not isinstance(value, int) or value < 0:
+            raise ProtocolError(f"channel {chan.name}: override {key} must be an int >= 0")
+        else:
+            changes[key] = value
+    if "tx" in changes and scope.tx is None:
+        raise ProtocolError(f"channel {chan.name}: override tx on a channel without TMA bytes")
+    return dataclasses.replace(scope, **changes)
+
+
+def _per_rank_counts(chan, key: str, value, cluster) -> dict:
+    ranks = range(cluster.size)
+    if isinstance(value, dict):
+        if set(value) != set(ranks):
+            raise ProtocolError(f"channel {chan.name}: override {key} needs ranks {list(ranks)}")
+        per_rank = value
+    else:
+        per_rank = dict.fromkeys(ranks, value)
+    out = {}
+    for rank, counts in per_rank.items():
+        counts = [counts] * chan.n if isinstance(counts, int) else list(counts)
+        if len(counts) != chan.n or any(not isinstance(c, int) or c <= 0 for c in counts):
+            raise ProtocolError(
+                f"channel {chan.name}: override {key} needs {chan.n} positive counts, got {counts}"
+            )
+        out[rank] = counts
+    return out
+
+
+def describe_overrides(chan) -> str:
+    """`` override ...`` text: each overridden value next to the derived one."""
+    parts = []
+    derived = chan.derived_scope
+    for key in chan.override or {}:
+        ours, theirs = getattr(derived, key), getattr(chan.scope, key)
+        note = " WARNING: differs from derived" if ours != theirs else ""
+        parts.append(f"{key}={_fmt(theirs)} (derived {_fmt(ours)}){note}")
+    if chan.remote_scope_overridden:
+        ours, theirs = chan.derived_remote_scope, chan.remote_scope
+        note = " WARNING: differs from derived" if ours != theirs else ""
+        parts.append(f"remote_scope={theirs} (derived {ours}){note}")
+    return "; override " + ", ".join(parts) if parts else ""
+
+
+def _fmt(value) -> str:
+    if isinstance(value, dict) and len({tuple(v) for v in value.values()}) == 1:
+        return str(next(iter(value.values())))
+    return str(value)
 
 
 def check_atoms(ctx_values, cluster):

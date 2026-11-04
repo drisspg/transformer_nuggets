@@ -64,6 +64,7 @@ from cutlass import Int32, cute
 
 from transformer_nuggets.cute.warp_roles.channels import Ring, Slots, Threads, Tma
 from transformer_nuggets.cute.warp_roles.protocol import ProtocolError, current_block, user_site
+from transformer_nuggets.cute.warp_roles.tracing import pop, push_if
 
 AXES = ("m", "n", "l")
 
@@ -315,9 +316,9 @@ class Clc(_Policy):
         # The scheduler's private response slot: try_cancel completes 16 bytes on the full
         # barrier (like a TMA load). The response is read through the generic proxy and the next
         # try_cancel overwrites it through the async proxy, so the release is fenced.
-        return {
-            "clc": Slots(1, Tma(16), Threads, payload=(Int32, (4,)), release_fence="smem_async")
-        }
+        clc = Slots(1, Tma(16), Threads, payload=(Int32, (4,)), release_fence="smem_async")
+        clc.internal = True  # completed by try_cancel, not by TMA copies
+        return {"clc": clc}
 
     def claim(self, fetch, problem):
         prod, cons = fetch["clc"]
@@ -564,6 +565,7 @@ class _CursorRecord:
     role: str
     advances: list = field(default_factory=list)  # (site, block)
     valid_blocks: list = field(default_factory=list)  # blocks that read ``valid``
+    trace: object = None
 
     def check(self):
         if not self.advances:
@@ -609,20 +611,24 @@ class TileCursor:
     role's consumer end of the work ring.
     """
 
-    def __init__(self, stream, problem, end, index, words, rec, count=None, slot=None):
+    def __init__(self, stream, problem, end, index, words, rec, count=None, slot=None, iket=None):
         self._stream, self._problem, self._end, self._rec = stream, problem, end, rec
         self.index, self._words = index, words
         self._count, self._slot = count, slot  # recording: items seen, (role ordinal, warp)
+        self._iket = iket  # IKET range name of one work item (the role name), or None
 
     @staticmethod
     def create(stream, problem, end, trace, *, scheduler: bool = False, slot=None):
         """Local mode: run the hooks and decode here. Broadcast mode: start at ``blockIdx.x``
         decoded locally, or, when hooks may move the first item, receive it from the scheduler
         (which publishes it in ``scheduler_role``)."""
-        rec = _CursorRecord(trace.role_name)
+        rec = _CursorRecord(trace.role_name, trace=trace)
         trace.checks.append(rec.check)
         count = Int32(0) if stream.record else None
-        cur = TileCursor(stream, problem, end, Int32(problem.first_unit()), [], rec, count, slot)
+        iket = trace.role_name if trace.iket else None
+        cur = TileCursor(
+            stream, problem, end, Int32(problem.first_unit()), [], rec, count, slot, iket
+        )
         if end is None:
             if stream.ready is not None:
                 stream.ready.wait()
@@ -630,15 +636,21 @@ class TileCursor:
                 cur.index = Int32(_skip_local(stream, cur.index, problem))
         elif _hooked(stream):
             if scheduler:
-                # scheduler_role runs the hooks, then publishes and receives the first item.
+                # scheduler_role runs the hooks, then publishes and receives the first item
+                # (and opens its range through _first_item()).
                 cur._words = [Int32(0)] * stream.order.words
                 return cur
             cur._receive()
-            cur._log()
+            cur._first_item()
             return cur
         cur._words = _decode(stream, cur.index, problem)
-        cur._log()
+        cur._first_item()
         return cur
+
+    def _first_item(self):
+        self._log()
+        if self._iket is not None:
+            push_if(self.index < self._problem.total, self._iket)
 
     def _log(self):
         if self._count is not None:
@@ -668,7 +680,15 @@ class TileCursor:
             count, n = Int32(values[n]), n + 1
         end = None if self._end is None else self._end.__new_from_mlir_values__(values[n:])
         return TileCursor(
-            self._stream, self._problem, end, Int32(values[0]), words, self._rec, count, self._slot
+            self._stream,
+            self._problem,
+            end,
+            Int32(values[0]),
+            words,
+            self._rec,
+            count,
+            self._slot,
+            self._iket,
         )
 
     @property
@@ -684,6 +704,9 @@ class TileCursor:
     def advance(self):
         """Move to this CTA's next work item (``valid`` turns false when there is none)."""
         self._rec.advances.append((user_site(), current_block()))
+        self._rec.trace.item_block = current_block()
+        if self._iket is not None:
+            pop()  # this item's range
         stream, problem = self._stream, self._problem
         if self._end is None:
             self.index = Int32(stream.policy.step(self.index, problem))
@@ -693,6 +716,8 @@ class TileCursor:
         else:
             self._receive()
         self._log()
+        if self._iket is not None:
+            push_if(self.index < problem.total, self._iket)
 
     def _receive(self):
         h = self._end.wait()
@@ -783,7 +808,7 @@ def scheduler_role(kernel, work, tiles: TileCursor, fetch: _Fetch):
                     first = fetch.claim()
             _publish(h0, first, _decode(stream, first, problem), problem.total)
         tiles._receive()
-        tiles._log()
+        tiles._first_item()
     while tiles.valid:
         with work.produce() as h:
             index = fetch.claim()

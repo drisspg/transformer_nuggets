@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import inspect
 import sys
+import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -12,10 +14,12 @@ from cutlass import Int32, cute, memory, pipeline
 from cutlass._mlir.dialects import nvvm
 
 from transformer_nuggets.cute.warp_roles.channels import (
+    Barriers,
     Channel,
     ConsumerEnd,
     ProducerEnd,
     Threads,
+    Tma,
     TurnEnd,
     Turnstile,
     Umma,
@@ -25,10 +29,17 @@ from transformer_nuggets.cute.warp_roles.cluster import (
     LEADER,
     PLACEMENTS,
     SingleCta,
+    apply_overrides,
     check_atoms,
     derive_scope,
+    describe_overrides,
 )
-from transformer_nuggets.cute.warp_roles.protocol import ProtocolError, ProtocolLog, RoleTrace
+from transformer_nuggets.cute.warp_roles.protocol import (
+    ProtocolError,
+    ProtocolLog,
+    RoleTrace,
+    take_opt_outs,
+)
 from transformer_nuggets.cute.warp_roles.scheduling import (
     TileCursor,
     Tiles,
@@ -36,7 +47,10 @@ from transformer_nuggets.cute.warp_roles.scheduling import (
     _Fetch,
     scheduler_role,
 )
+from transformer_nuggets.cute.warp_roles.tma import TmaReport
+from transformer_nuggets.cute.warp_roles.tma import check_role as check_tma
 from transformer_nuggets.cute.warp_roles.tmem import TmemPlan, TmemView
+from transformer_nuggets.cute.warp_roles.tracing import pop, pop_if, push
 
 WARP_SIZE = 32
 WARPGROUP = 4
@@ -101,7 +115,10 @@ _ANNOTATIONS = {
     "Instance": Instance,
     "Turn": Turn,
     "Tiles": Tiles,
+    "Barriers": Barriers,
 }
+# Parameters a raw role may take: no channel ends, cursors, or seats (they carry protocol state).
+_RAW_ANNOTATIONS = (Instance, Tmem, Barriers)
 
 
 @dataclass
@@ -116,6 +133,7 @@ class RoleInstance:
     params: list
     uses_tmem: bool = False
     cta: str = ALL  # "all": runs in every CTA of the cluster; "leader": leader CTA only
+    raw: bool = False  # dispatched without ends, protocol log, or trace checks
 
     @property
     def warps(self) -> range:
@@ -126,15 +144,20 @@ class RoleInstance:
         return self.num_warps * WARP_SIZE
 
 
-def role(warps, regs: int | None = None, cta: str = ALL):
+def role(warps, regs: int | None = None, cta: str = ALL, raw: bool = False):
     """Mark a method as a warp role. ``warps``: an int, a range, or a list of ranges.
 
     A list instantiates the method once per range; an ``Instance`` parameter receives the
     instance index. ``cta``: ``"all"`` (default) runs the role in every CTA of the kernel's
     cluster; ``"leader"`` runs it in the leader CTA only (the MMA issuer of a ``CtaPair``; a
-    no-op placement for a single CTA). Put this decorator directly above ``@cute.jit``: the
-    preprocessor only rewrites functions whose innermost decorator is ``<x>.jit``/``<x>.kernel``
-    and then re-applies the outer decorators to the rewritten function.
+    no-op placement for a single CTA). ``raw=True`` reserves the warps and register budget for
+    a user function the layer only dispatches: it takes ``Instance``, ``Tmem``, ``Barriers``,
+    and the context, but no channel ends, cursors, or seats, gets no protocol log or trace
+    checks, and is exempt from the "every role loops over the TileStream" rule. It still counts
+    in warpgroup padding, register budgets, and TMEM teardown. Put this decorator directly above
+    ``@cute.jit``: the preprocessor only rewrites functions whose innermost decorator is
+    ``<x>.jit``/``<x>.kernel`` and then re-applies the outer decorators to the rewritten
+    function.
     """
     if cta not in PLACEMENTS:
         raise ValueError(f"role cta must be one of {PLACEMENTS}, got {cta!r}")
@@ -149,7 +172,7 @@ def role(warps, regs: int | None = None, cta: str = ALL):
             raise ValueError(f"role warps must be non-empty unit-step ranges, got {warps!r}")
 
     def deco(fn):
-        fn._warp_roles = (ranges, regs, cta)
+        fn._warp_roles = (ranges, regs, cta, raw)
         return fn
 
     return deco
@@ -177,6 +200,8 @@ class WarpSpecialized:
 
     tmem_plan: TmemPlan | None = None
     trace_protocol: bool = False
+    iket: bool = False  # emit IKET ranges named after roles and channels (tracing.py)
+    iket_waits: bool = True  # with iket: also a range around every blocking channel wait
     cluster: SingleCta = SingleCta()  # or CtaPair(): one line switches to 2-CTA MMAs
 
     def __setattr__(self, name, value):
@@ -191,6 +216,9 @@ class WarpSpecialized:
             return
         chans = {k: v for k, v in vars(self).items() if isinstance(v, Channel)}
         turns = {k: v for k, v in vars(self).items() if isinstance(v, Turnstile)}
+        raw_bars = {k: v for k, v in vars(self).items() if isinstance(v, Barriers)}
+        for name, b in raw_bars.items():
+            b.name = name
         streams = {k: v for k, v in vars(self).items() if isinstance(v, TileStream)}
         if len(streams) > 1:
             raise ProtocolError(
@@ -217,7 +245,7 @@ class WarpSpecialized:
             meta = getattr(fn, "_warp_roles", None)
             if meta is None:
                 continue
-            ranges, regs, cta = meta
+            ranges, regs, cta, raw = meta
             if not hasattr(fn, "__wrapped__"):
                 raise TypeError(f"role {name}: put @role(...) directly above @cute.jit")
             params = []
@@ -225,10 +253,20 @@ class WarpSpecialized:
                 ann = p.annotation
                 if isinstance(ann, str):
                     ann = eval(ann, {**fn.__globals__, **_ANNOTATIONS})
+                if raw and ann is not inspect.Parameter.empty and ann not in _RAW_ANNOTATIONS:
+                    raise ProtocolError(
+                        f"raw role {name}: parameter {pname} is {getattr(ann, '__name__', ann)}; "
+                        "raw roles take Instance, Tmem, Barriers, and the context only (drive "
+                        "edges through Barriers, or make the role managed)"
+                    )
+                if ann is Barriers and pname not in raw_bars:
+                    raise ProtocolError(f"role {name}: no Barriers named {pname!r}")
                 params.append((pname, ann))
             for idx, wr in enumerate(ranges):
                 inst = f"{name}[{idx}]" if len(ranges) > 1 else name
-                ri = RoleInstance(inst, name, idx, wr.start, len(wr), regs, fn, params, cta=cta)
+                ri = RoleInstance(
+                    inst, name, idx, wr.start, len(wr), regs, fn, params, cta=cta, raw=raw
+                )
                 ri.uses_tmem = any(a is Tmem for _, a in params)
                 roles.append(ri)
                 self._bind(ri, chans, turns)
@@ -238,7 +276,10 @@ class WarpSpecialized:
         self._validate(chans, turns, roles)
         self._validate_placement(chans, turns, roles)
         self._ws_chans, self._ws_turns, self._ws_roles = chans, turns, roles
+        self._ws_raw_bars = raw_bars
         self._ws_streams = streams
+        self._ws_tma = {}  # channel name -> tma.TmaReport, filled while tracing
+        self._ws_opt_outs = []
         self._ws_log = ProtocolLog() if self.trace_protocol else None
 
     @staticmethod
@@ -252,7 +293,7 @@ class WarpSpecialized:
                 if ann is Tiles and pname != name:
                     raise ProtocolError(f"role {r.name}: no TileStream named {pname!r}")
         if st.policy.persistent:
-            idle = sorted({r.role for r in roles} - {r.role for r in users})
+            idle = sorted({r.role for r in roles if not r.raw} - {r.role for r in users})
             if idle:
                 raise ProtocolError(
                     f"{st.policy.describe()} runs several work items per CTA, but roles {idle} "
@@ -359,7 +400,8 @@ class WarpSpecialized:
                 )
         for ch in chans.values():
             ch.cluster = cluster
-            ch.scope = derive_scope(ch, cluster, internal=getattr(ch, "internal", False))
+            ch.derived_scope = derive_scope(ch, cluster, internal=ch.internal)
+            ch.scope = apply_overrides(ch, ch.derived_scope, cluster)
 
     def _validate(self, chans, turns, roles):
         owner = {}
@@ -452,6 +494,30 @@ class WarpSpecialized:
                 (None, tuple(range(-(-self.num_warps // WARPGROUP))), tuple(range(len(roles))))
             ]
 
+    def enable_iket(self, enabled: bool = True, *, waits: bool = True):
+        """Emit IKET ranges in the next compile (``tracing.py`` lists the names). Off: no IR.
+        ``waits=False`` keeps only the role/work-item ranges (fine-grained wait ranges cost
+        ~35% on FA4 under ``run-iket``; role ranges alone cost about nothing). Include
+        ``iket_key()`` in the compile-cache key (the examples' ``get_name`` does)."""
+        self.iket, self.iket_waits = enabled, waits
+        return self
+
+    def iket_key(self) -> str:
+        """Compile-key suffix of the IKET configuration ('' when off)."""
+        if not self.iket:
+            return ""
+        return "_iket" if self.iket_waits else "_iketroles"
+
+    @contextmanager
+    def trace_region(self, name: str):
+        """``with self.trace_region("exp"):`` inside a role: a named IKET range when IKET is
+        enabled, nothing otherwise."""
+        if self.iket:
+            push(name)
+        yield
+        if self.iket:
+            pop()
+
     @property
     def num_threads(self) -> int:
         self._collect()
@@ -470,6 +536,7 @@ class WarpSpecialized:
             )
         for r in self._ws_roles:
             where = " cta=leader" if pair and r.cta == LEADER else ""
+            where += " raw (no ends, unchecked)" if r.raw else ""
             lines.append(
                 f"  role {r.name:<11} warps {r.warps.start:>2}-{r.warps.stop - 1:<2} "
                 f"regs={r.regs}{where}"
@@ -500,16 +567,20 @@ class WarpSpecialized:
                 extra += " tail" if sc.tail else ""
                 lines.append(
                     f"  chan {name:<6} {kind:<8} {prods} -> {cons}; pair-scoped: full {full}; "
-                    f"empty {empty}{extra}"
+                    f"empty {empty}{extra}{describe_overrides(ch)}"
                 )
                 continue
             lines.append(
                 f"  chan {name:<6} {kind:<8} {prods} -> {cons}; full arrivals "
-                f"{ch.slot_counts('producer')}, empty arrivals {ch.slot_counts('consumer')}"
+                f"{sc.full_counts[0]}, empty arrivals {sc.empty_counts[0]}"
+                f"{describe_overrides(ch)}"
             )
         for name, ts in self._ws_turns.items():
             seats = " -> ".join(r.name for r in ts.parties)
             lines.append(f"  turnstile {name}: {seats} (enabled={ts.enabled})")
+        for name, b in self._ws_raw_bars.items():
+            init = "user-initialized" if b.counts is None else f"layer-initialized {b.counts}"
+            lines.append(f"  barriers {name}: {b.n} mbarriers, {init}, user-driven (unchecked)")
         for name, st in self._ws_streams.items():
             sched = next((r for r in self._ws_roles if r.fn is scheduler_role), None)
             dist = (
@@ -522,6 +593,9 @@ class WarpSpecialized:
             plan = self.tmem_plan
             lines.append(f"  tmem: {plan.used_cols} columns used, {plan.alloc_cols} allocated")
             lines.append(plan.describe())
+        # Filled by the last trace (compile): TMA verification status and check opt-outs.
+        lines.extend(report.describe(name) for name, report in self._ws_tma.items())
+        lines.extend(f"  {opt.describe()}" for opt in self._ws_opt_outs)
         if self._ws_log is not None and self._ws_log.ops:
             lines.append(self._ws_log.describe())
         return "\n".join(lines)
@@ -543,7 +617,19 @@ class WarpSpecialized:
                 counts = [ts.parties[(p - 1) % n].num_threads for p in range(n)]
                 plan.append((name, off, {c: counts for c in ranks}))
                 off += n
+        for name, b in self._ws_raw_bars.items():
+            counts = b.counts or [None] * b.n  # None: initialized by user code
+            plan.append((name, off, {c: counts for c in ranks}))
+            off += b.n
         return plan, off
+
+    def barrier_ptr(self, name: str):
+        """Pointer to the first mbarrier of a channel (full barriers at ``[0, n)``, empty at
+        ``[n, 2n)``), an enabled turnstile, or a ``Barriers`` declaration. Valid after
+        ``begin_roles()``; every CTA of a cluster has them at the same offsets."""
+        if name not in self._ws_bars:
+            raise ProtocolError(f"no barriers named {name!r} (have {sorted(self._ws_bars)})")
+        return self._ws_bars[name]
 
     def launch_config(self, work=None, grid=None) -> dict:
         """``grid``/``block``/``cluster`` for ``kernel(...).launch(**cfg, stream=stream)``."""
@@ -573,6 +659,9 @@ class WarpSpecialized:
                 f"got {sorted(problems)}"
             )
         self._ws_problems = problems
+        self._ws_tma = {}
+        self._ws_uses = {}  # (role, channel) -> acquires/waits per work item (0: inner loop)
+        take_opt_outs()  # drop opt-outs left over from an earlier, failed trace
         smem = memory.SmemAllocator()
         plan, total = self._barrier_plan()
         bars = smem.allocate_array(cutlass.Int64, max(total, 1))
@@ -623,7 +712,9 @@ class WarpSpecialized:
             rank = self.cluster.rank()
             with cute.arch.elect_one():
                 for i in cutlass.range_constexpr(len(leader)):
-                    if cutlass.const_expr(leader[i] == peer[i]):
+                    if cutlass.const_expr(leader[i] is None):
+                        pass  # user-initialized Barriers
+                    elif cutlass.const_expr(leader[i] == peer[i]):
                         cute.arch.mbarrier_init(bars + i, leader[i])
                     else:  # pair: rank 0 is the leader, rank 1 the peer
                         cute.arch.mbarrier_init(bars + i, leader[i] + (peer[i] - leader[i]) * rank)
@@ -668,6 +759,26 @@ class WarpSpecialized:
             # are released by the other CTA's tcgen05.commit drained them (tails) above.
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
+        self._finish_trace()
+
+    def _finish_trace(self):
+        """Collect check opt-outs; warn once about TMA channels the check could not verify."""
+        self._ws_opt_outs = take_opt_outs()
+        for name, ch in self._ws_chans.items():
+            if isinstance(ch.producer, Tma) and not ch.internal:
+                report = self._ws_tma.setdefault(name, TmaReport())
+                if not (report.copies or report.opted_out or report.unverified):
+                    report.unverified.append(
+                        "no TMA copy completes on a barrier taken from the layer (raw pointer?)"
+                    )
+        unverified = [n for n, rep in self._ws_tma.items() if rep.unverified]
+        if unverified:
+            details = "; ".join(self._ws_tma[n].describe(n).strip() for n in unverified)
+            warnings.warn(
+                f"warp_roles: TMA check could not verify channel(s) {unverified} (no error "
+                f"raised; see describe()): {details}",
+                stacklevel=2,
+            )
 
     @cute.jit
     def _dispatch_group(self, group, ctx, tmem_threads, warp_idx, rank):
@@ -687,10 +798,33 @@ class WarpSpecialized:
 
     def _dispatch(self, r: RoleInstance, ctx, tmem_threads: tuple[int, int]):
         # Plain Python (no dynamic control flow): runs at trace time inside the role's `if`.
-        trace = RoleTrace(r.name, self._ws_log)
+        trace = RoleTrace(
+            r.name, None if r.raw else self._ws_log, iket=self.iket, iket_waits=self.iket_waits
+        )
         args = self._role_args(r, ctx, trace)
-        if trace.tails:
-            final = _call_capturing_locals(r.fn, r.role, (self, *args))
+        # A role looping over a TileStream gets one IKET range per work item (TileCursor);
+        # any other role gets one over its whole body.
+        cursors = [
+            "tiles" if a is _SchedulerTiles else p  # scheduler_role's parameter name
+            for p, a in r.params
+            if a in (Tiles, _SchedulerTiles)
+        ]
+        whole_range = self.iket and not cursors
+        if whole_range:
+            push(r.name)
+        if r.raw:
+            r.fn(self, *args)
+        elif trace.tails or (self.iket and cursors):
+            final = _call_capturing_locals(r.fn, r.fn.__name__, (self, *args))
+            for pname in cursors if self.iket else ():
+                cur = final.get(pname)
+                if not isinstance(cur, TileCursor):
+                    raise ProtocolError(
+                        f"{r.name}: IKET closes the last work item's range at role exit using "
+                        f"the cursor bound to `{pname}`, but `{pname}` is then "
+                        f"{type(cur).__name__}; keep the cursor bound to its parameter name"
+                    )
+                pop_if(cur.index < cur._problem.total)
             for pname, rec in trace.tails:
                 end = final.get(pname)
                 if not isinstance(end, ProducerEnd) or end._rec is not rec:
@@ -703,7 +837,13 @@ class WarpSpecialized:
                 end.tail()
         else:
             r.fn(self, *args)
-        trace.finish()
+        if whole_range:
+            pop()
+        if not r.raw:
+            check_tma(trace, self.cluster, self._ws_tma)
+            trace.finish()
+        for chan, n in trace.uses_per_item().items():
+            self._ws_uses[(r.name, chan)] = n
         if r.uses_tmem:
             # Every TMEM user of this CTA finishes before the allocator warp frees it (a pair's
             # peer has no leader-only TMEM roles, so its count is smaller).
@@ -736,7 +876,9 @@ class WarpSpecialized:
                 args.append(self._make_end(pname, side is Producer, bound, trace, r.cta))
             elif ann is Tmem:
                 base = self._ws_tmem.retrieve_ptr(cutlass.Float32)
-                args.append(TmemView(base, self.tmem_plan, r.name, self._ws_log))
+                args.append(TmemView(base, self.tmem_plan, r.name, trace.log))
+            elif ann is Barriers:
+                args.append(self._ws_bars[pname])
             elif ann is Tiles or ann is _SchedulerTiles:
                 st = self._ws_streams[pname]
                 end = None
@@ -820,7 +962,13 @@ def _call_capturing_locals(fn, name: str, args) -> dict:
 
     def profile(frame, event, arg):
         # The outermost frame of the (preprocessor-rewritten) role returns last.
-        if event == "return" and frame.f_code.co_name == name and "self" in frame.f_locals:
+        code = frame.f_code
+        if (
+            event == "return"
+            and code.co_name == name
+            and code.co_argcount
+            and frame.f_locals.get(code.co_varnames[0]) is args[0]  # the role's `self`
+        ):
             captured.clear()
             captured.update(frame.f_locals)
         if previous is not None:
