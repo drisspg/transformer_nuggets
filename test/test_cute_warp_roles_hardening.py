@@ -583,8 +583,11 @@ class MixedGemm(Gemm):
             cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition.x32), cutlass.Float32),
             cute.zipped_divide(ctx.acc_fake, ctx.epi_tiler)[None, 0],
         ).get_slice(tidx)
-        tDgC = t2r.partition_D(cute.zipped_divide(ctx.tCgC, ctx.epi_tiler))
-        tDcC = t2r.partition_D(cute.zipped_divide(ctx.tCcC, ctx.epi_tiler))
+        # A raw role takes no tile cursor: OneShot over Raster() launches the tile grid, so the
+        # tile is blockIdx.
+        m, n, _ = cute.arch.block_idx()
+        tDgC = t2r.partition_D(cute.zipped_divide(ctx.tCgC[None, None, None, m, n], ctx.epi_tiler))
+        tDcC = t2r.partition_D(cute.zipped_divide(ctx.tCcC[None, None, None, m, n], ctx.epi_tiler))
         rAcc = cute.make_rmem_tensor(tDgC[None, None, 0].shape, cutlass.Float32)
         rC = cute.make_rmem_tensor(tDgC[None, None, 0].shape, self.dtype)
         tAcc = cute.make_tensor(tmem.ptr("acc"), ctx.acc_layout)

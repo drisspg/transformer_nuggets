@@ -1,8 +1,8 @@
 """BF16 ``D = A @ B^T`` (``F.linear`` layout) on SM100, written with ``warp_roles``.
 
-One CTA per 128x256 output tile, K stage 64, tcgen05 MMA 128x256x16, three A/B SMEM stages;
-warps 0-3 epilogue, 4 TMA load, 5 MMA. TMA zero-fills out-of-bounds boxes, so ragged M, N, K
-need only the epilogue store predicate.
+One CTA per 128x256 output tile (a ``TileStream`` with the ``OneShot`` policy), K stage 64,
+tcgen05 MMA 128x256x16, three A/B SMEM stages; warps 0-3 epilogue, 4 TMA load, 5 MMA. TMA
+zero-fills out-of-bounds boxes, so ragged M, N, K need only the epilogue store predicate.
 """
 
 from dataclasses import dataclass
@@ -18,9 +18,12 @@ from transformer_nuggets.cute.cache import compile_tvm_ffi_and_cache
 from transformer_nuggets.cute.utils import make_fake_compact_tensor
 from transformer_nuggets.cute.warp_roles import (
     Consumer,
+    OneShot,
     Producer,
     Ring,
     Threads,
+    Tiles,
+    TileStream,
     Tma,
     Tmem,
     TmemPlan,
@@ -41,20 +44,19 @@ class GemmCtx:
     tiled_mma: cute.TiledMma
     tma_a: cute.CopyAtom
     tma_b: cute.CopyAtom
-    tAsA: cute.Tensor  # TMA-partitioned SMEM stages of A and B, and their global tiles
-    tAgA: cute.Tensor
+    tAsA: cute.Tensor  # TMA-partitioned SMEM stages of A and B
+    tAgA: cute.Tensor  # whole-problem A tiles: (TMA, m_tiles, k_tiles)
     tBsB: cute.Tensor
-    tBgB: cute.Tensor
+    tBgB: cute.Tensor  # whole-problem B tiles: (TMA, n_tiles, k_tiles)
     tCrA: cute.Tensor  # MMA fragments over the SMEM stages
     tCrB: cute.Tensor
     num_k_tiles: cutlass.Int32
     acc_fake: cute.Tensor  # one accumulator stage, for building the TMEM load
     acc_layout: cute.Layout  # all accumulator stages
     epi_tiler: cute.Tile
-    tCgC: cute.Tensor  # this tile of the output, and its coordinates
-    tCcC: cute.Tensor
+    tCgC: cute.Tensor  # whole-problem output tiles: (MMA, MMA_M, MMA_N, m_tiles, n_tiles)
+    tCcC: cute.Tensor  # their coordinates
     mC: cute.Tensor
-    full_tile: cutlass.Boolean
 
 
 class Gemm(WarpSpecialized):
@@ -64,6 +66,7 @@ class Gemm(WarpSpecialized):
         self.ab = Ring(ab_stages, Tma((TILE[0] + TILE[1]) * TILE[2] * 2), Umma)
         self.acc = Ring(acc_stages, Umma, Threads)
         self.tmem_plan = TmemPlan().region("acc", TILE[1], acc_stages)
+        self.tiles = TileStream(policy=OneShot())  # one tile per CTA, m fastest
         self.trace_protocol = trace
 
     def get_name(self) -> str:
@@ -76,75 +79,93 @@ class Gemm(WarpSpecialized):
 
     @role(warps=4, regs=40)
     @cute.jit
-    def load(self, ab: Producer, ctx: GemmCtx):
-        for k in cutlass.range(ctx.num_k_tiles, unroll=1):
-            with ab.produce() as s:
-                cute.copy(
-                    ctx.tma_a, ctx.tAgA[None, k], ctx.tAsA[None, s.index], tma_bar_ptr=s.barrier
-                )
-                cute.copy(
-                    ctx.tma_b, ctx.tBgB[None, k], ctx.tBsB[None, s.index], tma_bar_ptr=s.barrier
-                )
+    def load(self, ab: Producer, tiles: Tiles, ctx: GemmCtx):
+        while tiles.valid:
+            m, n, _ = tiles.work
+            for k in cutlass.range(ctx.num_k_tiles, unroll=1):
+                with ab.produce() as s:
+                    cute.copy(
+                        ctx.tma_a,
+                        ctx.tAgA[None, m, k],
+                        ctx.tAsA[None, s.index],
+                        tma_bar_ptr=s.barrier,
+                    )
+                    cute.copy(
+                        ctx.tma_b,
+                        ctx.tBgB[None, n, k],
+                        ctx.tBsB[None, s.index],
+                        tma_bar_ptr=s.barrier,
+                    )
+            tiles.advance()
 
     @role(warps=5, regs=40)
     @cute.jit
-    def mma(self, ab: Consumer, acc: Producer, tmem: Tmem, ctx: GemmCtx):
+    def mma(self, ab: Consumer, acc: Producer, tiles: Tiles, tmem: Tmem, ctx: GemmCtx):
         tiled_mma = ctx.tiled_mma
         tCtAcc = cute.make_tensor(tmem.ptr("acc"), ctx.acc_layout)
-        with acc.produce() as a:
-            tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-            for k in cutlass.range(ctx.num_k_tiles, unroll=1):
-                with ab.consume() as s:
-                    for kb in cutlass.range_constexpr(cute.size(ctx.tCrA, mode=[2])):
-                        cute.gemm(
-                            tiled_mma,
-                            tCtAcc[None, None, None, a.index],
-                            ctx.tCrA[None, None, kb, s.index],
-                            ctx.tCrB[None, None, kb, s.index],
-                            tCtAcc[None, None, None, a.index],
-                        )
-                        tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+        while tiles.valid:
+            with acc.produce() as a:
+                tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                for k in cutlass.range(ctx.num_k_tiles, unroll=1):
+                    with ab.consume() as s:
+                        for kb in cutlass.range_constexpr(cute.size(ctx.tCrA, mode=[2])):
+                            cute.gemm(
+                                tiled_mma,
+                                tCtAcc[None, None, None, a.index],
+                                ctx.tCrA[None, None, kb, s.index],
+                                ctx.tCrB[None, None, kb, s.index],
+                                tCtAcc[None, None, None, a.index],
+                            )
+                            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+            tiles.advance()
 
     @role(warps=range(4), regs=160)
     @cute.jit
-    def epilogue(self, acc: Consumer, tmem: Tmem, ctx: GemmCtx):
+    def epilogue(self, acc: Consumer, tiles: Tiles, tmem: Tmem, ctx: GemmCtx):
         tidx, _, _ = cute.arch.thread_idx()
         t2r = tcgen05.make_tmem_copy(
             cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition.x32), cutlass.Float32),
             cute.zipped_divide(ctx.acc_fake, ctx.epi_tiler)[None, 0],
         ).get_slice(tidx)
-        tDgC = t2r.partition_D(cute.zipped_divide(ctx.tCgC, ctx.epi_tiler))
-        tDcC = t2r.partition_D(cute.zipped_divide(ctx.tCcC, ctx.epi_tiler))
-        rAcc = cute.make_rmem_tensor(tDgC[None, None, 0].shape, cutlass.Float32)
-        rC = cute.make_rmem_tensor(tDgC[None, None, 0].shape, self.dtype)
         tAcc = cute.make_tensor(tmem.ptr("acc"), ctx.acc_layout)
-        with acc.consume() as a:
-            tDtC = t2r.partition_S(
-                cute.zipped_divide(tAcc[None, None, None, a.index], ctx.epi_tiler)
+        rows, cols = ctx.mC.shape
+        while tiles.valid:
+            m, n, _ = tiles.work
+            tCgC = ctx.tCgC[None, None, None, m, n]
+            tDgC = t2r.partition_D(cute.zipped_divide(tCgC, ctx.epi_tiler))
+            tDcC = t2r.partition_D(
+                cute.zipped_divide(ctx.tCcC[None, None, None, m, n], ctx.epi_tiler)
             )
-            for i in cutlass.range_constexpr(EPI_SUBTILES):
-                cute.copy(t2r, tDtC[None, None, i], rAcc)
-                rC.store(rAcc.load().to(self.dtype))
-                if ctx.full_tile:
-                    cute.autovec_copy(rC, tDgC[None, None, i])
-                else:
-                    g, crd = tDgC[None, None, i], tDcC[None, None, i]
-                    for j in cutlass.range_constexpr(cute.size(rC)):
-                        if cute.elem_less(crd[j], ctx.mC.shape):
-                            g[j] = rC[j]
+            rAcc = cute.make_rmem_tensor(tDgC[None, None, 0].shape, cutlass.Float32)
+            rC = cute.make_rmem_tensor(tDgC[None, None, 0].shape, self.dtype)
+            full_tile = ((m + 1) * TILE[0] <= rows) & ((n + 1) * TILE[1] <= cols)
+            with acc.consume() as a:
+                tDtC = t2r.partition_S(
+                    cute.zipped_divide(tAcc[None, None, None, a.index], ctx.epi_tiler)
+                )
+                for i in cutlass.range_constexpr(EPI_SUBTILES):
+                    cute.copy(t2r, tDtC[None, None, i], rAcc)
+                    rC.store(rAcc.load().to(self.dtype))
+                    if full_tile:
+                        cute.autovec_copy(rC, tDgC[None, None, i])
+                    else:
+                        g, crd = tDgC[None, None, i], tDcC[None, None, i]
+                        for j in cutlass.range_constexpr(cute.size(rC)):
+                            if cute.elem_less(crd[j], ctx.mC.shape):
+                                g[j] = rC[j]
+            tiles.advance()
 
     # ----------------------------------------------------------------- kernel
 
     @cute.kernel
-    def kernel(self, tiled_mma, tma_a, mA, tma_b, mB, mC, a_layout, b_layout):
-        smem = self.begin_roles()
-        bidx, bidy, _ = cute.arch.block_idx()
-        coord = (bidx, bidy, None)
+    def kernel(self, tiled_mma, tma_a, mA, tma_b, mB, mC, a_layout, b_layout, work):
+        smem = self.begin_roles(tiles=work)
         sA = smem.allocate_tensor(self.dtype, a_layout.outer, 1024, a_layout.inner)
         sB = smem.allocate_tensor(self.dtype, b_layout.outer, 1024, b_layout.inner)
         thr_mma = tiled_mma.get_slice(0)
-        gA = cute.local_tile(mA, TILE, coord, proj=(1, None, 1))
-        gB = cute.local_tile(mB, TILE, coord, proj=(None, 1, 1))
+        # Whole-problem tile views: (BM, BK, m_tiles, k_tiles) and (BN, BK, n_tiles, k_tiles).
+        gA = cute.local_tile(mA, TILE, (None, None, None), proj=(1, None, 1))
+        gB = cute.local_tile(mB, TILE, (None, None, None), proj=(None, 1, 1))
         tAsA, tAgA = cpasync.tma_partition(
             tma_a,
             0,
@@ -163,7 +184,6 @@ class Gemm(WarpSpecialized):
         acc_fake = tiled_mma.make_fragment_C(acc_shape)
         acc_staged = tiled_mma.make_fragment_C(cute.append(acc_shape, self.acc_stages))
         cC = cute.make_identity_tensor(mC.shape)
-        m, n = mC.shape
         ctx = GemmCtx(
             tiled_mma=tiled_mma,
             tma_a=tma_a,
@@ -174,7 +194,7 @@ class Gemm(WarpSpecialized):
             tBgB=tBgB,
             tCrA=tiled_mma.make_fragment_A(sA),
             tCrB=tiled_mma.make_fragment_B(sB),
-            num_k_tiles=cute.size(gA, mode=[2]),
+            num_k_tiles=cute.size(gA, mode=[3]),
             acc_fake=acc_fake,
             acc_layout=acc_staged.layout,
             epi_tiler=(
@@ -183,10 +203,13 @@ class Gemm(WarpSpecialized):
                     cute.size(acc_fake, mode=[0, 1]) // EPI_SUBTILES,
                 ),
             ),
-            tCgC=thr_mma.partition_C(cute.local_tile(mC, TILE, coord, proj=(1, 1, None))),
-            tCcC=thr_mma.partition_C(cute.local_tile(cC, TILE, coord, proj=(1, 1, None))),
+            tCgC=thr_mma.partition_C(
+                cute.local_tile(mC, TILE, (None, None, None), proj=(1, 1, None))
+            ),
+            tCcC=thr_mma.partition_C(
+                cute.local_tile(cC, TILE, (None, None, None), proj=(1, 1, None))
+            ),
             mC=mC,
-            full_tile=((bidx + 1) * TILE[0] <= m) & ((bidy + 1) * TILE[1] <= n),
         )
         self.run_roles(ctx)
 
@@ -213,10 +236,11 @@ class Gemm(WarpSpecialized):
         tma_b, mB = cute.nvgpu.make_tiled_tma_atom_B(
             tma_op, b, cute.select(b_layout, mode=[0, 1, 2]), TILE, tiled_mma
         )
-        grid = cute.ceil_div((*c.layout.shape, 1), TILE[:2])
+        m_tiles, n_tiles = cute.ceil_div(c.layout.shape, TILE[:2])
+        work = self.tiles.problem((m_tiles, n_tiles, 1))
         self.kernel.set_name_prefix(self.get_name())
-        self.kernel(tiled_mma, tma_a, mA, tma_b, mB, c, a_layout, b_layout).launch(
-            grid=grid, block=(self.num_threads, 1, 1), stream=stream
+        self.kernel(tiled_mma, tma_a, mA, tma_b, mB, c, a_layout, b_layout, work).launch(
+            **self.launch_config(work), stream=stream
         )
 
 
