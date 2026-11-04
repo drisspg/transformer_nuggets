@@ -122,7 +122,8 @@ budgets, every channel's per-CTA arrival counts, masks and TMA bytes, the schedu
 - [Channels](docs/channels.md): rings, slots, round-robin instances, named barriers,
   overlapping handles, TMEM and turnstiles.
 - [Storage](docs/storage.md): stage views and checking declared aliases.
-- [CTA pairs](docs/cta_pairs.md): two-CTA MMA and cross-CTA handoffs.
+- [Clusters](docs/clusters.md): two-CTA MMA, larger clusters, TMA multicast and cross-CTA
+  handoffs.
 - [Dropping down](docs/dropping_down.md): raw barriers, count overrides and unchecked sites.
 - [Tracing](docs/tracing.md): inspect the kernel, capture IKET ranges and use the profiler.
 - [Examples](docs/examples.md): persistent GEMM, FA4 forward and swap-AB decode, input limits,
@@ -142,6 +143,6 @@ The first pytest command runs the normal suite; fuzz tests are skipped by defaul
 opts into quick fuzzing. FA4 tests skip without `flash_attn.cute`. Long campaigns, sanitizer and
 CUTracer runs are described in [GUARANTEES.md](GUARANTEES.md#fuzzing-and-evidence).
 
-The suite covers numerical correctness and determinism, shape reuse, schedules and CTA pairs,
-protocol errors, raw/managed synchronization, TMA and alias diagnostics, and the
-IKET-to-profiler path.
+The suite covers numerical correctness and determinism, shape reuse, schedules, CTA pairs and
+larger clusters, protocol errors, raw/managed synchronization, TMA and alias diagnostics, and
+the IKET-to-profiler path.

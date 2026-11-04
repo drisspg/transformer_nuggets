@@ -5,7 +5,8 @@ algorithm is live. A successful `describe()` checks declarations; a successful c
 checks local handle lifetimes, work-loop structure and recognizable TMA copies. Neither means
 that arbitrary accepted role bodies cannot deadlock.
 
-This contract is for CuTeDSL 4.8 on Blackwell SM100/SM103, with `SingleCta()` or `CtaPair()`.
+This contract is for CuTeDSL 4.8 on Blackwell SM100/SM103, with `SingleCta()`, `CtaPair()` or
+`Cluster(m, n, pair=...)` (at most 8 CTAs).
 It describes the layer, not the GEMM/FA4 example wrappers' tensor and numerical contracts.
 R/E/U/G identifiers are stable references for tests and fuzz findings.
 
@@ -56,18 +57,18 @@ These are conditional guarantees relative to that program, not a theorem about a
 
 | ID | The layer's part |
 |---|---|
-| R1 | Each role instance runs on exactly its declared contiguous warps. `leader` means rank 0 in a pair and is a no-op for one CTA. Warp holes run no user role. Full/empty barrier offsets are `[0,n)`/`[n,2n)` in each CTA. Elected initialization and the common fence/sync precede dispatch. |
+| R1 | Each role instance runs on exactly its declared contiguous warps. `leader` means the leader (even rank) of each MMA pair, rank 0 in a `CtaPair`, and every CTA without pairs; `rank0` means cluster rank 0. Warp holes run no user role. Full/empty barrier offsets are `[0,n)`/`[n,2n)` in each CTA. Elected initialization and the common fence/sync precede dispatch. |
 | R2 | A Ring end's operation k uses stage `k % n`; consumer phase is `(k // n) % 2`, producer phase is `1 XOR ((k // n) % 2)`. Acquire/wait advances the end; handles retain their snapshots. Matching epochs preserve publication order and block reuse until the declared consumers release. |
 | R3 | Slots keep one independent phase bit per slot (producer starts 1, consumer 0). Only the named slot flips; access order need not be numeric. Instance-bound acquire/wait only accepts its own slot. |
-| R4 | CTA-local counts sum bound contributions per slot: Threads contributes `32 * role.num_warps`, Tma/Umma one. Fan-out forms a join: the last contributing consumer controls reuse. Pair contributions are specified below. |
+| R4 | CTA-local counts sum bound contributions per slot: Threads contributes `32 * role.num_warps`, Tma/Umma one. Fan-out forms a join: the last contributing consumer controls reuse. Cross-CTA contributions are specified below. |
 | R5 | Ordinary producer/consumer close signals full/empty. TMA acquire arms bytes and TMA commit emits no signal. UMMA uses an elected `tcgen05.commit`. Declared `tmem_store`/`smem_async` fences precede that side's signal. `signal=False` emits neither signal nor its fence. |
-| R6 | Layer payloads are uninitialized, 16-byte-aligned, per-stage CTA-local SMEM, shaped `(*shape,n)`. `h.data` selects h.index. User pair-scoped payloads are rejected; scheduler payloads are explicitly filled in both CTAs. Channel buffers are covered by R21. |
-| R7 | Pair-scoped producers automatically tail when the consumer is Umma and empty targets include the peer. Ring tails use the explicitly returned final state; Slots tails drain only that end's acquired slots with their final phases. `retire()` is disallowed there. All threads perform cluster exit arrive/wait after dispatch/TMEM teardown. This is not a wait for arbitrary user async work. |
-| R8 | Nonalias TMEM regions occupy declaration-order intervals of `cols * slots`; aliases add no columns and stay inside their parent in each slot. Allocation is the next power of two covering `max(32,used)`, at most 512. No annotated users means no allocation. The first TMEM role allocates in one CTA; a pair needs the first all-CTA TMEM role. All declared users, raw included, join the unaligned teardown barrier before free. |
+| R6 | Layer payloads are uninitialized, 16-byte-aligned, per-stage CTA-local SMEM, shaped `(*shape,n)`. `h.data` selects h.index. User pair-scoped payloads are rejected; scheduler payloads are explicitly filled in every CTA. Channel buffers are covered by R21. |
+| R7 | Producers automatically tail when the consumer is Umma and some consumer CTA releases a producer in another CTA (a pair's peer, or a multicast partner). Ring tails use the explicitly returned final state; Slots tails drain only that end's acquired slots with their final phases. `retire()` is disallowed there. All threads perform cluster exit arrive/wait after dispatch/TMEM teardown. This is not a wait for arbitrary user async work. |
+| R8 | Nonalias TMEM regions occupy declaration-order intervals of `cols * slots`; aliases add no columns and stay inside their parent in each slot. Allocation is the next power of two covering `max(32,used)`, at most 512. No annotated users means no allocation. The first TMEM role allocates in one CTA; a cluster needs, and allocates from, the first all-CTA TMEM role. All declared users, raw included, join the unaligned teardown barrier before free. |
 | R9 | Numeric regs are integer multiples of 8 in [24,256]. Any numeric budget pads launch warps to full warpgroups. Owned warps in each group agree, including None; holes take that budget and entirely idle groups take 24. Adjustment branches are warpgroup-uniform, including peer padding. Accounted registers including default budgets and holes cannot exceed 65536. |
 | R10 | An enabled Turnstile orders a legal finite prefix of seats `0,1,...,p-1,0,...`; each seat's previous party supplies its arrival count. All seat threads participate. Disabled turnstiles emit no synchronization and promise no exclusion. |
-| R11 | Pair scope, barrier targets/counts, UMMA masks, TMA byte scaling and producer tails follow the placement rules below. Pair TMEM allocation/free uses the two-CTA handshake. |
-| R12 | For a correctly launched, drained stream, each kept linear index belongs to exactly one CTA/cluster work unit. Every participating role in that unit observes the same ordered sequence. All-CTA pair roles see it in each CTA; leader roles only in rank 0. This is not "every CTA sees every item." |
+| R11 | Cross-CTA scope, per-rank barrier targets/counts, UMMA masks, TMA byte scaling, multicast releases and producer tails follow the placement rules below. Pair TMEM allocation/free uses the two-CTA handshake with the CTA's pair peer (rank XOR 1). |
+| R12 | For a correctly launched, drained stream, each kept linear index belongs to exactly one CTA/cluster work unit. Every participating role in that unit observes the same ordered sequence. All-CTA roles see it in each CTA of the cluster; leader roles in each pair leader; rank0 roles only in rank 0. This is not "every CTA sees every item." |
 | R13 | Raster is a bijection over positive `(m,n,l)` extents, l slowest, with selected raster, bands and reversals; decode intermediates stay within max(index, item count), so it is exact for every index R18 admits. Plain OneShot Raster uses `(m*cs,n,l)` when n/l <=65535, otherwise a 1-D grid. Device decoding follows the actual grid, so the supported hand-built `(total*cs,1,1)` grid preserves item identity too. |
 | R14 | `decode` runs only for valid indices `[0,total)`, after the readiness hook, for every mapping without `decodes_any_index` (local cursors, the scheduler warp, skip loops and `single_item()` alike); a mapping with `decodes_any_index` may also be evaluated speculatively (at terminal indices, or before readiness in the tile-grid prologue) and the words are discarded; a skipping mapping's `keep` is only used for valid indices. A subclass that overrides `decode` does not inherit `decodes_any_index`. Only a mapping with `skips` may return a runtime `keep` (trace-time check), and a skipping mapping is decoded once per visited index. Broadcast schedulers acquire a free work slot before claiming, bounding lookahead by stages. CLC waits every response and issues none after failure. `AtomicPersistent` reports once in `close_claims`; the last report fences and zeros `[claims,finished]` for sequential launches/graph replay. |
 | R15 | Generated synchronization must implement the finite, live abstract protocol without extra waits, premature reuse, lost publications or added deadlock. Compilation alone does not establish that precondition; a timeout is a candidate failure requiring attribution, not proof of a layer bug. |
@@ -134,7 +135,7 @@ annotations and managed channel operations; `"strict"` raises only on a potentia
 `__cute_compile_key__()` includes `alias_check`, so the standard cache helpers never serve a
 strict build from a warn/off one (custom caches must include the hook, U12).
 
-Known blind spots (phase 1): CtaPair kernels (reported unverified), unannotated or raw accesses,
+Known blind spots (phase 1): cluster kernels (reported unverified), unannotated or raw accesses,
 raw ordering instructions, raw roles, raw signals (`signal=False`), ring-stage SMEM shared by two
 channels, `round_robin` channels (they add no ordering edges, so accesses ordered only through
 them would be reported), loops that run fewer than twice, epochs whose traced positions do not correspond
@@ -149,28 +150,49 @@ reported; strict, opt-out, off and cached-mode cases), `test/test_cute_warpdrive
 loop-carried same-role MMA pair, a TMA load read through another TMA channel, IR identical on
 and off) and `test/test_cute_warpdrive_storage.py`.
 
-### Pair placement rules (R11)
+### Cluster placement rules (R11)
 
-Write `C(r)={0}` for a leader role, `{0,1}` for an all-CTA role.
+Write `C(r)` for the ranks a role runs in: every rank for `all`, the pair leaders
+(`r % V == 0`, `V = 2` with pairs, else every rank) for `leader`, `{0}` for `rank0`. A
+multicast producer in rank p writes the SMEM of `reach(p)`: p and the ranks with p's
+coordinates except along each declared mode (`Cluster.line`).
 
-- Same placement on every participant is **CTA-local**, including all/all (one independent
-  channel in each CTA) and leader/leader. Counts are ordinary slot counts, tx unscaled,
-  targets empty, masks 1, no tail.
-- Otherwise full targets are the union of consumer CTAs, empty targets the union of producer
-  CTAs. For each target and slot, Threads counts sum
-  `32 * role.num_warps * len(C(role))` across matching signalers. TMA/UMMA contributes one
-  arrival per target. Nontarget ranks have placeholder count 1 and no promised waiter.
-- Masks have one bit per target. Pair UMMA signalers must be leader-only and use group TWO.
-- Ordinary pair-scoped TMA producers in both CTAs feed only leader-only consumers. The leader
-  arms `2 * Tma.tx_bytes`; each CTA copies the declared per-CTA bytes using group TWO.
-  Leader-only producer → both-CTA consumer needs unsupported multicast and is rejected.
-  All/all local TMA instead needs group ONE; leader/leader local accepts either group as far
-  as the layer's channel-group check is concerned.
-- The internal leader scheduler explicitly publishes each target's payload and uses unscaled
+- Same `C` on every participant and no multicast is **CTA-local**, including all/all (one
+  independent channel in each CTA) and leader/leader. Counts are ordinary slot counts, tx
+  unscaled, targets the CTA itself, masks 1 (a commit side: `1 << rank`), no tail.
+- Otherwise each rank r has a unit: r alone when every participant has the same `C` (only
+  multicast crosses), r's MMA pair when every participant runs in every pair, else the whole
+  cluster (a `rank0` participant). Full targets of producer rank p are the consumer CTAs in
+  p's unit; empty targets of consumer rank c are the producer CTAs p whose `reach(p)` meets
+  c's unit. For each target and slot, Threads counts sum `32 * role.num_warps` over every
+  signalling (instance, CTA); TMA/UMMA count one arrival per signalling CTA. Nontarget ranks
+  have placeholder count 1 and no promised waiter. In a `CtaPair` the unit is the cluster, so
+  these are the pair rules: targets are the union of consumer (producer) CTAs.
+- Masks have one bit per target: one int when every signalling CTA's mask agrees, else per
+  rank. UMMA signalers must be leader-only when the cluster has pairs, and use group TWO.
+- Ordinary cross-CTA TMA producers in every CTA feed only the pair leaders. Each leader arms
+  `2 * Tma.tx_bytes` (both CTAs' SMEM) and only leaders arm; each CTA's copies deliver the
+  declared per-CTA bytes using group TWO, multicast or not. A leader-only producer feeding
+  other CTAs is rejected, as is any other cross-CTA TMA shape. All/all local TMA (multicast or
+  not) needs group ONE; leader/leader local accepts either group as far as the layer's
+  channel-group check is concerned.
+- `Tma.tx_bytes` is what lands in each CTA's SMEM per stage. A multicast copy delivers its box
+  to every CTA of its mask; the layer derives only the release side from the declaration.
+  Multicast channels cannot have a `rank0` participant.
+- The internal scheduler (rank 0) explicitly publishes each target's payload and uses unscaled
   payload bytes. It is not ordinary multicast TMA.
+- Generalizing `CtaPair` to `Cluster` left the normalized SASS of the seven R19 configurations
+  unchanged (CuTeDSL 4.8.0, sm_100a, November 2026).
 - Without a payload, remote thread-arrival memory scope defaults to `cta`. If your ordinary
   SMEM/global writes are read by the peer, select `remote_scope="cluster"`. The layer cannot
   infer that requirement or make a pointer address peer SMEM for you.
+
+Tests: `test/test_cute_warpdrive_cluster.py` (pairs) and `test/test_cute_warpdrive_clusters.py`
+(geometry and validation; 2x2 multicast scopes, where each leader's release reaches all four
+CTAs; per-rank masks of a flat 2x2; a toy protocol over two and four pairs; the persistent GEMM
+on 2x2/4x1/flat clusters under every schedule with bitwise repeats and capped grids; the
+multicast TMA check). A mutant that releases only its own pair (multicast copies, no
+`multicast=` declaration, check opted out) returned wrong tiles on every static run.
 
 ### Work assignment (R12)
 
@@ -181,10 +203,11 @@ With U launched work units, initial item is unit b. Subsequent indices are:
 | OneShot | Terminal total; dropped items are not reassigned locally. |
 | StaticPersistent | `b+U, b+2U, ...`, filtered by `keep`. |
 | AtomicPersistent | `U + atomicAdd(claims,1)`, unique claims, no fixed inter-unit order. |
-| ClusterLaunchControl | Successfully canceled launch unit, or terminal on failure; pair canceled CTA x is divided by 2. |
+| ClusterLaunchControl | Successfully canceled launch unit, or terminal on failure; a cluster's canceled CTA x is divided by the cluster size. |
 
-Static/atomic launch at least one unit, capped by total and the supplied capacity; a pair
-capacity below two CTAs still launches one cluster. OneShot/CLC launch at least one unit or
+Static/atomic launch at least one unit, capped by total and the supplied capacity; a cluster
+capacity below one cluster's CTAs still launches one cluster. `launch_args()` supplies the CTAs
+of every cluster that fits at once (CUTLASS `HardwareInfo`), not a guarantee of co-residency. OneShot/CLC launch at least one unit or
 the OneShot tile grid. An empty space launches exactly one unit, which receives no work
 (R17). Atomic/CLC add the lowest free scheduler warp unless explicitly set.
 Work-ring consumers release on **receipt**, not after computing the item; everyone receives
@@ -204,10 +227,10 @@ What the layer does for any schedule, mapping and readiness hook:
 - Device, local schedules: every stream user computes `first_index(problem)`, then
   `next_index(index, problem)` once per `advance()` while its index is valid, with readiness and
   dropped items applied as for the built-ins (R14).
-- Device, broadcast schedules: one scheduler warp, leader CTA only in a pair, calls
+- Device, broadcast schedules: one scheduler warp, cluster rank 0 only, calls
   `claim_next(fetch, problem, previous index)` only after acquiring a free work slot and only
   while the previous claim was valid, decodes the kept item, publishes `[index, *words]` to
-  every user (both CTAs of a pair), and calls `close_claims` once after its last claim. When a
+  every user (every CTA of a cluster), and calls `close_claims` once after its last claim. When a
   readiness hook or `skips` may move the first item, the scheduler also decodes and publishes
   the first item. Otherwise every user starts at `first_index` and decodes that first item
   locally (no hook runs then, so a local decode reads only launch-time data); every later item
@@ -248,7 +271,7 @@ body at `describe()` time.
 
 | ID | Rejected input | Error |
 |---|---|---|
-| E01 | cta other than all/leader | ValueError |
+| E01 | cta other than all/leader/rank0 | ValueError |
 | E02 | Empty outer warp list; empty/non-unit-step/non-range normalized ranges | ValueError |
 | E03 | Overlapping role warp ownership | ValueError |
 | E04 | Mixed regs (including None) within an owned warpgroup | ValueError |
@@ -289,12 +312,12 @@ body at `describe()` time.
 | E34 | Slots.n >31 | ValueError |
 | E35 | Barriers.n not a positive Python int | ValueError |
 | E36 | Raw counts not a positive Python int or n positive integer entries | ValueError |
-| E37 | Pair UMMA signaler is not leader-only | ProtocolError |
+| E37 | UMMA signaler not leader-only in a cluster with pairs | ProtocolError |
 | E38 | Pair turnstile seats have different placements | ProtocolError |
 | E39 | Pair has TMEM users but none runs in both CTAs | ProtocolError |
 | E40 | User pair-scoped channel has a layer-owned payload | ProtocolError |
-| E41 | Ordinary leader-only TMA producer feeds both CTAs | ProtocolError |
-| E42 | Nonlocal both-CTA TMA producer has any nonleader consumer | ProtocolError |
+| E41 | Ordinary leader-only TMA producer feeds other CTAs | ProtocolError |
+| E42 | Other cross-CTA TMA shapes: producers not in every CTA, or consumers not exactly the pair leaders | ProtocolError |
 | E43 | Tma used as a consumer, including on a local channel | ValueError (constructor) |
 | E44 | tx/mask override not a nonnegative Python int | ProtocolError |
 | E45 | tx override on a channel without derived TMA bytes | ProtocolError |
@@ -344,8 +367,8 @@ same dynamic branch is locally accepted; another participant's matching branch i
 
 | ID | Rejected input | Error |
 |---|---|---|
-| E78 | Direct context TiledMma has known CTA span inconsistent with cluster.size | ProtocolError |
-| E79 | Direct context group-TWO G2S CopyAtom in a single-CTA kernel | ProtocolError |
+| E78 | Direct context TiledMma has known CTA span inconsistent with the cluster's MMA pair size | ProtocolError |
+| E79 | Direct context group-TWO G2S CopyAtom in a kernel without pairs; multicast G2S CopyAtom in a single-CTA kernel | ProtocolError |
 | E80 | Recognized TMA copy through a tracked barrier has a known wrong required group | ProtocolError |
 | E81 | Complete attributable stage's known copy-byte sum differs from effective expected per-CTA bytes | ProtocolError |
 | E82 | Raster.along not m/n | ValueError |
@@ -378,12 +401,18 @@ same dynamic branch is locally accepted; another participant's matching branch i
 | E121 | Named round-robin instances sharing stage barriers without an enabled `turnstile` over exactly them; an acquire/wait on that side outside its turn | ProtocolError / kernel.py, channels.py (trace) |
 | E122 | `alias.named_barrier(id, ...)` using a layer or named-channel ID | ProtocolError / kernel.py (trace) |
 | E123 | `commit(wait=True)` on an mbarrier channel or with `signal=False`; mbarrier pointer accessors on a named channel | ProtocolError / channels.py |
+| E124 | `Cluster` with a non-positive-int extent, non-bool `pair`, odd `m` with pairs, or more than 8 CTAs; `Tma.multicast` naming anything but "m"/"n" | ValueError / cluster.py, channels.py |
+| E125 | Multicast TMA channel with a `rank0` participant | ProtocolError / cluster.py |
+| E126 | Recognized multicast TMA copy into a channel whose `Tma` declares no multicast, or whose mask (from `Cluster.multicast`) has an undeclared mode | ProtocolError (trace time) / tma.py |
 
 TMA checking is **positive evidence only**. It follows recognizable direct SSA uses of
 handed-out barriers and counts static copy boxes in the opening region. A complete mismatch
 rejects; incomplete inspection alone must not. Opaque/raw pointers, nested/dynamic copies,
-multicast/new atoms, unknown IR or opted-out uses can leave a channel `unverified`, with a
-warning and reasons in `describe()`. Known wrong-group evidence still rejects. Context atom
+new atoms, multicast masks not from `Cluster.multicast`, unknown IR or opted-out uses can leave
+a channel `unverified`, with a warning and reasons in `describe()`. Known wrong-group or
+undeclared-multicast evidence still rejects. A multicast copy counts the bytes of its SMEM
+destination: in the symmetric `Cluster.multicast` partition that equals what the issuing CTA
+delivers across its mask's CTAs. Context atom
 checks visit direct fields and are not disabled by a per-use TMA opt-out. `verified` means
 recognized group/byte accounting, not descriptor legality, disjoint writes or async safety.
 

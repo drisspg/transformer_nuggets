@@ -21,8 +21,9 @@ All roles in a warpgroup must agree, including `None` versus a number. Numeric b
 be multiples of 8 from 24 to 256. Padding warps get the group's budget too; the adjustment
 happens in a warpgroup-uniform branch before role dispatch.
 
-`cta="leader"` restricts the role to rank 0 of a [CTA pair](cta_pairs.md). The default is
-`"all"`. They are equivalent for one CTA.
+`cta="leader"` restricts the role to the leader of each MMA pair of a
+[cluster](clusters.md), rank 0 of a CTA pair. `cta="rank0"` runs it once per cluster. The default
+is `"all"`. They are equivalent for one CTA.
 
 ## Arguments
 

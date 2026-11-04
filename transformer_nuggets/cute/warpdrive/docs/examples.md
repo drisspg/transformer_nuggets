@@ -5,7 +5,8 @@
 - [gemm.py](../examples/gemm.py): three roles and two rings, one CTA per output tile with
   `WorkStream(schedule=OneShot())`.
 - [persistent_gemm.py](../examples/persistent_gemm.py): all four schedules, double-buffered
-  accumulators, TMA stores, CTA pairs and configurable `tile_n`.
+  accumulators, TMA stores, CTA pairs, larger clusters with TMA multicast and configurable
+  `tile_n`.
 - [fa4_fwd.py](../examples/fa4_fwd.py): two softmax instances, a correction role, slots,
   fan-out/join, turnstiles, S/P aliasing, split-P, persistence and CTA pairs.
 - [packed_work.py](../examples/packed_work.py): a mapping for a device-built work table with
@@ -41,6 +42,20 @@ Empty outputs return early; K=0 writes zeros.
 
 `PersistentGemm` uses two accumulator stages by default so one tile's epilogue can overlap
 the next tile's mainloop. Changing stage counts still has to fit SMEM and TMEM.
+
+`cluster=Cluster(2, 2, pair=True)` runs two pairs side by side along N that multicast A
+([clusters](clusters.md#larger-clusters)). With `tile_n=224` that is cuBLAS's 256x224 2x2
+configuration for 3000x5000x4096. CUDA-graph replay, GB300, CuTeDSL 4.8.0, November 2026, best
+of three interleaved rounds of 60 replays (microseconds, lower is better):
+
+| M x N x K | `torch.mm` | pair 256 static | pair 224 static | 2x2 224 static | 2x2 224 CLC |
+|---|---:|---:|---:|---:|---:|
+| 3000 x 5000 x 4096 | 74.3 | 82.1 | 73.2 | 72.8 | 75.3 |
+| 4096 x 4096 x 4096 | 76.2 | 82.3 | 73.4 | 87.5 | 90.8 |
+
+At 4096 a 448-wide cluster tile leaves a partly empty last column and a fifth wave; the
+256-wide 2x2 runs 80.8 us there. 8192 x 8192 x 8192 replays varied by up to 15% between rounds
+on the shared GPU, so they are not listed.
 
 ## Attention forward
 
@@ -241,12 +256,13 @@ a FA4 default schedule and a matched single-CTA schedule answer different questi
 
 ## Still missing
 
-Larger clusters, TMA multicast and cp.async producer mechanisms are not supported. A ring read
-by several consumer cursors (FA4 decode's shared K/V ring) is not either; the decode example
-splits it into two rings. Using CUTLASS pipeline objects where their semantics match remains a
-possible implementation cleanup, not a reason to change the role bodies.
+cp.async producer mechanisms are not supported. A ring read by several consumer cursors (FA4
+decode's shared K/V ring) is not either; the decode example splits it into two rings. Clusters
+cannot fill other CTAs' stages from a leader-only TMA producer or multicast to a `rank0` role.
+Using CUTLASS pipeline objects where their semantics match remains a possible implementation
+cleanup, not a reason to change the role bodies.
 
-The alias diagnostic still needs IR-inferred accesses, partial K-block footprints, CTA-pair
+The alias diagnostic still needs IR-inferred accesses, partial K-block footprints, cluster
 analysis and completion-aware epoch checks. Its current limits are in
 [storage](storage.md#read-the-result).
 

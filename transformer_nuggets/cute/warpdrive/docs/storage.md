@@ -98,10 +98,10 @@ Nothing in `overlaps=` orders K and V. Your channel epochs must prevent a reader
 racing a writer of V. If two staged layouts overlap across *different* stage numbers, one
 ring's normal reuse ordering is not enough.
 
-In a CTA pair, each CTA allocates its own copy at the same offset. A bound buffer is allowed
+In a cluster, each CTA allocates its own copy at the same offset. A bound buffer is allowed
 on a pair-scoped channel, unlike a layer-owned `payload`. Binding does not imply DSMEM
 publication: `remote_scope` still defaults to `"cta"`, and no fence is added. For ordinary
-memory read by the peer, use the [pair memory-scope rules](cta_pairs.md#memory-scope).
+memory read by the peer, use the [pair memory-scope rules](clusters.md#memory-scope).
 
 ## Check declared aliases
 
@@ -190,7 +190,7 @@ instructions remain legal, but cannot supply an edge in the diagnostic's model. 
 - `potential hazard`: conflicting annotated accesses with a missing ordering edge. The report
   names the accesses, source lines and rule involved.
 - `unverified`: insufficient modeled information, such as an unannotated access, raw ordering
-  or a CTA pair. Phase 1 only models single-CTA kernels.
+  or a cluster. Phase 1 only models single-CTA kernels.
 - `no hazard found`: none found among the annotated conflicting pairs, not a proof of safety.
 
 Warn mode emits a warning for findings and leaves the report in `describe()`. Some unverified

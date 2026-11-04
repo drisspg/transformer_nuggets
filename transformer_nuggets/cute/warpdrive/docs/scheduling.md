@@ -16,7 +16,7 @@ def load(self, params: PersistentGemmParams, *, ab: Producer, work: WorkCursor):
     return ab, work
 ```
 
-A work unit is one CTA, or one cluster with `CtaPair()`. `schedule=` chooses its linear
+A work unit is one CTA, or one cluster with `CtaPair()` or `Cluster(...)`. `schedule=` chooses its linear
 indices; `mapping=` turns an index into the item returned by `work.item`. `ready=` is an
 optional wait before decoding starts. There can be one `WorkStream` per kernel.
 
@@ -35,7 +35,7 @@ axis into eight-tile bands, and `reverse="m"` visits m in reverse order. l is th
 
 One-shot and static schedules run locally in each role. Atomic and cluster launch control
 add a scheduler warp. The scheduler warp claims and decodes an item, then sends it to the
-other roles through a ring. In a CTA pair, the leader sends it to both CTAs.
+other roles through a ring. In a cluster, rank 0 sends it to every CTA.
 
 `stages` is the work ring's depth, not the number of A/B stages. A free work-ring slot is
 acquired before claiming more work. Roles release the slot when they receive the item, not
@@ -67,8 +67,10 @@ The keyword in `begin_roles(work=bound)` matches the `self.work` attribute. `bin
 `BoundWork`, the runtime problem passed to the kernel. Shapes, counts and the persistent grid
 cap are runtime values, not per-shape compile keys.
 
-`StaticPersistent` and `AtomicPersistent` need `max_ctas`. It caps CTAs, not clusters; a pair
-uses at most `max_ctas // 2` clusters, with a minimum of one. Keep both launch arguments in the
+`StaticPersistent` and `AtomicPersistent` need `max_ctas`. It caps CTAs, not clusters; a
+cluster of `cs` CTAs uses at most `max_ctas // cs` clusters, with a minimum of one.
+`launch_args()` returns the CTAs of every cluster that fits at once: the SM count for one CTA
+or a pair, fewer for 4-CTA clusters (36 clusters on a 152-SM GB300). Keep both launch arguments in the
 entry point's signature even for schedules that don't read them, so changing the schedule
 leaves the ABI alone.
 
@@ -244,7 +246,7 @@ Only the two named FA4 schedulers are supported. `SingleTileScheduler` depends o
 SMEM and barriers cannot be dropped in as mappings. The adapter does not call their advance,
 prefetch, tail or grid methods.
 
-Both adapters normalize empty spaces and provide Int64 counts. In a CTA pair, their tiles
+Both adapters normalize empty spaces and provide Int64 counts. In a cluster, their tiles
 are work-unit tiles: one item per cluster, with FA4 params built using a `(1, 1)` cluster shape.
 
 ## One item in a raw role
@@ -258,7 +260,7 @@ def epilogue(self, params, *, tmem: Tmem):
         ...
 ```
 
-Use this instead of reading `blockIdx` yourself. It handles the fallback grid, pairs, custom
+Use this instead of reading `blockIdx` yourself. It handles the fallback grid, clusters, custom
 mappings, readiness and dropped items like a managed cursor. It requires a non-persistent,
 local schedule such as `OneShot()` and must run after `begin_roles()`. Persistent and broadcast
 schedules reject it; their managed roles take a `WorkCursor` and loop.

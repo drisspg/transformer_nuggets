@@ -20,7 +20,8 @@ with ab.consume() as h:
 ```
 
 `Tma(tx_bytes)` completes the full barrier through TMA. Supply the bytes per stage per
-producing CTA. `Umma` signals with an elected `tcgen05.commit`; `Threads` has every thread
+producing CTA. `Tma(tx_bytes, multicast="n")` declares copies multicast along a cluster mode;
+see [clusters](clusters.md#multicast). `Umma` signals with an elected `tcgen05.commit`; `Threads` has every thread
 of every bound role arrive. A TMA or UMMA side must bind to exactly one single-warp role.
 TMA is a producer mechanism, not a consumer mechanism.
 
@@ -200,7 +201,7 @@ GEMM examples do. Reinterpret packed BF16 yourself.
 Allocations round up to a power of two from 32 to 512 columns. Capacity, duplicate names and
 alias bounds are checked. Every role using TMEM must take `tmem: Tmem`, including raw roles,
 so it participates in teardown. Without any annotated users, no TMEM allocation is made.
-Single-CTA allocation happens in `begin_roles()`; pairs allocate after the cluster sync in
+Single-CTA allocation happens in `begin_roles()`; clusters allocate after the cluster sync in
 `run_roles()`.
 
 Aliasing shares columns, not lifetimes. Order accesses to S and P yourself.

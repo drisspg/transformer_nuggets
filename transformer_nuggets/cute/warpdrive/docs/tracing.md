@@ -173,7 +173,8 @@ write_pipeline_perfetto("gemm.pftrace", timeline, measured, analysis=analysis)
 Use the JSON capture path produced by your IKET run in place of `capture.trace.json`.
 Open the resulting trace in [Perfetto](https://ui.perfetto.dev/).
 
-The plan is per CTA. `cta=1` excludes leader-only roles in a pair. Its regions are work-item
+The plan is per CTA. `cta=1` excludes leader-only roles in a pair; any rank excludes the roles
+that don't run there. Its regions are work-item
 granular, so ring occupancy and reuse estimates for an inner K loop are coarse, not
 measurements of individual stages. Traced reuse counts require a compile on this object;
 a cache hit need not populate its trace data.
