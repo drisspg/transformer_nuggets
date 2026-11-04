@@ -415,9 +415,14 @@ class WarpSpecialized:
         elif warp in owned:
             raise ValueError(f"TileStream {name}: scheduler_warp {warp} is claimed by a role")
         group = range(warp // WARPGROUP * WARPGROUP, (warp // WARPGROUP + 1) * WARPGROUP)
-        budgets = {r.regs for r in roles if r.regs is not None and set(r.warps) & set(group)}
+        # The scheduler shares its warpgroup's budget (setmaxnreg is per warpgroup), including a
+        # deliberate None; only an otherwise idle warpgroup takes the smallest declared budget.
+        budgets = {r.regs for r in roles if set(r.warps) & set(group)}
         any_regs = [r.regs for r in roles if r.regs is not None]
-        regs = budgets.pop() if len(budgets) == 1 else (min(any_regs) if any_regs else None)
+        if budgets:
+            regs = budgets.pop() if len(budgets) == 1 else min(b for b in budgets if b is not None)
+        else:
+            regs = min(any_regs) if any_regs else None
         work = f"{name}_work"
         fetch = [f"{name}_{k}" for k in st.policy.fetch_channels()]
         params = [(work, Producer), (name, _SchedulerTiles), (name, _SchedulerFetch)]
