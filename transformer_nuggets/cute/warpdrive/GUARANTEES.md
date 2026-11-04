@@ -545,6 +545,16 @@ counts, placement, per-unit item sequences and coverage, and bitwise determinism
   pair tail (no value changes).
 - Not covered: real MMA/TMEM data (the example tests cover those), raw roles, `Barriers`,
   overrides, `unchecked`, IKET, concurrent launches sharing a workspace, real PDL.
+- Larger clusters (`--cluster 2x2p` and friends): roles in all CTAs, pair leaders or rank 0,
+  2-CTA and multicast TMA channels, the rank-0 scheduler, whole-cluster grids. 640 generated
+  declarations (8 shapes x seeds 0-79) matched the independent scope model; 300 kernels passed
+  at runtime (2x2 pairs 140, flat 2x2 60, 4x1 pairs 40, 4x2 pairs 30, flat 2x4 30) plus 14
+  multicast seeds. The short-join, counter-reset and turnstile mutants are caught on 2x2.
+  Multicast is about 10% of cluster specs and never along both modes in one channel.
+- The 2x2 persistent GEMM (600x1000x264 and 1100x2064x200, `tile_n` 224/256, static/CLC/atomic,
+  capped grids): compute-sanitizer racecheck and synccheck clean, and CUTracer random delays
+  (5k/20k/100k ns, about 70-90 enabled sites per kernel including mbarrier waits, 2-CTA MMA, TMA
+  loads and commits) kept every result correct and bitwise repeatable.
 
 Run `pytest -m fuzz test/test_cute_warpdrive_fuzz_*.py` for the fixed-seed quick mode and
 `python scripts/fuzz_warpdrive.py {runtime,static,mutate} --help` for long campaigns.
