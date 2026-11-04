@@ -104,7 +104,8 @@ configurations executing correct handoffs through the same algorithm cache key.
 
 ## Alias diagnostic: a bug finder
 
-The alias diagnostic ([alias.py](alias.py), README *Alias diagnostic*) is **not a guarantee**.
+The alias diagnostic ([alias.py](alias.py), [usage](docs/storage.md#check-declared-aliases)) is
+**not a guarantee**.
 It reports `potential hazard` when it finds a conflicting annotated access pair on declared
 overlaps with no ordering edge under its rules, and `unverified` when an access or an edge is
 not visible to it. `no hazard found` means only that it found nothing among the annotated
