@@ -42,14 +42,25 @@ KINDS = {
 }
 
 
-# Multicast masks handed out by ``Cluster.multicast`` in the kernel being traced:
-# {hash of the mask's ir.Value: (mode, CTAs reached)}. Tracing is single-threaded; cleared at
-# ``begin_roles``.
-_MASKS: dict[int, tuple[str, int]] = {}
+# Multicast masks handed out by ``Cluster.multicast`` in the kernel being traced: {hash of the
+# mask's ir.Value, or ("const", bits) for a mask the same in every CTA: (mode, CTAs reached)}.
+# Tracing is single-threaded; cleared at ``begin_roles``.
+_MASKS: dict = {}
 
 
 def record_multicast_mask(mask, mode: str, ctas: int) -> None:
-    _MASKS[hash(mask.ir_value())] = (mode, ctas)
+    value = mask.ir_value()
+    owner = value.owner
+    if getattr(owner, "name", None) == "arith.constant":
+        # A constant mask is rematerialized at each use, so it is known by its bits.
+        _MASKS[("const", _constant_bits(owner))] = (mode, ctas)
+    else:
+        _MASKS[hash(value)] = (mode, ctas)
+
+
+def _constant_bits(op) -> int | None:
+    match = re.match(r"(-?\d+)", str(op.attributes["value"]))
+    return int(match.group(1)) & 0xFFFF if match else None
 
 
 def clear_multicast_masks() -> None:
@@ -283,7 +294,12 @@ def _mask_mode(copy_op) -> str:
     op = copy_op.operands[0].owner.operation
     while op.name == SET_VALUE:
         if "<mcast_mask>" in str(op.attributes["field"]):
-            mode, _ = _MASKS.get(hash(op.operands[1]), ("?", 0))
+            mask = op.operands[1]
+            owner = mask.owner
+            key = hash(mask)
+            if getattr(owner, "name", None) == "arith.constant":
+                key = ("const", _constant_bits(owner))
+            mode, _ = _MASKS.get(key, ("?", 0))
             return mode
         op = op.operands[0].owner.operation
     return "?"
