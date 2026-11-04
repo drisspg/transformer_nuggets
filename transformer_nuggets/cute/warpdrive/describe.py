@@ -13,7 +13,6 @@ import textwrap
 from transformer_nuggets.cute.warpdrive.channels import Threads, Tma, Umma
 from transformer_nuggets.cute.warpdrive.scheduling import _tile_grid, scheduler_role
 
-_RANK = {0: "leader", 1: "peer"}
 WIDTH = 100  # wrap channel flows past this many columns
 _LABEL = 8  # width of the channel detail labels ("override")
 
@@ -48,6 +47,13 @@ def fmt_counts(counts) -> str:
     return f"[{', '.join(str(c) for c in counts)}]"
 
 
+def rank_label(rank: int, cluster_size: int) -> str:
+    """``leader``/``peer`` in a CTA pair, ``rank r`` in any other cluster."""
+    if cluster_size <= 2:
+        return "leader" if rank == 0 else "peer"
+    return f"rank {rank}"
+
+
 def fmt_per_cta(per_rank: dict, ranks, by_rank: bool = False) -> str:
     """Counts of the CTAs ``ranks`` (``{rank: per-slot list}``), labelled by rank when
     ``by_rank`` or when they differ."""
@@ -55,14 +61,23 @@ def fmt_per_cta(per_rank: dict, ranks, by_rank: bool = False) -> str:
     values = [fmt_counts(per_rank[r]) for r in ranks]
     if not by_rank and len(set(values)) == 1:
         return values[0]
-    return ", ".join(f"{_RANK.get(r, f'rank {r}')} {v}" for r, v in zip(ranks, values))
+    size = max(len(per_rank), 2)
+    return ", ".join(f"{rank_label(r, size)} {v}" for r, v in zip(ranks, values))
+
+
+def fmt_mask(mask, cluster_size: int) -> str:
+    """A ``tcgen05.commit`` mask (one bit per CTA rank), or each signalling rank's mask."""
+    width = max(cluster_size, 2) + 2
+    if isinstance(mask, int):
+        return f"{mask:#0{width}b}"
+    return ", ".join(f"{rank_label(r, cluster_size)} {m:#0{width}b}" for r, m in mask.items())
 
 
 def _fmt_value(key: str, value, cluster_size: int) -> str:
     if key in ("full_counts", "empty_counts"):
         return fmt_per_cta(value, range(cluster_size))
     if key in ("full_mask", "empty_mask"):
-        return f"{value:#04b}"
+        return fmt_mask(value, cluster_size)
     return str(value)
 
 
@@ -160,7 +175,9 @@ def _channels(kernel) -> str:
         empty_ranks = sc.empty_ctas if sc.pair else range(cs)
         full = fmt_per_cta(sc.full_counts, full_ranks, by_rank=sc.pair)
         if sc.tx is not None:
-            full += f", tx {sc.tx} B" + (" (leader-armed)" if sc.pair else "")
+            leaders = set(kernel.cluster.ctas("leader"))
+            armed = sc.pair and all(r in leaders for r, cs in sc.full_targets.items() if cs)
+            full += f", tx {sc.tx} B" + (" (leader-armed)" if armed else "")
         details.append(("signal", f"{_mech(ch.producer)} -> {_mech(ch.consumer)}"))
         if ch.named:
             # One hardware barrier per slot and side; producers and consumers both arrive.
@@ -183,12 +200,15 @@ def _channels(kernel) -> str:
                     )
                 )
         if cs > 1:
-            scope = ["pair-scoped" if sc.pair else "CTA-local"]
+            scope = ["CTA-local"]
             if sc.pair:
+                scope = ["pair-scoped" if cs == 2 else "cross-CTA"]
+                if isinstance(ch.producer, Tma) and ch.producer.multicast:
+                    scope.append(f"multicast {'+'.join(ch.producer.multicast)}")
                 if ch.producer is Umma:
-                    scope.append(f"commit_mask {sc.full_mask:#04b}")
+                    scope.append(f"commit_mask {fmt_mask(sc.full_mask, cs)}")
                 if ch.consumer is Umma:
-                    scope.append(f"release_mask {sc.empty_mask:#04b}")
+                    scope.append(f"release_mask {fmt_mask(sc.empty_mask, cs)}")
                 if Threads in (ch.producer, ch.consumer):
                     scope.append(f"remote_scope {ch.remote_scope}")
                 if sc.tail:

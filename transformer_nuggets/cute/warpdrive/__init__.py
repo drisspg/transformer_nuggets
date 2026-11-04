@@ -28,7 +28,8 @@ schedule=...)`` and give roles ``work: WorkCursor``; the index schedule (``OneSh
 ``StaticPersistent``, ``AtomicPersistent``, ``ClusterLaunchControl``, or an ``IndexSchedule``
 subclass) and the mapping (``Raster``, a ``WorkMap`` subclass, or an ``adapters.py`` wrapper
 around a CUTLASS/FA4 scheduler's tile order) are one-line switches. Clusters
-(``cluster.py``): declare ``self.cluster = CtaPair()`` and pin the MMA role with ``@role(..., cta="leader")``. See
+(``cluster.py``): declare ``self.cluster = CtaPair()`` (or ``Cluster(m, n, pair=...)``, with
+multicast ``Tma`` loads) and pin the MMA role with ``@role(..., cta="leader")``. See
 ``examples/`` for a GEMM, a persistent GEMM, and an FA4-style attention forward.
 
 Storage (``storage.py``): an optional ``SmemPlan`` of named SMEM buffers (dtype, alignment,
@@ -105,7 +106,7 @@ from transformer_nuggets.cute.warpdrive.channels import (
     Turnstile,
     Umma,
 )
-from transformer_nuggets.cute.warpdrive.cluster import CtaPair, SingleCta
+from transformer_nuggets.cute.warpdrive.cluster import Cluster, CtaPair, SingleCta, TmaMulticast
 from transformer_nuggets.cute.warpdrive.kernel import (
     Consumer,
     Instance,
@@ -140,6 +141,7 @@ __all__ = [
     "Barriers",
     "BoundWork",
     "Channel",
+    "Cluster",
     "ClusterLaunchControl",
     "Consumer",
     "CtaPair",
@@ -165,6 +167,7 @@ __all__ = [
     "StaticPersistent",
     "Threads",
     "Tma",
+    "TmaMulticast",
     "Tmem",
     "TmemPlan",
     "TmemView",

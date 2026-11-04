@@ -874,7 +874,9 @@ def check(kernel, roles: list[RoleEvents]) -> AliasReport:
         res = AliasResult((x, y), kind)
         results.append(res)
         if kernel.cluster.size > 1:
-            res.unverified.append("CtaPair kernels are not modeled (phase 1 is single-CTA)")
+            res.unverified.append(
+                f"{type(kernel.cluster).__name__} kernels are not modeled (phase 1 is single-CTA)"
+            )
             continue
         mine = {n: [a for a in accesses if a.storage == (kind, n)] for n in (x, y)}
         for n in (x, y):

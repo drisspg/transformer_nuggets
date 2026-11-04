@@ -3,7 +3,8 @@
 A channel is a full/empty mbarrier pair per stage or slot. Each side names its signalling
 mechanism, which fixes how many arrivals the barrier expects:
 
-* ``Tma(tx_bytes)``: one elected ``arrive.expect_tx``; the TMA engine completes the phase.
+* ``Tma(tx_bytes, multicast=...)``: one elected ``arrive.expect_tx``; the TMA engine completes
+  the phase.
 * ``Umma``: one elected ``tcgen05.commit`` (completes once all prior MMAs of the issuing
   thread have finished).
 * ``Threads``: every thread of every role instance bound to the slot arrives.
@@ -44,7 +45,13 @@ import cutlass
 from cutlass import Int32, cute
 from cutlass._mlir.dialects import nvvm as _nvvm
 
-from transformer_nuggets.cute.warpdrive.cluster import ALL, LEADER, SCOPE_OVERRIDES
+from transformer_nuggets.cute.warpdrive.cluster import (
+    ALL,
+    MULTICAST_MODES,
+    SCOPE_OVERRIDES,
+    rank_in,
+    rank_value,
+)
 from transformer_nuggets.cute.warpdrive.protocol import ProtocolError, current_block, user_site
 from transformer_nuggets.cute.warpdrive.storage import SmemBuffer, StageView, project, stage_extent
 from transformer_nuggets.cute.warpdrive.tma import TmaUse, stage_closed
@@ -53,13 +60,28 @@ from transformer_nuggets.cute.warpdrive.tracing import wait_range
 
 @dataclass(frozen=True)
 class Tma:
-    """Producer side filled by TMA with ``tx_bytes`` per stage."""
+    """Producer side filled by TMA with ``tx_bytes`` per stage: the bytes landing in each
+    producing CTA's SMEM, whichever CTA issued the copies.
+
+    ``multicast``: the cluster modes ("m", "n", or both, as a string or tuple) along which the
+    copies are multicast (``Cluster.multicast``). A copy multicast along N lands in every CTA
+    with this CTA's coordinates except along N; the consumers there must release this CTA's
+    stage too, which the layer derives from the declaration."""
 
     tx_bytes: int
+    multicast: tuple[str, ...] | str = ()
 
     def __post_init__(self):
         if type(self.tx_bytes) is not int or self.tx_bytes <= 0:
             raise ValueError(f"Tma.tx_bytes must be a positive int, got {self.tx_bytes!r}")
+        modes = self.multicast
+        if not isinstance(modes, (str, tuple, list)) or any(
+            m not in MULTICAST_MODES for m in modes
+        ):
+            raise ValueError(
+                f"Tma.multicast must name cluster modes from {MULTICAST_MODES}, got {modes!r}"
+            )
+        object.__setattr__(self, "multicast", tuple(sorted(set(modes))))
 
 
 class Umma:
@@ -746,38 +768,59 @@ class _End:
         return (self._state >> slot) & 1
 
     @property
-    def targets(self) -> tuple[int, ...]:
-        """CTA ranks whose barrier this end's signal reaches (empty: this CTA only)."""
+    def ctas(self) -> tuple[int, ...]:
+        """CTA ranks this end's role runs in."""
+        cluster = self._chan.cluster
+        return (0,) if cluster is None else cluster.ctas(self._cta)
+
+    @property
+    def targets(self) -> dict:
+        """For each CTA rank this end runs in, the ranks whose barrier its signal reaches."""
         sc = self._chan.scope
-        if not sc.pair:
-            return ()
-        return sc.full_ctas if isinstance(self, ProducerEnd) else sc.empty_ctas
+        table = sc.full_targets if isinstance(self, ProducerEnd) else sc.empty_targets
+        return {r: table.get(r, ()) for r in self.ctas}
 
     def _arrive(self, mech, bar, fence, mask):
-        """Signal ``bar`` in each CTA of ``self.targets`` (empty: this CTA only); ``mask``: the
-        ``tcgen05.commit`` multicast mask."""
+        """Signal ``bar`` in each CTA of ``self.targets``; ``mask``: the ``tcgen05.commit``
+        multicast mask (an int, or ``{rank: mask}``)."""
         _fence(fence)
         cluster, targets = self._chan.cluster, self.targets
         if mech is Umma:
+            # Without pairs a commit to this CTA's own barrier needs no mask. Every tcgen05 op of
+            # a pair kernel is cta_group::2; the multicast mask names the CTAs whose barrier
+            # (same offset) receives the arrival.
+            multicast = cluster is not None and (
+                cluster.pair or any(cs != (r,) for r, cs in targets.items())
+            )
+            if multicast and isinstance(mask, dict):
+                mask = rank_value({r: mask[r] for r in self.ctas}, cluster_rank)
             with cute.arch.elect_one():
-                if cluster is None or cluster.size == 1:
-                    cute.nvgpu.tcgen05.commit(bar)
-                else:
-                    # Every tcgen05 op of a pair kernel is cta_group::2; the multicast mask
-                    # names the CTAs whose barrier (same offset) receives the arrival.
+                if multicast:
                     cute.nvgpu.tcgen05.commit(bar, mask, cluster.cta_group)
+                else:
+                    cute.nvgpu.tcgen05.commit(bar)
         elif mech is Threads:
-            if not targets:
+            if not self._chan.scope.pair:
                 cute.arch.mbarrier_arrive(bar)
                 return
             # See Channel.remote_scope: a cluster-scope release orders generic-memory data for
             # the other CTA's waiter; "cta" (CUTLASS's default) only counts the arrival.
             scope = _nvvm.MemScopeKind.CLUSTER if self._chan.remote_scope == "cluster" else None
-            for c in targets:
-                if c == 0 and self._cta == LEADER:
-                    cute.arch.mbarrier_arrive(bar, scope=scope)
-                else:
-                    cute.arch.mbarrier_arrive(bar, c, scope=scope)
+            shared = set(targets.values())
+            if len(shared) == 1:  # every CTA of the role signals the same ranks
+                for c in shared.pop():
+                    if self.ctas == (c,):
+                        cute.arch.mbarrier_arrive(bar, scope=scope)
+                    else:
+                        cute.arch.mbarrier_arrive(bar, c, scope=scope)
+                return
+            # Targets relative to the signalling CTA (its MMA pair): pick them by rank.
+            widths = {len(cs) for cs in targets.values()}
+            assert len(widths) == 1, targets
+            rank = cluster_rank()
+            for k in range(widths.pop()):
+                c = rank_value({r: cs[k] for r, cs in targets.items()}, rank)
+                cute.arch.mbarrier_arrive(bar, c, scope=scope)
         else:
             raise AssertionError(mech)
 
@@ -833,10 +876,18 @@ class ProducerEnd(_End):
         if not scope.pair:
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive_and_expect_tx(full, scope.tx)
-        elif self._cta == LEADER:
-            _arm_targets(full, scope.tx, scope.full_ctas)
+            return
+        arms = {r: cs for r, cs in self.targets.items() if cs}
+        if all(cs == (r,) for r, cs in arms.items()):
+            targets = (None,)  # each arming CTA arms its own barrier
         else:
-            _arm_if_leader(full, scope.tx, scope.full_ctas)
+            assert len(arms) == 1, arms  # one CTA arms the barriers of its targets
+            ((rank, targets),) = arms.items()
+            targets = tuple(None if c == rank else c for c in targets)
+        if len(arms) == len(self.ctas):
+            _arm_targets(full, scope.tx, targets)
+        else:
+            _arm_if(full, scope.tx, targets, tuple(arms), self._chan.cluster.size)
 
     def _signal(self, index):
         if isinstance(self._chan.producer, Tma):
@@ -901,8 +952,13 @@ def _named_arrive(barrier_id, threads: int):
     cute.arch.barrier_arrive(barrier_id=barrier_id, number_of_threads=threads, aligned=False)
 
 
-def _arm_one(full, tx: int, cta: int):
-    if cta == 0:  # the leader arms its own barrier
+def cluster_rank():
+    """This CTA's cluster rank without the warp-uniform hint (safe in divergent code)."""
+    return cute.arch.block_idx_in_cluster()
+
+
+def _arm_one(full, tx: int, cta: int | None):
+    if cta is None:  # this CTA's own barrier
         cute.arch.mbarrier_arrive_and_expect_tx(full, tx)
     else:
         cute.arch.mbarrier_arrive_and_expect_tx(full, tx, cta)
@@ -915,8 +971,15 @@ def _arm_targets(full, tx: int, targets):
 
 
 @cute.jit
-def _arm_if_leader(full, tx: cutlass.Constexpr, targets: cutlass.Constexpr):
-    if cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == 0:
+def _arm_if(
+    full,
+    tx: cutlass.Constexpr,
+    targets: cutlass.Constexpr,
+    ctas: cutlass.Constexpr,
+    size: cutlass.Constexpr,
+):
+    """Arm ``targets`` from the CTAs ``ctas`` only (a pair's leader)."""
+    if rank_in(cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()), ctas, size):
         _arm_targets(full, tx, targets)
 
 

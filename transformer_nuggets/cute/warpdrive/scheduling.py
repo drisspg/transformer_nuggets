@@ -58,12 +58,13 @@ Tracing checks that each role calls ``advance()`` exactly once, directly in the 
 ``while work.valid:`` loop (not under a branch or nested loop), so every role steps through
 the same sequence.
 
-Clusters (``CtaPair``): a work item belongs to a cluster. Indices count clusters (``blockIdx.x //
-2``, ``gridDim.x // 2``), the launch grid is two CTAs per cluster, local schedules compute the
-same sequence in both CTAs, and broadcast schedules claim on the leader only: its scheduler warp
-publishes each decoded item into the work-ring slot of both CTAs with ``st.async`` (the bytes
-complete each CTA's full barrier), and the consumers of both CTAs release the leader's empty
-barrier. CLC cancels whole clusters, so its response decodes to ``ctaid.x // 2``.
+Clusters (``CtaPair``, ``Cluster``): a work item belongs to a cluster of ``cs`` CTAs. Indices
+count clusters (``blockIdx.x // cs``, ``gridDim.x // cs``), the launch grid is ``cs`` consecutive
+CTAs per cluster (launch cluster ``(cs, 1, 1)``), local schedules compute the same sequence in
+every CTA, and broadcast schedules claim on cluster rank 0 only (a pair's leader): its scheduler
+warp publishes each decoded item into the work-ring slot of every CTA with ``st.async`` (the
+bytes complete each CTA's full barrier), and the consumers of every CTA release rank 0's empty
+barrier. CLC cancels whole clusters, so its response decodes to ``ctaid.x // cs``.
 
 Counter lifetime (``AtomicPersistent``): the workspace holds ``[claims, finished]``. Each CTA's
 scheduler reports once after its last claim and the last CTA to report zeroes both words, so
@@ -326,7 +327,7 @@ class IndexSchedule:
     """Public protocol for ``WorkStream(schedule=...)``: how a work unit gets its next linear
     index.
 
-    A work unit is a CTA, or a cluster of a ``CtaPair``. Schedules never see work items: they
+    A work unit is a CTA, or a cluster. Schedules never see work items: they
     return indices that the mapping decodes. Every index a schedule returns is a valid index in
     ``[0, problem.total)`` or a terminal value ``>= problem.total`` (never negative); once a unit
     returns a terminal index its stream has ended.
@@ -338,8 +339,8 @@ class IndexSchedule:
       index (the cursor keeps the first item's words), and raw roles may use ``single_item()``.
     * ``broadcast``: ``False`` computes indices locally, in every role, with
       ``first_index``/``next_index``; ``True`` claims them on a layer-owned scheduler warp with
-      ``claim_next`` and broadcasts the decoded items (leader CTA only in a pair). The layer owns
-      the ring, its counts, the drain, and the publication to both CTAs of a pair.
+      ``claim_next`` and broadcasts the decoded items (cluster rank 0 only). The layer owns the
+      ring, its counts, the drain, and the publication to every CTA of a cluster.
     * ``stages``: work-ring depth of a broadcast schedule (decoded items buffered ahead of the
       slowest role); a positive int.
     * ``uses_max_ctas``: ``launch_units`` reads the ``max_ctas`` cap (``BoundWork.grid`` then
@@ -495,8 +496,8 @@ class ClusterLaunchControl(IndexSchedule):
     """Blackwell cluster launch control: ``grid = total``; a running CTA cancels a not-yet-
     launched CTA with ``clusterlaunchcontrol.try_cancel`` and runs its item instead. The hardware
     balances load and yields SMs to other kernels, with no counter to manage. ``stages``: decoded
-    items buffered ahead of the slowest role. In a ``CtaPair`` the leader cancels whole
-    clusters (the response is not multicast; the decoded item is published to both CTAs)."""
+    items buffered ahead of the slowest role. In a cluster rank 0 cancels whole clusters (the
+    response is not multicast; the decoded item is published to every CTA)."""
 
     stages: int = 2
     broadcast = True
@@ -599,7 +600,7 @@ class WorkStream:
 
     @property
     def cluster_size(self) -> int:
-        """CTAs per work unit: 2 when the owning kernel declares ``CtaPair``."""
+        """CTAs per work unit: the owning kernel's cluster size (2 for ``CtaPair``)."""
         return 1 if self.owner is None else self.owner.cluster.size
 
     @property
@@ -608,7 +609,7 @@ class WorkStream:
         return -(-(1 + self.mapping.words) // 4) * 4
 
     def channel(self) -> Ring:
-        """The broadcast ring. In a pair the leader's scheduler fills both CTAs' slots with
+        """The broadcast ring. In a cluster rank 0's scheduler fills every CTA's slot with
         ``st.async`` (TMA-like: one armed arrival plus payload bytes per CTA)."""
         payload = (Int32, (self.payload_words,))
         if self.cluster_size == 1:
@@ -647,7 +648,7 @@ class WorkStream:
         takes no ``WorkCursor``. Only for non-persistent local schedules (``OneShot``), where a
         unit has at most one item. It runs the readiness hook and drops items like a managed
         role and reads the item the way the cursor does, so it stays correct on the 1-D
-        fallback grid, a hand-built ``(total, 1, 1)`` grid, a ``CtaPair``, and custom
+        fallback grid, a hand-built ``(total, 1, 1)`` grid, a cluster, and custom
         mappings. ``valid`` is false for an empty space or a skipped item. Call it after
         ``begin_roles``."""
         if self.schedule.persistent or self.schedule.broadcast:
@@ -744,13 +745,13 @@ class BoundWork:
         self.cs = stream.cluster_size  # CTAs per work unit
 
     def units(self):
-        """Device-side: launched work units along x (CTAs, or clusters of a pair); the
+        """Device-side: launched work units along x (CTAs, or clusters); the
         persistent schedules' stride. A ``OneShot`` tile grid has more units along y and z."""
         grid = cute.arch.grid_dim()[0]
         return grid if self.cs == 1 else grid // self.cs
 
     def first_unit(self):
-        """Device-side: this CTA's work unit (the cluster index of a pair), as a linear index."""
+        """Device-side: this CTA's work unit (its cluster's index), as a linear index."""
         bidx, bidy, bidz = cute.arch.block_idx()
         unit = bidx if self.cs == 1 else bidx // self.cs
         if _tile_grid(self.stream):
@@ -801,8 +802,8 @@ class BoundWork:
 
     def grid(self):
         """Launch grid for this schedule: ``(ctas, 1, 1)``, or the tile space for a ``OneShot``
-        over plain ``Raster()`` (``tile_grid_dims``); ``max_ctas`` caps CTAs, so a pair launches
-        at most ``max_ctas // 2`` clusters. An empty space launches one work unit. A space whose
+        over plain ``Raster()`` (``tile_grid_dims``); ``max_ctas`` caps CTAs, so a cluster of
+        ``cs`` CTAs launches at most ``max_ctas // cs`` clusters. An empty space launches one work unit. A space whose
         ``schedule.index_limit`` exceeds Int32 gets a zero-wide grid, which CUDA rejects at
         launch."""
         schedule = self.stream.schedule

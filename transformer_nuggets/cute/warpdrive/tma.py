@@ -33,7 +33,27 @@ from transformer_nuggets.cute.warpdrive.protocol import ProtocolError
 SET_VALUE = "cute_nvgpu.atom.set_value"
 MAKE_EXEC = "cute_nvgpu.atom.make_exec_tma"
 COPY = "cute.copy"
-GROUPS = {"sm_90": "ONE", "sm_100_2sm": "TWO"}  # TiledTmaLoadEnum spelling -> CtaGroup
+# TiledTmaLoadEnum spelling -> (CtaGroup, multicast)
+KINDS = {
+    "sm_90": ("ONE", False),
+    "sm_100_2sm": ("TWO", False),
+    "sm_90_multicast": ("ONE", True),
+    "sm_100_2sm_multicast": ("TWO", True),
+}
+
+
+# Multicast masks handed out by ``Cluster.multicast`` in the kernel being traced:
+# {hash of the mask's ir.Value: (mode, CTAs reached)}. Tracing is single-threaded; cleared at
+# ``begin_roles``.
+_MASKS: dict[int, tuple[str, int]] = {}
+
+
+def record_multicast_mask(mask, mode: str, ctas: int) -> None:
+    _MASKS[hash(mask.ir_value())] = (mode, ctas)
+
+
+def clear_multicast_masks() -> None:
+    _MASKS.clear()
 
 
 @dataclass
@@ -80,6 +100,9 @@ class _Copy:
     group: str
     nbytes: int | None  # None: not countable (dynamic layout or unparsed type)
     in_stage_region: bool  # issued in the region that acquired the stage (runs once per stage)
+    # The cluster mode of a multicast copy's mask ("?": a mask not from Cluster.multicast);
+    # None when not multicast.
+    multicast: str | None = None
 
 
 @dataclass
@@ -94,19 +117,21 @@ class _Stage:
 
 def required_group(chan, cluster) -> str | None:
     """The CTA group a TMA load into ``chan`` must use (None: either works)."""
-    if cluster.size == 1:
+    if not cluster.pair:
         return "ONE"
-    if chan.scope.pair:
+    if chan.derived_scope.tx_ctas > 1:
         return "TWO"  # both CTAs' bytes complete on the leader's barrier
-    if all(ri.cta == LEADER for ri, _ in [*chan.producers, *chan.consumers]):
+    leaders = set(cluster.ctas(LEADER))
+    if all(set(cluster.ctas(ri.cta)) <= leaders for ri, _ in [*chan.producers, *chan.consumers]):
         return None  # leader-only on both sides: a 2-CTA load also lands on the leader
     return "ONE"
 
 
 def expected_stage_bytes(chan) -> int:
-    """Bytes one producing CTA must copy per stage for the armed transaction count."""
+    """Bytes one producing CTA's copies must deliver per stage for the armed transaction count
+    (a multicast copy delivers its box to every CTA of its mask)."""
     sc = chan.scope
-    return sc.tx // len(sc.empty_ctas) if sc.pair else sc.tx
+    return sc.tx // chan.derived_scope.tx_ctas
 
 
 def stage_closed(trace, handle) -> None:
@@ -152,9 +177,16 @@ def check_role(trace, cluster, reports: dict) -> None:
                 partial_chans.setdefault(use.chan.name, problem)
             continue
         need = required_group(use.chan, cluster)
+        modes = use.chan.producer.multicast
         for cp in copies:
             if need is not None and cp.group != need:
                 raise ProtocolError(_group_message(trace.role_name, use, cp, need, cluster))
+            if cp.multicast is not None and (not modes or cp.multicast not in (*modes, "?")):
+                raise ProtocolError(_multicast_message(trace.role_name, use, cp))
+            if cp.multicast == "?":
+                report.unverified.append(
+                    f"multicast copy at {cp.site} takes a mask not from Cluster.multicast"
+                )
             report.groups.add(cp.group)
             report.copies.add(cp.site)
         if stage is not None:
@@ -192,14 +224,16 @@ def _copies(use: TmaUse) -> tuple[list[_Copy], list, str | None]:
             if not _is_tma_bar(op):
                 continue
             ops.append(op)
-            group = _group(op)
-            if group is None:
+            kind = _kind(op)
+            if kind is None:
                 return [], ops, f"unrecognized TMA atom {str(op.results[0].type)[:60]!r}"
+            group, multicast = kind
             copy_bits = re.search(r"copy_bits = (\d+)", str(op.results[0].type))
             for copy_op in _copy_ops(op):
                 nbytes = _copy_bytes(copy_op, copy_bits)
                 in_stage = use.handle is not None and copy_op.block == use.handle.block
-                copies.append(_Copy(use.site, group, nbytes, in_stage))
+                mode = _mask_mode(copy_op) if multicast else None
+                copies.append(_Copy(use.site, group, nbytes, in_stage, mode))
     except (AttributeError, KeyError, IndexError, ValueError, RuntimeError) as e:
         return [], ops, f"cannot inspect the IR at {use.site}: {type(e).__name__}: {e}"
     return copies, ops, None
@@ -232,15 +266,27 @@ def _untracked_tma_copies(root, reached: list) -> str | None:
     return f"{extra} TMA copy(ies) use a barrier the layer did not hand out" if extra else None
 
 
-def _group(set_value) -> str | None:
-    """CTA group of the atom an exec-atom ``set_value`` chain starts from."""
+def _kind(set_value) -> tuple[str, bool] | None:
+    """(CTA group, multicast) of the atom an exec-atom ``set_value`` chain starts from."""
     op = set_value
     while op.name == SET_VALUE:  # earlier fields set on the same exec atom
         op = op.operands[0].owner.operation  # atom-typed values have no DSL caster
     if op.name != MAKE_EXEC:
         return None
     kind = re.match(r"!cute_nvgpu\.atom\.non_exec_tiled_tma_load<(\w+),", str(op.operands[0].type))
-    return GROUPS.get(kind.group(1)) if kind else None
+    return KINDS.get(kind.group(1)) if kind else None
+
+
+def _mask_mode(copy_op) -> str:
+    """The cluster mode of the multicast mask set on a copy's atom, or "?" when the mask is not
+    one ``Cluster.multicast`` handed out."""
+    op = copy_op.operands[0].owner.operation
+    while op.name == SET_VALUE:
+        if "<mcast_mask>" in str(op.attributes["field"]):
+            mode, _ = _MASKS.get(hash(op.operands[1]), ("?", 0))
+            return mode
+        op = op.operands[0].owner.operation
+    return "?"
 
 
 def _copy_ops(set_value) -> list:
@@ -333,6 +379,19 @@ def _group_message(role: str, use: TmaUse, cp: _Copy, need: str, cluster) -> str
     else:
         fix = "build the atom's op with CtaGroup.ONE"
     return f"{head}{why}; {fix}"
+
+
+def _multicast_message(role: str, use: TmaUse, cp: _Copy) -> str:
+    chan = use.chan
+    modes = chan.producer.multicast
+    along = "" if cp.multicast == "?" else f" along {cp.multicast}"
+    declared = f"declares multicast={modes}" if modes else "declares no multicast"
+    return (
+        f"{role}: the TMA copy at {cp.site} is multicast{along} into channel {chan.name}, but "
+        f"its Tma {declared}: consumers in the CTAs the copy reaches would not release this "
+        f"CTA's stage, so it could be overwritten while they read it; declare "
+        f"Tma(..., multicast=...) with the copy's mode"
+    )
 
 
 def _bytes_message(role: str, use: TmaUse, copies: list, got: int, want: int) -> str:
