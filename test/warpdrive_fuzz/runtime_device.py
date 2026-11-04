@@ -127,8 +127,8 @@ def mark_warp(clog, base: Int32, code: cutlass.Constexpr[int]):
 
 
 @cute.jit
-def item_hash(m: Int32, n: Int32, l: Int32):
-    return (m * 1009 + n * 917 + l * 101) & 0x3FFFFFFF
+def item_hash(m: Int32, n: Int32, li: Int32):
+    return (m * 1009 + n * 917 + li * 101) & 0x3FFFFFFF
 
 
 @cute.jit
@@ -143,11 +143,11 @@ def log_item(
     hit_idx: Int32,
     pred,
 ):
-    m, n, l = words
+    m, n, li = words
     if pred:
         if k < cap:
             clog[base + k] = Int32(index)
-            clog[base + cap + k] = item_hash(Int32(m), Int32(n), Int32(l))
+            clog[base + cap + k] = item_hash(Int32(m), Int32(n), Int32(li))
         cute.arch.atomic_add(hits.iterator + hit_idx, Int32(1))
 
 

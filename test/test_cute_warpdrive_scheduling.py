@@ -82,10 +82,10 @@ def test_raster_is_a_bijection(order, ext):
 @pytest.mark.parametrize("ext", [(13, 29, 1), (8, 64, 2), (40, 3, 1)])
 def test_raster_along_and_l_slowest(ext):
     em, en, _ = ext
-    for i, (m, n, l) in enumerate(_all_coords(Raster(), ext)):
-        assert (m, n, l) == (i % em, (i // em) % en, i // (em * en))
-    for i, (m, n, l) in enumerate(_all_coords(Raster(along="n"), ext)):
-        assert (m, n, l) == ((i // en) % em, i % en, i // (em * en))
+    for i, (m, n, li) in enumerate(_all_coords(Raster(), ext)):
+        assert (m, n, li) == (i % em, (i // em) % en, i // (em * en))
+    for i, (m, n, li) in enumerate(_all_coords(Raster(along="n"), ext)):
+        assert (m, n, li) == ((i // en) % em, i % en, i // (em * en))
 
 
 @pytest.mark.parametrize("swizzle", [2, 4, 8])
@@ -96,8 +96,8 @@ def test_raster_swizzle_bands(swizzle, ext):
     ``swizzle`` columns and ``k`` (+1) rows."""
     em, en, _ = ext
     coords = _all_coords(Raster(swizzle=swizzle), ext)
-    for l in range(ext[2]):
-        layer = coords[l * em * en : (l + 1) * em * en]
+    for li in range(ext[2]):
+        layer = coords[li * em * en : (li + 1) * em * en]
         bands = [n // swizzle for _, n, _ in layer]
         assert bands == sorted(bands)
         for start in range(0, en, swizzle):
@@ -111,7 +111,7 @@ def test_raster_lpt_reverses_m():
     ext = (6, 4, 2)
     plain = _all_coords(Raster(swizzle=2), ext)
     lpt = _all_coords(Raster(swizzle=2, reverse="m"), ext)
-    assert [(ext[0] - 1 - m, n, l) for m, n, l in plain] == lpt
+    assert [(ext[0] - 1 - m, n, li) for m, n, li in plain] == lpt
     assert lpt[0][0] == ext[0] - 1  # the longest query block goes first
 
 
@@ -236,8 +236,8 @@ class ScheduleToy(WarpSpecialized):
 
     @cute.jit
     def _visit(self, r: int, tiles, count, ctx):
-        m, n, l = tiles.work
-        tile = (l * ctx.en + n) * ctx.em + m
+        m, n, li = tiles.work
+        tile = (li * ctx.en + n) * ctx.em + m
         # Out-of-range coordinates (a misread launch grid) never count, even when their linear
         # id happens to land on a real tile.
         in_range = (m < ctx.em) & (n < ctx.en)
@@ -367,8 +367,8 @@ def test_every_role_sees_every_tile_once(requires_blackwell, policy, ext, max_ct
         order = op.tiles.order
         for b in range(grid):
             for k in range(min(ScheduleToy.MAX_ITEMS, len(range(b, total, grid)))):
-                m, n, l = order.decode(b + k * grid, ext)
-                assert log[0, b, k] == (l * ext[1] + n) * ext[0] + m
+                m, n, li = order.decode(b + k * grid, ext)
+                assert log[0, b, k] == (li * ext[1] + n) * ext[0] + m
     assert ws[:2].tolist() == [0, 0], "dynamic counter must self-reset"
 
 
@@ -414,7 +414,7 @@ def test_skip_hook_hides_items_from_every_role(requires_blackwell, policy, ready
     want = torch.tensor(
         [
             0 if (m + n) % 2 else 1
-            for l in range(ext[2])
+            for li in range(ext[2])
             for n in range(ext[1])
             for m in range(ext[0])
         ],

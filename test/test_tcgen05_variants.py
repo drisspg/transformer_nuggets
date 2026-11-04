@@ -105,7 +105,9 @@ def test_list_cli_runs_without_gpu_dependencies():
     [["--arch", "sm_90"], ["--family", "wgmma"], ["--mode", "bandwidth"], ["--select", "("]],
 )
 def test_list_cli_rejects_invalid_selectors(args):
-    result = CliRunner().invoke(tcgen05_throughput.app, ["list", *args])
+    # Plain, wide output: CI forces color, and Rich would split the option name with ANSI codes.
+    env = {"NO_COLOR": "1", "FORCE_COLOR": "", "TERM": "dumb", "COLUMNS": "200"}
+    result = CliRunner().invoke(tcgen05_throughput.app, ["list", *args], env=env)
     assert result.exit_code == 2
     assert args[0] in result.output
 

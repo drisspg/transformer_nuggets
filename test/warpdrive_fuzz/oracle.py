@@ -25,7 +25,7 @@ def raster_order(s: StreamSpec) -> list[tuple[int, int, int]]:
     em, en, el = s.extents
     e_along, e_band = (em, en) if s.along == "m" else (en, em)
     out = []
-    for l in range(el):
+    for li in range(el):
         for start in range(0, e_band, s.swizzle):
             band = range(start, min(start + s.swizzle, e_band))
             for a in range(e_along):
@@ -35,7 +35,7 @@ def raster_order(s: StreamSpec) -> list[tuple[int, int, int]]:
                         m = em - 1 - m
                     if "n" in s.reverse:
                         n = en - 1 - n
-                    out.append((m, n, el - 1 - l if "l" in s.reverse else l))
+                    out.append((m, n, el - 1 - li if "l" in s.reverse else li))
     return out
 
 
@@ -43,8 +43,8 @@ def skipped(s: StreamSpec, item) -> bool:
     if s.skip is None:
         return False
     a, b, c, k = s.skip
-    m, n, l = item
-    return (m * a + n * b + l * c) % k == 0
+    m, n, li = item
+    return (m * a + n * b + li * c) % k == 0
 
 
 def expected_grid(spec: KernelSpec) -> tuple[int, int, int]:
@@ -67,8 +67,8 @@ def expected_grid(spec: KernelSpec) -> tuple[int, int, int]:
     return (max(s.total, 1) * cs, 1, 1)
 
 
-def item_hash(m: int, n: int, l: int) -> int:
-    return (m * 1009 + n * 917 + l * 101) & 0x3FFFFFFF
+def item_hash(m: int, n: int, li: int) -> int:
+    return (m * 1009 + n * 917 + li * 101) & 0x3FFFFFFF
 
 
 @dataclass

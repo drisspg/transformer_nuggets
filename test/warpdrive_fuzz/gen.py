@@ -141,9 +141,9 @@ class StreamSpec:
         """The layer launches the tile space itself (R13: OneShot, plain Raster, no record)."""
         return self.policy == "oneshot" and self.plain_raster and not self.record
 
-    def item_rounds(self, m: int, n: int, l: int) -> int:
+    def item_rounds(self, m: int, n: int, li: int) -> int:
         base, spread, a, b, c = self.rounds
-        return (m * a + n * b + l * c) % spread + base
+        return (m * a + n * b + li * c) % spread + base
 
 
 @dataclass(frozen=True)

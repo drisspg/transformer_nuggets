@@ -200,8 +200,8 @@ class Raster(WorkMapping):
     def decode(self, index, space):
         em, en, el = space
         per_l = em * en
-        l = index // per_l
-        r = index - l * per_l
+        li = index // per_l
+        r = index - li * per_l
         e_along, e_band = (em, en) if self.along == "m" else (en, em)
         if self.swizzle == 1:
             b = r // e_along
@@ -220,8 +220,8 @@ class Raster(WorkMapping):
         if "n" in self.reverse:
             n = en - 1 - n
         if "l" in self.reverse:
-            l = el - 1 - l
-        return m, n, l
+            li = el - 1 - li
+        return m, n, li
 
     def get_key(self) -> str:
         return f"{self.along}{self.swizzle}" + (
@@ -737,7 +737,7 @@ def tile_grid_dims(space, cs: int = 1):
 
 
 @cute.jit
-def _grid_item(order, space, m, n, l):
+def _grid_item(order, space, m, n, li):
     """Item words of a ``_tile_grid`` stream: ``blockIdx`` as is on a tile-space grid, or the
     decoded index on any 1-D grid (the fallback, or a hand-built ``(total, 1, 1)`` launch, where
     ``m`` is the linear index and ``n = l = 0``). The launch shape decides, not the extents, so
@@ -747,8 +747,8 @@ def _grid_item(order, space, m, n, l):
     _, gdy, gdz = cute.arch.grid_dim()
     if (gdy * gdz == 1) & (en * el > 1):
         dm, dn, dl = decode(m, space)
-        m, n, l = Int32(dm), Int32(dn), Int32(dl)
-    return m, n, l
+        m, n, li = Int32(dm), Int32(dn), Int32(dl)
+    return m, n, li
 
 
 def _tile_grid(stream) -> bool:
