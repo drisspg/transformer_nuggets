@@ -10,12 +10,18 @@ mapping and cluster are constructor arguments::
     PersistentGemm(schedule=ClusterLaunchControl())  # or your own IndexSchedule
     PersistentGemm(mapping=CutlassRaster(swizzle=8))  # any WorkMap, or an adapter
     PersistentGemm(cluster=CtaPair())  # 2-CTA: 256x256 MMA tiles, CtaGroup.TWO
+    PersistentGemm(cluster=Cluster(2, 2, pair=True), tile_n=224)  # two pairs share A tiles
 
 With ``CtaPair`` the MMA tile is 256x256x64: each CTA of the pair loads its 128 rows of A and
 its 128 rows of B, the leader's MMA warp issues 2-CTA MMAs reading both CTAs' SMEM, and each
 CTA's epilogue stores its 128x256 half from its own TMEM. The only source differences are the
 ``self.cluster`` declaration, ``cta="leader"`` on the MMA role (a no-op for one CTA), and the tile
-shapes derived from ``self.cluster.size``; the layer derives every cross-CTA barrier.
+shapes derived from the cluster; the layer derives every cross-CTA barrier.
+
+A larger ``Cluster`` runs one MMA tile per pair (per CTA without pairs) and multicasts the loads
+its CTAs share: pairs side by side along N need the same rows of A, so each CTA loads a part of
+its A tile and multicasts it (``Tma(..., multicast="n")``); pairs along M share B the same way.
+A work item is then a cluster tile, and each pair offsets it by its position in the cluster.
 
 One compile serves every M, N, K: tile counts, the persistent grid cap, and the atomic counter
 are runtime values; schedule, mapping, cluster, and stage counts are compile-time.
@@ -73,6 +79,10 @@ class PersistentGemmParams:
     tiled_mma: cute.TiledMma
     tma_a: cute.CopyAtom
     tma_b: cute.CopyAtom
+    mcast_a: object  # TMA multicast masks of A and B (None: not multicast)
+    mcast_b: object
+    tile_m: cutlass.Int32  # this CTA's MMA tile within a work item's cluster tile
+    tile_n: cutlass.Int32
     tAsA: StageView  # TMA partitions of the A and B stages: (TMA, stage)
     tAgA: cute.Tensor  # whole-problem A tiles: (TMA, m_tiles, k_tiles)
     tBsB: StageView
@@ -99,7 +109,7 @@ class PersistentGemm(WarpSpecialized):
         tile_n: int = 256,
     ):
         self.cluster = cluster or SingleCta()
-        cs = self.cluster.size
+        cs = self.cluster.pair_size  # CTAs per MMA
         if tile_n % EPI_TILE[1] or not 0 < tile_n <= 256 or tile_n // cs % 8:
             raise ValueError(
                 f"tile_n must be a multiple of {EPI_TILE[1]} in (0, 256], got {tile_n}"
@@ -123,7 +133,12 @@ class PersistentGemm(WarpSpecialized):
         a = self.smem_plan.buffer("A", self.dtype, align=1024)
         b = self.smem_plan.buffer("B", self.dtype, align=1024)
         self.smem_plan.buffer("C", self.dtype, align=128)
-        self.ab = Ring(ab_stages, Tma(stage_bytes), Umma, buffer={"A": a, "B": b})
+        # Pairs (CTAs) side by side along N share A tiles; along M, B tiles.
+        self.pairs_mn = (self.cluster.m // cs, self.cluster.n)
+        multicast = "n" * (self.pairs_mn[1] > 1) + "m" * (self.pairs_mn[0] > 1)
+        self.ab = Ring(
+            ab_stages, Tma(stage_bytes, multicast=multicast), Umma, buffer={"A": a, "B": b}
+        )
         self.acc = Ring(acc_stages, Umma, Threads)
         self.tmem_plan = TmemPlan().region("acc", cta_tile[1], acc_stages)
         self.work = WorkStream(
@@ -147,14 +162,17 @@ class PersistentGemm(WarpSpecialized):
     @cute.jit
     def load(self, params: PersistentGemmParams, *, ab: Producer, work: WorkCursor):
         ab = ab.views(A=params.tAsA, B=params.tBsB)
+        mcast_a = {} if params.mcast_a is None else {"mcast_mask": params.mcast_a}
+        mcast_b = {} if params.mcast_b is None else {"mcast_mask": params.mcast_b}
         while work.valid:
-            m, n, _ = work.item
+            m, n = self.mma_tile_mn(params, work.item)
             tAgA = params.tAgA[None, m, None]
             tBgB = params.tBgB[None, n, None]
             for k in cutlass.range(params.num_k_tiles, unroll=1):
                 with ab.produce() as s:
-                    cute.copy(params.tma_a, tAgA[None, k], s.view("A"), tma_bar_ptr=s.barrier)
-                    cute.copy(params.tma_b, tBgB[None, k], s.view("B"), tma_bar_ptr=s.barrier)
+                    a, b = s.view("A"), s.view("B")
+                    cute.copy(params.tma_a, tAgA[None, k], a, tma_bar_ptr=s.barrier, **mcast_a)
+                    cute.copy(params.tma_b, tBgB[None, k], b, tma_bar_ptr=s.barrier, **mcast_b)
             work.advance()
         return ab, work
 
@@ -198,7 +216,8 @@ class PersistentGemm(WarpSpecialized):
         ``C_STAGES`` SMEM buffers. TMA clips the ragged edges, so partial tiles cost the same."""
         tidx, _, _ = cute.arch.thread_idx()
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        thr_mma = params.tiled_mma.get_slice(self.cluster.rank())  # this CTA's rows of the tile
+        # This CTA's rows of the tile.
+        thr_mma = params.tiled_mma.get_slice(self.cluster.coords(self.cluster.rank())[0])
         tAcc = transform_partitioned_tensor_layout(
             cute.make_tensor(tmem.ptr("acc"), params.acc_layout)
         )
@@ -212,7 +231,7 @@ class PersistentGemm(WarpSpecialized):
         )
         gC_l = cute.make_tensor(gC.iterator, cute.append(gC.layout, cute.make_layout(1)))
         t2r, tTR_tAcc, tTR_rAcc = epilogue_tmem_copy_and_partition(
-            self, tidx, tAcc, gC_l, params.epi_tile, self.cluster.size > 1
+            self, tidx, tAcc, gC_l, params.epi_tile, self.cluster.pair
         )
         tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.dtype)
         r2s, tRS_rC, tRS_sC = epilogue_smem_copy_and_partition(self, t2r, tTR_rC, tidx, params.sC)
@@ -230,7 +249,7 @@ class PersistentGemm(WarpSpecialized):
         rotate = subtiles % C_STAGES != 0
         first = Int32(0)  # the buffer of this tile's first subtile
         while work.valid:
-            m, n, _ = work.item
+            m, n = self.mma_tile_mn(params, work.item)
             dst = cute.group_modes(bSG_gC[None, None, None, m, n], 1, 3)  # (TMA, SUB)
             with acc.consume() as a:
                 for i in cutlass.range_constexpr(subtiles):
@@ -254,6 +273,16 @@ class PersistentGemm(WarpSpecialized):
             cute.arch.cp_async_bulk_wait_group(0, read=True)
         return acc, work
 
+    def mma_tile_mn(self, params: PersistentGemmParams, item):
+        """This CTA's MMA tile of a work item (a cluster tile of ``pairs_mn`` MMA tiles)."""
+        m, n, _ = item
+        pairs_m, pairs_n = self.pairs_mn
+        if cutlass.const_expr(pairs_m > 1):
+            m = m * pairs_m + params.tile_m
+        if cutlass.const_expr(pairs_n > 1):
+            n = n * pairs_n + params.tile_n
+        return m, n
+
     # ----------------------------------------------------------------- kernel
 
     @cute.kernel
@@ -263,21 +292,24 @@ class PersistentGemm(WarpSpecialized):
         self.begin_roles(work=bound, layouts={"A": a_layout, "B": b_layout, "C": c_layout})
         sA, sB, sC = self.buffer("A"), self.buffer("B"), self.buffer("C")
         # This CTA's slice of the (possibly 2-CTA) MMA: its rows of A and of B.
-        thr_mma = tiled_mma.get_slice(self.cluster.rank())
+        mma_rank, pair_m, pair_n = self.cluster.coords(self.cluster.rank())
+        thr_mma = tiled_mma.get_slice(mma_rank)
         # Whole-problem tile views: (BM, BK, m_tiles, k_tiles) and (BN, BK, n_tiles, k_tiles).
         gA = cute.local_tile(mA, self.mma_tile, (None, None, None), proj=(1, None, 1))
         gB = cute.local_tile(mB, self.mma_tile, (None, None, None), proj=(None, 1, 1))
+        # Each CTA loads its part of the tiles it shares with the CTAs along N (A) or M (B).
+        share_a, share_b = self.cluster.multicast("n"), self.cluster.multicast("m")
         tAsA, tAgA = cpasync.tma_partition(
             tma_a,
-            0,
-            cute.make_layout(1),
+            share_a.coord,
+            share_a.layout,
             cute.group_modes(sA, 0, 3),
             cute.group_modes(thr_mma.partition_A(gA), 0, 3),
         )
         tBsB, tBgB = cpasync.tma_partition(
             tma_b,
-            0,
-            cute.make_layout(1),
+            share_b.coord,
+            share_b.layout,
             cute.group_modes(sB, 0, 3),
             cute.group_modes(thr_mma.partition_B(gB), 0, 3),
         )
@@ -287,6 +319,10 @@ class PersistentGemm(WarpSpecialized):
             tiled_mma=tiled_mma,
             tma_a=tma_a,
             tma_b=tma_b,
+            mcast_a=share_a.mask,
+            mcast_b=share_b.mask,
+            tile_m=pair_m,
+            tile_n=pair_n,
             tAsA=StageView(tAsA, axis=1),
             tAgA=tAgA,
             tBsB=StageView(tBsB, axis=1),
@@ -303,6 +339,12 @@ class PersistentGemm(WarpSpecialized):
         self.run_roles(params)
 
     # ------------------------------------------------------------------- host
+
+    def load_op(self, sharing_ctas: int):
+        """The TMA load op for an operand shared by ``sharing_ctas`` CTAs of the cluster."""
+        if sharing_ctas > 1:
+            return cpasync.CopyBulkTensorTileG2SMulticastOp(self.cluster.cta_group)
+        return cpasync.CopyBulkTensorTileG2SOp(self.cluster.cta_group)
 
     @cute.jit
     def __call__(
@@ -327,20 +369,33 @@ class PersistentGemm(WarpSpecialized):
         tiled_mma = cute.make_tiled_mma(op)
         a_layout = sm100_utils.make_smem_layout_a(tiled_mma, tile, self.dtype, self.ab.n)
         b_layout = sm100_utils.make_smem_layout_b(tiled_mma, tile, self.dtype, self.ab.n)
-        # 2-CTA loads (CtaGroup.TWO) signal the leader's full barrier from both CTAs.
-        tma_op = cpasync.CopyBulkTensorTileG2SOp(group)
+        # 2-CTA loads (CtaGroup.TWO) signal the leader's full barrier from both CTAs; loads
+        # shared along a cluster mode are multicast.
         vmnk = self.cluster.layout_vmnk().shape
         tma_a, mA = cute.nvgpu.make_tiled_tma_atom_A(
-            tma_op, a, cute.select(a_layout, mode=[0, 1, 2]), tile, tiled_mma, vmnk
+            self.load_op(self.pairs_mn[1]),
+            a,
+            cute.select(a_layout, mode=[0, 1, 2]),
+            tile,
+            tiled_mma,
+            vmnk,
         )
         tma_b, mB = cute.nvgpu.make_tiled_tma_atom_B(
-            tma_op, b, cute.select(b_layout, mode=[0, 1, 2]), tile, tiled_mma, vmnk
+            self.load_op(self.pairs_mn[0]),
+            b,
+            cute.select(b_layout, mode=[0, 1, 2]),
+            tile,
+            tiled_mma,
+            vmnk,
         )
         c_layout = sm100_utils.make_smem_layout_epi(self.dtype, self.c_layout, EPI_TILE, C_STAGES)
         tma_c, mC_tma = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileS2GOp(), c, cute.select(c_layout, mode=[0, 1]), EPI_TILE
         )
-        m_tiles, n_tiles = cute.ceil_div(c.layout.shape, self.mma_tile[:2])
+        # One work item per cluster tile; a ragged last cluster tile's extra MMA tiles fall past
+        # the edge, where TMA loads zeros and clips the stores.
+        cluster_tile = (self.mma_tile[0] * self.pairs_mn[0], self.mma_tile[1] * self.pairs_mn[1])
+        m_tiles, n_tiles = cute.ceil_div(c.layout.shape, cluster_tile)
         bound = self.work.bind((m_tiles, n_tiles, 1), workspace, max_ctas)
         self.kernel.set_name_prefix(self.get_name())
         self.kernel(
@@ -380,7 +435,8 @@ def persistent_gemm(
 ) -> torch.Tensor:
     """``a @ b.T`` for row-major bf16 ``a: (M, K)``, ``b: (N, K)``. ``schedule`` defaults to
     ``StaticPersistent()``; ``max_ctas`` caps the persistent grid in CTAs (default: the SM
-    count); ``cluster=CtaPair()`` runs 2-CTA 256x256 tiles."""
+    count); ``cluster=CtaPair()`` runs 2-CTA 256x256 tiles, ``Cluster(2, 2, pair=True)`` two such
+    pairs sharing A."""
     out = check_gemm_args(a, b, out)
     if out.numel() == 0:
         return out
@@ -401,12 +457,13 @@ def persistent_gemm(
 if __name__ == "__main__":
     from transformer_nuggets.cute.warpdrive import (
         AtomicPersistent,
+        Cluster,
         ClusterLaunchControl,
         CtaPair,
         OneShot,
     )
 
-    for cluster in (None, CtaPair()):
+    for cluster in (None, CtaPair(), Cluster(2, 2, pair=True)):
         for schedule in (
             OneShot(),
             StaticPersistent(),
@@ -421,3 +478,4 @@ if __name__ == "__main__":
                 err = (out.float() - ref).abs().max().item()
                 print(f"{cluster} {schedule.describe():<28} M={m} N={n} K={k}: err {err:.4g}")
     print(PersistentGemm(schedule=ClusterLaunchControl(), cluster=CtaPair()).describe())
+    print(PersistentGemm(cluster=Cluster(2, 2, pair=True), tile_n=224).describe())
