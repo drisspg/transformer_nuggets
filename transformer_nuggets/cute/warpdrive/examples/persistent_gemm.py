@@ -135,6 +135,14 @@ class PersistentGemm(WarpSpecialized):
         self.smem_plan.buffer("C", self.dtype, align=128)
         # Pairs (CTAs) side by side along N share A tiles; along M, B tiles.
         self.pairs_mn = (self.cluster.m // cs, self.cluster.n)
+        for count, operand in zip(self.pairs_mn, "BA"):
+            # Each CTA loads 1/count of the shared tile; the TMA partition needs that to divide
+            # the tile's power-of-two extents (3 compiles, then faults at runtime).
+            if count & (count - 1):
+                raise ValueError(
+                    f"{self.cluster} multicasts {operand} across {count} CTAs; PersistentGemm "
+                    "needs a power-of-two count of MMA tiles along each cluster mode"
+                )
         multicast = "n" * (self.pairs_mn[1] > 1) + "m" * (self.pairs_mn[0] > 1)
         self.ab = Ring(
             ab_stages, Tma(stage_bytes, multicast=multicast), Umma, buffer={"A": a, "B": b}

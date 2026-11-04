@@ -264,6 +264,15 @@ def test_cluster_placement_errors():
         FlatRank0Mma()._collect()
 
 
+@pytest.mark.parametrize(
+    "cluster", [Cluster(1, 3), Cluster(3, 1), Cluster(2, 3, pair=True)], ids=str
+)
+def test_gemm_rejects_non_power_of_two_multicast(cluster):
+    """Regression: 3-way multicast compiled, then faulted with an illegal instruction."""
+    with pytest.raises(ValueError, match="power-of-two count of MMA tiles"):
+        PersistentGemm(cluster=cluster)
+
+
 def test_fa4_rejects_clusters_beyond_a_pair():
     pytest.importorskip("flash_attn.cute")
     from transformer_nuggets.cute.warpdrive.examples.fa4_fwd import FlashAttentionForward

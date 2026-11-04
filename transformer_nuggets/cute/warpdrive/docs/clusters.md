@@ -121,7 +121,10 @@ each CTA's empty barrier waits for both leaders. Releasing only the own pair is 
 
 Get the multicast partition and mask from `Cluster.multicast` after `begin_roles()`. The TMA
 check verifies the mask's mode and the copy bytes. A multicast copy into a channel without
-`multicast=` is rejected; a mask from elsewhere leaves the channel `unverified`.
+`multicast=` is rejected; a mask from elsewhere leaves the channel `unverified`. The check
+does not prove the TMA descriptor legal: a 3-way multicast partition compiles and then faults
+at runtime, so the persistent GEMM rejects clusters with a non-power-of-two count of MMA tiles
+along either mode.
 
 ### Work items and the scheduler
 
