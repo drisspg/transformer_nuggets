@@ -256,6 +256,10 @@ def check_gemm_args(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor | None) 
 def gemm(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
     """``a @ b.T`` for row-major bf16 ``a: (M, K)``, ``b: (N, K)``."""
     out = check_gemm_args(a, b, out)
+    if out.numel() == 0:
+        return out
+    if a.shape[1] == 0:  # no K tiles: the MMA would publish an unwritten accumulator
+        return out.zero_()
     compile_gemm(Gemm())(a, b, out)
     return out
 

@@ -394,6 +394,18 @@ def _out_view(buf: torch.Tensor, offset: int, m: int, n: int) -> torch.Tensor:
 
 
 @GEMMS
+@pytest.mark.parametrize("m, n, k", [(64, 24, 0), (0, 8, 64), (64, 0, 64), (0, 0, 0)])
+def test_gemm_zero_work(requires_blackwell, fn, m, n, k):
+    """Empty K gives zeros (no MMA writes the accumulator); empty outputs launch nothing."""
+    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    out = torch.full((m, n), float("nan"), device="cuda", dtype=torch.bfloat16)
+    assert fn(a, b, out) is out
+    torch.cuda.synchronize()
+    assert torch.equal(out, torch.zeros_like(out))
+
+
+@GEMMS
 @pytest.mark.parametrize("alias", ["out_is_a", "out_is_b", "out_overlaps_half_of_a"])
 def test_gemm_rejects_out_overlapping_operands(requires_blackwell, fn, alias):
     """512^3 has 8 output tiles: a tile's store would overwrite rows another tile still loads."""
