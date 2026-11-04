@@ -112,6 +112,7 @@ exclude = [
 addopts = "-m 'not slow'"
 markers = [
     "slow: long-running tests skipped by default; run with `pytest -m slow`",
+    "fuzz: seeded warpdrive fuzz cases at a quick budget; long runs: scripts/fuzz_warpdrive.py",
 ]
 
 [tool.ruff.lint]
