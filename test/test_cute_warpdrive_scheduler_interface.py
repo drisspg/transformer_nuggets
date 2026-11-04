@@ -800,24 +800,33 @@ def test_device_built_list_under_pdl(requires_blackwell, schedule, cluster):
     )
     ws, _ = op.work.launch_args("cuda")
     for max_ctas in (148, 6):
-        table = torch.zeros(capacity, 3, dtype=torch.int32, device="cuda")
-        length = torch.zeros(1, dtype=torch.int32, device="cuda")
-        stamp = torch.zeros(1, dtype=torch.int32, device="cuda")
-        hits = torch.zeros(2, total, dtype=torch.int32, device="cuda")
-        entry = torch.zeros(capacity * cluster.size, dtype=torch.int32, device="cuda")
-        fn(table, length, stamp, hits, entry, ws, em, en, el, 200_000, max_ctas)
-        torch.cuda.synchronize()
-        assert int(length) == int((want > 0).sum())
-        assert torch.equal(hits[0].cpu(), want) and torch.equal(hits[1].cpu(), want), max_ctas
-        assert ws[:2].tolist() == [0, 0]
-        # Some consumer CTA entered before the producer's last write: the dependency was real.
-        # Tools that serialize launches (compute-sanitizer, CUTracer, CUDA_LAUNCH_BLOCKING)
-        # remove the overlap, not the correctness checks above.
-        if serialized_launches():
-            continue
-        launched = entry[entry != 0].cpu().long()
-        early = ((launched - int(stamp)) + 2**31) % 2**32 - 2**31 < 0
-        assert early.any(), "the consumer did not overlap the producer; PDL not exercised"
+        # A shared GPU may delay the consumer past the producer's spin. Retry only overlap,
+        # with a longer spin (0.2 to 3.2 ms); every launch must still produce correct results.
+        for attempt in range(5):
+            table = torch.zeros(capacity, 3, dtype=torch.int32, device="cuda")
+            length = torch.zeros(1, dtype=torch.int32, device="cuda")
+            stamp = torch.zeros(1, dtype=torch.int32, device="cuda")
+            hits = torch.zeros(2, total, dtype=torch.int32, device="cuda")
+            entry = torch.zeros(capacity * cluster.size, dtype=torch.int32, device="cuda")
+            delay = 200_000 * 2**attempt
+            fn(table, length, stamp, hits, entry, ws, em, en, el, delay, max_ctas)
+            torch.cuda.synchronize()
+            assert int(length) == int((want > 0).sum())
+            assert torch.equal(hits[0].cpu(), want) and torch.equal(hits[1].cpu(), want), max_ctas
+            assert ws[:2].tolist() == [0, 0]
+            # Tools that serialize launches (compute-sanitizer, CUTracer, CUDA_LAUNCH_BLOCKING)
+            # remove the overlap, not the correctness checks above.
+            if serialized_launches():
+                break
+            launched = entry[entry != 0].cpu().long()
+            early = ((launched - int(stamp)) + 2**31) % 2**32 - 2**31 < 0
+            if early.any():
+                break
+        else:
+            pytest.fail(
+                f"the consumer did not overlap the producer in 5 attempts (max_ctas={max_ctas}); "
+                "PDL not exercised"
+            )
 
 
 # --------------------------------------------------------------------------- #
