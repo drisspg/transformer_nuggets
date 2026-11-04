@@ -77,6 +77,7 @@ class SlotsToy(WarpSpecialized):
                         h.commit()
                     if cutlass.const_expr(self.mode == "wrong_side"):
                         h.release()
+        return ch
 
     @role(warps=1)
     @cute.jit
@@ -142,6 +143,7 @@ class BoundToy(WarpSpecialized):
         for i in cutlass.range(ctx.n, unroll=1):
             with ch.produce(slot) as h:
                 h.data[cute.arch.lane_idx()] = (stage + 1) * (i + 1)
+        return ch
 
     @role(warps=2)
     @cute.jit
@@ -179,6 +181,7 @@ class HoleToy(WarpSpecialized):
         for i in cutlass.range(ctx.n, unroll=1):
             with ch.produce(0) as h:
                 h.data[lane] = i * 32 + lane
+        return ch
 
     @role(warps=range(4, 8), regs=232)
     @cute.jit
@@ -213,7 +216,7 @@ class OverBudgetHoleToy(HoleToy):
     @role(warps=0, regs=232)
     @cute.jit
     def prod(self, ch: Producer, ctx):
-        pass
+        return ch
 
 
 def compile_toy(op):
@@ -344,6 +347,7 @@ class TypedCtxToy(WarpSpecialized):
         for i in cutlass.range(ctx.n, unroll=1):
             with ch.produce(0) as h:
                 h.data[lane] = i * 32 + lane
+        return ch
 
     @role(warps=1)
     @cute.jit
@@ -388,6 +392,7 @@ class NamespaceCtxToy(TypedCtxToy):
         for i in cutlass.range(ctx.n, unroll=1):
             with ch.produce(0) as h:
                 h.data[lane] = i * 32 + lane
+        return ch
 
     @role(warps=1)
     @cute.jit
@@ -444,7 +449,7 @@ class TypoAnnotationToy(WarpSpecialized):
     @role(warps=0)
     @cute.jit
     def load(self, ab: Producer, ctx: ToyCtx):
-        pass
+        return ab
 
     @role(warps=1)
     @cute.jit
@@ -524,7 +529,7 @@ class BoundSlotsToy(WarpSpecialized):
     @role(warps=[range(4), range(4, 8)])
     @cute.jit
     def prod(self, stage: Instance, ch: Producer[Instance], ctx):
-        pass
+        return ch
 
     @role(warps=range(8, 12))
     @cute.jit
@@ -557,7 +562,7 @@ class WideRolesToy(WarpSpecialized):
     @role(warps=range(4))
     @cute.jit
     def prod(self, ch: Producer, ctx):
-        pass
+        return ch
 
     @role(warps=range(4, 8))
     @cute.jit

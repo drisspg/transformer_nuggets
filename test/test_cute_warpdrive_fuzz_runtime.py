@@ -157,12 +157,14 @@ class _SchedulerInDefaultBudgetGroup(WarpSpecialized):
     def a(self, tiles: Tiles, ctx):
         while tiles.valid:
             tiles.advance()
+        return tiles
 
     @role(warps=range(4, 8), regs=160)
     @cute.jit
     def b(self, tiles: Tiles, ctx):
         while tiles.valid:
             tiles.advance()
+        return tiles
 
 
 def test_scheduler_takes_its_warpgroups_default_budget():

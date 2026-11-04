@@ -99,6 +99,7 @@ class Gemm(WarpSpecialized):
                         tma_bar_ptr=s.barrier,
                     )
             tiles.advance()
+        return ab, tiles
 
     @role(warps=5, regs=40)
     @cute.jit
@@ -120,6 +121,7 @@ class Gemm(WarpSpecialized):
                             )
                             tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
             tiles.advance()
+        return acc, tiles
 
     @role(warps=range(4), regs=160)
     @cute.jit
@@ -156,6 +158,7 @@ class Gemm(WarpSpecialized):
                             if cute.elem_less(crd[j], ctx.mC.shape):
                                 g[j] = rC[j]
             tiles.advance()
+        return tiles
 
     # ----------------------------------------------------------------- kernel
 

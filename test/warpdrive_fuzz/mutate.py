@@ -62,6 +62,7 @@ class Probe(WarpSpecialized):
     @cute.jit
     def prod(self, ch: PRODUCER_ANNOTATION, ctx):
 PRODUCER_BODY
+        return ch
 
     @role(warps=1)
     @cute.jit
@@ -97,6 +98,7 @@ class Probe(WarpSpecialized):
     @cute.jit
     def worker(self, tiles: Tiles, ctx):
 BODY
+        return tiles
 
     @cute.kernel
     def kernel(self, out: cute.Tensor, work):

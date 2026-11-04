@@ -19,7 +19,9 @@ unseeded wait cycle, and terminating user work. Specifically:
   CTA/cluster code; every participating thread reaches initialization and exit. Named barrier
   IDs **1 and 2** are reserved. Initialize `Barriers(counts=None)` before `run_roles`.
 - Carry ends, cursors and turnstile state through loops/helpers: return and reassign them.
-  Keep tailed producer ends and IKET tile cursors under their original parameter names.
+  Managed roles explicitly return their final tile cursor and tailed producer ends (one object
+  or a tuple). Local names and tuple order do not matter; returning a stale snapshot is not
+  detected and violates the state-carry obligation.
 - `Threads` means every thread of every bound role; `Tma`/`Umma` mean one single-warp role
   per side. Use matching dynamic counts/predicates across roles, slots and relevant CTAs.
 - Close each handle once in its opening dynamic region. Use storage only during its owned
@@ -50,7 +52,7 @@ These are conditional guarantees relative to that program, not a theorem about a
 | R4 | CTA-local counts sum bound contributions per slot: Threads contributes `32 * role.num_warps`, Tma/Umma one. Fan-out forms a join: the last contributing consumer controls reuse. Pair contributions are specified below. |
 | R5 | Ordinary producer/consumer close signals full/empty. TMA acquire arms bytes and TMA commit emits no signal. UMMA uses an elected `tcgen05.commit`. Declared `tmem_store`/`smem_async` fences precede that side's signal. `signal=False` emits neither signal nor its fence. |
 | R6 | Layer payloads are uninitialized, 16-byte-aligned, per-stage CTA-local SMEM, shaped `(*shape,n)`. `h.data` selects h.index. User pair-scoped payloads are rejected; scheduler payloads are explicitly filled in both CTAs. |
-| R7 | Pair-scoped producers automatically tail when the consumer is Umma and empty targets include the peer. Ring tails use the live final state; Slots tails drain only that end's acquired slots with their final phases. `retire()` is disallowed there. All threads perform cluster exit arrive/wait after dispatch/TMEM teardown. This is not a wait for arbitrary user async work. |
+| R7 | Pair-scoped producers automatically tail when the consumer is Umma and empty targets include the peer. Ring tails use the explicitly returned final state; Slots tails drain only that end's acquired slots with their final phases. `retire()` is disallowed there. All threads perform cluster exit arrive/wait after dispatch/TMEM teardown. This is not a wait for arbitrary user async work. |
 | R8 | Nonalias TMEM regions occupy declaration-order intervals of `cols * slots`; aliases add no columns and stay inside their parent in each slot. Allocation is the next power of two covering `max(32,used)`, at most 512. No annotated users means no allocation. The first TMEM role allocates in one CTA; a pair needs the first all-CTA TMEM role. All declared users, raw included, join the unaligned teardown barrier before free. |
 | R9 | Numeric regs are integer multiples of 8 in [24,256]. Any numeric budget pads launch warps to full warpgroups. Owned warps in each group agree, including None; holes take that budget and entirely idle groups take 24. Adjustment branches are warpgroup-uniform, including peer padding. Accounted registers including default budgets and holes cannot exceed 65536. |
 | R10 | An enabled Turnstile orders a legal finite prefix of seats `0,1,...,p-1,0,...`; each seat's previous party supplies its arrival count. All seat threads participate. Disabled turnstiles emit no synchronization and promise no exclusion. |
@@ -222,8 +224,9 @@ body at `describe()` time.
 | E71 | Cursor has no traced advance | ProtocolError |
 | E72 | Cursor has more than one traced advance site | ProtocolError |
 | E73 | Advance is not directly in the body of the while whose condition reads valid | ProtocolError |
-| E74 | IKET cursor parameter no longer holds the live cursor at role return | ProtocolError |
-| E75 | Tailed producer parameter no longer holds the same live end record | ProtocolError |
+| E74 | Managed role does not return its final tile cursor (IKET on or off) | ProtocolError |
+| E75 | Managed role does not return the producer end needed for a channel tail | ProtocolError |
+| E103 | Managed role returns an unsupported value, state from another role, or duplicate endpoint/cursor state | ProtocolError |
 | E76 | Unknown unchecked check (allowed: unclosed/cross_region/tma) | ValueError |
 | E77 | unchecked reason not a nonblank string | ValueError |
 

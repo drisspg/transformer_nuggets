@@ -58,6 +58,7 @@ class PersistentGemm(WarpSpecialized):  # abridged: the real one sizes stages pe
                     cute.copy(ctx.tma_b, ctx.tBgB[None, n, k], ctx.tBsB[None, s.index],
                               tma_bar_ptr=s.barrier)
             tiles.advance()
+        return ab, tiles
 
     @role(warps=5, regs=40, cta="leader")  # leader-only in a CTA pair
     @cute.jit
@@ -69,6 +70,7 @@ class PersistentGemm(WarpSpecialized):  # abridged: the real one sizes stages pe
                     with ab.consume() as s:
                         ...  # cute.gemm into tAcc[..., a.index], reading A/B stage s.index
             tiles.advance()
+        return acc, tiles
 
     @role(warps=range(4), regs=160)
     @cute.jit
@@ -78,6 +80,7 @@ class PersistentGemm(WarpSpecialized):  # abridged: the real one sizes stages pe
             with acc.consume() as a:
                 ...  # TMEM -> registers -> SMEM -> TMA store of tile (m, n)
             tiles.advance()
+        return tiles
 
     @cute.kernel
     def kernel(self, tiled_mma, tma_a, mA, tma_b, mB, tma_c, mC, ..., work):
@@ -209,6 +212,38 @@ out, lse = fa4_fwd(q, k, v, roles=roles)
 Changing the warp layout can also require changes to your tensor partitions; deriving barrier
 counts does not rewrite the math's thread-to-data mapping.
 
+### Returning final state
+
+A managed role returns the state that the layer needs after its body:
+
+- Its final tile cursor, whenever it takes `Tiles` (with or without IKET).
+- Its final producer endpoints for channels that require an exit tail, such as pair-scoped
+  operands consumed by UMMA. Returning other producer endpoints is also allowed, so the same
+  role can support both single-CTA and pair configurations.
+
+Return one object or a tuple, not a new wrapper or binding list:
+
+```python
+@role(warps=4, regs=40)
+@cute.jit
+def load(self, ab: Producer, tiles: Tiles, ctx):
+    while tiles.valid:
+        ...  # acquire and fill operand stages
+        tiles.advance()
+    return ab, tiles
+```
+
+The layer matches returned objects to their inputs, drains the producers that need it, and
+closes any remaining IKET work-item range using the returned cursor. Missing, duplicate or
+foreign state is an error. Tuple order and local variable names don't matter; execution state
+is not recovered from Python frames. Roles without required final state may return nothing. Raw role
+results are ignored.
+
+Return the **current loop-carried value**, not a snapshot saved before the loop. Helpers still
+return updated state to their callers (`ab = helper(ab, ...)`). The layer checks ownership and
+presence, not whether an old snapshot is stale. Stage handles are different: commit/release
+those inside the role; don't return them as endpoint state.
+
 ## Channels
 
 `Ring(n, producer, consumer)` cycles through stages 0..n-1. `Slots(n, producer, consumer)` lets
@@ -330,6 +365,7 @@ def load(self, ab: Producer, tiles: Tiles, ctx: PersistentGemmCtx):
         m, n, _ = tiles.work
         ...
         tiles.advance()
+    return ab, tiles
 ```
 
 `TileStream()` defaults to `Raster(along="m", swizzle=1)` and `OneShot()`:
@@ -625,6 +661,5 @@ TMA checks and the IKET-to-profiler path.
 ## Still to do
 
 - Use CUTLASS pipeline objects where the semantics match.
-- Explicit returns for drained producer ends.
 - A public custom-scheduler interface and optional channel storage binding.
 - Larger clusters, TMA multicast, round-robin role instances and cp.async producers.

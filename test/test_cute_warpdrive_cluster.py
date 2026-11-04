@@ -89,6 +89,7 @@ class PairToy(WarpSpecialized):
         if cutlass.const_expr(self.mode == "snapshot"):  # noqa: SIM102 (runtime inside const)
             if ctx.n > 0:  # a dynamic region that carries (rebuilds) the stale copy
                 ctx.out[3 + stage] = snapshot.full_barrier(stage).toint()
+        return ch
 
     @role(warps=2, cta="leader")
     @cute.jit
@@ -101,6 +102,7 @@ class PairToy(WarpSpecialized):
             pass
         if cute.arch.lane_idx() == 0:
             ctx.out[2] = 2 * ctx.n + 1
+        return back
 
     @role(warps=3)
     @cute.jit
@@ -180,7 +182,7 @@ class _Unpinned(WarpSpecialized):
     @role(warps=0)
     @cute.jit
     def prod(self, ch: Producer, ctx):
-        pass
+        return ch
 
     @role(warps=1)  # issues tcgen05 commits but runs in both CTAs
     @cute.jit
@@ -196,7 +198,7 @@ class _LeaderTmaToBoth(WarpSpecialized):
     @role(warps=0, cta="leader")
     @cute.jit
     def load(self, ch: Producer, ctx):
-        pass
+        return ch
 
     @role(warps=1)
     @cute.jit
@@ -212,7 +214,7 @@ class _BothTmaToMixed(WarpSpecialized):
     @role(warps=0)
     @cute.jit
     def load(self, ch: Producer, ctx):
-        pass
+        return ch
 
     @role(warps=[range(1, 2), range(2, 3)])
     @cute.jit
@@ -244,7 +246,7 @@ class _PairPayload(WarpSpecialized):
     @role(warps=0, cta="leader")
     @cute.jit
     def prod(self, ch: Producer, ctx):
-        pass
+        return ch
 
     @role(warps=1)
     @cute.jit
@@ -364,12 +366,14 @@ class PairStream(WarpSpecialized):
             if cute.arch.lane_idx() == 0:
                 cute.arch.atomic_add(ctx.out.iterator + m * ctx.n_tiles + n, cutlass.Int32(1))
             tiles.advance()
+        return tiles
 
     @role(warps=1, cta="leader")
     @cute.jit
     def other(self, tiles: Tiles, ctx):
         while tiles.valid:
             tiles.advance()
+        return tiles
 
     @cute.kernel
     def kernel(self, out: cute.Tensor, n_tiles: cutlass.Int32, work):

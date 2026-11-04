@@ -125,6 +125,7 @@ class _TmaToy(WarpSpecialized):
                     tma_bar_ptr=h.barrier,
                 )
             h.commit()
+        return ld
 
     @cute.jit
     def consume(self, ld, ctx):
@@ -316,6 +317,7 @@ class RawStateToy(WarpSpecialized):
             h = ch.acquire()
             cute.arch.mbarrier_arrive(h.full_barrier)  # count: 32 threads, as derived
             h.commit(signal=False)
+        return ch
 
     @role(warps=1)
     @cute.jit
@@ -380,6 +382,7 @@ class OptOutToy(WarpSpecialized):
                         h.commit()
                 else:
                     h.commit()
+        return ch
 
     @role(warps=1)
     @cute.jit
@@ -448,7 +451,7 @@ class _RawInPersistent(WarpSpecialized):
     @role(warps=0)
     @cute.jit
     def work(self, tiles: Tiles, ctx):
-        pass
+        return tiles
 
     @role(warps=range(4, 8), regs=200, raw=True)
     @cute.jit
@@ -478,12 +481,12 @@ class _Overrides(WarpSpecialized):
     @role(warps=0)
     @cute.jit
     def load(self, ab: Producer, ctx):
-        pass
+        return ab
 
     @role(warps=1)
     @cute.jit
     def mma(self, ab: Consumer, acc: Producer, ctx):
-        pass
+        return acc
 
     @role(warps=range(4, 8))
     @cute.jit
@@ -517,7 +520,7 @@ class _PairMasks(WarpSpecialized):
     @role(warps=0, cta="leader")
     @cute.jit
     def mma(self, back: Producer, ctx):
-        pass
+        return back
 
     @role(warps=1)
     @cute.jit

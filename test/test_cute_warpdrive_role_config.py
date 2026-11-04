@@ -69,6 +69,7 @@ class ConfiguredCopy(WarpSpecialized):
         for i in cutlass.range(ctx.iterations, unroll=1):
             with data.produce() as h:
                 h.data[lane] = i * 32 + lane
+        return data
 
     @role(config=lambda kernel: kernel.roles.consume)
     @cute.jit
@@ -107,7 +108,7 @@ class FixedCopy(ConfiguredCopy):
     @role(warps=0, regs=40)
     @cute.jit
     def load(self, data: Producer, ctx: CopyCtx):
-        pass
+        return data
 
     @role(warps=range(4, 8), regs=160)
     @cute.jit
@@ -166,7 +167,7 @@ def test_callable_object_and_lambda_instances(selector):
         @role(config=selector)
         @cute.jit
         def load(self, index: Instance, data: Producer[Instance], ctx):
-            pass
+            return data
 
         @role(warps=2)
         @cute.jit

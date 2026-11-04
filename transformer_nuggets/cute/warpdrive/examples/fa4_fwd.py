@@ -244,6 +244,7 @@ class FlashAttentionForward(WarpSpecialized):
                 with kv.produce() as h:
                     cute.copy(ctx.tma_v, tVgV[None, i], tVsV[None, h.index], tma_bar_ptr=h.barrier)
             tiles.advance()
+        return q, kv, tiles
 
     @role(config=lambda kernel: kernel.roles.mma)
     @cute.jit
@@ -333,6 +334,7 @@ class FlashAttentionForward(WarpSpecialized):
                     )
             v_last.release()
             tiles.advance()
+        return s, tiles
 
     def pv(self, p_last, j, tO, tOrP, tOrV, accumulate, ctx: Fa4Ctx):
         """O_j (+)= P_j V. With split-P the last quarter of the K blocks waits for p_last[j]
@@ -400,6 +402,7 @@ class FlashAttentionForward(WarpSpecialized):
             with s.consume(stage):  # the final "O_j done" commit; nothing to read
                 pass
             tiles.advance()
+        return p_last, stats, tiles
 
     def softmax_step(self, stage, s, p_last, stats, mufu, sm, t, is_first):
         """One KV block for one Q tile (plain Python: inlined into the role at trace time).
@@ -471,6 +474,7 @@ class FlashAttentionForward(WarpSpecialized):
                     lse = (row_max * ctx.scale_log2 + cute.math.log2(row_sum, fastmath=True)) * LN2
                     ctx.mLSE[batch, head, row] = lse if not empty_row else -Float32.inf
             tiles.advance()
+        return epi, tiles
 
     @cute.jit
     def rescale_o(self, thr_pv, tO, tidx, scale):
@@ -554,6 +558,7 @@ class FlashAttentionForward(WarpSpecialized):
                 cute.arch.cp_async_bulk_wait_group(Q_STAGE - 1 - j, read=True)
                 eh[j].release()
             tiles.advance()
+        return tiles
 
     # ----------------------------------------------------------------- kernel
 

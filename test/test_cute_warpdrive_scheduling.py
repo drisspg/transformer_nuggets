@@ -261,6 +261,7 @@ class ScheduleToy(WarpSpecialized):
                 tiles.advance()
             if cutlass.const_expr(self.mode == "double_advance"):
                 tiles.advance()
+        return tiles
 
     @role(warps=range(1, 3))
     @cute.jit
@@ -273,6 +274,7 @@ class ScheduleToy(WarpSpecialized):
                 self._visit(1, tiles, count, ctx)
                 count += 1
                 tiles.advance()
+        return tiles
 
     @cute.kernel
     def kernel(self, log: cute.Tensor, hits: cute.Tensor, work):
@@ -459,6 +461,7 @@ class CountToy(WarpSpecialized):
         while tiles.valid:
             self._count(0, ctx)
             tiles.advance()
+        return tiles
 
     @role(warps=range(1, 3))
     @cute.jit
@@ -466,6 +469,7 @@ class CountToy(WarpSpecialized):
         while tiles.valid:
             self._count(1, ctx)
             tiles.advance()
+        return tiles
 
     @cute.kernel
     def kernel(self, count: cute.Tensor, work):
@@ -617,7 +621,7 @@ class _IdleRole(WarpSpecialized):
     @role(warps=0)
     @cute.jit
     def a(self, tiles: Tiles, ctx):
-        pass
+        return tiles
 
     @role(warps=1)
     @cute.jit

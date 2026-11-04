@@ -14,7 +14,9 @@ annotation is a ``ProtocolError``.
 
 Ends are DSL values: dynamic loops carry their phases when the end is a local name that the
 loop body uses through a method call or reassignment. Helpers that take ends must return them
-and the caller must reassign (``s, stats = step(s, stats)``), as with any CuTeDSL value.
+and the caller must reassign (``s, stats = step(s, stats)``), as with any CuTeDSL value. Managed
+roles return their final tile cursor and any producer endpoints needed for exit tails, e.g.
+``return ab, tiles``. The layer uses these values directly; it does not inspect Python frames.
 Work scheduling (``scheduling.py``): declare ``self.tiles = TileStream(order=..., policy=...)``
 and give roles ``tiles: Tiles``; the policy (``OneShot``, ``StaticPersistent``,
 ``DynamicPersistent``, ``Clc``) is a one-line switch. Clusters (``cluster.py``): declare

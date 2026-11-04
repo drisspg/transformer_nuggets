@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import inspect
-import sys
 import warnings
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -955,39 +954,31 @@ class WarpSpecialized:
         args = self._role_args(r, ctx, trace)
         # A role looping over a TileStream gets one IKET range per work item (TileCursor);
         # any other role gets one over its whole body.
-        cursors = [
-            "tiles" if a is _SchedulerTiles else p  # scheduler_role's parameter name
-            for p, a in r.params
-            if a in (Tiles, _SchedulerTiles)
-        ]
-        whole_range = self.iket and not cursors
+        whole_range = self.iket and not any(isinstance(arg, TileCursor) for arg in args)
         if whole_range:
             push(r.name)
-        if r.raw:
-            r.fn(self, *args)
-        elif trace.tails or (self.iket and cursors):
-            final = _call_capturing_locals(r.fn, r.fn.__name__, (self, *args))
-            for pname in cursors if self.iket else ():
-                cur = final.get(pname)
-                if not isinstance(cur, TileCursor):
-                    raise ProtocolError(
-                        f"{r.name}: IKET closes the last work item's range at role exit using "
-                        f"the cursor bound to `{pname}`, but `{pname}` is then "
-                        f"{type(cur).__name__}; keep the cursor bound to its parameter name"
-                    )
-                pop_if(cur.index < cur._problem.total)
+        result = r.fn(self, *args)
+        if not r.raw:
+            final = _returned_state(r.name, result, args)
+            for pname, arg in zip((p for p, _ in r.params), args):
+                if isinstance(arg, TileCursor):
+                    cur = final.get(id(arg._rec))
+                    if cur is None:
+                        raise ProtocolError(
+                            f"{r.name}: return the final tile cursor for {pname} from the role "
+                            f"(for example, return {pname}); roles with Tiles must return it "
+                            "even when IKET is disabled"
+                        )
+                    if self.iket:
+                        pop_if(cur.index < cur._problem.total)
             for pname, rec in trace.tails:
-                end = final.get(pname)
-                if not isinstance(end, ProducerEnd) or end._rec is not rec:
+                end = final.get(id(rec))
+                if end is None:
                     raise ProtocolError(
-                        f"{r.name}: the layer drains channel {pname} at role exit using the end "
-                        f"bound to `{pname}` when the role returns, but `{pname}` is then "
-                        f"{type(end).__name__}; keep the end bound to its parameter name "
-                        f"(reassign it from helpers: `{pname} = helper({pname}, ...)`)"
+                        f"{r.name}: return the final producer end for {pname} from the role "
+                        f"(for example, return {pname}); its channel needs a tail at role exit"
                     )
                 end.tail()
-        else:
-            r.fn(self, *args)
         if whole_range:
             pop()
         if not r.raw:
@@ -1107,32 +1098,31 @@ class RoleContext(SimpleNamespace):
         return self
 
 
-def _call_capturing_locals(fn, name: str, args) -> dict:
-    """Call a role at trace time and return its frame's locals at return: the ends bound to the
-    parameter names then hold the role's final phases (loops rebind names to their results)."""
-    captured = {}
-    previous = sys.getprofile()
+def _returned_state(role_name: str, result, args: list) -> dict:
+    """Match explicitly returned endpoints/cursors to their input identities, not local names.
 
-    def profile(frame, event, arg):
-        # The outermost frame of the (preprocessor-rewritten) role returns last.
-        code = frame.f_code
-        if (
-            event == "return"
-            and code.co_name == name
-            and code.co_argcount
-            and frame.f_locals.get(code.co_varnames[0]) is args[0]  # the role's `self`
-        ):
-            captured.clear()
-            captured.update(frame.f_locals)
-        if previous is not None:
-            previous(frame, event, arg)
-
-    sys.setprofile(profile)
-    try:
-        fn(*args)
-    finally:
-        sys.setprofile(previous)
-    return captured
+    Loop-carried reconstructions share a record, so returning a renamed or helper-updated end
+    still identifies its channel. Which version is current remains an explicit dataflow
+    obligation: returning an old snapshot cannot be made safe by inspecting Python names.
+    """
+    values = () if result is None else result if isinstance(result, tuple) else (result,)
+    owned = {id(arg._rec) for arg in args if isinstance(arg, (ProducerEnd, TileCursor))}
+    final = {}
+    for value in values:
+        if not isinstance(value, (ProducerEnd, TileCursor)):
+            raise ProtocolError(
+                f"{role_name}: return final producer ends and tile cursors (a single value or "
+                f"a tuple), not {type(value).__name__}"
+            )
+        key = id(value._rec)
+        if key not in owned:
+            raise ProtocolError(f"{role_name}: returned state does not belong to this role")
+        if key in final:
+            raise ProtocolError(
+                f"{role_name}: returned the same endpoint or cursor more than once"
+            )
+        final[key] = value
+    return final
 
 
 def _barrier_unaligned(barrier_id: int, num_threads):

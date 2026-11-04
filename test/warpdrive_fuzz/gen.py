@@ -1034,6 +1034,11 @@ def _emit_role(src: _Src, spec: KernelSpec, r: RoleSpec):
         src(f"D.put(ctx.clog, base + {off}, k_{ch}_{side}, lead)")
         if side == "c":
             src(f"D.add(ctx.clog, base + {off} + 1, err_{ch})")
+    returned = [ch for ch, side in counters if side == "p"]
+    if spec.stream is not None:
+        returned.append("tiles")
+    if returned:
+        src(f"return {', '.join(returned)}")
     src.end()
     src()
 

@@ -53,6 +53,7 @@ class TmaProbe(WarpSpecialized):
                     bar = h.barrier
                 cute.copy(ctx.tma, ctx.tg[None, 0], ctx.ts[None, h.index], tma_bar_ptr=bar)
             h.commit()
+        return ch
 
     @cute.jit
     def use(self, ch, ctx):

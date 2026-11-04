@@ -149,6 +149,7 @@ class PersistentGemm(WarpSpecialized):
                         ctx.tma_b, tBgB[None, k], ctx.tBsB[None, s.index], tma_bar_ptr=s.barrier
                     )
             tiles.advance()
+        return ab, tiles
 
     @role(warps=5, regs=40, cta="leader")
     @cute.jit
@@ -170,6 +171,7 @@ class PersistentGemm(WarpSpecialized):
                             )
                             tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
             tiles.advance()
+        return acc, tiles
 
     @role(warps=range(4), regs=160)
     @cute.jit
@@ -224,6 +226,7 @@ class PersistentGemm(WarpSpecialized):
             tiles.advance()
         if warp == 0:
             cute.arch.cp_async_bulk_wait_group(0, read=True)
+        return tiles
 
     # ----------------------------------------------------------------- kernel
 
