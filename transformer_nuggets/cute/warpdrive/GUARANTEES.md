@@ -48,8 +48,10 @@ unseeded wait cycle, and terminating user work. Specifically:
   `launch_config(bound)`/`bound.grid()`. A hand-built grid must itself respect that limit and
   CUDA's grid limits. Custom mappings, `record` log offsets and resource limits must fit Int32
   and CUDA limits on their own (U10).
-- Use distinct workspaces for concurrent launches. An atomic workspace starts with two zero
-  Int32 words. Use `launch_config(bound)`/`bound.grid()`, or the supported OneShot 1-D grid.
+- Use distinct workspaces for concurrent launches (`launch_args()` returns one per device and
+  current stream, so launches on different streams through it qualify). An atomic workspace
+  starts with two zero Int32 words. Use `launch_config(bound)`/`bound.grid()`, or the supported
+  OneShot 1-D grid.
 
 ## Runtime guarantees
 
@@ -65,7 +67,7 @@ These are conditional guarantees relative to that program, not a theorem about a
 | R6 | Layer payloads are uninitialized, 16-byte-aligned, per-stage CTA-local SMEM, shaped `(*shape,n)`. `h.data` selects h.index. User pair-scoped payloads are rejected; scheduler payloads are explicitly filled in every CTA. Channel buffers are covered by R21. |
 | R7 | Producers automatically tail when the consumer is Umma and some consumer CTA releases a producer in another CTA (a pair's peer, or a multicast partner). Ring tails use the explicitly returned final state; Slots tails drain only that end's acquired slots with their final phases. `retire()` is disallowed there. All threads perform cluster exit arrive/wait after dispatch/TMEM teardown. This is not a wait for arbitrary user async work. |
 | R8 | Nonalias TMEM regions occupy declaration-order intervals of `cols * slots`; aliases add no columns and stay inside their parent in each slot. Allocation is the next power of two covering `max(32,used)`, at most 512. No annotated users means no allocation. The first TMEM role allocates in one CTA; a cluster needs, and allocates from, the first all-CTA TMEM role. All declared users, raw included, join the unaligned teardown barrier before free. |
-| R9 | Numeric regs are integer multiples of 8 in [24,256]. Any numeric budget pads launch warps to full warpgroups. Owned warps in each group agree, including None; holes take that budget and entirely idle groups take 24. Adjustment branches are warpgroup-uniform, including peer padding. Accounted registers including default budgets and holes cannot exceed 65536. |
+| R9 | Numeric regs are integer multiples of 8 in [24,256]. Any numeric budget pads launch warps to full warpgroups. Owned warps in each group agree, including None; holes take that budget and entirely idle groups take 24. Adjustment branches are warpgroup-uniform, including peer padding. Accounted registers including default budgets and holes cannot exceed the registers the launch starts with: the default budget (65536 / padded threads, rounded down to a multiple of 8, at most 256) times the padded threads, since `setmaxnreg` only moves registers between warps. |
 | R10 | An enabled Turnstile orders a legal finite prefix of seats `0,1,...,p-1,0,...`; each seat's previous party supplies its arrival count. All seat threads participate. Disabled turnstiles emit no synchronization and promise no exclusion. |
 | R11 | Cross-CTA scope, per-rank barrier targets/counts, UMMA masks, TMA byte scaling, multicast releases and producer tails follow the placement rules below. Pair TMEM allocation/free uses the two-CTA handshake with the CTA's pair peer (rank XOR 1). |
 | R12 | For a correctly launched, drained stream, each kept linear index belongs to exactly one CTA/cluster work unit. Every participating role in that unit observes the same ordered sequence. All-CTA roles see it in each CTA of the cluster; leader roles in each pair leader; rank0 roles only in rank 0. This is not "every CTA sees every item." |
@@ -278,7 +280,7 @@ body at `describe()` time.
 | E02 | Empty outer warp list; empty/non-unit-step/non-range normalized ranges | ValueError |
 | E03 | Overlapping role warp ownership | ValueError |
 | E04 | Mixed regs (including None) within an owned warpgroup | ValueError |
-| E05 | Accounted registers including padding >65536 | ValueError |
+| E05 | Accounted registers including padding above default budget x padded threads (R9) | ValueError |
 | E06 | More than one WorkStream | ProtocolError |
 | E07 | Unresolvable string annotation | ProtocolError |
 | E08 | Layer declaration/implementation class instead of a marker annotation | ProtocolError |

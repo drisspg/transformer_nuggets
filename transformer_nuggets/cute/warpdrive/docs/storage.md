@@ -181,7 +181,9 @@ Access annotations themselves emit no device code. The analysis is host-only; sw
 
 Managed channel signals and their declared fences are recorded automatically. Raw ordering
 instructions remain legal, but cannot supply an edge in the diagnostic's model. Similarly,
-`signal=False` makes the managed close visible without describing the manual signal.
+`signal=False` makes the managed close visible without describing the manual signal. A pair
+that only such a signal would order, or that a handle opened under `unchecked("unclosed")`
+and never closed might order, is reported `unverified`.
 
 ### Read the result
 

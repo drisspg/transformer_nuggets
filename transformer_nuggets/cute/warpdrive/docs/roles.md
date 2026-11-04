@@ -21,6 +21,12 @@ All roles in a warpgroup must agree, including `None` versus a number. Numeric b
 be multiples of 8 from 24 to 256. Padding warps get the group's budget too; the adjustment
 happens in a warpgroup-uniform branch before role dispatch.
 
+The budgets have to fit in the registers the launch starts with. Every warp starts with
+65536 / threads, rounded down to a multiple of 8 and capped at 256 (168 for 12 warps), and
+`setmaxnreg` only moves registers between warps. So 12 warps can split 232/232/40 but not
+232/232/48: that totals 65536, more than 168 x 384, and the increase would wait forever. It
+raises `ValueError`. `None` counts as the starting budget.
+
 `cta="leader"` restricts the role to the leader of each MMA pair of a
 [cluster](clusters.md), rank 0 of a CTA pair. `cta="rank0"` runs it once per cluster. The default
 is `"all"`. They are equivalent for one CTA.

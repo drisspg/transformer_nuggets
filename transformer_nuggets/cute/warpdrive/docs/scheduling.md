@@ -77,8 +77,11 @@ leaves the ABI alone.
 `AtomicPersistent` uses two zeroed Int32 words, `[claims, finished]`. After the first item,
 a claim returns `launched_units + atomicAdd(claims, 1)`. The last scheduler to report completion
 zeros both words for the next launch, including ordered CUDA-graph replays. `launch_args()`
-caches workspace by device and current stream. Never pass the same workspace to concurrent
-launches.
+caches workspace by device and current stream: launches on one stream share it because they
+run in order, and launches made with it on different streams get different workspaces, so
+they can run concurrently. Never pass the same workspace to concurrent launches yourself.
+They would claim from one counter, taking some of each other's items, and the first launch
+to finish could zero it while the other is still claiming.
 
 ### The grid and empty work
 
