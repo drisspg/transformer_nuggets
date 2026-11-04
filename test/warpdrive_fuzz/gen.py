@@ -519,26 +519,27 @@ def _scheduler_warp(roles: list[dict], explicit: int | None) -> int:
     return next(w for w in range(max(owned) + 2) if w not in owned)
 
 
-def register_total(roles: list[dict], sched: int | None, sched_regs) -> int | None:
-    """Total accounted registers per R9 (holes take their warpgroup's budget, idle groups 24,
-    ``None`` the default), or None when the warpgroup rule is violated."""
+def registers_fit(roles: list[dict], sched: int | None) -> bool:
+    """R9: warpgroup-uniform budgets (holes take their warpgroup's budget, idle groups 24,
+    ``None`` the default) whose total fits the registers the launch starts with: the default
+    budget of every padded warp (``setmaxnreg`` only moves registers between warps)."""
     budget = {}
     for r in roles:
         for f in r["warps"]:
             for w in range(f, f + r["width"]):
                 budget[w] = r["regs"]
     if sched is not None:
-        budget[sched] = sched_regs
+        budget[sched] = _scheduler_regs(roles, sched)
     nw = -(-(max(budget) + 1) // WARPGROUP) * WARPGROUP
     default = _default_regs(nw)
     total = 0
     for g in range(nw // WARPGROUP):
         vals = {budget[w] for w in range(g * 4, g * 4 + 4) if w in budget}
         if len(vals) > 1:
-            return None
+            return False
         regs = vals.pop() if vals else MIN_REGS
         total += 4 * 32 * (default if regs is None else regs)
-    return total
+    return total <= default * nw * 32
 
 
 def _assign_regs(rng: random.Random, roles: list[dict]) -> None:
@@ -804,8 +805,7 @@ def _budget_new_groups(ext, roles, first_new, sched) -> bool:
         for regs in options:
             for r in members:
                 r["regs"] = regs
-            total = register_total(roles, sched, _scheduler_regs(roles, sched))
-            if total is not None and total <= REGS_PER_SM:
+            if registers_fit(roles, sched):
                 break
         else:
             return False
@@ -1146,8 +1146,7 @@ def generate(
     if rng.random() < 0.5:
         for _ in range(20):
             _assign_regs(rng, roles)
-            total = register_total(roles, sched, _scheduler_regs(roles, sched))
-            if total is not None and total <= REGS_PER_SM:
+            if registers_fit(roles, sched):
                 break
         else:
             for r in roles:
