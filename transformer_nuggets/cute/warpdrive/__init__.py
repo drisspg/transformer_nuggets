@@ -29,6 +29,11 @@ around a CUTLASS/FA4 scheduler's tile order) are one-line switches. Clusters
 (``cluster.py``): declare ``self.cluster = CtaPair()`` and pin the MMA role with ``@role(..., cta="leader")``. See
 ``examples/`` for a GEMM, a persistent GEMM, and an FA4-style attention forward.
 
+Storage (``storage.py``): an optional ``SmemPlan`` of named SMEM buffers (dtype, alignment,
+stage axis; layouts bind at ``begin_roles(layouts=...)``) that channels bind with ``buffer=``;
+``h.data`` is the handle's stage view and ``end.views(A=StageView(tAsA, axis=1))`` registers
+partitions that ``h.view("A")`` projects at ``h.index``.
+
 Design principles
 -----------------
 The layer exists so that agents and people can write and iterate on warp-specialized kernels
@@ -117,6 +122,7 @@ from transformer_nuggets.cute.warpdrive.scheduling import (
     WorkMap,
     WorkStream,
 )
+from transformer_nuggets.cute.warpdrive.storage import SmemBuffer, SmemPlan, StageView
 from transformer_nuggets.cute.warpdrive.tmem import TmemPlan, TmemView
 
 __all__ = [
@@ -143,6 +149,9 @@ __all__ = [
     "RoleConfig",
     "SingleCta",
     "Slots",
+    "SmemBuffer",
+    "SmemPlan",
+    "StageView",
     "StaticPersistent",
     "Threads",
     "Tma",

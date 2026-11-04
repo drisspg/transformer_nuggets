@@ -3,7 +3,7 @@
 ``describe_kernel`` reads only host-side state collected by ``WarpSpecialized._collect`` (and,
 after a compile, the TMA check reports, check opt-outs, and the traced protocol), so the output
 is stable for a given declaration. Sections: header, roles, channels, turnstiles, raw barriers,
-streams, TMEM, opt-outs, traced protocol.
+streams, TMEM, SMEM plan, opt-outs, traced protocol.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ def describe_kernel(kernel) -> str:
         _raw_barriers(kernel),
         _streams(kernel),
         _tmem(kernel),
+        _smem(kernel),
         _opt_outs(kernel),
         _protocol(kernel),
     ]
@@ -178,12 +179,16 @@ def _channels(kernel) -> str:
         if ch.payload is not None:
             dtype, shape = ch.payload
             extra.append(f"payload {getattr(dtype, '__name__', dtype)}{tuple(shape)}")
+        if ch.buffers:
+            names = [k if k == b.name else f"{k}={b.name}" for k, b in ch.buffers.items()]
+            extra.append(f"buffer {', '.join(names)}")
         if ch.commit_fence:
             extra.append(f"commit_fence {ch.commit_fence}")
         if ch.release_fence:
             extra.append(f"release_fence {ch.release_fence}")
         if extra:
-            details.append(("storage" if ch.payload is not None else "fences", ", ".join(extra)))
+            storage = ch.payload is not None or ch.buffers
+            details.append(("storage" if storage else "fences", ", ".join(extra)))
         details += [("override", o) for o in _overrides(ch, cs)]
         tma = _tma_status(kernel, name, ch)
         if tma:
@@ -267,6 +272,48 @@ def _tmem(kernel) -> str:
         return ""
     head = f"TMEM: {plan.used_cols} columns used, {plan.alloc_cols} allocated"
     return f"{head}\n{plan.describe()}"
+
+
+def _smem(kernel) -> str:
+    plan = kernel.smem_plan
+    if plan is None:
+        return ""
+    resolved = kernel._ws_smem
+    per_cta = (
+        " per CTA (each CTA of the pair holds its own copy)" if kernel.cluster.size > 1 else ""
+    )
+    if resolved:
+        owned = [r.nbytes for r in resolved.values() if r.buffer.overlaps is None]
+        total = "?" if None in owned else str(sum(owned))
+        head = f"SMEM plan: {total} B in {len(owned)} buffer(s){per_cta}, plus alignment padding"
+    else:
+        head = f"SMEM plan: layouts bind at begin_roles (compile to see bytes){per_cta}"
+    rows = []
+    for name, buf in plan.buffers.items():
+        res = resolved.get(name)
+        size = "" if res is None or res.nbytes is None else f"{res.nbytes} B"
+        stages = (
+            ""
+            if res is None or res.stages is None
+            else f"{res.stages} stages (mode {buf.stage_axis})"
+        )
+        where = (
+            f"overlaps {buf.overlaps.name}" if buf.overlaps is not None else f"align {buf.align}"
+        )
+        chans = [
+            n for n, ch in kernel._ws_chans.items() if any(b is buf for b in ch.buffers.values())
+        ]
+        rows.append(
+            [
+                name,
+                getattr(buf.dtype, "__name__", str(buf.dtype)),
+                size,
+                stages,
+                where,
+                f"-> {', '.join(chans)}" if chans else "",
+            ]
+        )
+    return "\n".join([head, *_table(rows, right={2})])
 
 
 def _opt_outs(kernel) -> str:

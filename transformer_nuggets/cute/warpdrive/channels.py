@@ -25,6 +25,7 @@ from cutlass._mlir.dialects import nvvm as _nvvm
 
 from transformer_nuggets.cute.warpdrive.cluster import ALL, LEADER, SCOPE_OVERRIDES
 from transformer_nuggets.cute.warpdrive.protocol import ProtocolError, current_block, user_site
+from transformer_nuggets.cute.warpdrive.storage import SmemBuffer, StageView, project, stage_extent
 from transformer_nuggets.cute.warpdrive.tma import TmaUse, stage_closed
 from transformer_nuggets.cute.warpdrive.tracing import wait_range
 
@@ -72,7 +73,11 @@ class Channel:
 
     ``producer_role``/``consumer_roles`` optionally name the roles allowed on each side; the
     layer checks them against role annotations. ``payload=(dtype, shape)`` makes the layer own
-    a per-slot SMEM buffer exposed as ``handle.data``. ``commit_fence``/``release_fence`` say
+    a per-slot SMEM buffer exposed as ``handle.data``. ``buffer=`` binds buffers of the kernel's
+    ``SmemPlan`` instead (one ``SmemBuffer``, or a ``{name: SmemBuffer}`` dict): ``handle.data`` is
+    then the stage's canonical view and ``handle.view(name)`` a registered partition
+    (``storage.py``). A buffer, unlike a payload, changes neither ``remote_scope`` nor fences
+    and is allowed on pair-scoped channels. ``commit_fence``/``release_fence`` say
     what the producer/consumer wrote before signalling ("tmem_store" or "smem_async"); the
     layer emits the matching fence before every arrive on that side.
 
@@ -99,6 +104,7 @@ class Channel:
     producer_role: str | None = None
     consumer_roles: tuple[str, ...] | None = None
     payload: tuple | None = None
+    buffer: SmemBuffer | dict | None = None
     commit_fence: str | None = None
     release_fence: str | None = None
     remote_scope: str | None = None
@@ -116,6 +122,8 @@ class Channel:
     remote_scope_overridden: bool = field(default=False, init=False, repr=False)
     # Layer-owned channels (the scheduler's rings) publish without TMA copies.
     internal: bool = field(default=False, init=False, repr=False)
+    # ``buffer`` normalized to {name: SmemBuffer}; a single buffer is keyed by its plan name.
+    buffers: dict = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self):
         if type(self.n) is not int:
@@ -135,6 +143,27 @@ class Channel:
             raise ValueError("TMA producers do not arrive, so they have no commit to fence")
         if self.remote_scope not in (None, "cta", "cluster"):
             raise ValueError(f"remote_scope must be 'cta' or 'cluster', got {self.remote_scope!r}")
+        if self.buffer is not None:
+            if self.payload is not None:
+                raise ValueError("a channel takes payload= or buffer=, not both")
+            named = (
+                {self.buffer.name: self.buffer}
+                if isinstance(self.buffer, SmemBuffer)
+                else self.buffer
+            )
+            if (
+                not isinstance(named, dict)
+                or not named
+                or any(
+                    not isinstance(k, str) or not isinstance(v, SmemBuffer)
+                    for k, v in named.items()
+                )
+            ):
+                raise ValueError(
+                    "channel buffer must be a SmemBuffer or a non-empty {name: SmemBuffer} dict, "
+                    f"got {self.buffer!r}"
+                )
+            self.buffers = dict(named)
         unknown = set(self.override or {}) - set(SCOPE_OVERRIDES)
         if unknown:
             raise ValueError(f"unknown override keys {sorted(unknown)}; one of {SCOPE_OVERRIDES}")
@@ -228,6 +257,15 @@ class HandleRecord:
     unclosed_ok: object = None  # the unchecked("unclosed") opt-out active at open
 
 
+@dataclass(frozen=True)
+class StageBuffer:
+    """A channel buffer as an end sees it: the whole staged tensor and its stage mode."""
+
+    tensor: object
+    axis: int
+    storage: str | None  # the SmemPlan buffer name; None for a layer payload
+
+
 class Handle:
     """One acquired stage or slot. Close it exactly once, in the region that opened it.
 
@@ -284,11 +322,38 @@ class Handle:
 
     @property
     def data(self):
-        """This slot's view of the channel's ``payload`` buffer."""
-        buf = self._end._payload
-        if buf is None:
-            raise ProtocolError(f"channel {self._end._chan.name} has no payload")
-        return buf[(*([None] * (cute.rank(buf) - 1)), self.index)]
+        """This stage's canonical view of the channel's storage: the ``payload`` tensor, the
+        bound buffer, or ``{name: view}`` for named buffers. Every mode but the stage mode is
+        kept."""
+        buffers = self._end._buffers
+        if not buffers:
+            raise ProtocolError(f"channel {self._end._chan.name} has no payload or buffer")
+        views = {k: project(b.tensor, b.axis, self.index) for k, b in buffers.items()}
+        return next(iter(views.values())) if len(views) == 1 else views
+
+    def view(self, name: str | None = None, *coord):
+        """Buffer ``name`` at this stage: the partition registered with ``end.views(name=...)``,
+        else the canonical view. ``name`` may be omitted (``None``) for a single buffer.
+        ``coord``: indices of the other modes, taken in the same slice as the stage
+        (``h.view("A", None, None, kb)`` is ``tCrA[None, None, kb, h.index]``)."""
+        key, b = self._buffer(name)
+        part = self._end._views.get(key)
+        tensor, axis = (part.tensor, part.axis) if part is not None else (b.tensor, b.axis)
+        return project(tensor, axis, self.index, coord)
+
+    def _buffer(self, name):
+        buffers, chan = self._end._buffers, self._end._chan
+        if name is None:
+            if len(buffers) != 1:
+                raise ProtocolError(
+                    f"channel {chan.name} has buffers {sorted(buffers)}; name the one to view"
+                )
+            name = next(iter(buffers))
+        if name not in buffers:
+            raise ProtocolError(
+                f"channel {chan.name} has no buffer {name!r} (have {sorted(buffers)})"
+            )
+        return name, buffers[name]
 
     def commit(self, signal: bool = True):
         """Producer: publish the stage (signal full). ``signal=False``: the caller signals the
@@ -352,15 +417,18 @@ class _End:
     derived scope it selects local or remote arrivals and who arms transaction barriers.
     """
 
-    def __init__(self, chan, bars, payload, trace, bound_slot, state, cta=ALL, rec=None):
+    def __init__(
+        self, chan, bars, buffers, trace, bound_slot, state, cta=ALL, rec=None, views=None
+    ):
         self._chan = chan
         self._bars = bars  # full barriers at [0, n), empty barriers at [n, 2n)
-        self._payload = payload
+        self._buffers = buffers  # {name: StageBuffer}: the payload or the bound plan buffers
         self._trace = trace
         self._bound = bound_slot
         self._state = state
         self._cta = cta
         self._rec = rec if rec is not None else _EndRecord()
+        self._views = views or {}  # {buffer name: StageView} registered with views()
 
     def __extract_mlir_values__(self):
         if self._chan.fixed:
@@ -375,12 +443,47 @@ class _End:
         return type(self)(
             self._chan,
             self._bars,
-            self._payload,
+            self._buffers,
             self._trace,
             self._bound,
             state,
             self._cta,
             self._rec,
+            self._views,
+        )
+
+    def views(self, **named: StageView):
+        """This end with partitions of its channel's buffers: ``ab = ab.views(A=StageView(tAsA,
+        axis=1))`` makes ``h.view("A")`` return ``tAsA`` at ``h.index``. The name must be one of
+        the channel's buffers and the view's stage mode must have the channel's stage count.
+        The returned end shares this end's state; use it (and return it) in place of this one."""
+        chan = self._chan
+        for name, part in named.items():
+            if name not in self._buffers or self._buffers[name].storage is None:
+                raise ProtocolError(
+                    f"{self._trace.role_name}: {chan.name}.views({name}=...): the channel has no "
+                    f"buffer {name!r} (have {sorted(k for k, b in self._buffers.items() if b.storage)})"
+                )
+            if not isinstance(part, StageView):
+                raise ProtocolError(
+                    f"{chan.name}.views({name}=...) takes a StageView, got {type(part).__name__}"
+                )
+            extent = stage_extent(part.tensor, part.axis, f"{chan.name}.views({name}=...)")
+            if extent != chan.n:
+                raise ProtocolError(
+                    f"{self._trace.role_name}: {chan.name}.views({name}=...): the view's stage "
+                    f"mode {part.axis} has {extent} stages, but {chan.name} has {chan.n}"
+                )
+        return type(self)(
+            chan,
+            self._bars,
+            self._buffers,
+            self._trace,
+            self._bound,
+            self._state,
+            self._cta,
+            self._rec,
+            {**self._views, **named},
         )
 
     def _full(self, index):

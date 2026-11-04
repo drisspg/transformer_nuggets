@@ -19,6 +19,7 @@ from transformer_nuggets.cute.warpdrive.channels import (
     Channel,
     ConsumerEnd,
     ProducerEnd,
+    StageBuffer,
     Threads,
     Tma,
     TurnEnd,
@@ -47,6 +48,7 @@ from transformer_nuggets.cute.warpdrive.scheduling import (
     _Fetch,
     scheduler_role,
 )
+from transformer_nuggets.cute.warpdrive.storage import SmemPlan, allocate, stage_extent
 from transformer_nuggets.cute.warpdrive.tma import TmaReport
 from transformer_nuggets.cute.warpdrive.tma import check_role as check_tma
 from transformer_nuggets.cute.warpdrive.tmem import TmemPlan, TmemView
@@ -304,6 +306,7 @@ class WarpSpecialized:
     """
 
     tmem_plan: TmemPlan | None = None
+    smem_plan: SmemPlan | None = None  # SMEM buffers channels bind with buffer= (storage.py)
     trace_protocol: bool = False
     iket: bool = False  # emit IKET ranges named after roles and channels (tracing.py)
     iket_waits: bool = True  # with iket: also a range around every blocking channel wait
@@ -360,6 +363,14 @@ class WarpSpecialized:
                 obj.consumers.clear()
             else:
                 obj.parties.clear()
+        plan = self.smem_plan
+        for name, ch in chans.items():
+            for key, buf in ch.buffers.items():
+                if plan is None or plan.buffers.get(buf.name) is not buf:
+                    raise ProtocolError(
+                        f"channel {name}: buffer {key!r} ({buf.name}) is not a buffer of this "
+                        "kernel's smem_plan; declare it with self.smem_plan.buffer(...)"
+                    )
         roles = []
         ctx_types = {}  # annotated context type -> first "role.param" using it
         for name in dir(type(self)):
@@ -453,6 +464,7 @@ class WarpSpecialized:
         self._ws_raw_bars = raw_bars
         self._ws_streams = streams
         self._ws_tma = {}  # channel name -> tma.TmaReport, filled while tracing
+        self._ws_smem = {}  # SmemPlan buffer name -> storage.ResolvedBuffer, after begin_roles
         self._ws_opt_outs = []
         self._ws_log = ProtocolLog() if self.trace_protocol else None
 
@@ -785,11 +797,14 @@ class WarpSpecialized:
 
     # ---- device-side ------------------------------------------------------- #
 
-    def begin_roles(self, **problems):
-        """Allocate and initialize barriers and payload buffers; allocate TMEM.
+    def begin_roles(self, layouts: dict | None = None, **problems):
+        """Allocate and initialize barriers and payload buffers; allocate TMEM; allocate the
+        ``smem_plan`` buffers.
 
         ``problems``: the ``BoundWork`` of each declared ``WorkStream``, by name
-        (``self.begin_roles(work=bound)``).
+        (``self.begin_roles(work=bound)``). ``layouts``: the layout (plain or swizzled) of every
+        ``smem_plan`` buffer, by name. Plan buffers are allocated last, in declaration order, so
+        ``smem`` allocations after this call follow them; ``self.buffer(name)`` returns each.
 
         Plain Python at trace time (the loops are over host-side declarations); only the
         barrier initialization is a device-side branch.
@@ -814,13 +829,12 @@ class WarpSpecialized:
             [c for _, _, counts in plan for c in counts[rank]] for rank in range(self.cluster.size)
         ]
         self._init_barriers(bars)
-        self._ws_payload = {}
+        self._ws_buffers = {}  # channel name -> {buffer name: StageBuffer}
         for name, ch in self._ws_chans.items():
             if ch.payload is not None:
                 dtype, shape = ch.payload
-                self._ws_payload[name] = smem.allocate_tensor(
-                    dtype, cute.make_layout((*shape, ch.n)), 16
-                )
+                payload = smem.allocate_tensor(dtype, cute.make_layout((*shape, ch.n)), 16)
+                self._ws_buffers[name] = {"payload": StageBuffer(payload, -1, None)}
         self._ws_tmem = None
         pair = self.cluster.size > 1
         tmem_roles = [r for r in self._ws_roles if r.uses_tmem]
@@ -845,7 +859,48 @@ class WarpSpecialized:
                 # Only the allocator warp executes tcgen05.alloc (checked inside).
                 tmem.allocate(self.tmem_plan.alloc_cols)
                 tmem.relinquish_alloc_permit()
+        self._allocate_plan(smem, layouts or {})
         return smem
+
+    def _allocate_plan(self, smem, layouts: dict):
+        """Allocate every ``smem_plan`` buffer and check each channel binding's stage count."""
+        plan = self.smem_plan
+        names = set() if plan is None else set(plan.buffers)
+        if set(layouts) != names:
+            raise ProtocolError(
+                f"begin_roles(layouts=...) needs a layout for each smem_plan buffer "
+                f"{sorted(names)}, got {sorted(layouts)}"
+            )
+        self._ws_smem = {}
+        if plan is None:
+            return
+        for buf in plan.buffers.values():
+            self._ws_smem[buf.name] = allocate(smem, buf, layouts[buf.name], self._ws_smem)
+        for name, ch in self._ws_chans.items():
+            if not ch.buffers:
+                continue
+            bound = {}
+            for key, buf in ch.buffers.items():
+                res = self._ws_smem[buf.name]
+                res.channels.append(name)
+                what = f"channel {name} buffer {key!r}"
+                extent = stage_extent(res.tensor, buf.stage_axis, what)
+                if extent != ch.n:
+                    raise ProtocolError(
+                        f"{what}: stage mode {buf.stage_axis} of {buf.name}'s layout has "
+                        f"{extent} stages, but {name} has {ch.n}"
+                    )
+                bound[key] = StageBuffer(res.tensor, buf.stage_axis, buf.name)
+            self._ws_buffers[name] = bound
+
+    def buffer(self, name: str):
+        """The whole tensor of ``smem_plan`` buffer ``name`` (valid after ``begin_roles``)."""
+        if name not in self._ws_smem:
+            raise ProtocolError(
+                f"no allocated SMEM buffer named {name!r} (have {sorted(self._ws_smem)}); "
+                "declare it in smem_plan and call begin_roles(layouts=...) first"
+            )
+        return self._ws_smem[name].tensor
 
     @cute.jit
     def _init_barriers(self, bars):
@@ -1094,7 +1149,7 @@ class WarpSpecialized:
             )
         cls = ProducerEnd if is_prod else ConsumerEnd
         end = cls(
-            chan, self._ws_bars[pname], self._ws_payload.get(pname), trace, bound, state, cta
+            chan, self._ws_bars[pname], self._ws_buffers.get(pname, {}), trace, bound, state, cta
         )
         return end
 

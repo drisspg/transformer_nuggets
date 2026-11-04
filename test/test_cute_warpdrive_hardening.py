@@ -560,7 +560,11 @@ class MixedGemm(Gemm):
         super().__init__(ab_stages=3, acc_stages=1)
         del self.acc  # replaced by a user-driven edge
         self.ab = Ring(
-            3, Tma((TILE[0] + TILE[1]) * TILE[2] * 2), Umma, override={"empty_counts": 1}
+            3,
+            Tma((TILE[0] + TILE[1]) * TILE[2] * 2),
+            Umma,
+            override={"empty_counts": 1},
+            buffer=self.ab.buffer,
         )
         self.acc_bars = Barriers(2)  # full + empty of a 1-stage PipelineUmmaAsync
 
@@ -575,14 +579,15 @@ class MixedGemm(Gemm):
         acc_producer, _ = ctx.acc_pipe.make_participants()
         a = acc_producer.acquire_and_advance()
         tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+        ab = ab.views(A=ctx.tCrA, B=ctx.tCrB)
         for k in cutlass.range(ctx.num_k_tiles, unroll=1):
             s = ab.wait()
-            for kb in cutlass.range_constexpr(cute.size(ctx.tCrA, mode=[2])):
+            for kb in cutlass.range_constexpr(cute.size(ctx.tCrA.tensor, mode=[2])):
                 cute.gemm(
                     tiled_mma,
                     tCtAcc[None, None, None, a.index],
-                    ctx.tCrA[None, None, kb, s.index],
-                    ctx.tCrB[None, None, kb, s.index],
+                    s.view("A", None, None, kb),
+                    s.view("B", None, None, kb),
                     tCtAcc[None, None, None, a.index],
                 )
                 tiled_mma.set(tcgen05.Field.ACCUMULATE, True)

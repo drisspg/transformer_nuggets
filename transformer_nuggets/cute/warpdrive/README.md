@@ -27,21 +27,24 @@ from dataclasses import dataclass
 import cutlass
 from cutlass import cute
 from transformer_nuggets.cute.warpdrive import (
-    Consumer, Producer, Raster, Ring, StaticPersistent, Threads, WorkCursor, WorkStream, Tma, Tmem,
-    TmemPlan, Umma, WarpSpecialized, role,
+    Consumer, Producer, Raster, Ring, SmemPlan, StageView, StaticPersistent, Threads,
+    WorkCursor, WorkStream, Tma, Tmem, TmemPlan, Umma, WarpSpecialized, role,
 )
 
 @dataclass(frozen=True)
 class PersistentGemmParams:  # prologue values every role reads
     tma_a: cute.CopyAtom
     tAgA: cute.Tensor   # (TMA, m_tiles, k_tiles)
-    tAsA: cute.Tensor   # (TMA, stage)
+    tAsA: StageView     # TMA partition of the A stages: (TMA, stage)
     num_k_tiles: cutlass.Int32
     ...
 
 class PersistentGemm(WarpSpecialized):  # abridged: the real one sizes stages per cluster
     def __init__(self, schedule=None, ab_stages=4, acc_stages=2):
-        self.ab = Ring(ab_stages, Tma((128 + 256) * 64 * 2), Umma)   # TMA fills, MMA drains
+        self.smem_plan = SmemPlan()
+        a = self.smem_plan.buffer("A", cutlass.BFloat16, align=1024)
+        b = self.smem_plan.buffer("B", cutlass.BFloat16, align=1024)
+        self.ab = Ring(ab_stages, Tma((128 + 256) * 64 * 2), Umma, buffer={"A": a, "B": b})
         self.acc = Ring(acc_stages, Umma, Threads)                   # MMA fills, epilogue drains
         self.tmem_plan = TmemPlan().region("acc", 256, acc_stages)
         self.work = WorkStream(mapping=Raster(swizzle=8), schedule=schedule or StaticPersistent())
@@ -49,13 +52,14 @@ class PersistentGemm(WarpSpecialized):  # abridged: the real one sizes stages pe
     @role(warps=4, regs=40)
     @cute.jit
     def load(self, params: PersistentGemmParams, *, ab: Producer, work: WorkCursor):
+        ab = ab.views(A=params.tAsA, B=params.tBsB)  # s.view("A") is tAsA at s's stage
         while work.valid:
             m, n, _ = work.item
             for k in cutlass.range(params.num_k_tiles, unroll=1):
                 with ab.produce() as s:
-                    cute.copy(params.tma_a, params.tAgA[None, m, k], params.tAsA[None, s.index],
+                    cute.copy(params.tma_a, params.tAgA[None, m, k], s.view("A"),
                               tma_bar_ptr=s.barrier)
-                    cute.copy(params.tma_b, params.tBgB[None, n, k], params.tBsB[None, s.index],
+                    cute.copy(params.tma_b, params.tBgB[None, n, k], s.view("B"),
                               tma_bar_ptr=s.barrier)
             work.advance()
         return ab, work
@@ -68,7 +72,7 @@ class PersistentGemm(WarpSpecialized):  # abridged: the real one sizes stages pe
             with acc.produce() as a:
                 for k in cutlass.range(params.num_k_tiles, unroll=1):
                     with ab.consume() as s:
-                        ...  # cute.gemm into tAcc[..., a.index], reading A/B stage s.index
+                        ...  # cute.gemm into tAcc[..., a.index] from s.view("A", None, None, kb), ...
             work.advance()
         return ab, acc, work
 
@@ -83,9 +87,10 @@ class PersistentGemm(WarpSpecialized):  # abridged: the real one sizes stages pe
         return acc, work
 
     @cute.kernel
-    def kernel(self, tiled_mma, tma_a, mA, tma_b, mB, tma_c, mC, ..., work):
-        smem = self.begin_roles(work=bound)
-        ...  # allocate SMEM tiles, TMA-partition them, build the context
+    def kernel(self, tiled_mma, tma_a, mA, tma_b, mB, tma_c, mC, a_layout, b_layout, ..., bound):
+        self.begin_roles(work=bound, layouts={"A": a_layout, "B": b_layout, ...})
+        sA = self.buffer("A")  # the whole staged tensor
+        ...  # TMA-partition the buffers, build the context
         params = PersistentGemmParams(tma_a=tma_a, tAgA=tAgA, tAsA=tAsA, num_k_tiles=..., ...)
         self.run_roles(params)
 ```
@@ -101,8 +106,9 @@ Swapping the schedule is the `schedule=` argument: `OneShot()`, `StaticPersisten
 `mapping=` (a `Raster`, your own `WorkMap`, or a wrapped CUTLASS/FA4 scheduler order). The role code doesn't change. The
 accumulator ring has two stages so the epilogue of one tile overlaps the mainloop of the next.
 
-`begin_roles()` allocates and initializes barriers and payloads, and returns the
-`SmemAllocator` for your own storage. `run_roles(params)` synchronizes, dispatches the roles and
+`begin_roles()` allocates and initializes barriers and payloads, allocates the `smem_plan`
+buffers (see [Channel storage](#channel-storage)), and returns the `SmemAllocator` for your own
+storage. `run_roles(params)` synchronizes, dispatches the roles and
 frees TMEM after its users finish. Single-CTA TMEM allocation happens in `begin_roles`; CTA pairs
 allocate after the cluster sync in `run_roles`.
 
@@ -327,9 +333,56 @@ Handles must close once, in the same dynamic region (loop/branch) that opened th
 raise `ProtocolError` with source lines during compilation. `h.retire()` closes a producer
 handle without publishing, for a final unused acquire; it is not allowed on tailed pair channels.
 
-Buffers are separate from the channel unless you supply `payload=(dtype, shape)`, which allocates
-per-stage SMEM accessible as `h.data`. `commit_fence` and `release_fence` accept `"tmem_store"`
-or `"smem_async"`; TMA producers cannot have a commit fence.
+Storage is separate from the channel unless you bind it: `payload=(dtype, shape)` allocates small
+per-stage SMEM accessible as `h.data`, and `buffer=` binds buffers of an SMEM plan (next
+section). `commit_fence` and `release_fence` accept `"tmem_store"` or `"smem_async"`; TMA
+producers cannot have a commit fence.
+
+## Channel storage
+
+Declare SMEM once in an `SmemPlan`, bind buffers to the channels that hand them over, and let
+each handle select its own stage:
+
+```python
+self.smem_plan = SmemPlan()
+q = self.smem_plan.buffer("Q", cutlass.BFloat16, align=1024)       # stage_axis=-1: last mode
+k = self.smem_plan.buffer("K", cutlass.BFloat16, align=1024)
+v = self.smem_plan.buffer("V", cutlass.BFloat16, align=1024, overlaps=k)  # K's bytes, no new ones
+self.q = Slots(2, Tma(q_bytes), Umma, buffer=q)
+self.kv = Ring(3, Tma(kv_bytes), Umma, buffer={"K": k, "V": v})
+
+# Kernel prologue: layouts (including swizzles) are trace-time values, so they bind here.
+self.begin_roles(work=bound, layouts={"Q": sQ_layout, "K": sK_layout, "V": sV_layout})
+sK = self.buffer("K")  # the whole staged tensor, for partitions and fragments
+
+# A role registers the partitions it uses; handles project them at their own stage.
+kv = kv.views(K=StageView(thr_qk.make_fragment_B(sK), axis=3))
+with kv.consume() as h:
+    tSrK = h.view("K")  # tSrK[None, None, None, h.index]
+    h.data  # the canonical view of every bound buffer at h.index ({name: view} for several)
+```
+
+- A buffer has a dtype, an alignment, an explicit stage axis (the last mode by default, as in
+  CUTLASS's staged layouts) and, at `begin_roles`, a plain or swizzled layout. Buffers are
+  allocated after the layer's barriers, payloads and TMEM holder, in declaration order. That is
+  where a prologue's hand allocation sat in the examples, so the generated code is unchanged.
+- `overlaps=` reuses another buffer's bytes from its first byte (FA4's V over K, or O over Q).
+  It must fit inside and not need a stricter alignment. The plan owns SMEM accounting: overlaps
+  and several channels binding one buffer count once. `describe()` lists each buffer's bytes,
+  stages and channels after a compile.
+- The plan is per CTA: in a `CtaPair` each CTA holds its own copy at the same offset (where
+  2-CTA MMAs read the peer's operands). A buffer implies no DSMEM publication and adds no fence:
+  `remote_scope` and fences are what they would be without it, and pair-scoped channels may bind
+  buffers (a payload may not).
+- Storage projects the handle's stage snapshot (`h.index`); there is no second cursor. The
+  binding checks that each buffer's stage mode, and each registered `StageView`'s, has exactly
+  the channel's stage count, and that view names are buffers of the channel.
+- `end.views(...)` returns an end that shares the original's state: use it and return it.
+  `h.view(name, *coord)` takes the other modes' indices in the same slice
+  (`s.view("A", None, None, kb)` is `tCrA[None, None, kb, s.index]`), which keeps the
+  generated address arithmetic identical to hand-indexed code.
+- The layer does not infer partitions, choose views by role, or certify layout transformations:
+  you build every partition and the tensors, layouts and pointers stay yours.
 
 ## TMEM and turnstiles
 
@@ -629,7 +682,8 @@ Channels
              full      leader 1 x6, tx 65536 B (leader-armed)
              empty     leader 1 x6, peer 1 x6
              scope     pair-scoped, release_mask 0b11, tail
-             tma       verified CtaGroup.TWO, 32768 B/stage per CTA @ persistent_gemm.py:151,157
+             storage   buffer A, B
+             tma       verified CtaGroup.TWO, 32768 B/stage per CTA @ persistent_gemm.py:156,157
   acc        Ring(2)  mma -> epilogue
              signal    Umma -> Threads
              full      leader 1 x2, peer 1 x2
@@ -655,6 +709,11 @@ Streams
 
 TMEM: 512 columns used, 512 allocated
   tmem acc [0, 256), [256, 512)
+
+SMEM plan: 212992 B per CTA in 3 buffer(s), plus alignment padding
+  A  BFloat16  98304 B  6 stages (mode -1)  align 1024  -> ab
+  B  BFloat16  98304 B  6 stages (mode -1)  align 1024  -> ab
+  C  BFloat16  16384 B                      align 128
 ```
 
 `describe()` returns a string. Set `op.trace_protocol = True` before the first `describe()` or
@@ -833,5 +892,4 @@ TMA checks and the IKET-to-profiler path.
 ## Still to do
 
 - Use CUTLASS pipeline objects where the semantics match.
-- Optional channel storage binding.
 - Larger clusters, TMA multicast, round-robin role instances and cp.async producers.

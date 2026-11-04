@@ -44,6 +44,8 @@ from transformer_nuggets.cute.warpdrive import (
     Raster,
     Ring,
     SingleCta,
+    SmemPlan,
+    StageView,
     StaticPersistent,
     Threads,
     Tma,
@@ -71,12 +73,12 @@ class PersistentGemmParams:
     tiled_mma: cute.TiledMma
     tma_a: cute.CopyAtom
     tma_b: cute.CopyAtom
-    tAsA: cute.Tensor  # TMA-partitioned SMEM stages of A and B
+    tAsA: StageView  # TMA partitions of the A and B stages: (TMA, stage)
     tAgA: cute.Tensor  # whole-problem A tiles: (TMA, m_tiles, k_tiles)
-    tBsB: cute.Tensor
+    tBsB: StageView
     tBgB: cute.Tensor  # whole-problem B tiles: (TMA, n_tiles, k_tiles)
-    tCrA: cute.Tensor  # MMA fragments over the SMEM stages
-    tCrB: cute.Tensor
+    tCrA: StageView  # MMA fragments over the SMEM stages: (MMA, MMA_M, MMA_K, stage)
+    tCrB: StageView
     num_k_tiles: cutlass.Int32
     acc_layout: cute.Layout  # all accumulator stages
     epi_tile: cute.Tile
@@ -116,7 +118,12 @@ class PersistentGemm(WarpSpecialized):
         stage_bytes = (cta_tile[0] + cta_tile[1] // cs) * cta_tile[2] * 2  # this CTA's copies
         if ab_stages is None:  # fill ~192 KB of SMEM (48 KB stages for 1 CTA, 32 KB for a pair)
             ab_stages = 192 * 1024 // stage_bytes
-        self.ab = Ring(ab_stages, Tma(stage_bytes), Umma)
+        # A and B stages for the mainloop ring, C staging buffers for the TMA-store epilogue.
+        self.smem_plan = SmemPlan()
+        a = self.smem_plan.buffer("A", self.dtype, align=1024)
+        b = self.smem_plan.buffer("B", self.dtype, align=1024)
+        self.smem_plan.buffer("C", self.dtype, align=128)
+        self.ab = Ring(ab_stages, Tma(stage_bytes), Umma, buffer={"A": a, "B": b})
         self.acc = Ring(acc_stages, Umma, Threads)
         self.tmem_plan = TmemPlan().region("acc", cta_tile[1], acc_stages)
         self.work = WorkStream(
@@ -139,24 +146,15 @@ class PersistentGemm(WarpSpecialized):
     @role(warps=4, regs=40)
     @cute.jit
     def load(self, params: PersistentGemmParams, *, ab: Producer, work: WorkCursor):
+        ab = ab.views(A=params.tAsA, B=params.tBsB)
         while work.valid:
             m, n, _ = work.item
             tAgA = params.tAgA[None, m, None]
             tBgB = params.tBgB[None, n, None]
             for k in cutlass.range(params.num_k_tiles, unroll=1):
                 with ab.produce() as s:
-                    cute.copy(
-                        params.tma_a,
-                        tAgA[None, k],
-                        params.tAsA[None, s.index],
-                        tma_bar_ptr=s.barrier,
-                    )
-                    cute.copy(
-                        params.tma_b,
-                        tBgB[None, k],
-                        params.tBsB[None, s.index],
-                        tma_bar_ptr=s.barrier,
-                    )
+                    cute.copy(params.tma_a, tAgA[None, k], s.view("A"), tma_bar_ptr=s.barrier)
+                    cute.copy(params.tma_b, tBgB[None, k], s.view("B"), tma_bar_ptr=s.barrier)
             work.advance()
         return ab, work
 
@@ -173,17 +171,18 @@ class PersistentGemm(WarpSpecialized):
     ):
         tiled_mma = params.tiled_mma
         tCtAcc = cute.make_tensor(tmem.ptr("acc"), params.acc_layout)
+        ab = ab.views(A=params.tCrA, B=params.tCrB)
         while work.valid:
             with acc.produce() as a:
                 tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
                 for k in cutlass.range(params.num_k_tiles, unroll=1):
                     with ab.consume() as s:
-                        for kb in cutlass.range_constexpr(cute.size(params.tCrA, mode=[2])):
+                        for kb in cutlass.range_constexpr(cute.size(params.tCrA.tensor, mode=[2])):
                             cute.gemm(
                                 tiled_mma,
                                 tCtAcc[None, None, None, a.index],
-                                params.tCrA[None, None, kb, s.index],
-                                params.tCrB[None, None, kb, s.index],
+                                s.view("A", None, None, kb),
+                                s.view("B", None, None, kb),
                                 tCtAcc[None, None, None, a.index],
                             )
                             tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
@@ -255,10 +254,8 @@ class PersistentGemm(WarpSpecialized):
     def kernel(
         self, tiled_mma, tma_a, mA, tma_b, mB, tma_c, mC_tma, a_layout, b_layout, c_layout, bound
     ):
-        smem = self.begin_roles(work=bound)
-        sA = smem.allocate_tensor(self.dtype, a_layout.outer, 1024, a_layout.inner)
-        sB = smem.allocate_tensor(self.dtype, b_layout.outer, 1024, b_layout.inner)
-        sC = smem.allocate_tensor(self.dtype, c_layout.outer, 128, c_layout.inner)
+        self.begin_roles(work=bound, layouts={"A": a_layout, "B": b_layout, "C": c_layout})
+        sA, sB, sC = self.buffer("A"), self.buffer("B"), self.buffer("C")
         # This CTA's slice of the (possibly 2-CTA) MMA: its rows of A and of B.
         thr_mma = tiled_mma.get_slice(self.cluster.rank())
         # Whole-problem tile views: (BM, BK, m_tiles, k_tiles) and (BN, BK, n_tiles, k_tiles).
@@ -284,12 +281,12 @@ class PersistentGemm(WarpSpecialized):
             tiled_mma=tiled_mma,
             tma_a=tma_a,
             tma_b=tma_b,
-            tAsA=tAsA,
+            tAsA=StageView(tAsA, axis=1),
             tAgA=tAgA,
-            tBsB=tBsB,
+            tBsB=StageView(tBsB, axis=1),
             tBgB=tBgB,
-            tCrA=tiled_mma.make_fragment_A(sA),
-            tCrB=tiled_mma.make_fragment_B(sB),
+            tCrA=StageView(tiled_mma.make_fragment_A(sA), axis=3),
+            tCrB=StageView(tiled_mma.make_fragment_B(sB), axis=3),
             num_k_tiles=cute.size(gA, mode=[3]),
             acc_layout=acc_staged.layout,
             epi_tile=EPI_TILE,
