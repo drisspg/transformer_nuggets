@@ -2,6 +2,7 @@
 work-item accessor, swapped into the same kernels with one argument."""
 
 import importlib
+import math
 import sys
 import warnings
 from dataclasses import dataclass
@@ -14,7 +15,7 @@ pytest.importorskip("cutlass.cute")
 
 import cutlass
 from cuda.bindings import driver as cuda
-from cutlass import Int32, cute
+from cutlass import Int32, Int64, cute
 from cutlass_static_persistent_tile_scheduler import (
     PersistentTileSchedulerParams,
     StaticPersistentTileScheduler,
@@ -50,6 +51,7 @@ from transformer_nuggets.cute.warpdrive import (
     StaticPersistent,
     WarpSpecialized,
     WorkCursor,
+    WorkMap,
     WorkStream,
     role,
 )
@@ -804,3 +806,268 @@ def test_device_built_list_under_pdl(requires_blackwell, schedule, cluster):
         launched = entry[entry != 0].cpu().long()
         early = ((launched - int(stamp)) + 2**31) % 2**32 - 2**31 < 0
         assert early.any(), "the consumer did not overlap the producer; PDL not exercised"
+
+
+# --------------------------------------------------------------------------- #
+# Split work: (tile, split) items with K ranges, and FA4 split-KV descriptors
+# --------------------------------------------------------------------------- #
+
+
+def _wide(value):
+    return value if isinstance(value, int) else Int64(value)
+
+
+@dataclass(frozen=True)
+class SplitK(WorkMap):
+    """``(m, n, l, split, begin, end)`` items: tile ``index // splits`` in ``Raster`` order and
+    its split's k-tile range ``[begin, end)``. A split whose range is empty (more splits than
+    k tiles) is dropped. Space ``((m_tiles, n_tiles, l), splits, k_tiles)``, ``splits >= 1``.
+    Splits of one tile are distinct items that write distinct partials; a later reduction sums
+    them (nothing here, and nothing in ``close_claims``, is a fixup)."""
+
+    words = 6
+    skips = True
+
+    def bind(self, space):
+        extents, splits, k_tiles = space
+        return Raster().bind(extents), splits, k_tiles
+
+    def count64(self, space):
+        extents, splits, _ = space
+        return _wide(Raster().count64(extents)) * _wide(splits)
+
+    def decode(self, index, space):
+        extents, splits, k_tiles = space
+        tile = index // splits
+        split = index - tile * splits
+        _, (m, n, li) = Raster().decode(tile, extents)
+        begin = split * k_tiles // splits
+        end = (split + 1) * k_tiles // splits
+        return begin < end, (m, n, li, split, begin, end)
+
+    def get_key(self) -> str:
+        return "split_k"
+
+
+@pytest.mark.parametrize("splits,k_tiles", [(3, 7), (5, 3), (1, 4)])
+def test_split_k_ranges_partition_k(splits, k_tiles):
+    """Each tile's kept splits cover ``[0, k_tiles)`` exactly once, in order; empty ranges are
+    dropped."""
+    mapping = SplitK()
+    space = mapping.bind(((3, 2, 2), splits, k_tiles))
+    ranges = {}
+    for index in range(mapping.count64(space)):
+        keep, (m, n, li, split, begin, end) = mapping.decode(index, space)
+        assert bool(keep) == (begin < end)
+        if keep:
+            ranges.setdefault((m, n, li), []).append((begin, end))
+    assert len(ranges) == 12
+    for spans in ranges.values():
+        assert [k for b, e in spans for k in range(b, e)] == list(range(k_tiles))
+        assert len(spans) == min(splits, k_tiles)
+
+
+K_TILE = 4  # K elements per k tile in the split-K toy
+
+
+class SplitKToy(WarpSpecialized):
+    """Role ``compute`` (warp 0) sums ``x[tile, k]`` over its item's K range into
+    ``partial[split, tile]``; role ``count`` (warp 1) counts each item in ``hits``."""
+
+    def __init__(self, schedule, cluster=None):
+        self.cluster = cluster or SingleCta()
+        self.work = WorkStream(mapping=SplitK(), schedule=schedule)
+
+    def get_name(self) -> str:
+        return f"warpdrive_split_k_toy_{self.work.get_key()}_cs{self.cluster.size}"
+
+    @role(warps=0)
+    @cute.jit
+    def compute(self, work: WorkCursor, ctx):
+        while work.valid:
+            m, n, li, split, begin, end = work.item
+            tile = (li * ctx.en + n) * ctx.em + m
+            if cute.arch.lane_idx() == 0:
+                acc = Int32(0)
+                for k in cutlass.range(begin * K_TILE, end * K_TILE, unroll=1):
+                    acc += ctx.x[tile, k]
+                ctx.partial[split, tile] = acc
+            work.advance()
+        return work
+
+    @role(warps=1)
+    @cute.jit
+    def count(self, work: WorkCursor, ctx):
+        while work.valid:
+            m, n, li, split, _, _ = work.item
+            tile = (li * ctx.en + n) * ctx.em + m
+            if cute.arch.lane_idx() == 0:
+                cute.arch.atomic_add(ctx.hits.iterator + (split * ctx.x.shape[0] + tile), Int32(1))
+            work.advance()
+        return work
+
+    @cute.kernel
+    def kernel(self, x, partial, hits, em: Int32, en: Int32, bound):
+        self.begin_roles(work=bound)
+        self.run_roles(SimpleNamespace(x=x, partial=partial, hits=hits, em=em, en=en))
+
+    @cute.jit
+    def __call__(
+        self,
+        x: cute.Tensor,
+        partial: cute.Tensor,
+        hits: cute.Tensor,
+        workspace: cute.Tensor,
+        em: Int32,
+        en: Int32,
+        el: Int32,
+        splits: Int32,
+        k_tiles: Int32,
+        max_ctas: Int32,
+        stream: cuda.CUstream,
+    ):
+        bound = self.work.bind(((em, en, el), splits, k_tiles), workspace, max_ctas)
+        self.kernel.set_name_prefix(self.get_name())
+        self.kernel(x, partial, hits, em, en, bound).launch(
+            **self.launch_config(bound), stream=stream
+        )
+
+
+@pytest.mark.parametrize("cluster", [SingleCta(), CtaPair()], ids=["single", "pair"])
+@pytest.mark.parametrize("schedule", ["oneshot", "static", "atomic", "clc"])
+def test_split_k_partials_reduce_on_the_host(requires_blackwell, schedule, cluster):
+    """Every nonempty (tile, split) item writes its partial once per CTA of its unit; empty
+    splits never run (their partials keep the sentinel); summing the written partials per tile
+    gives the full K reduction."""
+    schedules = {
+        "oneshot": OneShot(),
+        "static": StaticPersistent(),
+        "atomic": AtomicPersistent(stages=2),
+        "clc": ClusterLaunchControl(stages=2),
+    }
+    op = SplitKToy(schedules[schedule], cluster)
+    i32 = cutlass.Int32
+    fn = compile_tvm_ffi(
+        op,
+        *(make_fake_compact_tensor(i32, (cute.sym_int(), cute.sym_int())) for _ in range(2)),
+        *(make_fake_compact_tensor(i32, (cute.sym_int(),)) for _ in range(2)),
+        *(Int32(1) for _ in range(6)),
+    )
+    ws, _ = op.work.launch_args("cuda")
+    em, en, el = 5, 3, 2
+    tiles = em * en * el
+    sentinel = 2**30
+    for splits, k_tiles, max_ctas in [(3, 7, 148), (5, 3, 4), (4, 4, 148)]:
+        torch.manual_seed(splits)
+        x = torch.randint(-100, 100, (tiles, k_tiles * K_TILE), dtype=torch.int32, device="cuda")
+        partial = torch.full((splits, tiles), sentinel, dtype=torch.int32, device="cuda")
+        hits = torch.zeros(splits * tiles, dtype=torch.int32, device="cuda")
+        fn(x, partial, hits, ws, em, en, el, splits, k_tiles, max_ctas)
+        torch.cuda.synchronize()
+        nonempty = torch.tensor(
+            [s * k_tiles // splits < (s + 1) * k_tiles // splits for s in range(splits)]
+        )
+        want_hits = (nonempty.view(-1, 1).int() * cluster.size).expand(splits, tiles)
+        assert torch.equal(hits.view(splits, tiles).cpu(), want_hits)
+        written = partial.cpu() != sentinel
+        assert torch.equal(written, nonempty.view(-1, 1).expand(splits, tiles))
+        reduced = torch.where(written, partial.cpu(), 0).sum(0)
+        assert torch.equal(reduced, x.cpu().sum(1, dtype=torch.int32))
+        assert ws[:2].tolist() == [0, 0]
+
+
+@dataclass(frozen=True)
+class SplitKv(WorkMap):
+    """FA4 decode-style split-KV items ``(q_block, head, batch, split, begin, end)``, as FA4's
+    ``tile_scheduler`` reads per-sequence split counts: one query block per (head, batch), up to
+    ``max_splits`` splits, of which sequence ``b`` uses ``num_splits[b]``, each over a range of
+    its ``ceil(seqlen_k[b] / n_block)`` key blocks. Splits past ``num_splits[b]`` and empty
+    ranges (short or empty sequences) are dropped. Space ``(num_head, num_batch, seqlen_k,
+    num_splits)`` with per-sequence tables (device tensors in a kernel; lists on the host)."""
+
+    max_splits: int = 4
+    n_block: int = 128
+    words = 6
+    skips = True
+
+    def count64(self, space):
+        num_head, num_batch, _, _ = space
+        return _wide(num_head) * _wide(num_batch) * self.max_splits
+
+    def decode(self, index, space):
+        num_head, _, seqlen_k, num_splits = space
+        split = index % self.max_splits
+        hb = index // self.max_splits
+        head = hb % num_head
+        batch = hb // num_head
+        splits = num_splits[batch]
+        blocks = (seqlen_k[batch] + self.n_block - 1) // self.n_block
+        begin = split * blocks // splits
+        end = (split + 1) * blocks // splits
+        return (split < splits) & (begin < end), (0, head, batch, split, begin, end)
+
+    def get_key(self) -> str:
+        return f"split_kv{self.max_splits}_{self.n_block}"
+
+
+def test_split_kv_items_follow_per_sequence_splits():
+    """Host order check (no GPU kernel): kept items cover each (head, batch)'s key blocks once,
+    with exactly ``min(num_splits[b], blocks)`` nonempty splits, and drop every other item.
+    Schedules distribute any mapping (the GPU tests above), so this checks the descriptors."""
+    mapping = SplitKv(max_splits=4, n_block=128)
+    seqlen_k = [1000, 0, 129, 300, 128]
+    num_splits = [4, 2, 3, 1, 4]
+    space = mapping.bind((3, len(seqlen_k), seqlen_k, num_splits))
+    kept = {}
+    for index in range(mapping.count64(space)):
+        keep, (q_block, head, batch, split, begin, end) = mapping.decode(index, space)
+        assert q_block == 0
+        if keep:
+            assert split < num_splits[batch] and begin < end
+            kept.setdefault((head, batch), []).append((split, begin, end))
+    for head in range(3):
+        for batch, (sk, ns) in enumerate(zip(seqlen_k, num_splits, strict=True)):
+            blocks = -(-sk // 128)
+            spans = kept.get((head, batch), [])
+            assert [k for _, b, e in spans for k in range(b, e)] == list(range(blocks))
+            assert len(spans) == min(ns, blocks)
+            assert [s for s, _, _ in spans] == sorted(s for s, _, _ in spans)
+
+
+def fa4_example_cases():
+    """name -> (schedule, mapping factory, cluster) for the FA4 example's ``mapping=``."""
+    return {
+        "lpt_static": (StaticPersistent(), lambda ts: Raster(reverse="m"), SingleCta()),
+        "fa4_static": (
+            StaticPersistent(),
+            lambda ts: Fa4Mapping(ts.StaticPersistentTileScheduler),
+            SingleCta(),
+        ),
+        "fa4_clc_pair": (
+            ClusterLaunchControl(),
+            lambda ts: Fa4Mapping(ts.StaticPersistentTileScheduler),
+            CtaPair(),
+        ),
+    }
+
+
+@pytest.mark.parametrize("case", list(fa4_example_cases()))
+def test_fa4_example_swaps_mapping(requires_blackwell, case):
+    """The FA4 example's (query block, head, batch) items take any mapping, including FA4's own
+    scheduler order, with unchanged numerics."""
+    from test_cute_warpdrive import fa4_inputs
+
+    from transformer_nuggets.cute.warpdrive.examples.fa4_fwd import fa4_fwd
+
+    ts = fa4_tile_scheduler()
+    schedule, make_mapping, cluster = fa4_example_cases()[case]
+    q, k, v = fa4_inputs(2, 5, 1536, 384, True)
+    qf, kf, vf = (x.float().transpose(1, 2) for x in (q, k, v))
+    ref = torch.nn.functional.scaled_dot_product_attention(qf, kf, vf).transpose(1, 2)
+    ref_lse = torch.logsumexp((qf @ kf.transpose(-1, -2)) / math.sqrt(128), dim=-1)
+    tol = 2**-7 * ref.abs().max().item() + 4e-3
+    o, lse = fa4_fwd(
+        q, k, v, schedule=schedule, cluster=cluster, mapping=make_mapping(ts), max_ctas=7
+    )
+    assert (o.float() - ref).abs().max().item() <= tol
+    torch.testing.assert_close(lse, ref_lse, atol=1e-3, rtol=1e-4)

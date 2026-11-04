@@ -70,6 +70,7 @@ from transformer_nuggets.cute.warpdrive import (
     Umma,
     WarpSpecialized,
     WorkCursor,
+    WorkMap,
     WorkStream,
     role,
 )
@@ -152,6 +153,7 @@ class FlashAttentionForward(WarpSpecialized):
         cluster=None,
         split_p: bool = False,
         roles: Fa4Roles | None = None,
+        mapping: WorkMap | None = None,
     ):
         self.roles = roles if roles is not None else Fa4Roles()
         self.cluster = cluster or SingleCta()
@@ -184,7 +186,10 @@ class FlashAttentionForward(WarpSpecialized):
         )
         # Work items: (256-row Q block, head, batch); all Q blocks of a head run back to back so
         # its K/V stays in L2.
-        self.work = WorkStream(mapping=Raster(along="m"), schedule=schedule or OneShot())
+        # Items are (query block, head, batch); any WorkMap over that space swaps in.
+        self.work = WorkStream(
+            mapping=mapping or Raster(along="m"), schedule=schedule or OneShot()
+        )
         self.trace_protocol = trace
 
     def get_name(self) -> str:
@@ -753,6 +758,7 @@ def fa4_fwd(
     cluster=None,
     split_p: bool = False,
     roles: Fa4Roles | None = None,
+    mapping: WorkMap | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Attention forward for ``(batch, seqlen, heads, 128)`` bf16 tensors; returns (O, LSE).
 
@@ -761,6 +767,8 @@ def fa4_fwd(
     ``ClusterLaunchControl()`` run several (Q block, head, batch) items per CTA). ``max_ctas`` caps the
     static/atomic persistent grid in CTAs (default: the SM count). ``cluster=CtaPair()``
     runs FA4's default 2-CTA schedule (512-row work items, 6 KV stages by default).
+    ``mapping``: the order of the ``(query block, head, batch)`` items (default
+    ``Raster(along="m")``; e.g. ``Raster(reverse="m")`` or ``Fa4Mapping(...)``).
     """
     if any(t.dtype != torch.bfloat16 for t in (q, k, v)):
         raise TypeError("fa4_fwd expects bfloat16 q, k, v")
@@ -775,11 +783,17 @@ def fa4_fwd(
     scale = softmax_scale if softmax_scale is not None else HEAD_DIM**-0.5
     out = torch.empty_like(q)
     lse = torch.empty(q.shape[0], q.shape[2], q.shape[1], device=q.device, dtype=torch.float32)
-    key = (kv_stages, turnstile, schedule, cluster, split_p, roles)
+    key = (kv_stages, turnstile, schedule, cluster, split_p, roles, mapping)
     op = _OPS.get(key)
     if op is None:
         op = _OPS[key] = FlashAttentionForward(
-            kv_stages, turnstile, schedule=schedule, cluster=cluster, split_p=split_p, roles=roles
+            kv_stages,
+            turnstile,
+            schedule=schedule,
+            cluster=cluster,
+            split_p=split_p,
+            roles=roles,
+            mapping=mapping,
         )
     fn = compile_fa4_fwd(op)
     workspace, sms = op.work.launch_args(q.device)
