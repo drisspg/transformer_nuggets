@@ -30,6 +30,9 @@ unseeded wait cycle, and terminating user work. Specifically:
 - Drain each managed stream with `while tiles.valid:` and one direct-body `advance()` at the
   end. Read the current item before advancing; do not restore stale cursor state. Custom
   mappings/readiness hooks are coherent and terminating; `skip` permanently hides an item.
+  Custom policies, mappings and adapters meet the protocol obligations in
+  [Custom schedules](#custom-schedules-r19) (U15). Raw roles read a OneShot item through
+  `self.tiles.work_item()`, not `blockIdx`.
 - Supply valid storage, layouts, descriptors and atoms, and the required async/proxy fences
   and completion waits. Order alias accesses. Declare every TMEM user.
 - Raster extents may be any Int32 values (wider values are converted to Int32 first): empty
@@ -65,6 +68,8 @@ These are conditional guarantees relative to that program, not a theorem about a
 | R16 | `describe()` reports derived/effective structure, not runtime correctness. Protocol logs are static traced sites, not execution histories. IKET off emits no IKET ops; cache keys must include IKET/protocol trace choices. Exported plans are per-CTA, work-item-granular approximations, not deadlock proofs. |
 | R17 | A space with any Raster extent <= 0 is empty: `bind` stores `(1,1,0)` (what the kernel's `work.space` reads), `work.grid()` launches one work unit under every policy, single CTA or pair, every role's first `valid` is false, no decode divides by zero (host or device), and the dynamic workspace is left zeroed for the next launch. The check is host code in the jit entry point; kernels pay nothing. |
 | R18 | `work.grid()` admits a space only when `policy.reach` of Raster's saturating Int64 count fits Int32: `total*cs` for OneShot/Clc (the 1-D grid; terminal index `total`), `total + units - 1` for Static/Dynamic (the last unit's terminal index). Within it, no grid extent, index, claim or CLC result wraps. |
+| R19 | For any `Policy`/`WorkMapping`/`Readiness` subclass meeting U15, the layer calls the protocol exactly as documented (below) and keeps owning distribution. Built-in policies go through the same protocol; making it public left the normalized SASS of seven example configurations unchanged (gemm OneShot; persistent GEMM static single/pair and 2-CTA CLC; FA4 single, 2-CTA CLC, 2-CTA CLC split-P; CuTeDSL 4.8.0, GB300, November 2026). |
+| R20 | `self.tiles.work_item()` returns, in a raw role under a non-persistent local policy, the item and validity a managed role's cursor would start with: the same `first`, readiness hook, skip and tile-grid/1-D decoding, so it is correct on the 65535 fallback, hand-built 1-D grids, pairs and custom mappings. |
 
 Role parameters may be positional or keyword-only. The dispatcher follows each signature,
 while dependency binding remains by parameter name and annotation. The examples use
@@ -133,6 +138,35 @@ the OneShot tile grid. An empty space launches exactly one unit, which receives 
 (R17). Dynamic/CLC add the lowest free scheduler warp unless explicitly set.
 Work-ring consumers release on **receipt**, not after computing the item; everyone receives
 the terminal marker, which is not work.
+
+### Custom schedules (R19)
+
+What the layer does for any policy, mapping and readiness hook:
+
+- Host, in the jit entry point: `order.bind(space)` once in `problem()`; `order.size` and
+  `order.size64`, then `policy.grid_size(total, cap)` (`cap` is `max_ctas` in work units when
+  `uses_max_ctas`, else `None`) and `policy.reach` in `work.grid()`. A space whose reach passes
+  Int32 gets the zero-wide grid (E102). The workspace is required and passed to the kernel when
+  `uses_workspace` (or `record`).
+- Device, local policies: every stream user computes `first(problem)`, then `step(index,
+  problem)` once per `advance()` while its index is valid, with readiness and skip applied as for
+  the built-ins (R14).
+- Device, broadcast policies: every user starts at `first` (or receives it from the scheduler
+  when hooks may move it); one scheduler warp, leader CTA only in a pair, calls
+  `claim(fetch, problem, previous index)` only after acquiring a free work slot and only while the
+  previous claim was valid, decodes the kept item, publishes `[index, *words]` to every user
+  (both CTAs of a pair; users never decode), and calls `finish` once. The layer derives the ring counts, payload, fences, tails,
+  drain and the scheduler's warp and budget; `fetch_channels` channels get the same derivation.
+- `item(words)` is what `tiles.work` returns; `decode` results past the end are discarded.
+
+What it does not check (U15): that indices are in range, that `first`/`step` agree across roles,
+that a mapping is a bijection, or that `reach` really bounds the policy.
+
+Tests: `test/test_cute_warpdrive_scheduler_interface.py` runs a local and a broadcast custom
+policy (exact per-unit sequences, skips, pairs, empty and overflowing spaces), checks the CUTLASS
+adapter against the vendored CuTeDSL helper and the FA4 adapter against FA4's schedulers
+(per-CTA sequences), covers `work_item()` on every grid shape, and runs the persistent GEMM
+under every built-in, custom and adapted schedule.
 
 ## Rejection catalogue
 
@@ -257,6 +291,10 @@ same dynamic branch is locally accepted; another participant's matching branch i
 | E90 | Producer/Consumer subscript other than Instance | TypeError |
 | E91 | Role-marked function lacks the JIT wrapper | TypeError |
 | E104 | Role signature has variadic positional or keyword parameters | ProtocolError |
+| E105 | TileStream `order`/`policy`/`ready` is not a `WorkMapping`/`Policy`/`Readiness` (or None) subclass instance | TypeError |
+| E106 | Local policy without `step`, or broadcast policy without `claim` | TypeError |
+| E107 | `work_item()` under a persistent or broadcast policy, or outside a role (before `begin_roles`) | ProtocolError |
+| E108 | Unsupported adapter configuration: `Fa4Scheduler` of a scheduler that is not index-addressable, non-positive-int head dims/element size, non-bool `lpt` flags, or a space of the wrong rank; `CutlassStaticPersistent` along not m/n or swizzle not a positive int | ValueError / adapters.py |
 
 TMA checking is **positive evidence only**. It follows recognizable direct SSA uses of
 handed-out barriers and counts static copy boxes in the opening region. A complete mismatch
@@ -308,6 +346,7 @@ Python-int slot accessor behavior; this is not a blanket bounds/ownership check 
 | U12 | No declaration mutation/recollection promise after first collection. Fresh compile keys must include all static choices, IKET and protocol tracing. |
 | U13 | No post-close payload/pointer ownership check; raw barrier accessors and Slots phase range/binding are not bounds-checked. |
 | U14 | No performance threshold, inter-unit deterministic order, race-freedom proof or profiler-plan proof of liveness. |
+| U15 | Custom policies: every returned index is in `[0,total)` or terminal `>= total` (never negative); `first` depends only on launch values and `problem`, and `first`/`step` are identical pure functions in every role; claims across units cover each kept index once (R12 then holds); the policy terminates; `uses_max_ctas`/`uses_workspace`/`reach`/`get_key` are truthful (`reach` bounds every index and grid extent; the key names every compile-time field, in lowercase identifier characters). Custom mappings: U10, and a bijection over `[0,size)` if every item must run once. |
 
 ## Known gaps
 
@@ -322,8 +361,10 @@ Python-int slot accessor behavior; this is not a blanket bounds/ownership check 
 - **G6 (closed for Raster):** empty and negative spaces run no work under every policy (R17),
   and spaces past Int32 reject at launch (E102, R18). `decode` is defined on bound spaces:
   `Raster().decode(0,(0,1,1))` on raw extents still divides by zero, while
-  `decode(i, bind((0,1,1)))` does not. Still the caller's: hand-built grids, custom mappings
-  (U10), `record` log offsets, and launch resources other than the grid extent.
+  `decode(i, bind((0,1,1)))` does not. The adapters normalize extents like Raster and have
+  exact `size64` counts; FA4's params are built over one tile (an empty KV as one key) with
+  the count forced to 0. Still the caller's: hand-built grids, custom mappings and policies
+  (U10, U15), `record` log offsets, and launch resources other than the grid extent.
 - **G7 (partly closed):** missing streams, duplicate declaration objects and scheduler name
   collisions now reject. Post-collection mutation/recollection is still unsupported (U12).
 - **G8:** post-close handle access and raw phase/barrier accessor limits remain U13.

@@ -97,8 +97,9 @@ means read-only: write into the tensors it holds, but its fields can't be reboun
 `SimpleNamespace` still works too, with an unannotated `params`.
 
 Swapping the schedule is the `policy=` argument: `OneShot()`, `StaticPersistent()`,
-`DynamicPersistent()` or `Clc()`; the role code doesn't change. The accumulator ring has two
-stages so the epilogue of one tile overlaps the mainloop of the next.
+`DynamicPersistent()`, `Clc()` or your own `Policy`; the tile order is `order=` (a `Raster`, your
+own `WorkMapping`, or a wrapped CUTLASS/FA4 scheduler). The role code doesn't change. The
+accumulator ring has two stages so the epilogue of one tile overlaps the mainloop of the next.
 
 `begin_roles()` allocates and initializes barriers and payloads, and returns the
 `SmemAllocator` for your own storage. `run_roles(params)` synchronizes, dispatches the roles and
@@ -371,7 +372,14 @@ def load(self, params: PersistentGemmParams, *, ab: Producer, tiles: Tiles):
     return ab, tiles
 ```
 
-`TileStream()` defaults to `Raster(along="m", swizzle=1)` and `OneShot()`:
+A schedule is three independent pieces, each swapped by one argument:
+
+- `policy=`: how a work unit (a CTA, or a cluster of a pair) gets its next linear index.
+- `order=`: the mapping from an index to the work item `tiles.work` returns.
+- `ready=`: an optional wait before the first decode, such as `PdlWait()`.
+
+Role code doesn't change when any of them does. `TileStream()` defaults to
+`Raster(along="m", swizzle=1)` and `OneShot()`. The built-in policies:
 
 - `OneShot()`: one work item per CTA. With the default `Raster()` the launch grid is the tile
   space, `(m_tiles, n_tiles, l)`, and the item is read from `blockIdx`. When `n_tiles` or `l`
@@ -402,7 +410,9 @@ smem = self.begin_roles(tiles=work)
 ```
 
 Static/dynamic policies need `max_ctas`. The dynamic int32 counter starts zeroed and resets after
-each launch; don't share its workspace across concurrent launches.
+each launch; don't share its workspace across concurrent launches. Keep the `launch_args`
+pair in the entry point's signature even for policies that don't read it, so swapping the policy
+leaves the ABI alone.
 
 Extents are runtime values converted to Int32, so the space is checked in the entry point's host
 code, not in the kernel:
@@ -416,6 +426,104 @@ code, not in the kernel:
   `work.grid()` makes a larger space zero-wide, so the launch raises a CUDA
   invalid-configuration error instead of covering a wrapped space. A hand-built grid gets no
   check.
+
+### Custom policies and mappings
+
+`Policy`, `WorkMapping` and `Readiness` are the public protocols the built-ins implement.
+Subclass them; their docstrings in [scheduling.py](scheduling.py) list every method, where it runs
+and what it must guarantee. A local policy defines `step`, and optionally `first`:
+
+```python
+@cute.jit
+def _countdown(index, problem):  # a valid index, or the terminal index `total`
+    return cutlass.select_(index >= 0, index, problem.total)
+
+
+@dataclass(frozen=True)
+class ReverseStatic(Policy):
+    """Unit b runs total-1-b, total-1-b-U, ... (U = launched units)."""
+
+    def first(self, problem):  # runs in every role: launch values and `problem` only
+        return _countdown(problem.total - 1 - problem.first_unit(), problem)
+
+    def step(self, index, problem):  # the next index after a valid `index`
+        return _countdown(index - problem.units(), problem)
+
+
+self.tiles = TileStream(order=Raster(swizzle=8), policy=ReverseStatic())
+```
+
+A broadcast policy sets `broadcast = True` and `stages`, and defines
+`claim(fetch, problem, index)` (plus `finish` and `fetch_channels` if it needs them). It runs on
+the layer's scheduler warp, which receives the previous index, so a stateful sequence needs no
+extra storage. The layer still owns distribution: the work ring and its counts, publication to
+both CTAs of a pair, leader-only claims, the drain and the scheduler's register budget.
+
+Rules for every policy: return a valid index in `[0, total)` or a terminal index `>= total`,
+never a negative one; compute `first`/`step` identically in every role; `uses_max_ctas` and
+`uses_workspace` declare which launch arguments it reads; `reach` must bound the largest
+index or grid extent (the default, `total + units - 1`, bounds strided sequences); `get_key()`
+names every compile-time field. A mapping defines `words`, `bind`, `size`, `decode` and
+`get_key`, and optionally `size64`, `item`, `skips`/`skip`. `bind` runs in the entry point and
+must make an empty space safe; `decode` may see indices past the end.
+
+### External schedulers
+
+[adapters.py](adapters.py) wraps an external scheduler's index-to-tile mapping as a
+`WorkMapping`, so it swaps in through `order=` and runs under any policy. `native_policy`
+reproduces the library's own per-CTA sequence:
+
+```python
+from flash_attn.cute.tile_scheduler import StaticPersistentTileScheduler
+
+order = CutlassStaticPersistent(swizzle=8)  # CUTLASS StaticPersistentTileScheduler order
+self.tiles = TileStream(order=order, policy=order.native_policy)  # CUTLASS's own schedule
+self.tiles = TileStream(order=order, policy=Clc())  # the same tiles, claimed through CLC
+self.tiles = TileStream(order=Fa4Scheduler(StaticPersistentTileScheduler), policy=Clc())
+```
+
+The kernel keeps binding `(m_tiles, n_tiles, l)`; the adapter derives the external space from it.
+`Fa4Scheduler(SingleTileLPTScheduler)` sizes its L2 sections from the K/V bytes per head, so its
+stream binds `(num_block, num_head, num_batch, seqlen_k)`; its compile-time arguments (`lpt`,
+`lpt_global`, `head_dim`, `head_dim_v`, `element_size`) are adapter fields and in its key. Limits:
+
+- Only index-addressable schedulers adapt: those whose state is one linear index and whose tile
+  is a function of it. FA4's `SingleTileScheduler` (3-D `blockIdx`) is rejected. QuACK's and
+  the CLC/dynamic schedulers own pipelines, SMEM and barriers that would duplicate the layer's
+  distribution; use their mapping with a warpdrive policy instead.
+- The external `advance_to_next_work`/`prefetch_next_work`/`producer_tail`/`get_grid_shape`
+  aren't called; the policy picks indices and the layer launches its own grid.
+- Items are per work unit: tiles are work-unit tiles (FA4's params use a `(1, 1)` cluster
+  shape), so a `CtaPair` gets one item per cluster.
+- CUTLASS pads swizzle bands and hands out the padded tiles; the adapter skips them. Both
+  adapters have an exact `size64`, so spaces past Int32 are rejected at launch like `Raster`'s.
+- An empty space has no items: CUTLASS's order binds like `Raster`; FA4's params are built
+  over one tile (an empty KV as one key) with the count forced to 0, so no external arithmetic
+  divides by zero. No FA4 split-KV.
+- `CutlassStaticPersistent` reimplements CUTLASS's order natively (it is `Raster` over the
+  padded space) rather than wrapping the deprecated `cutlass.utils` copy, so it imports no
+  CUTLASS scheduler and emits no deprecation warning. Provenance: the BSD-3 CuTeDSL helper
+  NVIDIA/cutlass `examples/python/CuTeDSL/helpers/static_persistent_tile_scheduler.py` at
+  `e13f5cd`, vendored as the test oracle in `test/cutlass_static_persistent_tile_scheduler.py`;
+  the tests compare per-CTA sequences against it.
+- `Fa4Scheduler` imports `flash_attn.cute` when constructed; warpdrive itself doesn't need it.
+
+### Raw roles
+
+A raw role takes no `Tiles` cursor. Under `OneShot` it reads its unit's item with
+`self.tiles.work_item()`, not `blockIdx`, which is wrong on the 1-D fallback grid, a hand-built
+grid, a pair or a non-`Raster` mapping:
+
+```python
+@role(warps=range(4), regs=160, raw=True)
+@cute.jit
+def epilogue(self, params, *, tmem: Tmem):
+    valid, (m, n, _) = self.tiles.work_item()  # runs ready= and skip like a managed role
+    ...
+```
+
+`valid` is false for an empty space or a skipped item. Persistent and broadcast policies raise
+`ProtocolError`: a role with several items takes `tiles: Tiles` and loops.
 
 ## CTA pairs
 
@@ -537,9 +645,10 @@ def epilogue(self, params, *, acc_bars: Barriers, tmem: Tmem):
 ```
 
 Raw roles take `Instance`, `Tmem`, `Barriers` and the context, not channel ends, tile cursors or
-turnstile seats. They skip protocol checks and the persistent-stream requirement but
-still participate in register padding and TMEM teardown. Build your own `cutlass.pipeline` with
-`self.barrier_ptr("acc_bars")` and `defer_sync=True` between `begin_roles` and `run_roles`.
+turnstile seats; under `OneShot` they read their item with `self.tiles.work_item()`. They skip
+protocol checks and the persistent-stream requirement but still participate in register padding
+and TMEM teardown. Build your own `cutlass.pipeline` with `self.barrier_ptr("acc_bars")` and
+`defer_sync=True` between `begin_roles` and `run_roles`.
 Named barrier IDs 1 and 2 are reserved.
 
 Raw state is available without a raw role:
@@ -668,5 +777,5 @@ TMA checks and the IKET-to-profiler path.
 ## Still to do
 
 - Use CUTLASS pipeline objects where the semantics match.
-- A public custom-scheduler interface and optional channel storage binding.
+- Optional channel storage binding.
 - Larger clusters, TMA multicast, round-robin role instances and cp.async producers.
