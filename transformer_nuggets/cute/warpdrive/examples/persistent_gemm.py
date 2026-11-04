@@ -225,12 +225,16 @@ class PersistentGemm(WarpSpecialized):
         )
         tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc) - 1)  # (..., SUB, STAGE)
         subtiles = cute.size(tTR_tAcc, mode=[3])
+        # Buffers rotate across tiles too: with a subtile count that is not a multiple of
+        # C_STAGES (tile_n=224: 7), a tile's first subtile alternates buffers.
+        rotate = subtiles % C_STAGES != 0
+        first = Int32(0)  # the buffer of this tile's first subtile
         while work.valid:
             m, n, _ = work.item
             dst = cute.group_modes(bSG_gC[None, None, None, m, n], 1, 3)  # (TMA, SUB)
             with acc.consume() as a:
                 for i in cutlass.range_constexpr(subtiles):
-                    buf = i % C_STAGES
+                    buf = (first + i) % C_STAGES if rotate else i % C_STAGES
                     cute.copy(t2r, tTR_tAcc[None, None, None, i, a.index], tTR_rAcc)
                     tRS_rC.store(r2s.retile(tTR_rAcc).load().to(self.dtype))
                     cute.copy(r2s, tRS_rC, tRS_sC[None, None, None, buf])
@@ -243,6 +247,8 @@ class PersistentGemm(WarpSpecialized):
                         # C_STAGES - 1 stores still reading SMEM.
                         cute.arch.cp_async_bulk_wait_group(C_STAGES - 1, read=True)
                     cute.arch.barrier(barrier_id=EPI_BARRIER_ID, number_of_threads=128)
+            if cutlass.const_expr(rotate):
+                first = (first + subtiles) % C_STAGES
             work.advance()
         if warp == 0:
             cute.arch.cp_async_bulk_wait_group(0, read=True)

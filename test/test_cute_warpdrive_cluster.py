@@ -470,6 +470,13 @@ def test_pair_gemm_tile_n(requires_blackwell, schedule, tile_n):
     _check_gemm(SCHEDULES[schedule], 3000, 1000, 520, tile_n=tile_n)
 
 
+def test_pair_gemm_odd_subtiles_rotate_c_buffers(requires_blackwell):
+    """tile_n=224 stores 7 subtiles per tile through 2 C staging buffers. Regression: each tile
+    restarted at buffer 0 and rewrote the buffer the previous tile's last TMA store could still
+    be reading."""
+    _check_gemm(SCHEDULES["static"], 4097, 2056, 520, max_ctas=16, reps=3, tile_n=224)
+
+
 @pytest.mark.parametrize("schedule", ["static", "atomic", "atomic1", "clc1"])
 @pytest.mark.parametrize("max_ctas", [2, 3, 10])
 def test_pair_gemm_capped_grid(requires_blackwell, schedule, max_ctas):
