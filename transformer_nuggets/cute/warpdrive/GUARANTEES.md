@@ -17,14 +17,17 @@ unseeded wait cycle, and terminating user work. Specifically:
 
 - Launch the declared block/cluster shape. Call `begin_roles` and `run_roles` in converged
   CTA/cluster code; every participating thread reaches initialization and exit. Named barrier
-  IDs **1 and 2** are reserved. Initialize `Barriers(counts=None)` before `run_roles`.
+  IDs **1 and 2** are reserved, and named-barrier channels own the IDs `named_barrier_ids`
+  lists (allocated from 15 down). Hand-picked IDs must avoid both; only `alias.named_barrier`
+  calls are checked (E122). Initialize `Barriers(counts=None)` before `run_roles`.
 - Carry ends, cursors and turnstile state through loops/helpers: return and reassign them.
   Managed roles return every stateful argument: producer/consumer endpoints, work cursors and
   turnstile seats (one object or a tuple). Self, params, instance indices, TMEM views and raw
   barrier pointers are input-only. Local names and tuple order do not matter; a stale snapshot
   is not detected and violates the state-carry obligation.
 - `Threads` means every thread of every bound role; `Tma`/`Umma` mean one single-warp role
-  per side. Use matching dynamic counts/predicates across roles, slots and relevant CTAs.
+  per side. On a `round_robin` side, that applies to the instance whose turn it is. Use
+  matching dynamic counts/predicates across roles, slots and relevant CTAs.
 - Close each handle once in its opening dynamic region. Use storage only during its owned
   lifetime. `retire()` is only for a genuinely terminal, unused acquire.
 - Drain each managed stream with `while work.valid:` and one direct-body `advance()` at the
@@ -74,6 +77,16 @@ These are conditional guarantees relative to that program, not a theorem about a
 | R19 | For any `IndexSchedule`/`WorkMap`/`Readiness` subclass meeting U15, the layer calls the protocol exactly as documented (below) and keeps owning distribution. Built-in schedules go through the same protocol. Normalized SASS of seven example configurations (gemm OneShot; persistent GEMM static single/pair and 2-CTA CLC; FA4 single, 2-CTA CLC, 2-CTA CLC split-P; CuTeDSL 4.8.0, GB300) was unchanged by making the protocol public and by the `(keep, words)` decode; host-side counting changed it only by reading `total` from a kernel parameter instead of recomputing the extent product, with neutral CUDA-graph timings. |
 | R20 | `self.work.single_item()` returns, in a raw role under a non-persistent local schedule, the item and validity a managed role's cursor would start with: the same `first_index`, readiness hook, dropped items and tile-grid/1-D decoding, so it is correct on the 65535 fallback, hand-built 1-D grids, pairs and custom mappings. |
 | R21 | `smem_plan` buffers are allocated by `begin_roles` after barriers, payloads and the TMEM holder, in declaration order, with their declared dtype, layout (swizzle included) and alignment; an `overlaps=` buffer is the root buffer's first byte recast to its own dtype/swizzle/layout and allocates nothing. Each CTA of a cluster holds every buffer at the same offset. A binding's stage mode and every registered `StageView` have exactly the channel's stage count. `h.data`, `h.view` and `h.access` address the handle's own stage (`h.index`), never a separately advanced cursor. Binding a buffer changes no count, scope, `remote_scope` or fence. Porting the examples' hand-indexed stages to buffers left the normalized SASS of the seven R19 configurations unchanged (CuTeDSL 4.8.0, sm_100a target compiled on a GB300 host, November 2026; both revisions compiled in one process, `nvdisasm` listings compared with addresses stripped). |
+| R22 | A `round_robin` Ring side with `k` bound instances of one role and width (the order instances are bound, i.e. instance index) gives instance `j` the side's epochs `j, j+k, j+2k, ...`: its operation m uses epoch `j + m*k`, stage `(j + m*k) % n` and that epoch's phase from R2. Each slot's count on that side is one instance's contribution (R4 with one signaller). A side with one instance is unchanged; both sides may rotate. Round-robin channels are CTA-local; the layer adds no turn-taking between mbarrier instances, whose phases already separate epochs. Normalized SASS of the seven R19 configurations was unchanged by adding R22/R23 (CuTeDSL 4.8.0, sm_100a target, November 2026). |
+| R23 | A `sync="named"` channel (Threads on both sides, CTA-local) uses no mbarriers: slot `s` has full and empty named barriers `named_ids[0][s]`, `named_ids[1][s]`, consecutive per channel, allocated from ID 15 downward in declaration order and never 0, 1 or 2. Both count `producer + consumer` threads of that slot (R22 applied per side). Acquire is an unaligned `barrier.cta.sync` on empty, commit fences (`commit_fence`) then an unaligned `barrier.cta.arrive` on full; `commit(wait=True)` syncs on full instead, so every producer and consumer thread has arrived when it returns. Wait/release mirror these on full/empty with `release_fence`. Each consumer instance arrives once on the empty barrier of every slot it consumes first (bound slot, all slots, or for a round-robin side the stages `s` with `s % k == j`) at role start, before its body. The last release of a run is left unmatched at exit. When round-robin instances share stage barriers (`n % k != 0`), every acquire/wait on that side must run inside a turn of the declared `turnstile` (trace-checked). |
+
+### Round-robin and named channels (R22, R23)
+
+Tests: `test/test_cute_warpdrive_decode.py` runs a toy where three instances take a two-stage
+ring's epochs in turn (3 does not divide 2), forward them through a three-stage named ring and a
+one-stage named mailbox taken in turn, over 1-13 epochs; it checks values, the instance that saw
+each epoch, `describe()` counts and IDs, and E117-E122. The FA4 decode port exercises both
+features with real data (partials bitwise equal to FA4's).
 
 Role parameters may be positional or keyword-only. The dispatcher follows each signature,
 while dependency binding remains by parameter name and annotation. The examples use
@@ -123,7 +136,8 @@ strict build from a warn/off one (custom caches must include the hook, U12).
 
 Known blind spots (phase 1): CtaPair kernels (reported unverified), unannotated or raw accesses,
 raw ordering instructions, raw roles, raw signals (`signal=False`), ring-stage SMEM shared by two
-channels, loops that run fewer than twice, epochs whose traced positions do not correspond
+channels, `round_robin` channels (they add no ordering edges, so accesses ordered only through
+them would be reported), loops that run fewer than twice, epochs whose traced positions do not correspond
 across roles (U1), partial footprints narrower than the annotation states, and the tcgen05
 waits/thread-sync fences around barriers and signals (assumed, not checked). Rules and PTX
 citations: `alias.RULES`.
@@ -357,6 +371,13 @@ same dynamic branch is locally accepted; another participant's matching branch i
 | E114 | `end.views(...)` naming no buffer of the channel or passing a non-StageView; `h.view`/`h.access` naming an unknown buffer, or omitting the name on a multi-buffer channel; `h.data` on a channel without payload or buffer (E53); `self.buffer(name)` before allocation | ProtocolError / channels.py, kernel.py |
 | E115 | Annotation without read/write, an unknown agent, or a TMEM agent other than threads/umma; TMEM `lanes`/`cols` that are not a range or callable, or a range leaving the region; `warps` that are not ints (at annotation); warps outside the role or a callable footprint leaving the region (when the diagnostic runs) | ValueError / channels.py, tmem.py |
 | E116 | `alias_check` other than warn/strict/off; `"strict"` with a potential hazard | ValueError; ProtocolError / kernel.py, alias.py |
+| E117 | Non-bool `round_robin`; `round_robin` on `Slots`; `sync` other than mbarrier/named; a named channel with a non-Threads side or an `override`; `turnstile=` without a named round-robin channel | ValueError / channels.py |
+| E118 | `round_robin` with no side holding several instances; round-robin instances of different roles or widths | ProtocolError / kernel.py |
+| E119 | A named or round-robin channel whose roles make it pair-scoped | ProtocolError / kernel.py |
+| E120 | Named channels needing more barrier IDs than 3-15 provide | ProtocolError / kernel.py |
+| E121 | Named round-robin instances sharing stage barriers without an enabled `turnstile` over exactly them; an acquire/wait on that side outside its turn | ProtocolError / kernel.py, channels.py (trace) |
+| E122 | `alias.named_barrier(id, ...)` using a layer or named-channel ID | ProtocolError / kernel.py (trace) |
+| E123 | `commit(wait=True)` on an mbarrier channel or with `signal=False`; mbarrier pointer accessors on a named channel | ProtocolError / channels.py |
 
 TMA checking is **positive evidence only**. It follows recognizable direct SSA uses of
 handed-out barriers and counts static copy boxes in the opening region. A complete mismatch
@@ -410,6 +431,7 @@ Python-int slot accessor behavior; this is not a blanket bounds/ownership check 
 | U14 | No performance threshold, inter-unit deterministic order, race-freedom proof or profiler-plan proof of liveness. |
 | U15 | Custom schedules: every returned index is in `[0,total)` or terminal `>= total` (never negative); `first_index` depends only on launch values and `problem`, and `first_index`/`next_index` are identical pure functions in every role; claims across units cover each kept index once (R12 then holds); the schedule terminates; `uses_max_ctas`/`uses_workspace`/`index_limit`/`get_key` are truthful (`index_limit` bounds every index and grid extent; the key names every compile-time field, in lowercase identifier characters); `close_claims` only closes claim state. Custom mappings: U10; each kept index is a distinct work item (repeated outputs such as split-K partials are distinct `(tile, split)` items reduced elsewhere), and every needed item must be reachable as a kept index in `[0,count)`. |
 | U16 | Storage: layouts and partitions are yours (the layer infers none and certifies no layout transformation); a `StageView`'s tensor must view the buffer its name binds; accesses through `self.buffer(...)` or prologue tensors bypass handle stage projection; buffer reuse across channels, overlaps and peer (DSMEM) reads need your ordering and `remote_scope="cluster"` where U5 applies. |
+| U17 | Named barriers: raw `cute.arch.barrier`/`barrier_arrive` calls with hard-coded IDs are invisible to E122; keep them clear of `named_barrier_ids` (allocating from 15 down keeps small hand-picked IDs such as persistent_gemm's 3 clear until channels need them). Seeding at role start means a consumer cannot order writes before the first producer acquire through the channel. Named channels count threads, not phases: per-epoch balance (U1) is what keeps a fast side from reaching a barrier twice in one generation. |
 
 ## Known gaps
 
@@ -438,6 +460,8 @@ Python-int slot accessor behavior; this is not a blanket bounds/ownership check 
   `use_ldred_rowmax` checks for an SM103-family compile target; it changes only the unmasked
   row-max reduction, not any managed channel or the default SM100/software path. See
   [the example's measurements and tests](docs/examples.md#hardware-row-max-on-sm103).
+- **G11:** the swap-AB decode example (`examples/fa4_decode_swapab.py`) supports `OneShot` only;
+  its done flags and mailboxes are balanced per item but untested across persistent items.
 
 ## Fuzzing and evidence
 

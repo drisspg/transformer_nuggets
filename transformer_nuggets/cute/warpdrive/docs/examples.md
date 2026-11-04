@@ -10,6 +10,9 @@
   fan-out/join, turnstiles, S/P aliasing, split-P, persistence and CTA pairs.
 - [packed_work.py](../examples/packed_work.py): a mapping for a device-built work table with
   a host-visible capacity and device-side length.
+- [fa4_decode_swapab.py](../examples/fa4_decode_swapab.py): FA4's swap-AB single-token decode:
+  split-KV work items with per-sequence split counts, round-robin softmax warpgroups,
+  named-barrier mailboxes and P staged through SMEM.
 
 ## GEMM
 
@@ -154,6 +157,77 @@ then profiles one complete forward per variant between CUDA profiler start/stop.
 seven standard example configurations keep identical normalized SASS versus `origin/main`
 on SM100 and SM103; only the opt-in hardware-max variant intentionally changes it.
 
+## Single-token decode
+
+```python
+from transformer_nuggets.cute.warpdrive.examples.fa4_decode_swapab import fa4_decode
+
+out, lse = fa4_decode(q, k, v, num_splits=8, seqused_k=lengths, splits_per_seq=counts)
+```
+
+A port of FA4's `flash_fwd_decode_sm100.py`: S^T = K Q^T and O^T = V^T P^T, so 128 KV tokens
+fill the MMA's M and the query heads of one KV head fill N. Q is `(batch, 1, heads, 128)`, K and
+V `(batch, kv_len, kv_heads, 128)`, all BF16 and contiguous, with up to 32 query heads per KV
+head. `seqused_k` (int32 per sequence) shortens sequences; KV rows past it must be finite, since
+FA4's bounded V descriptor isn't ported. `splits_per_seq` caps each sequence's splits, as FA4's
+prepare kernel does. `decode_partials` returns the fp32 split partials in FA4's combine layout;
+`fa4_decode` combines them with FA4's combine kernel. No paging, varlen Q, masks or score mods.
+
+The roles match FA4's placement: a QK and a PV MMA warp, a K/V load warp that also writes the
+split's LSE, a Q-load/O-store warp, two softmax warpgroups alternating KV blocks and a
+correction warpgroup. What it needed from the layer:
+
+- Work items `(split, kv_head, batch)` from a `SplitKV` mapping. With per-sequence counts it
+  reads the table after `PdlWait()` and drops the splits past each count.
+- `round_robin` rings for S, P and the row-max/row-sum mailboxes, so softmax[i] takes blocks
+  i, i+2, ... with one warpgroup's counts.
+- Named-barrier channels for the thread mailboxes and done flags, with a turnstile around the
+  shared row-max exchange.
+- P in a 4-stage SMEM ring read as the PV MMA's B operand; no TMEM alias.
+
+FA4 reads one K/V ring with two MMA cursors, keeping K two blocks ahead of V with two extra named
+barriers. Here K and V have their own rings, 7 and 5 stages at FA4's total of 12 (8-head tiles).
+The other changes: the first PV into each O slot overwrites it instead of the correction
+warpgroup zero-filling TMEM first, done flags also sync on a pre-seeded empty barrier, and an
+empty split runs the normal tail with zero sums.
+
+Split partials match FA4's bit for bit on every shape below, with FA4's own split count and
+per-sequence table (captured at its combine call); the combined outputs are identical too.
+Kernel times are CUPTI medians of CUDA-graph replays, in microseconds; the better of two
+interleaved rounds of 200 replays. Graph times also include FA4's prepare kernel (per-sequence
+rows) and the shared combine. Buffers are reused, so short shapes run from L2.
+
+```bash
+gpu-run --timeout 1800 auto -- timeout --signal=TERM --kill-after=5s 900s \
+  .venv/bin/python -m transformer_nuggets.cute.warpdrive.examples.bench_fa4_decode
+```
+
+GB300, CuTeDSL 4.8.0, PyTorch `2.15.0.dev20260922+cu132`, FA4 `00807a02`, November 2026,
+shared GPUs.
+
+| batch x kv_len, heads/kv_heads | splits | FA4 decode | port | ratio | graph FA4 / port |
+|---|---|---:|---:|---:|---:|
+| 1x8192, 8/1 | 16 | 4.32 | 4.77 | 1.104 | 17.01 / 18.19 |
+| 1x32768, 32/1 | 32 | 7.07 | 8.00 | 1.131 | 19.66 / 20.86 |
+| 4x16384, 32/8 | 4 | 39.84 | 41.14 | 1.033 | 48.80 / 50.53 |
+| 8x32768, 32/8 | 2 | 152.08 | 149.57 | 0.983 | 160.42 / 157.41 |
+| 8x65536 ragged, 8/1 | per-seq <= 32 | 26.40 | 27.98 | 1.060 | 38.21 / 38.30 |
+| 16x32768 ragged, 64/8 | per-seq <= 10 | 179.82 | 180.50 | 1.004 | 190.11 / 190.14 |
+| 2x131072 ragged, 16/1 | per-seq <= 32 | 9.31 | 9.57 | 1.028 | 21.92 / 20.56 |
+
+Long splits run at parity. Short ones pay about 0.5-0.9 us more per CTA. Under NCU (1x8192,
+cold caches) the port issues 5% more instructions and spends more stall cycles on long and short
+scoreboards. Its other resources match FA4's: 68 registers, no spills, 512 threads.
+Changes measured and ruled out as the cause, each within noise: allocating TMEM from warp 1 as
+FA4 does, aligned instead of unaligned named barriers, K/V stage splits from 4:7 to 9:3
+(FA4's shared ring has no direct equivalent), decoding the item and reading `seqused_k` once in
+the prologue, skipping all setup for dropped splits (slower: it serializes on the PDL wait), and
+prefetching the TMA descriptors (kept, as FA4 does). The remaining gap is unattributed.
+
+Code size, counting lines that are neither blank, comments nor docstrings: FA4's file has 1,496,
+of which 1,347 are the kernel without the interface adapter, including paging, masks, score
+mods and varlen Q. The port has 993, including its wrappers and work mapping.
+
 ## Historical timings
 
 The [original README at 49b9713](https://github.com/drisspg/transformer_nuggets/blob/49b9713/transformer_nuggets/cute/warp_roles/README.md)
@@ -166,8 +240,9 @@ a FA4 default schedule and a matched single-CTA schedule answer different questi
 
 ## Still missing
 
-Larger clusters, TMA multicast, round-robin role instances and cp.async producer mechanisms
-are not supported. Using CUTLASS pipeline objects where their semantics match remains a
+Larger clusters, TMA multicast and cp.async producer mechanisms are not supported. A ring read
+by several consumer cursors (FA4 decode's shared K/V ring) is not either; the decode example
+splits it into two rings. Using CUTLASS pipeline objects where their semantics match remains a
 possible implementation cleanup, not a reason to change the role bodies.
 
 The alias diagnostic still needs IR-inferred accesses, partial K-block footprints, CTA-pair

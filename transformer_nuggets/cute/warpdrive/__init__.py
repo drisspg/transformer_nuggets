@@ -11,6 +11,8 @@ by name and annotation (``Producer``, ``Consumer``, ``Consumer[Instance]``), the
 passed to ``run_roles`` (a frozen dataclass of prologue values in the examples) goes to the
 parameter annotated with its type, or to the role's single unannotated parameter; any other
 annotation is a ``ProtocolError``.
+``Ring(..., round_robin=True)`` lets the instances of one role take a side's epochs in turn;
+``sync="named"`` builds a Threads-to-Threads channel from CTA named barriers (``channels.py``).
 
 Ends are DSL values: dynamic loops carry their phases when the end is a local name that the
 loop body uses through a method call or reassignment. Helpers that take ends must return them

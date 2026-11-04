@@ -154,8 +154,9 @@ and `get_key()`.
 
 Split work uses distinct indices too: a split-K mapping returns `(tile, split)` and the split's
 K range, dropping empty ranges. Reduce the partials in a later kernel, not in the schedule.
-A split-KV mapping can carry split id and count words the same way; the FA4 adapter below
-doesn't provide one.
+The decode example's `SplitKV` mapping returns `(split, kv_head, batch, splits)` and, with
+per-sequence split counts from a preceding kernel, drops splits past a sequence's count after
+`PdlWait()`. The FA4 adapter below doesn't provide split-KV.
 
 ## Custom index schedules
 

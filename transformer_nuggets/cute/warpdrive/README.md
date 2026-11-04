@@ -119,12 +119,14 @@ budgets, every channel's per-CTA arrival counts, masks and TMA bytes, the schedu
 
 - [Roles](docs/roles.md): placement, params, returned state and register budgets.
 - [Scheduling](docs/scheduling.md): launch setup, custom work lists and CUTLASS/FA4 mappings.
-- [Channels](docs/channels.md): rings, slots, overlapping handles, TMEM and turnstiles.
+- [Channels](docs/channels.md): rings, slots, round-robin instances, named barriers,
+  overlapping handles, TMEM and turnstiles.
 - [Storage](docs/storage.md): stage views and checking declared aliases.
 - [CTA pairs](docs/cta_pairs.md): two-CTA MMA and cross-CTA handoffs.
 - [Dropping down](docs/dropping_down.md): raw barriers, count overrides and unchecked sites.
 - [Tracing](docs/tracing.md): inspect the kernel, capture IKET ranges and use the profiler.
-- [Examples](docs/examples.md): persistent GEMM, FA4, input limits, SM103 hardware row max and timings.
+- [Examples](docs/examples.md): persistent GEMM, FA4 forward and swap-AB decode, input limits,
+  SM103 hardware row max and timings.
 
 ## Tests
 

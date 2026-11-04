@@ -68,6 +68,64 @@ An unbound end can visit any slot. This is useful for one MMA warp producing two
 two softmax instances consume independently. The [FA4 example](../examples/fa4_fwd.py) uses
 this pattern.
 
+## Round-robin instances
+
+```python
+self.s = Ring(4, Umma, Threads, round_robin=True)
+
+
+@role(warps=[range(4, 8), range(8, 12)], regs=120)
+@cute.jit
+def softmax(self, params, *, stage: Instance, s: Consumer):
+    for j in cutlass.range(stage, n_blocks, 2, unroll=1):
+        with s.consume() as h:  # block j's S
+            ...
+    return s
+```
+
+With `round_robin=True`, the instances on a side take the epochs in turn. Instance j of k
+handles epochs j, j + k, j + 2k, ..., so softmax[1] above starts at the second stage and skips
+softmax[0]'s. Each epoch's count is one instance's arrivals: 128 here, not the 256 of a join.
+`describe()` prints the rotation and the per-epoch count. The instances must be one role with
+the same width, and their loops must visit their own epochs; nothing checks that the trip counts
+add up. The stage count doesn't have to be a multiple of k: the phases tell the instances apart.
+The [decode example](../examples/fa4_decode_swapab.py) alternates KV blocks this way.
+
+## Named-barrier channels
+
+```python
+self.row_sum = Ring(2, Threads, Threads, sync="named", round_robin=True)
+self.row_max = Ring(1, Threads, Threads, sync="named", round_robin=True, turnstile="mufu")
+self.mufu = Turnstile()
+
+with mufu.turn():
+    mh = row_max.acquire()
+    ...  # atomically max this warpgroup's block max into sRowMax
+    mh.commit(wait=True)  # every producer and consumer thread has arrived
+    ...  # read the shared max
+```
+
+`sync="named"` builds each slot from a full and an empty CTA named barrier instead of mbarriers:
+`acquire`/`wait` are unaligned `bar.sync`, `commit`/`release` unaligned `bar.arrive`. A named
+barrier has no phase. It completes once the slot's producer and consumer threads have all
+arrived, so the count is their sum. Both sides must be `Threads` and in one CTA, and overrides
+don't apply. Each consumer instance arrives once on its slots' empty barriers when its role
+starts; that is the named version of a ring starting empty. Consumers therefore can't write
+anything the producer's first acquire depends on before that arrival.
+
+`commit(wait=True)` makes the producer wait on the full barrier too. When it returns, every
+thread of the exchange has arrived, so the producers also see each other's writes. FA4's decode
+uses it for the shared running max.
+
+Because a named barrier can't tell instances apart, two round-robin instances that share a
+stage's barriers (`n % k != 0`) could complete it between themselves. Name a turnstile over
+them; their acquires (or waits) must run inside its turn, which is checked while tracing.
+
+IDs are allocated from 15 downward; `op.named_barrier_ids` and `describe()` list them. IDs 1
+and 2 belong to the layer, so 13 are free. Hand-picked IDs in raw code should stay low and
+clear of these. Calls through `alias.named_barrier` are checked against them. Raw
+`cute.arch.barrier` calls are not.
+
 ## Overlapping handles
 
 A handle does not have to use a context manager. FA4's K and V share a ring; the MMA can hold

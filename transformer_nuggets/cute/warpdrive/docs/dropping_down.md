@@ -46,7 +46,8 @@ def epilogue(
 `Barriers(2)` reserves storage without initializing it. Initialize between `begin_roles()`
 and `run_roles()`. `self.barrier_ptr("acc_bars")` gives the pointer in the prologue, so you
 can build your own `cutlass.pipeline` there with `defer_sync=True`. Named barrier IDs 1 and 2
-are reserved.
+are reserved, and [named-barrier channels](channels.md#named-barrier-channels) take IDs from 15
+down. Use `alias.named_barrier` for hand-picked IDs so a collision raises while tracing.
 
 Raw roles can take the context, `Instance`, `Tmem` and `Barriers`. They cannot take managed
 channel ends, work cursors or turnstile seats, and their return values are ignored. They
