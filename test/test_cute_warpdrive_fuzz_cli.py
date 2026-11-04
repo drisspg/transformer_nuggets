@@ -18,6 +18,7 @@ def campaign_args(tmp_path, seeds="0,1"):
         jobs=2,
         seeds=seeds,
         pair=None,
+        cluster="",
         stream=None,
         empty=False,
         timeout=1,
@@ -29,7 +30,9 @@ def campaign_args(tmp_path, seeds="0,1"):
 
 def stub_specs(monkeypatch):
     monkeypatch.setattr(
-        gen, "generate", lambda seed, **kwargs: SimpleNamespace(seed=seed, pair=False, stream=None)
+        gen,
+        "generate",
+        lambda seed, **kwargs: SimpleNamespace(seed=seed, pair=False, cluster=(), stream=None),
     )
     monkeypatch.setattr(gen, "features", lambda spec: set())
 

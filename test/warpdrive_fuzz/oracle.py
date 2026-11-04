@@ -184,7 +184,7 @@ def initial_clog(spec: KernelSpec, rows: int) -> np.ndarray:
 
 
 def placed(spec: KernelSpec, rname: str, rank: int) -> bool:
-    return spec.role(rname).cta == "all" or rank == 0
+    return rank in spec.ctas(rname)
 
 
 FULL_CHECK_CTAS = 4096
@@ -276,7 +276,7 @@ def check_launch(spec: KernelSpec, run: Launch, tag: str) -> Report:
                 prev = unit_items[cta.unit]
                 rep.expect(
                     seqs[0][2] == prev[: spec.item_cap] or len(prev) > spec.item_cap,
-                    f"{tag}: cta {cta.b} (rank {cta.rank}) item sequence differs from its pair",
+                    f"{tag}: cta {cta.b} (rank {cta.rank}) item sequence differs from its cluster",
                 )
             if expect is not None:
                 unit_items[cta.unit] = expect
@@ -300,7 +300,7 @@ def check_launch(spec: KernelSpec, run: Launch, tag: str) -> Report:
                 for name, per_cta in run.timeline.items():
                     role_name = name.split("[")[0]
                     runs_here = (
-                        cta.rank == 0 or not spec.pair
+                        cta.rank == 0  # one scheduler per cluster, in rank 0
                         if name == "work.scheduler"
                         else placed(spec, role_name, cta.rank)
                     )

@@ -62,9 +62,11 @@ def check_raster(s: gen.StreamSpec) -> list[str]:
     return []
 
 
-def check_grid(s: gen.StreamSpec, cs: int) -> list[str]:
+def check_grid(s: gen.StreamSpec, cluster: int | tuple[int, int, bool]) -> list[str]:
+    """``cluster``: 1 (a single CTA), 2 (``CtaPair``) or a ``Cluster`` shape ``(m, n, pair)``."""
     from transformer_nuggets.cute.warpdrive import (
         AtomicPersistent,
+        Cluster,
         ClusterLaunchControl,
         CtaPair,
         OneShot,
@@ -81,7 +83,11 @@ def check_grid(s: gen.StreamSpec, cs: int) -> list[str]:
         "clc": ClusterLaunchControl(s.stages),
     }[s.schedule]
     stream = WorkStream(mapping=raster_of(s), schedule=schedule)
-    stream.owner = SimpleNamespace(cluster=CtaPair() if cs == 2 else SingleCta())
+    if isinstance(cluster, tuple):
+        declared, cs = Cluster(*cluster), cluster[0] * cluster[1]
+    else:
+        declared, cs = (CtaPair() if cluster == 2 else SingleCta()), cluster
+    stream.owner = SimpleNamespace(cluster=declared)
     got = tuple(BoundWork(stream, stream.mapping.bind(s.extents), None, s.max_ctas).grid())
     want = oracle.expected_grid(SimpleNamespace(cs=cs, stream=s, units=1))
     return (
@@ -135,10 +141,6 @@ class Inst:
     slot: int | None
 
 
-def _ranks(inst: Inst, cs: int) -> tuple[int, ...]:
-    return (0,) if inst.cta == "leader" else tuple(range(cs))
-
-
 @dataclass
 class WantScope:
     pair: bool
@@ -148,8 +150,14 @@ class WantScope:
     empty_counts: dict
     tx: int | None
     tail: bool
-    full_mask: int
-    empty_mask: int
+    full_mask: int | dict
+    empty_mask: int | dict
+
+
+def _mask(targets: dict) -> int | dict:
+    """``tcgen05.commit`` masks per signalling rank, one int when every rank agrees."""
+    masks = {r: sum(1 << t for t in ts) for r, ts in targets.items()}
+    return masks.popitem()[1] if len(set(masks.values())) == 1 else masks
 
 
 def want_scope(
@@ -158,66 +166,95 @@ def want_scope(
     cons_mech: str,
     producers: list[Inst],
     consumers: list[Inst],
-    cs: int,
+    geom: gen.Geometry,
     tma_bytes: int | None,
+    *,
+    internal: bool = False,
+    multicast: tuple[str, ...] = (),
 ) -> WantScope:
-    """R4 (CTA-local) and R11 (pair) counts, from the participants alone."""
+    """R4 (CTA-local) and R11 (cross-CTA) counts, from the participants and the cluster."""
+    ranks = tuple(range(geom.size))
+    insts = (*producers, *consumers)
+    where = {i.name: geom.ctas(i.cta) for i in insts}
+    reach = {r: geom.reach(r, multicast) for r in ranks}
+    copies_cross = any(len(cs) > 1 for cs in reach.values())
+    same = len(set(where.values())) == 1
 
-    def local_counts(mech, insts):
-        return [
-            sum(i.threads if mech == "threads" else 1 for i in insts if i.slot in (None, j))
-            for j in range(n)
-        ]
+    def per_slot(insts, j):
+        return [i for i in insts if i.slot in (None, j)]
 
-    placements = {i.cta for i in (*producers, *consumers)}
-    if cs == 1 or len(placements) == 1:
-        full, empty = local_counts(prod_mech, producers), local_counts(cons_mech, consumers)
+    if same and not copies_cross:
+        full, empty = (
+            [
+                sum(i.threads if mech == "threads" else 1 for i in per_slot(side, j))
+                for j in range(n)
+            ]
+            for mech, side in ((prod_mech, producers), (cons_mech, consumers))
+        )
+
+        def local_mask(mech, side):  # a CTA's own commit: bit ``rank`` of each signalling CTA
+            if mech != "umma":
+                return 1
+            return _mask({c: (c,) for i in side for c in where[i.name]})
+
         return WantScope(
             False,
             (),
             (),
-            {c: full for c in range(cs)},
-            {c: empty for c in range(cs)},
+            dict.fromkeys(ranks, full),
+            dict.fromkeys(ranks, empty),
             tma_bytes,
             False,
-            1,
-            1,
+            local_mask(prod_mech, producers),
+            local_mask(cons_mech, consumers),
         )
-    full_ctas = tuple(sorted({c for i in consumers for c in _ranks(i, cs)}))
-    empty_ctas = tuple(sorted({c for i in producers for c in _ranks(i, cs)}))
+    full_ctas = tuple(sorted({c for i in consumers for c in where[i.name]}))
+    empty_ctas = tuple(sorted({c for i in producers for c in where[i.name]}))
+    # The CTAs one signal may reach: itself when only multicast crosses CTAs, its MMA pair when
+    # every participant runs somewhere in each pair, else the whole cluster.
+    if same:
+        unit = {r: (r,) for r in ranks}
+    elif all(set(cs) & set(geom.group(r)) for cs in where.values() for r in ranks):
+        unit = {r: geom.group(r) for r in ranks}
+    else:
+        unit = dict.fromkeys(ranks, ranks)
+    full_targets = {p: tuple(c for c in full_ctas if c in unit[p]) for p in empty_ctas}
+    empty_targets = {
+        c: tuple(p for p in empty_ctas if set(reach[p]) & set(unit[c])) for c in full_ctas
+    }
+    tx = tma_bytes
+    leaders = geom.ctas("leader")
+    if tma_bytes is not None and not internal and not same:
+        assert geom.pair and empty_ctas == ranks and full_ctas == leaders, "generator bug"
+        tx = tma_bytes * 2  # 2-CTA copies of each pair complete on the leader's barrier
+        full_targets = {p: (p,) for p in leaders}
 
-    def pair_counts(mech, insts, targets):
+    def counts(mech, side, targets):
         out = {}
-        for c in range(cs):
-            if c not in targets:
-                out[c] = [1] * n
-                continue
-            # Threads: every thread of every instance in each of its CTAs; a TMA arm or a
-            # multicast tcgen05.commit: one arrival per target barrier.
-            out[c] = [
-                sum(i.threads * len(_ranks(i, cs)) for i in insts if i.slot in (None, j))
-                if mech == "threads"
-                else int(any(i.slot in (None, j) for i in insts))
-                for j in range(n)
-            ]
+        for c in ranks:
+            row = []
+            for j in range(n):
+                senders = [(i, s) for i in per_slot(side, j) for s in where[i.name]]
+                senders = [(i, s) for i, s in senders if c in targets.get(s, ())]
+                # Threads: every thread of every signalling (instance, CTA); a TMA arm or a
+                # multicast tcgen05.commit: one arrival per signalling CTA.
+                if mech == "threads":
+                    row.append(sum(i.threads for i, _ in senders))
+                else:
+                    row.append(len({s for _, s in senders}))
+            out[c] = row if any(row) else [1] * n
         return out
 
-    tx = None
-    if tma_bytes is not None:
-        if empty_ctas == tuple(range(cs)) and full_ctas == (0,):
-            tx = tma_bytes * cs
-        else:
-            tx = tma_bytes  # leader-only producer: the scheduler ring (user TMA is local here)
     return WantScope(
         True,
         full_ctas,
         empty_ctas,
-        pair_counts(prod_mech, producers, full_ctas),
-        pair_counts(cons_mech, consumers, empty_ctas),
+        counts(prod_mech, producers, full_targets),
+        counts(cons_mech, consumers, empty_targets),
         tx,
-        cons_mech == "umma" and any(c != 0 for c in empty_ctas),
-        sum(1 << c for c in full_ctas),
-        sum(1 << c for c in empty_ctas),
+        cons_mech == "umma" and any(p != c for c, ps in empty_targets.items() for p in ps),
+        _mask(full_targets),
+        _mask(empty_targets),
     )
 
 
@@ -239,7 +276,8 @@ def scheduler_warp(spec: gen.KernelSpec) -> int:
 
 
 def expected_scopes(spec: gen.KernelSpec) -> dict[str, WantScope]:
-    cs = spec.cs
+    geom = spec.geom
+    cs = geom.size
     out = {}
     for ch in spec.channels:
         out[ch.name] = want_scope(
@@ -248,12 +286,15 @@ def expected_scopes(spec: gen.KernelSpec) -> dict[str, WantScope]:
             ch.consumer,
             _insts(spec, list(ch.producers)),
             _insts(spec, list(ch.consumers)),
-            cs,
+            geom,
             ch.tma_bytes if ch.producer == "tma" else None,
+            multicast=tuple(ch.multicast),
         )
     s = spec.stream
     if s is not None and s.schedule in ("atomic", "clc"):
-        sched = Inst("work.scheduler", 32, "leader" if cs > 1 else "all", None)
+        # One scheduler per cluster: rank 0 (the leader in a CTA pair) publishes to every CTA.
+        place = "all" if cs == 1 else "leader" if geom.ctas("leader") == (0,) else "rank0"
+        sched = Inst("work.scheduler", 32, place, None)
         users = [
             Inst(f"{r.name}[{i}]", r.threads, r.cta, None)
             for r in spec.roles
@@ -265,11 +306,12 @@ def expected_scopes(spec: gen.KernelSpec) -> dict[str, WantScope]:
             "threads",
             [sched],
             [*users, sched],
-            cs,
+            geom,
             16 if cs > 1 else None,
+            internal=True,
         )
         if s.schedule == "clc":
-            out["work_clc"] = want_scope(1, "tma", "threads", [sched], [sched], cs, 16)
+            out["work_clc"] = want_scope(1, "tma", "threads", [sched], [sched], geom, 16)
     return out
 
 

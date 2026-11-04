@@ -11,6 +11,9 @@ hang. Results stream to ``<out>/results.jsonl``; failing cases keep their spec J
 with ``CUTE_DSL_ARCH=sm_100a``)::
 
     python scripts/fuzz_warpdrive.py static --seed 0 --budget 1000
+
+``--cluster 2x2p`` (or ``2x2``, ``4x1p``, ...) generates kernels on a larger ``Cluster`` with
+``all``/``leader``/``rank0`` placements instead of single CTAs and ``CtaPair``s.
 """
 
 from __future__ import annotations
@@ -58,6 +61,8 @@ def runtime_campaign(args) -> int:
             force["stream"] = args.stream
         if args.empty:
             force["empty"] = True
+        if args.cluster:
+            force["cluster"] = gen.parse_cluster(args.cluster)
         spec = gen.generate(seed, **force)
         # "{seed}" in the wrapper names per-case tool outputs (CUTracer delay dumps).
         wrapper = args.wrapper.replace("{seed}", str(seed)).split() if args.wrapper else None
@@ -76,6 +81,7 @@ def runtime_campaign(args) -> int:
             counts[label] = counts.get(label, 0) + 1
             row = asdict(res)
             row["pair"], row["schedule"] = spec.pair, spec.stream.schedule if spec.stream else None
+            row["cluster"] = spec.cluster
             row["known"], row["features"] = known, sorted(gen.features(spec))
             log.write(json.dumps(row) + "\n")
             log.flush()
@@ -139,6 +145,11 @@ def main() -> int:
         help="cancel queued jobs after this long; collect running jobs (0: all)",
     )
     rt.add_argument("--pair", type=lambda s: s == "1", default=None, help="force CtaPair (1/0)")
+    rt.add_argument(
+        "--cluster",
+        default="",
+        help="declare Cluster(m, n): 'MxN', with a trailing 'p' for MMA pairs (e.g. 2x2p)",
+    )
     rt.add_argument("--stream", type=lambda s: s == "1", default=None, help="force a WorkStream")
     rt.add_argument("--empty", action="store_true", help="zero-work boundary corpus (G6)")
     rt.add_argument(

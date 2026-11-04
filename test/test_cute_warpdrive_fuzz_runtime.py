@@ -38,10 +38,10 @@ def requires_blackwell() -> None:
         pytest.skip("warpdrive runtime fuzzing requires SM100-family tcgen05 and CLC")
 
 
-def _covering_seeds(pool: range, limit: int) -> list[int]:
+def _covering_seeds(pool: range, limit: int, **force) -> list[int]:
     """Greedy seeds covering the generator's knob classes, skipping the >65535-CTA grids (their
     host check is slow; the long campaign runs them)."""
-    specs = {s: gen.features(gen.generate(s)) for s in pool}
+    specs = {s: gen.features(gen.generate(s, **force)) for s in pool}
     specs = {s: f for s, f in specs.items() if "grid_yz_edge" not in f}
     chosen, covered = [], set()
     while len(chosen) < limit:
@@ -54,6 +54,7 @@ def _covering_seeds(pool: range, limit: int) -> list[int]:
 
 
 QUICK_SEEDS = _covering_seeds(range(300), 24)
+CLUSTERS = {"2x2p": (2, 2, True), "2x2": (2, 2, False)}
 QUICK_SEEDS += [s for s in range(300, 400) if s not in QUICK_SEEDS][
     : max(0, 16 - len(QUICK_SEEDS))
 ]
@@ -63,7 +64,12 @@ def _explain(spec, res) -> str:
     lines = [
         f"seed {spec.seed} key {res.key}: {res.status}",
         f"source: {res.source}",
-        f"rerun: python scripts/fuzz_warpdrive.py runtime --seeds {spec.seed}",
+        f"rerun: python scripts/fuzz_warpdrive.py runtime --seeds {spec.seed}"
+        + (
+            f" --cluster {'x'.join(map(str, spec.cluster[:2]))}{'p' * spec.pair}"
+            if spec.cluster
+            else ""
+        ),
         *res.failures[:20],
         res.detail[-3000:],
     ]
@@ -76,6 +82,25 @@ def test_generated_kernel_matches_model(requires_blackwell, tmp_path_factory, se
     work item reaches each placed role once with identical per-CTA sequences; launches are
     bitwise repeatable for deterministic schedules; nothing hangs."""
     spec = gen.generate(seed)
+    res = runtime.run_isolated(spec, tmp_path_factory.getbasetemp() / "wdfuzz", CASE_TIMEOUT)
+    assert res.status == runtime.PASS, _explain(spec, res)
+
+
+CLUSTER_SEEDS = [
+    (name, seed)
+    for name, shape in CLUSTERS.items()
+    for seed in _covering_seeds(range(100), 4 if shape[2] else 2, cluster=shape)
+]
+
+
+@pytest.mark.parametrize("cluster,seed", CLUSTER_SEEDS)
+def test_generated_cluster_kernel_matches_model(
+    requires_blackwell, tmp_path_factory, cluster, seed
+):
+    """The same model on clusters of two MMA pairs (and four CTAs without pairs): roles in all,
+    leader or rank-0 CTAs, channels scoped to each pair or the whole cluster, and the rank-0
+    scheduler publishing to all four CTAs."""
+    spec = gen.generate(seed, cluster=CLUSTERS[cluster])
     res = runtime.run_isolated(spec, tmp_path_factory.getbasetemp() / "wdfuzz", CASE_TIMEOUT)
     assert res.status == runtime.PASS, _explain(spec, res)
 
@@ -121,9 +146,10 @@ def test_launch_grid_matches_contract():
     failures = []
     for _ in range(400):
         stream = sched.random_stream(rng)
-        failures += sched.check_grid(stream, 1) + sched.check_grid(stream, 2)
+        for cluster in (1, 2, *CLUSTERS.values(), (4, 1, True), (2, 4, False)):
+            failures += sched.check_grid(stream, cluster)
     for space in sched.grid_boundary_spaces():
-        for cs in (1, 2):
+        for cs in (1, 2, 4, 8):
             failures += sched.check_tile_grid_dims(space, cs)
     assert not failures, failures[:5]
 
@@ -136,6 +162,18 @@ def test_declared_scopes_match_independent_model(tmp_path_factory, chunk):
     failures = []
     for seed in range(chunk * 40, chunk * 40 + 40):
         spec = gen.generate(seed)
+        failures += [f"seed {seed}: {f}" for f in sched.check_declared(spec, workdir).failures]
+    assert not failures, failures[:10]
+
+
+@pytest.mark.parametrize("cluster", [*CLUSTERS.values(), (4, 1, True), (2, 1, True)])
+def test_declared_cluster_scopes_match_independent_model(tmp_path_factory, cluster):
+    """The same recomputation on generated cluster kernels: per-rank counts, per-pair and
+    whole-cluster targets, per-rank commit masks, and the rank-0 scheduler's ring."""
+    workdir = tmp_path_factory.getbasetemp() / "wdfuzz_decl"
+    failures = []
+    for seed in range(40):
+        spec = gen.generate(seed, cluster=cluster)
         failures += [f"seed {seed}: {f}" for f in sched.check_declared(spec, workdir).failures]
     assert not failures, failures[:10]
 

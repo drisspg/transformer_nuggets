@@ -18,10 +18,13 @@ Validity (the contract's "valid managed program", section 1) is by construction:
   ``i`` of a role waits only on upstream publications of iteration ``i`` and on downstream
   releases of iterations ``<= i - 1``.
 * ``Threads`` sides are executed by every thread of every bound instance; ``Tma``/``Umma`` sides
-  belong to one single-warp, single-instance role (leader-only in a pair).
+  belong to one single-warp, single-instance role (leader-placed in a cluster of MMA pairs).
 * Payloads only ride on CTA-local channels with ``Threads`` or ``Tma`` producers and ``Threads``
-  consumers; ``Umma`` and pair-scoped channels are tokens (counts only). TMA stages read by
+  consumers; ``Umma`` and cross-CTA channels are tokens (counts only). TMA stages read by
   threads declare ``release_fence="smem_async"`` (the U4 user obligation).
+* In a ``Cluster`` roles run in every CTA, the pair leaders or rank 0; cross-CTA channels and
+  multicast TMA stay within the layer's derivable placements (R11), so each CTA runs the same
+  per-iteration program and the argument above holds across CTAs.
 * With a ``WorkStream`` every role drains it (``while work.valid: ...; work.advance()``) and
   runs ``rounds(item)`` iterations per item, computed identically by every role.
 """
@@ -48,12 +51,69 @@ BOUND = -1
 
 
 @dataclass(frozen=True)
+class Geometry:
+    """Cluster geometry from the contract (R11), independent of ``warpdrive.cluster``: rank
+    ``r = v + V * (mi + (m // V) * ni)`` with ``V = 2`` CTAs per MMA pair (1 without pairs)."""
+
+    m: int
+    n: int
+    pair: bool
+
+    @property
+    def size(self) -> int:
+        return self.m * self.n
+
+    @property
+    def v(self) -> int:
+        return 2 if self.pair else 1
+
+    def coords(self, rank: int) -> tuple[int, int, int]:
+        pairs_m = self.m // self.v
+        return rank % self.v, rank // self.v % pairs_m, rank // self.v // pairs_m
+
+    def ctas(self, placement: str) -> tuple[int, ...]:
+        if placement == "rank0":
+            return (0,)
+        if placement == "leader":
+            return tuple(r for r in range(self.size) if r % self.v == 0)
+        return tuple(range(self.size))
+
+    def group(self, rank: int) -> tuple[int, ...]:
+        return tuple(r for r in range(self.size) if r // self.v == rank // self.v)
+
+    def reach(self, rank: int, modes: tuple[str, ...]) -> tuple[int, ...]:
+        """``rank`` and every CTA differing from it only along one of ``modes``."""
+        v, mi, ni = self.coords(rank)
+        out = {rank}
+        for r in range(self.size):
+            rv, rm, rn = self.coords(r)
+            if rv == v and (("m" in modes and rn == ni) or ("n" in modes and rm == mi)):
+                out.add(r)
+        return tuple(sorted(out))
+
+    def emit(self) -> str | None:
+        if self.size == 1:
+            return None
+        return f"Cluster({self.m}, {self.n}, pair={self.pair})"
+
+    def key(self) -> str:
+        return f"m{self.m}n{self.n}" + ("_pairs" if self.pair else "")
+
+
+def parse_cluster(text: str) -> tuple[int, int, bool]:
+    """``"2x2p"`` -> ``(2, 2, True)``; a trailing ``p`` declares MMA pairs."""
+    pair = text.endswith("p")
+    m, n = (int(x) for x in text.removesuffix("p").split("x"))
+    return m, n, pair
+
+
+@dataclass(frozen=True)
 class RoleSpec:
     name: str
     warps: tuple[int, ...]  # first warp of each instance
     width: int  # warps per instance
     regs: int | None
-    cta: str  # "all" | "leader"
+    cta: str  # "all" | "leader" | "rank0"
     jitter: int  # spin scale in cycles (0: none)
     tmem: bool
     # Per-iteration handle program: ("o" | "c", channel, side, key) in execution order.
@@ -87,6 +147,8 @@ class ChannelSpec:
     payload: bool = False
     tma_rows: int = 0
     tma_pair: bool = False  # pair-scoped: both CTAs copy, CtaGroup.TWO, leader-only consumers
+    # Tma(multicast=mode): each CTA copies its part of the tile into every CTA along the mode.
+    multicast: str = ""
     commit_fence: str | None = None
     release_fence: str | None = None
     remote_scope: str | None = None
@@ -169,16 +231,39 @@ class KernelSpec:
     # arguments, so one binary must serve them all.
     variants: tuple[tuple[tuple[int, int, int], int, int], ...] = ()
     graph: bool = False  # also capture one launch in a CUDA graph and replay it twice
+    # (m, n, pair) of a declared ``Cluster``; () is the legacy shape: ``CtaPair()`` when
+    # ``pair``, else a single CTA. ``pair`` always says whether the cluster has MMA pairs.
+    cluster: tuple = ()
+
+    @property
+    def shape(self) -> tuple[int, int, bool]:
+        if self.cluster:
+            return tuple(self.cluster)
+        return (2, 1, True) if self.pair else (1, 1, False)
+
+    @property
+    def geom(self) -> Geometry:
+        return Geometry(*self.shape)
 
     @property
     def cs(self) -> int:
-        return 2 if self.pair else 1
+        return self.geom.size
 
     def role(self, name: str) -> RoleSpec:
         return next(r for r in self.roles if r.name == name)
 
+    def ctas(self, rname: str) -> tuple[int, ...]:
+        """Ranks role ``rname`` runs in."""
+        return self.geom.ctas(self.role(rname).cta)
+
     def key(self) -> str:
-        blob = json.dumps(asdict(self), sort_keys=True).encode()
+        d = asdict(self)
+        if not d["cluster"]:  # legacy specs keep their keys (kernel names, cached builds)
+            del d["cluster"]
+        for ch in d["channels"]:
+            if not ch["multicast"]:
+                del ch["multicast"]
+        blob = json.dumps(d, sort_keys=True).encode()
         return hashlib.sha1(blob).hexdigest()[:12]
 
     def to_json(self) -> str:
@@ -209,11 +294,8 @@ def spec_from_dict(d: dict) -> KernelSpec:
 
 
 def is_local(spec: KernelSpec, ch: ChannelSpec) -> bool:
-    """CTA-local per the contract (R11): single CTA, or every participant has one placement."""
-    if not spec.pair:
-        return True
-    ctas = {spec.role(r).cta for r, _ in (*ch.producers, *ch.consumers)}
-    return len(ctas) == 1
+    """CTA-local per the contract (R11): every participant runs in the same CTAs."""
+    return len({spec.ctas(r) for r, _ in (*ch.producers, *ch.consumers)}) == 1
 
 
 def payload_offsets(spec: KernelSpec, ch: ChannelSpec) -> tuple[dict, int]:
@@ -401,16 +483,38 @@ def _laminar(rng: random.Random, events: list) -> list[Key]:
     return sorted(chosen)
 
 
+def _placement(rng: random.Random, pair: bool, cluster: tuple) -> str:
+    if not cluster:  # legacy draws: seeds keep their specs
+        return "leader" if pair and rng.random() < 0.35 else "all"
+    if cluster[0] * cluster[1] == 1:
+        return "all"
+    x = rng.random()
+    return "leader" if x < 0.3 else "rank0" if x < 0.45 else "all"
+
+
 def generate(
-    seed: int, *, pair: bool | None = None, stream: bool | None = None, empty: bool = False
+    seed: int,
+    *,
+    pair: bool | None = None,
+    stream: bool | None = None,
+    empty: bool = False,
+    cluster: tuple[int, int, bool] | None = None,
 ) -> KernelSpec:
     """A random valid kernel. ``pair``/``stream`` force those knobs; otherwise random.
+    ``cluster=(m, n, pair)`` declares ``Cluster(m, n, pair=pair)`` (overriding ``pair``) and
+    draws placements among ``all``, ``leader`` and ``rank0``; without it the kernel is a single
+    CTA or a ``CtaPair``.
     ``empty``: the zero-work boundary corpus (a WorkStream whose space has a zero extent; the
     contract treats it separately from the nonempty corpus, G6)."""
     if empty:
         stream = True
     rng = random.Random(seed)
-    pair = rng.random() < 0.3 if pair is None else pair
+    cluster = tuple(cluster) if cluster is not None else ()
+    if cluster:
+        pair = cluster[2]
+    else:
+        pair = rng.random() < 0.3 if pair is None else pair
+    geom = Geometry(*cluster) if cluster else Geometry(2 if pair else 1, 1, pair)
     use_stream = rng.random() < 0.6 if stream is None else stream
     nroles = rng.randint(2, 6)
     roles = []
@@ -421,7 +525,7 @@ def generate(
                 "name": f"r{i}",
                 "width": width,
                 "instances": rng.choice([1, 1, 1, 2, 3]) if width <= 2 else 1,
-                "cta": "leader" if pair and rng.random() < 0.35 else "all",
+                "cta": _placement(rng, pair, cluster),
                 "jitter": rng.choice([0, 0, 0, 40, 400, 3000]),
                 "tmem": False,
                 "regs": None,
@@ -493,32 +597,53 @@ def generate(
             }
         )
 
-    # Pair placement rules: tcgen05.commit sides are leader-only; TMA only CTA-local.
-    if pair:
-        for ch in channels:
-            for side in ("producers", "consumers"):
-                mech = ch["producer" if side == "producers" else "consumer"]
-                if mech == "umma":
-                    for rname, _ in ch[side]:
+    # Cluster placement rules: with MMA pairs tcgen05.commit sides run in leaders; TMA is
+    # CTA-local, or 2-CTA (producers in every CTA, consumers in exactly the leaders).
+    def placed_ctas(side):
+        return {geom.ctas(roles[int(r[1:])]["cta"]) for r, _ in side}
+
+    everyone, leaders = geom.ctas("all"), geom.ctas("leader")
+    if geom.size > 1:
+        if pair:
+            for ch in channels:
+                for side in ("producers", "consumers"):
+                    mech = ch["producer" if side == "producers" else "consumer"]
+                    if mech == "umma":
+                        for rname, _ in ch[side]:
+                            if roles[int(rname[1:])]["cta"] == "all":
+                                roles[int(rname[1:])]["cta"] = "leader"
+            for ch in channels:  # promote some TMA consumers so the channel becomes pair-scoped
+                if (
+                    ch["producer"] == "tma"
+                    and placed_ctas(ch["producers"]) == {everyone}
+                    and rng.random() < 0.4
+                ):
+                    for rname, _ in ch["consumers"]:
                         roles[int(rname[1:])]["cta"] = "leader"
-        for ch in channels:  # promote some TMA consumers so the channel becomes pair-scoped
-            prod = {roles[int(r[1:])]["cta"] for r, _ in ch["producers"]}
-            if ch["producer"] == "tma" and prod == {"all"} and rng.random() < 0.4:
-                for rname, _ in ch["consumers"]:
-                    roles[int(rname[1:])]["cta"] = "leader"
+            # A rank-0 tcgen05.commit side can only serve rank 0's pair: the other side's
+            # MMA pairs each need their own leader. Promote until stable.
+            changed = True
+            while changed:
+                changed = False
+                for ch in channels:
+                    for side, other in (("producers", "consumers"), ("consumers", "producers")):
+                        if ch["producer" if side == "producers" else "consumer"] != "umma":
+                            continue
+                        served = {geom.group(c)[0] for cs in placed_ctas(ch[other]) for c in cs}
+                        for rname, _ in ch[side]:
+                            r = roles[int(rname[1:])]
+                            if r["cta"] == "rank0" and served - {0}:
+                                r["cta"], changed = "leader", True
         for ch in channels:
             if ch["producer"] == "tma":
-                prod = {roles[int(r[1:])]["cta"] for r, _ in ch["producers"]}
-                cons = {roles[int(r[1:])]["cta"] for r, _ in ch["consumers"]}
-                if prod == {"all"} and cons == {"leader"} and rng.random() < 0.7:
-                    ch["tma_pair"] = True  # both CTAs' bytes complete on the leader (R11)
+                prod, cons = placed_ctas(ch["producers"]), placed_ctas(ch["consumers"])
+                if pair and prod == {everyone} and cons == {leaders} and rng.random() < 0.7:
+                    ch["tma_pair"] = True  # each pair's bytes complete on its leader (R11)
                 elif len(prod | cons) > 1:
                     ch["producer"] = "threads"
     spec_roles = {r["name"]: r for r in roles}
     for ch in channels:
-        local = not pair or (
-            len({spec_roles[r]["cta"] for r, _ in (*ch["producers"], *ch["consumers"])}) == 1
-        )
+        local = len(placed_ctas((*ch["producers"], *ch["consumers"]))) == 1
         if ch["producer"] == "tma":
             ch["tma_rows"] = rng.choice([1, 2, 4, 8])
             ch["release_fence"] = "smem_async"
@@ -536,6 +661,20 @@ def generate(
             )
             if width > 512:
                 ch["payload"] = False
+    if cluster:  # multicast TMA along a mode with more than one CTA (never with rank0 roles)
+        modes = [m for m in "mn" if len(geom.reach(0, (m,))) > 1]
+        for ch in channels:
+            side = (*ch["producers"], *ch["consumers"])
+            if ch["producer"] != "tma" or not modes:
+                continue
+            if any(roles[int(r[1:])]["cta"] == "rank0" for r, _ in side):
+                continue
+            if len(placed_ctas(side)) > 1 and not ch["tma_pair"]:
+                continue
+            if rng.random() < 0.6:
+                ch["multicast"] = rng.choice(modes)
+                # Each sharing CTA copies a slice of whole rows.
+                ch["tma_rows"] = max(ch["tma_rows"], len(geom.reach(0, (ch["multicast"],))))
 
     # TMEM: a plan and a few roles that take the view (alloc/free/teardown barrier counts).
     tmem_regions = ()
@@ -550,8 +689,8 @@ def generate(
         users = rng.sample(range(nroles), rng.randint(1, nroles))
         for i in users:
             roles[i]["tmem"] = True
-        # E39: a pair allocates TMEM from a role that runs in both CTAs.
-        if pair and all(roles[i]["cta"] == "leader" for i in users):
+        # E39: a cluster allocates TMEM from a role that runs in every CTA.
+        if geom.size > 1 and not any(roles[i]["cta"] == "all" for i in users):
             everywhere = [r for r in roles if r["cta"] == "all"]
             if everywhere:
                 rng.choice(everywhere)["tmem"] = True
@@ -565,7 +704,9 @@ def generate(
 
     _place(rng, roles)
     if max(f + r["width"] for r in roles for f in r["warps"]) > 24:
-        return generate(seed + 1_000_003, pair=pair, stream=stream, empty=empty)
+        return generate(
+            seed + 1_000_003, pair=pair, stream=stream, empty=empty, cluster=cluster or None
+        )
 
     stream_spec = None
     if use_stream:
@@ -674,7 +815,7 @@ def generate(
         units = 1
         s = stream_spec
         if s.schedule in ("static", "atomic"):
-            grid_rows = max(1, min(s.total, max(s.max_ctas // (2 if pair else 1), 1)))
+            grid_rows = max(1, min(s.total, max(s.max_ctas // geom.size, 1)))
         else:
             grid_rows = max(s.total, 1)
     big_grid = grid_rows > 4096
@@ -702,6 +843,7 @@ def generate(
     return KernelSpec(
         seed=seed,
         pair=pair,
+        cluster=cluster,
         roles=tuple(
             RoleSpec(
                 name=r["name"],
@@ -875,9 +1017,10 @@ def _emit_body(src: _Src, spec: KernelSpec, r: RoleSpec, extra: bool):
                     f"{c.salt})"
                 )
             elif c.producer == "tma":
+                mcast = f", mcast_mask=ctx.mc_{ch}" if c.multicast else ""
                 src(
                     f"cute.copy(ctx.tma_{ch}, ctx.tg_{ch}[None, {e} % {c.tma_tiles}], "
-                    f"ctx.ts_{ch}[None, {h}.index], tma_bar_ptr={h}.barrier)"
+                    f"ctx.ts_{ch}[None, {h}.index], tma_bar_ptr={h}.barrier{mcast})"
                 )
         else:
             offs = tuple(lay.cons[(ch, r.name, i)] for i in range(r.instances))
@@ -967,7 +1110,7 @@ def _emit_body(src: _Src, spec: KernelSpec, r: RoleSpec, extra: bool):
 def _emit_role(src: _Src, spec: KernelSpec, r: RoleSpec):
     lay = Layout.of(spec)
     regs = "" if r.regs is None else f", regs={r.regs}"
-    cta = "" if r.cta == "all" else ', cta="leader"'
+    cta = "" if r.cta == "all" else f', cta="{r.cta}"'
     warps = f"[{', '.join(f'range({w}, {w + r.width})' for w in r.warps)}]"
     src(f"@role(warps={warps}{regs}{cta})")
     src("@cute.jit")
@@ -1061,6 +1204,7 @@ def emit(spec: KernelSpec) -> str:
     src("from test.warpdrive_fuzz import runtime_device as D")
     src("from transformer_nuggets.cute.warpdrive import (")
     for name in (
+        "Cluster",
         "ClusterLaunchControl",
         "Consumer",
         "CtaPair",
@@ -1108,11 +1252,15 @@ def emit(spec: KernelSpec) -> str:
     src()
     src.block(f"class {class_name(spec)}(WarpSpecialized):")
     src.block("def __init__(self):")
-    if spec.pair:
+    if spec.cluster:
+        if spec.geom.emit():
+            src(f"self.cluster = {spec.geom.emit()}")
+    elif spec.pair:
         src("self.cluster = CtaPair()")
     for ch in spec.channels:
         cls = "Ring" if ch.kind == "ring" else "Slots"
-        prod = f"Tma({ch.tma_bytes})" if ch.producer == "tma" else _MECH[ch.producer]
+        mcast = f', multicast="{ch.multicast}"' if ch.multicast else ""
+        prod = f"Tma({ch.tma_bytes}{mcast})" if ch.producer == "tma" else _MECH[ch.producer]
         args = [str(ch.n), prod, _MECH[ch.consumer]]
         if ch.payload:
             _, width = payload_offsets(spec, ch)
@@ -1165,8 +1313,13 @@ def emit(spec: KernelSpec) -> str:
             f"s_{c} = smem.allocate_tensor(Int32, cute.make_ordered_layout(({ch.tma_rows}, "
             f"{TMA_COLS}, {ch.n}), order=(1, 0, 2)), 128)"
         )
+        coord, layout = "0", "cute.make_layout(1)"
+        if ch.multicast:
+            src(f'mc_{c} = self.cluster.multicast("{ch.multicast}")')
+            coord, layout = f"mc_{c}.coord", f"mc_{c}.layout"
+            ctx.append(f"mc_{c}=mc_{c}.mask")
         src(
-            f"ts_{c}, tgp_{c} = cpasync.tma_partition(tma_{c}, 0, cute.make_layout(1), "
+            f"ts_{c}, tgp_{c} = cpasync.tma_partition(tma_{c}, {coord}, {layout}, "
             f"cute.group_modes(s_{c}, 0, 2), cute.group_modes(tg_{c}, 0, 2))"
         )
         ctx += [f"tma_{c}=tma_{c}", f"tg_{c}=tgp_{c}", f"ts_{c}=ts_{c}", f"s_{c}=s_{c}"]
@@ -1198,10 +1351,14 @@ def emit(spec: KernelSpec) -> str:
             "order=(1, 0, 2))"
         )
         group = "TWO" if ch.tma_pair else "ONE"
+        op, sharing = "CopyBulkTensorTileG2SOp", ""
+        if ch.multicast:
+            op = "CopyBulkTensorTileG2SMulticastOp"
+            sharing = f", num_multicast={len(spec.geom.reach(0, (ch.multicast,)))}"
         src(
-            f"tma_{c}, tgt_{c} = cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileG2SOp("
+            f"tma_{c}, tgt_{c} = cpasync.make_tiled_tma_atom(cpasync.{op}("
             f"tcgen05.CtaGroup.{group}), src_{c}, cute.select(layout_{c}, mode=[0, 1]), "
-            f"({ch.tma_rows}, {TMA_COLS}))"
+            f"({ch.tma_rows}, {TMA_COLS}){sharing})"
         )
         src(f"tiles_{c} = cute.local_tile(tgt_{c}, ({ch.tma_rows}, {TMA_COLS}), (None, 0))")
         launch_args += [f"tma_{c}", f"tiles_{c}"]
@@ -1220,7 +1377,8 @@ def emit(spec: KernelSpec) -> str:
 
 def features(spec: KernelSpec) -> set[str]:
     """Knob classes a spec exercises (for campaign coverage summaries)."""
-    out = {"pair" if spec.pair else "single", f"roles{len(spec.roles)}"}
+    out = {f"roles{len(spec.roles)}"}
+    out.add(f"cluster_{spec.geom.key()}" if spec.cluster else "pair" if spec.pair else "single")
     s = spec.stream
     out.add(f"schedule_{s.schedule}" if s else "no_stream")
     if s is not None:
@@ -1259,6 +1417,8 @@ def features(spec: KernelSpec) -> set[str]:
         out.add("instances")
     if any(r.cta == "leader" for r in spec.roles):
         out.add("leader_roles")
+    if any(r.cta == "rank0" for r in spec.roles):
+        out.add("rank0_roles")
     if any(r.with_handles for r in spec.roles):
         out.add("with_blocks")
     for ch in spec.channels:
@@ -1272,12 +1432,14 @@ def features(spec: KernelSpec) -> set[str]:
             out.add("join")
         if any(b for _, b in (*ch.producers, *ch.consumers)):
             out.add("bound_slots")
-        if spec.pair and not is_local(spec, ch):
+        if spec.cs > 1 and not is_local(spec, ch):
             out.add("pair_scoped")
         if ch.payload:
             out.add("payload")
         if ch.tma_pair:
             out.add("tma_pair")
+        if ch.multicast:
+            out.add("tma_multicast")
         if ch.kind == "slots" and ch.n > 4:
             out.add("slots_many")
     return out
