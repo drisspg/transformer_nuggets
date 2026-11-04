@@ -56,6 +56,7 @@ WARP_SIZE = 32
 WARPGROUP = 4
 REGS_PER_SM = 65536
 MIN_REGS = 24  # setmaxnreg floor: the budget of a warpgroup no role owns
+MAX_WARPS = 32  # CUDA's 1024-thread block limit
 # Named barrier ids owned by the layer; user code must not reuse them.
 TMEM_PTR_BARRIER_ID = 1
 TMEM_TEARDOWN_BARRIER_ID = 2
@@ -210,15 +211,30 @@ def role(warps, regs: int | None = None, cta: str = ALL, raw: bool = False):
     """
     if cta not in PLACEMENTS:
         raise ValueError(f"role cta must be one of {PLACEMENTS}, got {cta!r}")
-    if isinstance(warps, int):
+    if regs is not None and (
+        type(regs) is not int or not MIN_REGS <= regs <= 256 or regs % 8 != 0
+    ):
+        raise ValueError(
+            f"role regs must be None or an int multiple of 8 in [24, 256], got {regs!r}"
+        )
+    if type(warps) is int:
         ranges = [range(warps, warps + 1)]
     elif isinstance(warps, range):
         ranges = [warps]
     else:
-        ranges = list(warps)
+        try:
+            ranges = list(warps)
+        except TypeError as exc:
+            raise ValueError(
+                f"role warps must be an int, range, or list of ranges, got {warps!r}"
+            ) from exc
+    if not ranges:
+        raise ValueError(f"role warps must contain at least one range, got {warps!r}")
     for r in ranges:
         if not isinstance(r, range) or r.step != 1 or len(r) == 0:
             raise ValueError(f"role warps must be non-empty unit-step ranges, got {warps!r}")
+        if r.start < 0 or r.stop > MAX_WARPS:
+            raise ValueError(f"role warps must lie in [0, {MAX_WARPS}), got {warps!r}")
 
     def deco(fn):
         fn._warpdrive = (ranges, regs, cta, raw)
@@ -477,6 +493,8 @@ class WarpSpecialized:
             ch.scope = apply_overrides(ch, ch.derived_scope, cluster)
 
     def _validate(self, chans, turns, roles):
+        if not roles:
+            raise ValueError("warp-specialized kernels need at least one role")
         owner = {}
         for r in roles:
             for w in r.warps:
@@ -518,6 +536,8 @@ class WarpSpecialized:
         elif any(r.uses_tmem for r in roles):
             raise ProtocolError("roles take Tmem but the kernel has no tmem_plan")
         num_warps = max(owner) + 1
+        if min(owner) < 0 or num_warps > MAX_WARPS:
+            raise ValueError(f"role warps must lie in [0, {MAX_WARPS})")
         uses_regs = any(r.regs is not None for r in roles)
         # setmaxnreg is .aligned per warpgroup: pad to whole warpgroups and require every warp
         # of a warpgroup to request the same budget.

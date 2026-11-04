@@ -4,6 +4,7 @@ import pytest
 
 pytest.importorskip("cutlass.cute")
 
+from test.warpdrive_fuzz.static import collect_roles, declaration_role
 from transformer_nuggets.cute.warpdrive import (
     Barriers,
     ProtocolError,
@@ -67,3 +68,20 @@ def test_tmem_rejects_duplicate_names_before_plan_corruption():
 def test_tmem_unknown_alias_parent_is_protocol_error():
     with pytest.raises(ProtocolError, match="no TMEM region"):
         TmemPlan().alias("b", of="missing", offset=0, cols=16)
+
+
+@pytest.mark.parametrize("warps", [[], -1, 32, range(-1, 1), range(31, 33), True, 1.5, None])
+def test_role_rejects_warps_outside_cuda_block_domain(warps):
+    with pytest.raises(ValueError, match="role warps"):
+        declaration_role(warps)
+
+
+@pytest.mark.parametrize("regs", [0, 23, 25, 257, 24.0, True, "40"])
+def test_role_rejects_illegal_setmaxnreg_budget(regs):
+    with pytest.raises(ValueError, match="role regs"):
+        declaration_role(0, regs=regs)
+
+
+def test_kernel_without_roles_has_clear_declaration_error():
+    with pytest.raises(ValueError, match="at least one role"):
+        collect_roles({})
