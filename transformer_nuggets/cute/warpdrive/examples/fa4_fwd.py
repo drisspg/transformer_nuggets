@@ -514,10 +514,9 @@ class FlashAttentionForward(WarpSpecialized):
             # The unmasked x32 loads each return a row max alongside their scores.
             rMax = cute.make_rmem_tensor(((1, 1), *rS.shape[1:]), Float32)
             cute.copy(t.thr_ld, t.tStS, (rS, rMax))
-            hw_max = Float32(-Float32.inf)
-            for i in range(cute.size(rMax)):
-                hw_max = cute.arch.fmax(hw_max, rMax[i])
-            row_max, acc_scale = sm.update_row_max_precomputed(hw_max, is_first)
+            # Reuse the software updater on four maxima to preserve its fast exp2/FTZ
+            # rescale arithmetic; FA4's precomputed-max updater uses non-fast exp2.
+            row_max, acc_scale = sm.update_row_max(rMax.load(), is_first)
         else:
             cute.copy(t.thr_ld, t.tStS, rS)
             row_max, acc_scale = sm.update_row_max(rS.load(), is_first)
