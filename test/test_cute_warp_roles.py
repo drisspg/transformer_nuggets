@@ -258,6 +258,21 @@ def test_register_holes_take_their_warpgroup_budget():
     assert "padding          warps  1-3  regs=56" in HoleToy().describe()
 
 
+def test_register_budget_branches_are_warpgroup_uniform():
+    """setmaxnreg is .sync.aligned per warpgroup: the layer emits one adjustment per budget
+    under a warpgroup-uniform branch, so every warpgroup lands in exactly one branch and each
+    role (and hole) is dispatched inside its warpgroup's branch."""
+    kernel = HoleToy()
+    kernel.describe()
+    groups = kernel._ws_budget_groups
+    assert len({regs for regs, _, _ in groups}) == len(groups)
+    covered = sorted(g for _, wgs, _ in groups for g in wgs)
+    assert covered == list(range(kernel.num_warps // 4))
+    for _, wgs, role_ids in groups:
+        for i in role_ids:
+            assert {w // 4 for w in kernel._ws_roles[i].warps} <= set(wgs)
+
+
 def test_trace_time_wrong_slot(requires_blackwell):
     with pytest.raises(Exception, match=r"bound to slot 0, but acquire\(1\)"):
         compile_toy(BoundToy("wrong_slot"))

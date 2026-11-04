@@ -411,6 +411,8 @@ class WarpSpecialized:
         # (warps, regs) for each run of warps no role owns, holes included: they take their
         # warpgroup's budget (MIN_REGS for an all-idle warpgroup).
         self._ws_padding = []
+        # One budget per warpgroup, applied before role dispatch (see run_roles).
+        self._ws_wg_regs = []
         if uses_regs:
             regs_of = {w: r.regs for r in roles for w in r.warps}
             for g in range(self.num_warps // WARPGROUP):
@@ -420,6 +422,7 @@ class WarpSpecialized:
                 if len(vals) > 1:
                     raise ValueError(f"warpgroup {g} has mixed register budgets {budgets}")
                 regs = vals.pop() if vals else MIN_REGS
+                self._ws_wg_regs.append(regs)
                 idle = [w for w in group if w not in owner]
                 self._ws_padding += [(run, regs) for run in _runs(idle)]
             total = sum(
@@ -428,6 +431,26 @@ class WarpSpecialized:
             )
             if total > REGS_PER_SM:
                 raise ValueError(f"register budgets need {total} > {REGS_PER_SM}")
+        # (regs, warpgroups, role indices): one dispatch branch per register budget.
+        wg_of = [w // WARPGROUP for w in range(self.num_warps)]
+        if self._ws_wg_regs:
+            budgets = list(dict.fromkeys(self._ws_wg_regs))
+            self._ws_budget_groups = [
+                (
+                    b,
+                    tuple(g for g, regs in enumerate(self._ws_wg_regs) if regs == b),
+                    tuple(
+                        i
+                        for i, r in enumerate(roles)
+                        if self._ws_wg_regs[wg_of[r.first_warp]] == b
+                    ),
+                )
+                for b in budgets
+            ]
+        else:
+            self._ws_budget_groups = [
+                (None, tuple(range(-(-self.num_warps // WARPGROUP))), tuple(range(len(roles))))
+            ]
 
     @property
     def num_threads(self) -> int:
@@ -631,24 +654,14 @@ class WarpSpecialized:
             sum(r.num_threads for r in roles if r.uses_tmem),
             sum(r.num_threads for r in roles if r.uses_tmem and r.cta == ALL),
         )
-        for i in cutlass.range_constexpr(len(roles)):
-            r = roles[i]
-            # Only a call on `self` inside the dynamic `if`: an assignment through `self`
-            # would make the preprocessor carry `self` as an if-result.
-            if cutlass.const_expr(pair and r.cta == LEADER):
-                if _in_warps(warp_idx, r.first_warp, r.num_warps) & (rank == 0):
-                    self._dispatch(r, ctx, tmem_threads)
-                # setmaxnreg is per warpgroup: the peer's idle warps take the same budget.
-                if _in_warps(warp_idx, r.first_warp, r.num_warps) & (rank != 0):
-                    self._set_regs(r.regs)
-            else:
-                if _in_warps(warp_idx, r.first_warp, r.num_warps):
-                    self._dispatch(r, ctx, tmem_threads)
-        padding = [(w, regs) for w, regs in self._ws_padding if regs is not None]
-        for i in cutlass.range_constexpr(len(padding)):
-            warps, regs = padding[i]
-            if _in_warps(warp_idx, warps.start, len(warps)):
-                self._set_regs(regs)
+        # setmaxnreg is .sync.aligned over a warpgroup: every warp of a group must execute the
+        # same instruction. Branch once per register budget on a warpgroup-uniform condition,
+        # adjust there, then split into roles inside that branch (as CUTLASS does), so ptxas
+        # still allocates each role's code under its budget.
+        groups = self._ws_budget_groups
+        for gi in cutlass.range_constexpr(len(groups)):
+            if _in_warpgroups(warp_idx, groups[gi][1]):
+                self._dispatch_group(groups[gi], ctx, tmem_threads, warp_idx, rank)
         if cutlass.const_expr(pair):
             # Remote arrivals into a CTA must land before it exits: every thread-issued remote
             # arrive precedes its thread's cluster arrive (release), and producers whose stages
@@ -656,9 +669,24 @@ class WarpSpecialized:
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
 
+    @cute.jit
+    def _dispatch_group(self, group, ctx, tmem_threads, warp_idx, rank):
+        regs, _, role_ids = group
+        self._set_regs(regs)
+        pair = self.cluster.size > 1
+        for i in cutlass.range_constexpr(len(role_ids)):
+            r = self._ws_roles[role_ids[i]]
+            # Only a call on `self` inside the dynamic `if`: an assignment through `self`
+            # would make the preprocessor carry `self` as an if-result.
+            if cutlass.const_expr(pair and r.cta == LEADER):
+                if _in_warps(warp_idx, r.first_warp, r.num_warps) & (rank == 0):
+                    self._dispatch(r, ctx, tmem_threads)
+            else:
+                if _in_warps(warp_idx, r.first_warp, r.num_warps):
+                    self._dispatch(r, ctx, tmem_threads)
+
     def _dispatch(self, r: RoleInstance, ctx, tmem_threads: tuple[int, int]):
         # Plain Python (no dynamic control flow): runs at trace time inside the role's `if`.
-        self._set_regs(r.regs)
         trace = RoleTrace(r.name, self._ws_log)
         args = self._role_args(r, ctx, trace)
         if trace.tails:
@@ -821,6 +849,15 @@ def _runs(warps: list[int]) -> list[range]:
         else:
             runs.append(range(w, w + 1))
     return runs
+
+
+def _in_warpgroups(warp_idx, groups: tuple[int, ...]):
+    """Warpgroup-uniform predicate: does ``warp_idx`` fall in one of ``groups``?"""
+    cond = None
+    for run in _runs(list(groups)):
+        term = _in_warps(warp_idx, run.start * WARPGROUP, len(run) * WARPGROUP)
+        cond = term if cond is None else cond | term
+    return cond
 
 
 def _in_warps(warp_idx, first: int, count: int):
