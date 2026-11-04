@@ -90,19 +90,100 @@ class TmemPlan:
         return "\n".join(lines)
 
 
+TMEM_AGENTS = ("threads", "umma")
+
+
 class TmemView:
-    """Device-side TMEM base pointer plus the plan; records which regions each role touches."""
+    """Device-side TMEM base pointer plus the plan; records which regions each role touches.
 
-    def __init__(self, base, plan: TmemPlan, role_name: str, log: ProtocolLog | None):
-        self.base, self._plan, self._role, self._log = base, plan, role_name, log
+    ``ptr``/``cols``/``base`` are unannotated acquisitions. ``view``/``access`` annotate an access
+    for the alias diagnostic (``alias.py``) at the point of the call: ``by="threads"``
+    (``tcgen05.ld``/``st``) or ``by="umma"`` (a ``tcgen05.mma`` A-operand read or D write).
+    Footprint: ``warps`` (default every warp of the role), ``lanes`` and ``cols`` (ranges, or
+    callables of the warp index; ``cols`` relative to the region). Defaults: a thread access
+    covers its warp's 32-lane subpartition (``32 * (warp % 4)``), an MMA all 128 lanes, and both
+    the whole region."""
 
-    def cols(self, name: str, slot: int = 0) -> int:
-        """Column offset of ``name[slot]`` relative to the allocation base."""
+    def __init__(self, base, plan: TmemPlan, role_name: str, log: ProtocolLog | None, trace=None):
+        self._base, self._plan, self._role, self._log = base, plan, role_name, log
+        self._trace = trace
+
+    # The preprocessor carries a local name that a loop body calls a method on. The view is
+    # defined once per role and never rebound, so it carries nothing and rebuilds as itself.
+    def __extract_mlir_values__(self):
+        return []
+
+    def __new_from_mlir_values__(self, values):
+        return self
+
+    @property
+    def base(self):
+        """The allocation's FP32 base pointer (an unannotated acquisition of every region)."""
+        if self._trace is not None:
+            for name in self._plan.regions:
+                self._trace.event("raw", storage=("tmem", name))
+        return self._base
+
+    def _col(self, name: str, slot: int) -> int:
         col = self._plan.col(name, slot)
         if self._log is not None:
             self._log.tmem.setdefault(self._role, set()).add(f"{name}[{slot}]")
         return col
 
+    def cols(self, name: str, slot: int = 0) -> int:
+        """Column offset of ``name[slot]`` relative to the allocation base."""
+        col = self._col(name, slot)
+        if self._trace is not None:
+            self._trace.event("raw", storage=("tmem", name))
+        return col
+
     def ptr(self, name: str, slot: int = 0):
         """FP32 TMEM pointer to ``name[slot]``."""
-        return self.base + self.cols(name, slot)
+        return self._base + self.cols(name, slot)
+
+    def view(self, name: str, slot: int = 0, **access):
+        """FP32 TMEM pointer to ``name[slot]``, annotating an access here (see ``access``)."""
+        self.access(name, slot, **access)
+        return self._base + self._col(name, slot)
+
+    def access(
+        self,
+        name: str,
+        slot: int = 0,
+        *,
+        read: bool = False,
+        write: bool = False,
+        by: str = "threads",
+        warps=None,
+        lanes=None,
+        cols=None,
+    ):
+        """Annotate an access to ``name[slot]`` here, through a tensor built earlier. No IR."""
+        if not (read or write):
+            raise ValueError("a TMEM access needs read=True and/or write=True")
+        if by not in TMEM_AGENTS:
+            raise ValueError(f"TMEM access agent must be one of {TMEM_AGENTS}, got {by!r}")
+        for what, value in (("lanes", lanes), ("cols", cols)):
+            if value is not None and not (isinstance(value, range) or callable(value)):
+                raise ValueError(f"TMEM access {what} must be a range or a callable of the warp")
+        if warps is not None:
+            warps = tuple(warps)
+            if not warps or any(type(w) is not int for w in warps):
+                raise ValueError(f"TMEM access warps must be ints, got {warps!r}")
+        self._col(name, slot)  # validates the region and slot
+        width = self._plan.regions[name].cols
+        for what, value, limit in (("lanes", lanes, 128), ("cols", cols, width)):
+            if isinstance(value, range) and (value.start < 0 or value.stop > limit):
+                raise ValueError(f"TMEM access {what} {value} leaves {name} ([0, {limit}))")
+        if self._trace is not None:
+            self._trace.event(
+                "access",
+                storage=("tmem", name),
+                slot=slot,
+                read=read,
+                write=write,
+                agent=by,
+                warps=warps,
+                lanes=lanes,
+                cols=cols,
+            )

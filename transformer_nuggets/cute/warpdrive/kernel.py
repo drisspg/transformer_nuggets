@@ -14,6 +14,7 @@ import cutlass
 from cutlass import Int32, cute, memory, pipeline
 from cutlass._mlir.dialects import nvvm
 
+from transformer_nuggets.cute.warpdrive import alias
 from transformer_nuggets.cute.warpdrive.channels import (
     Barriers,
     Channel,
@@ -41,6 +42,7 @@ from transformer_nuggets.cute.warpdrive.protocol import (
     ProtocolLog,
     RoleTrace,
     take_opt_outs,
+    tracing_role,
 )
 from transformer_nuggets.cute.warpdrive.scheduling import (
     WorkCursor,
@@ -307,6 +309,9 @@ class WarpSpecialized:
 
     tmem_plan: TmemPlan | None = None
     smem_plan: SmemPlan | None = None  # SMEM buffers channels bind with buffer= (storage.py)
+    # Alias diagnostic (alias.py): "warn" (describe() plus one warning on findings), "strict"
+    # (raise on a potential hazard), or "off". Host-only; it never changes the generated code.
+    alias_check: str = "warn"
     trace_protocol: bool = False
     iket: bool = False  # emit IKET ranges named after roles and channels (tracing.py)
     iket_waits: bool = True  # with iket: also a range around every blocking channel wait
@@ -465,6 +470,7 @@ class WarpSpecialized:
         self._ws_streams = streams
         self._ws_tma = {}  # channel name -> tma.TmaReport, filled while tracing
         self._ws_smem = {}  # SmemPlan buffer name -> storage.ResolvedBuffer, after begin_roles
+        self._ws_alias = None  # alias.AliasReport, after a trace
         self._ws_opt_outs = []
         self._ws_log = ProtocolLog() if self.trace_protocol else None
 
@@ -709,6 +715,7 @@ class WarpSpecialized:
             self.cluster.get_key(),
             self.iket_key(),
             self.trace_key(),
+            self.alias_check,  # a cached kernel skips the trace-time diagnostic (strict too)
         )
 
     def enable_iket(self, enabled: bool = True, *, waits: bool = True):
@@ -819,6 +826,7 @@ class WarpSpecialized:
         for problem in problems.values():
             problem.start()  # per-CTA start values, computed once ahead of role dispatch
         self._ws_tma = {}
+        self._ws_alias_roles = []  # alias.RoleEvents of every dispatched role
         self._ws_uses = {}  # (role, channel) -> acquires/waits per work item (0: inner loop)
         take_opt_outs()  # drop opt-outs left over from an earlier, failed trace
         smem = memory.SmemAllocator()
@@ -989,8 +997,15 @@ class WarpSpecialized:
         return ctx
 
     def _finish_trace(self):
-        """Collect check opt-outs; warn once about TMA channels the check could not verify."""
+        """Collect check opt-outs; warn once about TMA channels the check could not verify; run
+        the alias diagnostic."""
         self._ws_opt_outs = take_opt_outs()
+        self._ws_alias = None
+        if self.alias_check not in alias.MODES:
+            raise ValueError(f"alias_check must be one of {alias.MODES}, got {self.alias_check!r}")
+        if self.alias_check != "off":
+            self._ws_alias = alias.check(self, self._ws_alias_roles)
+            alias.report(self._ws_alias, self.alias_check, type(self).__name__)
         for name, ch in self._ws_chans.items():
             if isinstance(ch.producer, Tma) and not ch.internal:
                 report = self._ws_tma.setdefault(name, TmaReport())
@@ -1040,7 +1055,8 @@ class WarpSpecialized:
                 keywords[name] = arg
             else:
                 positional.append(arg)
-        result = r.fn(self, *positional, **keywords)
+        with tracing_role(trace):
+            result = r.fn(self, *positional, **keywords)
         if not r.raw:
             state_args = [
                 (pname, arg)
@@ -1063,6 +1079,8 @@ class WarpSpecialized:
             trace.finish()
         for chan, n in trace.uses_per_item().items():
             self._ws_uses[(r.name, chan)] = n
+        # The role's regions are live now; the diagnostic keeps plain data only.
+        self._ws_alias_roles.append(alias.RoleEvents.from_trace(trace, r))
         if r.uses_tmem:
             # Every TMEM user of this CTA finishes before the allocator warp frees it (a pair's
             # peer has no leader-only TMEM roles, so its count is smaller).
@@ -1095,7 +1113,7 @@ class WarpSpecialized:
                 args.append(self._make_end(pname, side is Producer, bound, trace, r.cta))
             elif ann is Tmem:
                 base = self._ws_tmem.retrieve_ptr(cutlass.Float32)
-                args.append(TmemView(base, self.tmem_plan, r.name, trace.log))
+                args.append(TmemView(base, self.tmem_plan, r.name, trace.log, trace))
             elif ann is Barriers:
                 args.append(self._ws_bars[pname])
             elif ann is WorkCursor or ann is _SchedulerCursor:

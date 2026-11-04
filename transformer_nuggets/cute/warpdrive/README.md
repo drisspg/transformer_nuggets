@@ -72,7 +72,7 @@ class PersistentGemm(WarpSpecialized):  # abridged: the real one sizes stages pe
             with acc.produce() as a:
                 for k in cutlass.range(params.num_k_tiles, unroll=1):
                     with ab.consume() as s:
-                        ...  # cute.gemm into tAcc[..., a.index] from s.view("A", None, None, kb), ...
+                        ...  # cute.gemm into tAcc[..., a.index] from s.view("A", None, None, kb)
             work.advance()
         return ab, acc, work
 
@@ -91,7 +91,9 @@ class PersistentGemm(WarpSpecialized):  # abridged: the real one sizes stages pe
         self.begin_roles(work=bound, layouts={"A": a_layout, "B": b_layout, ...})
         sA = self.buffer("A")  # the whole staged tensor
         ...  # TMA-partition the buffers, build the context
-        params = PersistentGemmParams(tma_a=tma_a, tAgA=tAgA, tAsA=tAsA, num_k_tiles=..., ...)
+        params = PersistentGemmParams(
+            tma_a=tma_a, tAgA=tAgA, tAsA=StageView(tAsA, axis=1), num_k_tiles=..., ...
+        )
         self.run_roles(params)
 ```
 
@@ -378,6 +380,8 @@ with kv.consume() as h:
   binding checks that each buffer's stage mode, and each registered `StageView`'s, has exactly
   the channel's stage count, and that view names are buffers of the channel.
 - `end.views(...)` returns an end that shares the original's state: use it and return it.
+  Views registered inside a loop (FA4's per-item TMA partitions) hold that loop's values; use
+  `h.view` only inside the region that registered them.
   `h.view(name, *coord)` takes the other modes' indices in the same slice
   (`s.view("A", None, None, kb)` is `tCrA[None, None, kb, s.index]`), which keeps the
   generated address arithmetic identical to hand-indexed code.
@@ -404,10 +408,90 @@ power of two (32 to 512 columns). `print(self.tmem_plan.describe())` shows the m
 
 `tmem.ptr("S", stage)` gives an fp32 TMEM pointer; `tmem.cols("S", stage)` gives its column
 offset. Reinterpret packed bf16 yourself. Capacity and alias bounds are checked. You must order
-accesses to aliased regions.
+accesses to aliased regions; the [alias diagnostic](#alias-diagnostic) looks for orderings you
+missed.
 
 `self.mufu = Turnstile()` and `mufu: Turn` give role instances a round-robin critical section:
 `with mufu.turn():`. FA4 uses it around exp2. `Turnstile(enabled=False)` emits nothing.
+
+## Alias diagnostic
+
+Declared overlaps (`TmemPlan.alias` regions, `SmemPlan.buffer(..., overlaps=...)` buffers) are
+checked by a bug finder at each compile. It reports potential hazards. It never proves an
+alias safe. Annotate accesses where they happen:
+
+```python
+tmem.access("S", j, write=True, by="umma")              # this QK writes S_j (no IR emitted)
+p = tmem.view("P", j, write=True, cols=range(0, 48))    # pointer + annotation (threads: st)
+k = h.view("K", read=True, by="umma")                   # a stage view the MMA reads
+h.access("O", read=True, by="tma")                      # a TMA store selecting its own stage
+```
+
+`by` is the agent: `"threads"` (generic SMEM, `tcgen05.ld/st`), `"tma"` (TMA load writes,
+TMA store reads) or `"umma"` (`tcgen05.mma` operand reads, TMEM A-operand reads and D writes).
+TMEM footprints default to the whole region; a thread access covers its warp's 32-lane
+subpartition, an MMA all 128 lanes; `warps=`, `lanes=` and `cols=` (ranges, or callables of the
+warp index) narrow them. Ordering comes from managed channel operations and from recording
+wrappers that emit exactly the `cute.arch` instruction: `fence_async_shared()`,
+`bulk_commit_group()`, `bulk_wait_group(n, read=True)` and `named_barrier(id, threads)`. Raw
+`cute.arch` calls stay legal; the diagnostic cannot see them, so what they order is reported
+unverified.
+
+For the FA4 mutant that issues the S-overwriting QK before the PV reading P (in
+`test/test_cute_warpdrive_alias.py`), `describe()` shows:
+
+```text
+Alias diagnostic (bug finder: reports potential hazards; never proves safety)
+  P ~ S (tmem)  potential hazard
+      potential hazard: mma write S[0] by umma @ test_cute_warpdrive_alias.py:164 then mma
+      read P[0] by umma @ fa4_fwd.py:425: not a pipelined pair in one thread, and no
+      completion wait between them [pipelined]
+  V ~ K (smem)  no hazard found among 20 conflicting annotated access pair(s)
+```
+
+Per alias the status is `potential hazard` (a conflicting pair, the missing edge, source lines
+and the rule), `unverified` (an access or edge it cannot see), or `no hazard found`. By default
+(`alias_check = "warn"`) the report is in `describe()` and one warning names the findings;
+`"strict"` raises `ProtocolError` on a potential hazard (for CI); `"off"` skips the analysis.
+`with unchecked("alias", reason=...)` leaves the accesses annotated inside it out, and
+`describe()` lists the opt-out. The diagnostic is host-only: on or off, the SASS is identical.
+It runs while a compile traces the kernel, so a cached build shows the report of the build that
+traced it; the `cute.cache` helpers key on `alias_check` through `__cute_compile_key__()`, and
+custom caches must include that hook so a strict build is never served from a warn/off one.
+
+How it orders a conflicting pair (overlapping footprints, at least one write, two different
+names): accesses inside handles of one channel slot with a single stage (`Slots`, a one-stage
+`Ring`), or through a ring's own stage views, are a whole-region handoff, valid when each access
+completes before its handle's close signals. Anything else, including every pair in one role
+(other than ring stages through their own handles), is checked on a happens-before graph of the
+traced roles: dynamic loops unrolled twice (so loop-carried pairs count), two work items under a
+persistent schedule (one otherwise), and epoch-matched channel edges. A deeper ring orders epoch
+e only before e + n, so it hands over nothing but storage indexed by its own stage. The rules,
+each cited in [alias.py](alias.py) `RULES` (PTX ISA 9.5):
+
+| Rule | Statement | PTX |
+|---|---|---|
+| `pipelined` | Same-warp pairs order themselves only when pipelined: mma A read -> mma D write, mma D write -> D write (same accumulator), st -> ld, st -> st, ld -> st. mma D write -> A read is not; different warps never are. | 9.7.18.6.2 |
+| `commit` | `tcgen05.commit` tracks the issuing thread's earlier mma/cp/shift with the same cta_group, not ld/st, TMA or other threads. | 9.7.18.12.1, 9.7.18.6.2.1 |
+| `wait_group_read` | `cp.async.bulk.wait_group.read N` means that thread's older groups finished reading their sources; other threads learn it through that thread's later signal. | 9.7.10.28.6.2 |
+| `proxy` | Generic and async-proxy (TMA, MMA operand) accesses to the same SMEM need `fence.proxy.async` in the generic thread before the synchronization. | 9.7.10.28.2, 9.7.18.6.5 |
+| `tmem_store` | `tcgen05.st` is waited (`tmem_store` fence) before the signal that hands the columns to another thread or an MMA. | 9.7.18.6.2.1.2, 9.7.18.6.3 |
+| `complete_tx` | A TMA load's complete-tx publishes only that copy's bytes, on its own handle's barrier, not the issuing thread's other stores. | 8.9.1.1 |
+| `channel` | A managed signal followed by the matching wait/acquire orders what the signaller completed; fan-out consumers (fan-in producers) of one epoch are unordered. | warpdrive R2-R5, 9.7.15.16.16 |
+| `barrier` | Different warps of one role are ordered inside a handle only by a barrier over the whole role between the accesses; the tcgen05 waits and `fence::before/after_thread_sync` PTX also requires around it are assumed, not checked. | 9.7.18.6.2, 9.7.18.6.3 |
+| `stages` | Overlapping buffers bound to one ring may overlap only in the same stage. | warpdrive R2 |
+
+Limits (phase 1): single-CTA kernels only (a `CtaPair` reports unverified); only annotated
+accesses (a role that takes a pointer to an aliased region without annotating it, and raw roles,
+make the alias unverified); ring-stage SMEM accesses on different channels are unverified;
+epochs are matched by traced position, assuming balanced per-item counts (U1); when two roles'
+traced counts differ, every commit of an item is linked only to the consumer's last wait of that
+item, which per-item balance makes sound; loops are assumed to run at least twice; TMEM loads
+are assumed waited before the thread's next signal, and tcgen05 thread-sync fences are assumed
+around recorded barriers and channel signals; SMEM accesses of one role are one thread set (no
+cross-warp SMEM check). Ring-stage handoffs need static, disjoint stage spans, else the alias is
+unverified. Accesses are trusted to cover a role's uses of a region it annotates. Not a
+guarantee: see [GUARANTEES.md](GUARANTEES.md#alias-diagnostic-a-bug-finder).
 
 ## Scheduling
 
@@ -849,7 +933,7 @@ See the [pipeline profiler](../profiler/README.md#declarative-pipeline-analysis)
 - [fa4_fwd.py](examples/fa4_fwd.py): FA4-style forward, two softmax instances, correction, slots,
   fan-out/join, turnstile, S/P aliasing, split-P, persistence, `mapping=` and CTA pairs;
   channel storage with V over K and optional O over Q (`overlap_o_q=True`, one work item per
-  CTA).
+  CTA) and alias annotations.
 - [packed_work.py](examples/packed_work.py): `PackedWork`, a work list built on the device
   (capacity on the host, length read in `decode`).
 
@@ -894,4 +978,6 @@ TMA checks and the IKET-to-profiler path.
 ## Still to do
 
 - Use CUTLASS pipeline objects where the semantics match.
+- Alias diagnostic phase 2: infer annotations from the IR, partial K-block footprints, CTA
+  pairs; phase 3: completion-aware epoch checks.
 - Larger clusters, TMA multicast, round-robin role instances and cp.async producers.

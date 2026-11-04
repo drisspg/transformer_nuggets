@@ -23,7 +23,8 @@ class ProtocolError(Exception):
 #   unclosed      handles opened inside the block may stay open at role exit
 #   cross_region  closes inside the block may sit in a different loop/branch than their open
 #   tma           TMA copies into barriers taken inside the block skip the atom and byte checks
-CHECKS = ("unclosed", "cross_region", "tma")
+#   alias         accesses annotated inside the block are left out of the alias diagnostic
+CHECKS = ("unclosed", "cross_region", "tma", "alias")
 
 
 @dataclass
@@ -44,6 +45,22 @@ class OptOut:
 
 _ACTIVE: list[OptOut] = []  # innermost last; tracing is single-threaded
 _SEEN: list[OptOut] = []  # every opt-out entered since the last take_opt_outs()
+_ROLE: list = []  # the RoleTrace of the role being traced (alias.py's ordering wrappers)
+
+
+@contextmanager
+def tracing_role(trace):
+    """Make ``trace`` the current role trace while its body is traced."""
+    _ROLE.append(trace)
+    try:
+        yield
+    finally:
+        _ROLE.remove(trace)
+
+
+def current_trace():
+    """The RoleTrace of the role being traced, or None outside a managed role body."""
+    return _ROLE[-1] if _ROLE else None
 
 
 @contextmanager
@@ -118,6 +135,33 @@ def _ancestors(block, root) -> list:
     return chain
 
 
+@dataclass
+class Event:
+    """One traced event for the alias diagnostic (``alias.py``): a handle open/close, an
+    annotated or raw storage access, or a recorded ordering instruction.
+
+    ``where``: the enclosing dynamic regions, outermost first, as ``(block key, kind)`` with kind
+    ``loop`` (``scf.for``/``scf.while`` body), ``if`` or ``other``; ``open``: the handle records
+    open at the event; ``opted_out``: inside ``unchecked("alias")``."""
+
+    kind: str
+    data: dict
+    site: str
+    where: tuple
+    open: tuple
+    opted_out: bool = False
+
+
+def _region_kind(block) -> str:
+    try:
+        name = block.owner.operation.name
+    except (AttributeError, ValueError, RuntimeError):
+        return "other"
+    if name in ("scf.for", "scf.while"):
+        return "loop"
+    return "if" if name == "scf.if" else "other"
+
+
 class ProtocolLog:
     """Per role instance: the static sequence of channel ops recorded while tracing.
 
@@ -161,7 +205,31 @@ class RoleTrace:
         self.open: list = []
         self.checks: list = []  # end-of-role trace checks (e.g. work cursors)
         self.tma_bars: list = []  # TMA-channel full-barrier pointers handed out (tma.py)
+        self.events: list[Event] = []  # alias-diagnostic events, in trace order
+        self._blocks: list = []  # (block, key, kind) of every region an event was recorded in
         self.root = current_block()
+
+    def where(self) -> tuple:
+        """The enclosing dynamic regions of the current insertion point, outermost first."""
+        out = []
+        for block in reversed(_ancestors(current_block(), self.root)[:-1]):
+            entry = next((e for e in self._blocks if e[0] == block), None)
+            if entry is None:
+                entry = (block, len(self._blocks), _region_kind(block))
+                self._blocks.append(entry)
+            out.append(entry[1:])
+        return tuple(out)
+
+    def block_key(self, block) -> int | None:
+        """The key ``where()`` gave ``block`` (None if no event was recorded inside it)."""
+        return next((key for b, key, _ in self._blocks if b == block), None)
+
+    def event(self, kind: str, **data):
+        site = user_site()
+        opted_out = False
+        if kind == "access":
+            opted_out = self.opt_out("alias", f"{data['storage'][1]} access at {site}")
+        self.events.append(Event(kind, data, site, self.where(), tuple(self.open), opted_out))
 
     def opt_out(self, check: str, what: str) -> bool:
         """True (and recorded) when an ``unchecked(check)`` block is active here."""

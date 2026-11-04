@@ -163,8 +163,10 @@ def allocate(smem, buf: SmemBuffer, layout, resolved: dict) -> ResolvedBuffer:
     stride = _stage_stride(outer.shape[axis], outer.stride[axis])
     out = ResolvedBuffer(buf, tensor, outer, nbytes, stages if isinstance(stages, int) else None)
     if nbytes is not None and isinstance(stages, int) and stride is not None:
-        out.stage_stride = stride * width // 8
-        out.stage_bytes = nbytes - (stages - 1) * out.stage_stride
+        stage_stride = stride * width // 8
+        stage_bytes = nbytes - (stages - 1) * stage_stride
+        if 0 < stage_bytes <= stage_stride:  # the stage mode is outermost: stages are disjoint
+            out.stage_stride, out.stage_bytes = stage_stride, stage_bytes
     if buf.overlaps is not None:
         root = resolved[buf.root.name]
         if nbytes is not None and root.nbytes is not None and nbytes > root.nbytes:

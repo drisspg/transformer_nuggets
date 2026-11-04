@@ -247,7 +247,7 @@ class Barriers:
 # --------------------------------------------------------------------------- #
 
 
-@dataclass
+@dataclass(eq=False)
 class HandleRecord:
     what: str
     site: str
@@ -255,6 +255,9 @@ class HandleRecord:
     closed_at: str | None = None
     closed_op: str | None = None
     unclosed_ok: object = None  # the unchecked("unclosed") opt-out active at open
+    chan: object = None  # the Channel
+    slot: int | None = None  # the Slots slot; None for a Ring stage (dynamic)
+    producer: bool = False
 
 
 @dataclass(frozen=True)
@@ -264,6 +267,9 @@ class StageBuffer:
     tensor: object
     axis: int
     storage: str | None  # the SmemPlan buffer name; None for a layer payload
+
+
+AGENTS = ("threads", "tma", "umma")
 
 
 class Handle:
@@ -282,8 +288,16 @@ class Handle:
         self._label = label
         self._is_producer = is_producer
         # Trace-time lifetime record, shared by loop-carried copies of this handle.
-        self.rec = HandleRecord(self.describe(), user_site(), current_block())
+        self.rec = HandleRecord(
+            self.describe(),
+            user_site(),
+            current_block(),
+            chan=end._chan,
+            slot=index if end._chan.fixed else None,
+            producer=is_producer,
+        )
         end._trace.opened(self.rec)
+        end._trace.event("open", handle=self.rec)
 
     # The preprocessor carries every name a loop or branch reassigns, so reusing a handle name
     # across a dynamic region boundary (``with kv.produce() as h`` before and inside a loop)
@@ -324,22 +338,47 @@ class Handle:
     def data(self):
         """This stage's canonical view of the channel's storage: the ``payload`` tensor, the
         bound buffer, or ``{name: view}`` for named buffers. Every mode but the stage mode is
-        kept."""
+        kept. An unannotated use: for aliased storage prefer ``view(..., read=/write=)``."""
         buffers = self._end._buffers
         if not buffers:
             raise ProtocolError(f"channel {self._end._chan.name} has no payload or buffer")
+        for b in buffers.values():
+            self._record_raw(b)
         views = {k: project(b.tensor, b.axis, self.index) for k, b in buffers.items()}
         return next(iter(views.values())) if len(views) == 1 else views
 
-    def view(self, name: str | None = None, *coord):
+    def view(
+        self,
+        name: str | None = None,
+        *coord,
+        read: bool = False,
+        write: bool = False,
+        by="threads",
+    ):
         """Buffer ``name`` at this stage: the partition registered with ``end.views(name=...)``,
         else the canonical view. ``name`` may be omitted (``None``) for a single buffer.
         ``coord``: indices of the other modes, taken in the same slice as the stage
-        (``h.view("A", None, None, kb)`` is ``tCrA[None, None, kb, h.index]``)."""
+        (``h.view("A", None, None, kb)`` is ``tCrA[None, None, kb, h.index]``). ``read``/
+        ``write`` with ``by`` ("threads", "tma", "umma") annotate the access for the alias
+        diagnostic."""
         key, b = self._buffer(name)
         part = self._end._views.get(key)
         tensor, axis = (part.tensor, part.axis) if part is not None else (b.tensor, b.axis)
+        if read or write:
+            self._record_access(b, read, write, by)
+        else:
+            self._record_raw(b)
         return project(tensor, axis, self.index, coord)
+
+    def access(
+        self, name: str | None = None, *, read: bool = False, write: bool = False, by="threads"
+    ):
+        """Annotate an access to buffer ``name`` at this stage made through a tensor obtained
+        elsewhere (for example a TMA copy function that selects the stage itself). No IR."""
+        if not (read or write):
+            raise ValueError("access() needs read=True and/or write=True")
+        _, b = self._buffer(name)
+        self._record_access(b, read, write, by)
 
     def _buffer(self, name):
         buffers, chan = self._end._buffers, self._end._chan
@@ -354,6 +393,25 @@ class Handle:
                 f"channel {chan.name} has no buffer {name!r} (have {sorted(buffers)})"
             )
         return name, buffers[name]
+
+    def _record_access(self, b: StageBuffer, read: bool, write: bool, by):
+        if by not in AGENTS:
+            raise ValueError(f"access agent must be one of {AGENTS}, got {by!r}")
+        if b.storage is None:
+            return  # a layer payload is never aliased
+        self._end._trace.event(
+            "access",
+            storage=("smem", b.storage),
+            slot=self.rec.slot,
+            read=read,
+            write=write,
+            agent=by,
+            handle=self.rec,
+        )
+
+    def _record_raw(self, b: StageBuffer):
+        if b.storage is not None:
+            self._end._trace.event("raw", storage=("smem", b.storage))
 
     def commit(self, signal: bool = True):
         """Producer: publish the stage (signal full). ``signal=False``: the caller signals the
@@ -389,6 +447,7 @@ class Handle:
             )
         trace.closed(self.rec, op)
         trace.record(self._end._chan.name, op, self._label)
+        trace.event("close", handle=self.rec, signal=op in ("commit", "release"))
         if producer and isinstance(self._end._chan.producer, Tma):
             stage_closed(trace, self.rec)
 

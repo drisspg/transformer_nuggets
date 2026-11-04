@@ -30,6 +30,8 @@ SMEM is an ``SmemPlan``: sO, sQ and sK, with V reusing K's stages (``overlaps=``
 epi, q and kv channels so each handle selects its own stage. ``overlap_o_q=True`` also places sO
 over sQ (FA4's ``overlap_sO_sQ``, 64 KB less SMEM); it needs one work item per CTA, because this
 example has no epilogue -> load edge to keep a persistent CTA's next Q off the O being stored.
+Accesses to the aliases are annotated (``tmem.access``, ``h.view(..., read=True)``) for the
+alias diagnostic, which reports no potential hazard for this kernel.
 
 2-CTA (``cluster=CtaPair()``, FA4's default schedule): a work item is 512 query rows. Q tile j of
 the item is one 256-row MMA tile split across the pair (each CTA holds 128 rows, as FA4's
@@ -79,6 +81,8 @@ from transformer_nuggets.cute.warpdrive import (
     WorkCursor,
     WorkMap,
     WorkStream,
+    bulk_commit_group,
+    bulk_wait_group,
     role,
 )
 
@@ -277,17 +281,18 @@ class FlashAttentionForward(WarpSpecialized):
             cute.copy(
                 params.tma_k,
                 tKgK[None, 0],
-                h.view("K"),
+                h.view("K", write=True, by="tma"),
                 tma_bar_ptr=h.barrier,
             )
         for j in cutlass.range_constexpr(Q_STAGE):
             with q.produce(j) as h:
+                h.access(write=True, by="tma")  # load_q selects stage j itself
                 load_q(src_idx=j, dst_idx=j, tma_bar_ptr=h.barrier)
         with kv.produce() as h:
             cute.copy(
                 params.tma_v,
                 tVgV[None, 0],
-                h.view("V"),
+                h.view("V", write=True, by="tma"),
                 tma_bar_ptr=h.barrier,
             )
         for i in cutlass.range(1, params.n_blocks, unroll=1):
@@ -295,14 +300,14 @@ class FlashAttentionForward(WarpSpecialized):
                 cute.copy(
                     params.tma_k,
                     tKgK[None, i],
-                    h.view("K"),
+                    h.view("K", write=True, by="tma"),
                     tma_bar_ptr=h.barrier,
                 )
             with kv.produce() as h:
                 cute.copy(
                     params.tma_v,
                     tVgV[None, i],
-                    h.view("V"),
+                    h.view("V", write=True, by="tma"),
                     tma_bar_ptr=h.barrier,
                 )
         return q, kv
@@ -343,11 +348,12 @@ class FlashAttentionForward(WarpSpecialized):
             for j in cutlass.range_constexpr(Q_STAGE):
                 qh.append(q.wait(j))
                 sp = s.acquire(j)  # previous item's final S_j released: O_j stored, P_j read
+                tmem.access("S", j, write=True, by="umma")
                 umma(
                     params.mma_qk,
                     tS[j],
-                    qh[j].view(),
-                    k0.view("K"),
+                    qh[j].view(read=True, by="umma"),
+                    k0.view("K", read=True, by="umma"),
                     False,
                 )
                 sp.commit()
@@ -364,9 +370,10 @@ class FlashAttentionForward(WarpSpecialized):
                         j,
                         tO[j],
                         tOrP[j],
-                        v.view("V"),
+                        v.view("V", read=True, by="umma"),
                         i > 0,
                         params,
+                        tmem,
                     )
                     if cutlass.const_expr(j == 0):
                         k = kv.wait()
@@ -375,11 +382,12 @@ class FlashAttentionForward(WarpSpecialized):
                     # Overwrites S_j (and the P_j alias) after PV_j read P_j: an MMA's TMEM A
                     # read and a later MMA's D write from one thread are pipelined (PTX ISA
                     # 9.7.18.6.2), so no extra barrier is needed. The reverse order is not.
+                    tmem.access("S", j, write=True, by="umma")
                     umma(
                         params.mma_qk,
                         tS[j],
-                        qh[j].view(),
-                        k.view("K"),
+                        qh[j].view(read=True, by="umma"),
+                        k.view("K", read=True, by="umma"),
                         False,
                     )
                     # No O_full commit here: correction rescales O_j only after waiting S_j(i)
@@ -401,24 +409,29 @@ class FlashAttentionForward(WarpSpecialized):
                         j,
                         tO[j],
                         tOrP[j],
-                        v_last.view("V"),
+                        v_last.view("V", read=True, by="umma"),
                         params.n_blocks > 1,
                         params,
+                        tmem,
                     )
             v_last.release()
             work.advance()
         return q, kv, s, p_last, work
 
-    def pv(self, p_last, j, tO, tOrP, tOrV, accumulate, params: Fa4Params):
+    def pv(self, p_last, j, tO, tOrP, tOrV, accumulate, params: Fa4Params, tmem):
         """O_j (+)= P_j V. With split-P the last quarter of the K blocks waits for p_last[j]
         (plain Python: inlined; returns the end so loops carry its phase)."""
         if cutlass.const_expr(not self.split_p):
+            tmem.access("P", j, read=True, by="umma")
             umma(params.mma_pv, tO, tOrP, tOrV, accumulate)
             return p_last
         n = cute.size(tOrP.shape[2])
         first = n * SPLIT_P // 4
+        p_cols = N_BLOCK // 2  # P packs two bf16 per 32-bit column; K block k reads n-th of them
+        tmem.access("P", j, read=True, by="umma", cols=range(p_cols * first // n))
         umma(params.mma_pv, tO, tOrP, tOrV, accumulate, range(first))
         with p_last.consume(j):  # release = commit: this PV has read the last quarter
+            tmem.access("P", j, read=True, by="umma", cols=range(p_cols * first // n, p_cols))
             umma(params.mma_pv, tO, tOrP, tOrV, True, range(first, n))
         return p_last
 
@@ -455,6 +468,7 @@ class FlashAttentionForward(WarpSpecialized):
         thr_st = tcgen05.make_tmem_copy(st_atom, tStP).get_slice(tidx)
         t = SimpleNamespace(
             tidx=tidx,
+            tmem=tmem,
             thr_ld=thr_ld,
             thr_st=thr_st,
             tStS=thr_ld.partition_S(tSAcc),
@@ -485,6 +499,7 @@ class FlashAttentionForward(WarpSpecialized):
         """
         sh = s.wait(stage)
         rS = cute.make_rmem_tensor(t.rS_shape, Float32)
+        t.tmem.access("S", stage, read=True)
         cute.copy(t.thr_ld, t.tStS, rS)
         row_max, acc_scale = sm.update_row_max(rS.load(), is_first)
         with stats.produce(stage) as st:
@@ -496,11 +511,14 @@ class FlashAttentionForward(WarpSpecialized):
             sm.apply_exp2_convert(rS, rP)
         n_st = cute.size(t.tStP.shape[2])
         split = n_st * SPLIT_P // 4 if self.split_p else n_st
+        p_cols = N_BLOCK // 2  # P's 32-bit columns (two bf16 each); store i writes n_st-th of them
+        t.tmem.access("P", stage, write=True, cols=range(p_cols * split // n_st))
         for i in range(split):  # plain Python: no preprocessor here
             cute.copy(t.thr_st, rP32[None, None, i], t.tStP[None, None, i])
         sh.release()  # layer fences the tcgen05.st of P before arriving
         if cutlass.const_expr(self.split_p):
             with p_last.produce(stage):  # layer fences the last quarter's tcgen05.st
+                t.tmem.access("P", stage, write=True, cols=range(p_cols * split // n_st, p_cols))
                 for i in range(split, n_st):
                     cute.copy(t.thr_st, rP32[None, None, i], t.tStP[None, None, i])
         sm.update_row_sum(rS.load(), acc_scale, is_first)
@@ -541,7 +559,9 @@ class FlashAttentionForward(WarpSpecialized):
                 inv_sum = cute.arch.rcp_approx(row_sum if not empty_row else 1.0)
                 # Final S_j commit: O_j holds the last PV. The epi handle is sO's stage j.
                 with s.consume(j), epi.produce(j) as eo:
-                    self.store_o_smem(params.mma_pv, thr_pv, tO[j], tidx, inv_sum, eo.view())
+                    self.store_o_smem(
+                        params.mma_pv, thr_pv, tO[j], tidx, inv_sum, eo.view(write=True)
+                    )
                 # FA4 work_q_block: Q tile j of the item, this CTA's 128 rows of it.
                 row = ((m_blk * Q_STAGE + j) * self.cluster.size + rank) * M_BLOCK + tidx
                 if row < params.seqlen_q:
@@ -635,10 +655,11 @@ class FlashAttentionForward(WarpSpecialized):
         eh = []
         for j in range(Q_STAGE):
             eh.append(epi.wait(j))
+            eh[j].access(read=True, by="tma")  # store_o selects stage j itself
             store_o(src_idx=j, dst_idx=j)
-            cute.arch.cp_async_bulk_commit_group()
+            bulk_commit_group()
         for j in range(Q_STAGE):
-            cute.arch.cp_async_bulk_wait_group(Q_STAGE - 1 - j, read=True)  # sO stage j read
+            bulk_wait_group(Q_STAGE - 1 - j, read=True)  # sO stage j read: release it
             eh[j].release()
         return epi
 

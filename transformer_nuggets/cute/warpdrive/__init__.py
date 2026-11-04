@@ -32,7 +32,9 @@ around a CUTLASS/FA4 scheduler's tile order) are one-line switches. Clusters
 Storage (``storage.py``): an optional ``SmemPlan`` of named SMEM buffers (dtype, alignment,
 stage axis; layouts bind at ``begin_roles(layouts=...)``) that channels bind with ``buffer=``;
 ``h.data`` is the handle's stage view and ``end.views(A=StageView(tAsA, axis=1))`` registers
-partitions that ``h.view("A")`` projects at ``h.index``.
+partitions that ``h.view("A")`` projects at ``h.index``. The alias diagnostic (``alias.py``)
+reports potential hazards between annotated accesses (``tmem.access``/``h.view(..., read=...)``)
+to declared overlaps; it is a bug finder, never a proof (``alias_check``).
 
 Design principles
 -----------------
@@ -84,6 +86,12 @@ case. The cluster scope costs about 30% on FA4's hot S channel.
 """
 
 from transformer_nuggets.cute.warpdrive.adapters import CutlassRaster, Fa4Mapping
+from transformer_nuggets.cute.warpdrive.alias import (
+    bulk_commit_group,
+    bulk_wait_group,
+    fence_async_shared,
+    named_barrier,
+)
 from transformer_nuggets.cute.warpdrive.channels import (
     Barriers,
     Channel,
@@ -165,6 +173,10 @@ __all__ = [
     "WorkCursor",
     "WorkMap",
     "WorkStream",
+    "bulk_commit_group",
+    "bulk_wait_group",
+    "fence_async_shared",
+    "named_barrier",
     "plan_from_warpdrive",
     "role",
     "unchecked",

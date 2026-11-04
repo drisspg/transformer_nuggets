@@ -35,9 +35,9 @@ unseeded wait cycle, and terminating user work. Specifically:
   [Custom schedules](#custom-schedules-r19) (U15). Raw roles read a OneShot item through
   `self.work.single_item()`, not `blockIdx`.
 - Supply valid storage, layouts, descriptors and atoms, and the required async/proxy fences
-  and completion waits. Order alias accesses. Declare every TMEM user. Give
-  `begin_roles(layouts=...)` a layout for every `smem_plan` buffer and build `StageView`
-  partitions from the buffers they name (U16).
+  and completion waits. Order alias accesses (the alias diagnostic is a bug finder, not a
+  check that you did). Declare every TMEM user. Give `begin_roles(layouts=...)` a layout for
+  every `smem_plan` buffer and build `StageView` partitions from the buffers they name (U16).
 - Raster extents may be any Int32 values (wider values are converted to Int32 first): empty
   and negative spaces are in the domain (R17),
   and spaces past the Int32 limit are rejected at launch (E102) when you launch with
@@ -68,12 +68,12 @@ These are conditional guarantees relative to that program, not a theorem about a
 | R13 | Raster is a bijection over positive `(m,n,l)` extents, l slowest, with selected raster, bands and reversals; decode intermediates stay within max(index, item count), so it is exact for every index R18 admits. Plain OneShot Raster uses `(m*cs,n,l)` when n/l <=65535, otherwise a 1-D grid. Device decoding follows the actual grid, so the supported hand-built `(total*cs,1,1)` grid preserves item identity too. |
 | R14 | `decode` runs only for valid indices `[0,total)`, after the readiness hook, for every mapping without `decodes_any_index` (local cursors, the scheduler warp, skip loops and `single_item()` alike); a mapping with `decodes_any_index` may also be evaluated speculatively (at terminal indices, or before readiness in the tile-grid prologue) and the words are discarded; a skipping mapping's `keep` is only used for valid indices. A subclass that overrides `decode` does not inherit `decodes_any_index`. Only a mapping with `skips` may return a runtime `keep` (trace-time check), and a skipping mapping is decoded once per visited index. Broadcast schedulers acquire a free work slot before claiming, bounding lookahead by stages. CLC waits every response and issues none after failure. `AtomicPersistent` reports once in `close_claims`; the last report fences and zeros `[claims,finished]` for sequential launches/graph replay. |
 | R15 | Generated synchronization must implement the finite, live abstract protocol without extra waits, premature reuse, lost publications or added deadlock. Compilation alone does not establish that precondition; a timeout is a candidate failure requiring attribution, not proof of a layer bug. |
-| R16 | `describe()` reports derived/effective structure (including the SMEM plan), not runtime correctness. Protocol logs are static traced sites, not execution histories. IKET off emits no IKET ops; cache keys must include IKET/protocol trace choices. Exported plans are per-CTA, work-item-granular approximations, not deadlock proofs. |
+| R16 | `describe()` reports derived/effective structure (including the SMEM plan and the alias diagnostic's findings), not runtime correctness. Protocol logs are static traced sites, not execution histories. IKET off emits no IKET ops; cache keys must include IKET/protocol trace choices. Exported plans are per-CTA, work-item-granular approximations, not deadlock proofs. |
 | R17 | A space with any Raster extent <= 0 is empty: `bind` stores `(1,1,0)` (what the kernel's `bound.space` reads), `count64` is 0, `bound.grid()` launches one work unit under every schedule, single CTA or pair, every role's first `valid` is false, no mapping without `decodes_any_index` is decoded (Raster and the adapters may evaluate and discard index 0), no decode divides by zero (host or device), and the atomic workspace is left zeroed for the next launch. The check is host code in the jit entry point; kernels pay nothing. |
 | R18 | The mapping's `count64` (Int64, saturating at 2^31; Raster's never wraps) is evaluated once on the host and narrowed to the Int32 `total` the kernel receives. `bound.grid()` admits a space only when `schedule.index_limit` of that count fits Int32: `total*cs` for OneShot/ClusterLaunchControl (the 1-D grid; terminal index `total`), `total + units - 1` for Static/Atomic (the last unit's terminal index). Within it, no grid extent, index, claim or CLC result wraps, and the narrowing never truncates a launched count. |
 | R19 | For any `IndexSchedule`/`WorkMap`/`Readiness` subclass meeting U15, the layer calls the protocol exactly as documented (below) and keeps owning distribution. Built-in schedules go through the same protocol. Normalized SASS of seven example configurations (gemm OneShot; persistent GEMM static single/pair and 2-CTA CLC; FA4 single, 2-CTA CLC, 2-CTA CLC split-P; CuTeDSL 4.8.0, GB300) was unchanged by making the protocol public and by the `(keep, words)` decode; host-side counting changed it only by reading `total` from a kernel parameter instead of recomputing the extent product, with neutral CUDA-graph timings. |
 | R20 | `self.work.single_item()` returns, in a raw role under a non-persistent local schedule, the item and validity a managed role's cursor would start with: the same `first_index`, readiness hook, dropped items and tile-grid/1-D decoding, so it is correct on the 65535 fallback, hand-built 1-D grids, pairs and custom mappings. |
-| R21 | `smem_plan` buffers are allocated by `begin_roles` after barriers, payloads and the TMEM holder, in declaration order, with their declared dtype, layout (swizzle included) and alignment; an `overlaps=` buffer is the root buffer's first byte recast to its own dtype/swizzle/layout and allocates nothing. Each CTA of a cluster holds every buffer at the same offset. A binding's stage mode and every registered `StageView` have exactly the channel's stage count. `h.data` and `h.view` address the handle's own stage (`h.index`), never a separately advanced cursor. Binding a buffer changes no count, scope, `remote_scope` or fence. Porting the examples' hand-indexed stages to buffers left the normalized SASS of the seven R19 configurations unchanged (CuTeDSL 4.8.0, November 2026). |
+| R21 | `smem_plan` buffers are allocated by `begin_roles` after barriers, payloads and the TMEM holder, in declaration order, with their declared dtype, layout (swizzle included) and alignment; an `overlaps=` buffer is the root buffer's first byte recast to its own dtype/swizzle/layout and allocates nothing. Each CTA of a cluster holds every buffer at the same offset. A binding's stage mode and every registered `StageView` have exactly the channel's stage count. `h.data`, `h.view` and `h.access` address the handle's own stage (`h.index`), never a separately advanced cursor. Binding a buffer changes no count, scope, `remote_scope` or fence. Porting the examples' hand-indexed stages to buffers left the normalized SASS of the seven R19 configurations unchanged (CuTeDSL 4.8.0, sm_100a target compiled on a GB300 host, November 2026; both revisions compiled in one process, `nvdisasm` listings compared with addresses stripped). |
 
 Role parameters may be positional or keyword-only. The dispatcher follows each signature,
 while dependency binding remains by parameter name and annotation. The examples use
@@ -101,6 +101,38 @@ explicitly, and other static algorithm choices remain the author's responsibilit
 Tests: `test/test_cute_warpdrive_role_config.py` covers named functions, lambdas and callable
 objects, per-instance snapshots, graph validation, raw roles, equivalent-key reuse and differing
 configurations executing correct handoffs through the same algorithm cache key.
+
+## Alias diagnostic: a bug finder
+
+The alias diagnostic ([alias.py](alias.py), README *Alias diagnostic*) is **not a guarantee**.
+It reports `potential hazard` when it finds a conflicting annotated access pair on declared
+overlaps with no ordering edge under its rules, and `unverified` when an access or an edge is
+not visible to it. `no hazard found` means only that it found nothing among the annotated
+accesses; it never reports an alias as proven or safe. It does not establish U3/U4 for you.
+
+What it does promise: it is host-only (annotations, `alias_check` and the recording wrappers
+`fence_async_shared`/`bulk_commit_group`/`bulk_wait_group`/`named_barrier` emit exactly the
+`cute.arch` instructions the code would emit without it; normalized SASS of the seven R19
+configurations is identical with `alias_check` "warn" and "off", sm_100a target compiled on a
+GB300 host, November 2026); it reads only the traced
+annotations and managed channel operations; `"strict"` raises only on a potential hazard; and
+`unchecked("alias", reason=...)` removes exactly the accesses annotated inside the block.
+`__cute_compile_key__()` includes `alias_check`, so the standard cache helpers never serve a
+strict build from a warn/off one (custom caches must include the hook, U12).
+
+Known blind spots (phase 1): CtaPair kernels (reported unverified), unannotated or raw accesses,
+raw ordering instructions, raw roles, raw signals (`signal=False`), ring-stage SMEM shared by two
+channels, loops that run fewer than twice, epochs whose traced positions do not correspond
+across roles (U1), partial footprints narrower than the annotation states, and the tcgen05
+waits/thread-sync fences around barriers and signals (assumed, not checked). Rules and PTX
+citations: `alias.RULES`.
+
+Tests: `test/test_cute_warpdrive_alias.py` (unmodified FA4 single/split-P/O-over-Q report no
+hazard; QK-before-PV, a dropped epilogue->load edge with sO over sQ and a raw TMEM read are
+reported; strict, opt-out, off and cached-mode cases), `test/test_cute_warpdrive_alias_models.py`
+(an FA4-backward-style cross-warp P-over-S model, a two-stage ring handing over unstaged TMEM, a
+loop-carried same-role MMA pair, a TMA load read through another TMA channel, IR identical on
+and off) and `test/test_cute_warpdrive_storage.py`.
 
 ### Pair placement rules (R11)
 
@@ -287,7 +319,7 @@ body at `describe()` time.
 | E74 | Managed role does not return its final work cursor (IKET on or off) | ProtocolError |
 | E75 | Managed role does not return a producer/consumer endpoint or turnstile seat | ProtocolError |
 | E103 | Managed role returns an unsupported value, state from another role, or duplicate endpoint/cursor state | ProtocolError |
-| E76 | Unknown unchecked check (allowed: unclosed/cross_region/tma) | ValueError |
+| E76 | Unknown unchecked check (allowed: unclosed/cross_region/tma/alias) | ValueError |
 | E77 | unchecked reason not a nonblank string | ValueError |
 
 These checks compare traced structure, not runtime trip counts. Opening/closing within the
@@ -321,7 +353,9 @@ same dynamic branch is locally accepted; another participant's matching branch i
 | E111 | SmemPlan overlap naming an unknown buffer or a buffer of another plan; a channel buffer that is not in the kernel's `smem_plan` | ProtocolError / storage.py, kernel.py |
 | E112 | Channel with both `payload=` and `buffer=`, or a `buffer=` that is not a `SmemBuffer` or a non-empty `{str: SmemBuffer}` dict | ValueError / channels.py |
 | E113 | `begin_roles(layouts=...)` not naming exactly the plan's buffers; a stage axis outside the layout's rank; an overlap larger than its root (static layouts); a bound buffer or `StageView` whose static stage mode differs from the channel's stage count, or is dynamic | ProtocolError / kernel.py, storage.py |
-| E114 | `end.views(...)` naming no buffer of the channel or passing a non-StageView; `h.view` naming an unknown buffer, or omitting the name on a multi-buffer channel; `h.data` on a channel without payload or buffer (E53); `self.buffer(name)` before allocation | ProtocolError / channels.py, kernel.py |
+| E114 | `end.views(...)` naming no buffer of the channel or passing a non-StageView; `h.view`/`h.access` naming an unknown buffer, or omitting the name on a multi-buffer channel; `h.data` on a channel without payload or buffer (E53); `self.buffer(name)` before allocation | ProtocolError / channels.py, kernel.py |
+| E115 | Annotation without read/write, an unknown agent, or a TMEM agent other than threads/umma; TMEM `lanes`/`cols` that are not a range or callable, or a range leaving the region; `warps` that are not ints (at annotation); warps outside the role or a callable footprint leaving the region (when the diagnostic runs) | ValueError / channels.py, tmem.py |
+| E116 | `alias_check` other than warn/strict/off; `"strict"` with a potential hazard | ValueError; ProtocolError / kernel.py, alias.py |
 
 TMA checking is **positive evidence only**. It follows recognizable direct SSA uses of
 handed-out barriers and counts static copy boxes in the opening region. A complete mismatch
@@ -366,7 +400,7 @@ Python-int slot accessor behavior; this is not a blanket bounds/ownership check 
 | U5 | Peer ordinary-memory publication needs cluster scope and correctly addressed peer storage. |
 | U6 | Unverified/raw-pointer TMA and opted-out uses require independent validation. |
 | U7 | Overrides, signal=False, raw state/pointers/barriers. Validly typed masks may name nonexistent targets; tx=0 is still permitted as an override. |
-| U8 | unchecked suppresses only its selected property/site: unclosed at open, cross_region at close, tma at barrier access. Tracing-global opt-out lists are not a thread-safe compilation API. |
+| U8 | unchecked suppresses only its selected property/site: unclosed at open, cross_region at close, tma at barrier access, alias for accesses annotated inside the block. Tracing-global opt-out lists are not a thread-safe compilation API. |
 | U9 | Raw roles get placement/regs/init/annotated TMEM teardown, not managed end/cursor/turnstile checks or the persistent-drain requirement. |
 | U10 | State return/reassignment, coherent `keep`/maps, workspace ABI/zeros, and avoiding concurrent workspace reuse. A custom mapping's `count64` must be exact up to 2^31 and never wrap (saturate instead), and its `decode` must be safe for every valid index of a bound space; with `decodes_any_index` it must also be safe past the end and on empty spaces. A device-built list must not change after readiness. `record` log offsets and launch resources other than the grid extent must fit Int32 and CUDA limits. The strict work-loop checks do not recognize stale state restoration or prove all per-item work is correct. |
 | U11 | Frozen contexts are shallow: referenced tensors/lists/objects remain mutable. Namespaces are not made immutable. |

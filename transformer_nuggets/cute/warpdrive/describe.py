@@ -3,7 +3,7 @@
 ``describe_kernel`` reads only host-side state collected by ``WarpSpecialized._collect`` (and,
 after a compile, the TMA check reports, check opt-outs, and the traced protocol), so the output
 is stable for a given declaration. Sections: header, roles, channels, turnstiles, raw barriers,
-streams, TMEM, SMEM plan, opt-outs, traced protocol.
+streams, TMEM, SMEM plan, opt-outs, alias diagnostic, traced protocol.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ def describe_kernel(kernel) -> str:
         _tmem(kernel),
         _smem(kernel),
         _opt_outs(kernel),
+        _alias(kernel),
         _protocol(kernel),
     ]
     return "\n\n".join(s for s in sections if s)
@@ -279,30 +280,26 @@ def _smem(kernel) -> str:
     if plan is None:
         return ""
     resolved = kernel._ws_smem
-    per_cta = (
-        " per CTA (each CTA of the pair holds its own copy)" if kernel.cluster.size > 1 else ""
-    )
+    per_cta = " per CTA" if kernel.cluster.size > 1 else ""  # each CTA holds its own copy
     if resolved:
         owned = [r.nbytes for r in resolved.values() if r.buffer.overlaps is None]
         total = "?" if None in owned else str(sum(owned))
-        head = f"SMEM plan: {total} B in {len(owned)} buffer(s){per_cta}, plus alignment padding"
+        head = f"SMEM plan: {total} B{per_cta} in {len(owned)} buffer(s), plus alignment padding"
     else:
         head = f"SMEM plan: layouts bind at begin_roles (compile to see bytes){per_cta}"
     rows = []
     for name, buf in plan.buffers.items():
         res = resolved.get(name)
         size = "" if res is None or res.nbytes is None else f"{res.nbytes} B"
-        stages = (
-            ""
-            if res is None or res.stages is None
-            else f"{res.stages} stages (mode {buf.stage_axis})"
-        )
-        where = (
-            f"overlaps {buf.overlaps.name}" if buf.overlaps is not None else f"align {buf.align}"
-        )
         chans = [
             n for n, ch in kernel._ws_chans.items() if any(b is buf for b in ch.buffers.values())
         ]
+        stages = ""  # the stage mode matters only to the channels binding the buffer
+        if chans and res is not None and res.stages is not None:
+            stages = f"{res.stages} stages (mode {buf.stage_axis})"
+        where = (
+            f"overlaps {buf.overlaps.name}" if buf.overlaps is not None else f"align {buf.align}"
+        )
         rows.append(
             [
                 name,
@@ -314,6 +311,11 @@ def _smem(kernel) -> str:
             ]
         )
     return "\n".join([head, *_table(rows, right={2})])
+
+
+def _alias(kernel) -> str:
+    rep = kernel._ws_alias
+    return "" if rep is None else rep.describe()
 
 
 def _opt_outs(kernel) -> str:
