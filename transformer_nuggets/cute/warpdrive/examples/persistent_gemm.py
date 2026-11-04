@@ -7,6 +7,7 @@ tile i; the epilogue stores through SMEM with TMA, which also clips ragged edges
 policy and the cluster are constructor arguments::
 
     PersistentGemm(policy=StaticPersistent())      # or OneShot(), DynamicPersistent(), Clc()
+    PersistentGemm(order=Raster(along="n", swizzle=4))  # any WorkMapping
     PersistentGemm(cluster=CtaPair())              # 2-CTA: 256x256 MMA tiles, CtaGroup.TWO
 
 With ``CtaPair`` the MMA tile is 256x256x64: each CTA of the pair loads its 128 rows of A and
@@ -51,6 +52,7 @@ from transformer_nuggets.cute.warpdrive import (
     TmemPlan,
     Umma,
     WarpSpecialized,
+    WorkMapping,
     role,
 )
 from transformer_nuggets.cute.warpdrive.examples.gemm import check_gemm_args
@@ -86,7 +88,7 @@ class PersistentGemm(WarpSpecialized):
     def __init__(
         self,
         policy=None,
-        order: Raster | None = None,
+        order: WorkMapping | None = None,
         ab_stages: int | None = None,
         acc_stages: int = 2,
         trace: bool = False,
@@ -365,7 +367,7 @@ def persistent_gemm(
     b: torch.Tensor,
     out: torch.Tensor | None = None,
     policy=None,
-    order: Raster | None = None,
+    order: WorkMapping | None = None,
     max_ctas: int | None = None,
     cluster=None,
     tile_n: int = 256,

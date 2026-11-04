@@ -65,11 +65,17 @@ Counter lifetime (``DynamicPersistent``): the workspace holds ``[claims, finishe
 scheduler reports once after its last claim and the last CTA to report zeroes both words, so
 launches ordered on one stream (including CUDA-graph replays) reuse one workspace with no host
 reset. A workspace must not be shared by concurrently running launches.
+
+Custom schedules subclass the same public protocols as the built-ins: ``Policy`` (next index),
+``WorkMapping`` (index -> item, optional ``skip``), and ``Readiness`` (wait before the first
+decode). Their docstrings say which methods run on the host (in the ``@cute.jit`` entry point)
+and which on the device, and what each must guarantee.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass, field, fields, is_dataclass
 
 import cutlass
 from cutlass import Int32, Int64, cute
@@ -86,6 +92,18 @@ class Tiles:
     """Annotation: the role receives a ``TileCursor`` over the stream with the parameter's name."""
 
 
+def _field_key(obj, skip: tuple[str, ...] = ()) -> str:
+    """``_<name><value>`` for each dataclass field: the default compile key of a protocol object
+    with constructor arguments (override ``get_key`` for values that are not short tokens)."""
+    if not is_dataclass(obj):
+        return ""
+    return "".join(
+        f"_{f.name}" + re.sub(r"[^0-9a-z]+", "_", str(getattr(obj, f.name)).lower())
+        for f in fields(obj)
+        if f.name not in skip
+    )
+
+
 def _min(a, b):
     if isinstance(a, int) and isinstance(b, int):
         return min(a, b)
@@ -98,17 +116,36 @@ def _min(a, b):
 
 
 class WorkMapping:
-    """Protocol for ``order=``. ``words``: Int32 words per item. ``bind(space)`` normalizes the
-    runtime space (a DSL value), ``size(space)`` counts items, ``decode(index, space)`` returns
-    ``words`` Int32 values, and ``item(words)`` builds what ``tiles.work`` returns.
-    ``size64(space)`` is the Int64 item count for the launch's range check
-    (``TileProblem.grid``): exact up to ``2**31``, and it may saturate there but must not wrap.
-    The default widens ``size``, so a mapping whose count can exceed Int32 overrides it.
+    """Public protocol for ``TileStream(order=...)``: linear work index -> work item.
 
-    ``decode`` and ``size`` receive the bound space. ``decode`` may be called with
-    ``index >= size`` (its result is then ignored), including on an empty space, and must not
-    fault or divide by zero there. ``skip(item, space)`` (optional, only called for valid
-    indices) permanently removes items no role should see; it is not a readiness wait.
+    Subclass it (``Raster`` and the ``adapters.py`` mappings do) and set or override:
+
+    * ``words`` (class attribute, positive int): Int32 words per item. Broadcast policies ship
+      ``[index, *words]`` through the work ring, so keep it small.
+    * ``bind(space)``, host (the ``@cute.jit`` entry point, inside ``TileStream.problem``):
+      normalize the runtime space and return the bound space, any DSL value
+      (``extract_mlir_values`` must work on it: tuples of ``Int32``, tensors, CuTeDSL params
+      objects). It is passed to the kernel and to every method below. ``bind`` must make an
+      empty space safe (``Raster`` stores ``(1, 1, 0)``).
+    * ``size(space)``, host and device: the item count, Int32. Items are indices
+      ``[0, size)``.
+    * ``size64(space)``, host: the Int64 count for the launch's range check
+      (``TileProblem.grid``): exact up to ``2**31``, it may saturate there but must not wrap.
+      The default widens ``size``, so a mapping whose count can exceed Int32 overrides it.
+    * ``decode(index, space)``, device: ``words`` Int32-convertible values. It may be called with
+      ``index >= size`` (the result is then ignored), including on an empty space, and must not
+      fault or divide by zero there.
+    * ``item(words)``, device: what ``tiles.work`` returns (default: the tuple of words).
+    * ``skips`` and ``skip(item, space)`` (optional), device: with ``skips = True``, items whose
+      ``skip`` is true are removed permanently for every role. Only called for valid indices; it
+      is not a readiness wait. It must give the same answer in every role and CTA.
+    * ``get_key()``, host: compile-key fragment naming every compile-time choice (never runtime
+      extents), in lowercase letters, digits and underscores (examples put it in kernel names).
+      ``describe()`` (optional): text for ``describe()``.
+
+    Every method sees the bound space. ``decode`` and ``skip`` must be pure functions of their
+    arguments (plus tables written before the launch, or before ``ready`` returns), so every role
+    that decodes an index gets the same item.
     """
 
     words: int = 1
@@ -242,8 +279,21 @@ class Raster(WorkMapping):
 # --------------------------------------------------------------------------- #
 
 
+class Readiness:
+    """Public protocol for ``TileStream(ready=...)``: ``wait()`` runs on the device once,
+    wherever the stream decodes (each role in local mode, the scheduler warp in broadcast mode),
+    before the first ``decode``/``skip``. It must return in every warp that calls it.
+    ``get_key()`` (host) names it in the compile key."""
+
+    def wait(self):
+        raise NotImplementedError
+
+    def get_key(self) -> str:
+        return type(self).__name__.lower() + _field_key(self)
+
+
 @dataclass(frozen=True)
-class PdlWait:
+class PdlWait(Readiness):
     """Readiness hook: ``griddepcontrol.wait`` before the first mapping-dependent read, for
     mappings that read tables written by the preceding kernel under programmatic dependent
     launch."""
@@ -251,23 +301,80 @@ class PdlWait:
     def wait(self):
         cute.arch.griddepcontrol_wait()
 
+    def get_key(self) -> str:
+        return "pdl"
+
 
 # --------------------------------------------------------------------------- #
 # Policies: how a CTA gets its next linear index
 # --------------------------------------------------------------------------- #
 
 
-class _Policy:
-    """``broadcast``: indices are claimed by one scheduler warp and broadcast to every role.
+class Policy:
+    """Public protocol for ``TileStream(policy=...)``: how a work unit gets its next linear index.
 
-    Indices, ``grid_size``, and the cap count work units: CTAs, or clusters of a ``CtaPair``.
+    A work unit is a CTA, or a cluster of a ``CtaPair``. Policies never see tiles: they return
+    indices that the mapping decodes. Every index a policy returns is a valid index in
+    ``[0, problem.total)`` or a terminal value ``>= problem.total`` (never negative); once a unit
+    returns a terminal index its stream has ended.
+
+    Class attributes:
+
+    * ``persistent``: a unit may run more than one item, so every managed role must loop. With
+      ``persistent = False`` a unit runs at most one item: ``step`` must return a terminal index
+      (the cursor keeps the first item's words), and raw roles may use ``work_item()``.
+    * ``broadcast``: ``False`` computes indices locally, in every role, with ``first``/``step``;
+      ``True`` claims them on a layer-owned scheduler warp with ``claim`` and broadcasts the
+      decoded items (leader CTA only in a pair). The layer owns the ring, its counts, the drain,
+      and the publication to both CTAs of a pair.
+    * ``stages``: work-ring depth of a broadcast policy (decoded items buffered ahead of the
+      slowest role); a positive int.
+    * ``uses_max_ctas``: ``grid_size`` reads the ``max_ctas`` cap (``TileProblem.grid`` then
+      requires one).
+    * ``uses_workspace``: device code reads ``problem.workspace`` (the int32 tensor from
+      ``launch_args``).
+
+    Host methods (the ``@cute.jit`` entry point; ``total`` is the item count):
+
+    * ``grid_size(total, max_units)``: launched work units; at least 1. ``max_units`` is the cap
+      in work units, or ``None`` without ``uses_max_ctas``.
+    * ``reach(total, units, cs)``: the largest grid x extent or index the launch computes, from
+      the Int64 ``total`` (``WorkMapping.size64``); ``TileProblem.grid`` launches a zero-wide
+      grid (which CUDA rejects) when it exceeds Int32. Override it when the default
+      (``total + units - 1``, a strided terminal index) does not bound your policy.
+    * ``get_key()``: compile-key fragment naming every compile-time field, in lowercase letters,
+      digits and underscores. The default is the lowercased class name, ``stages`` and each other
+      dataclass field as ``_<name><value>``; override it when a value is not a short token.
+      ``describe()``.
+    * ``fetch_channels()`` (broadcast): ``{name: Channel}`` of extra layer-owned channels whose
+      producer and consumer ends the scheduler warp both hold (CLC's response slot).
+
+    Device methods (``problem`` is the kernel's ``TileProblem``: ``total``, ``space``,
+    ``workspace``, ``cs``, ``units()``, ``first_unit()``):
+
+    * ``first(problem)``: this unit's first index. It runs in every role (and the scheduler), so
+      it may depend only on the launch (``blockIdx``, ``gridDim``) and ``problem``. Default:
+      ``problem.first_unit()``.
+    * ``step(index, problem)`` (local): the next index after a valid ``index``; the same pure
+      function in every role.
+    * ``claim(fetch, problem, index)`` (broadcast): claim the next index on the scheduler warp.
+      ``index`` is the unit's previous index (valid or skipped), ``fetch`` maps each
+      ``fetch_channels`` name to its ``(producer end, consumer end)``. Called only when a
+      ring slot is free and the previous claim was valid.
+    * ``finish(fetch, problem)`` (broadcast): once, after the unit's last claim.
+
+    All values are Int32. Extents past Int32 are rejected at launch through ``reach``.
     """
 
     broadcast = False
     persistent = True
     stages = 0
+    uses_max_ctas = True
+    uses_workspace = False
 
     def grid_size(self, total, max_units):
+        if max_units is None:  # uses_max_ctas = False: one unit per item
+            return cutlass.max(total, 1)
         return cutlass.max(cutlass.min(total, max_units), 1)
 
     def reach(self, total, units, cs: int):
@@ -276,6 +383,9 @@ class _Policy:
         overshoots ``total`` by less than the stride (``units``)."""
         return total + units - 1
 
+    def get_key(self) -> str:
+        return f"{type(self).__name__.lower()}{self.stages}" + _field_key(self, skip=("stages",))
+
     def describe(self) -> str:
         return type(self).__name__ + (f"(stages={self.stages})" if self.broadcast else "()")
 
@@ -283,12 +393,25 @@ class _Policy:
         """Extra layer-owned channels the scheduler warp holds both ends of."""
         return {}
 
+    def first(self, problem):
+        return problem.first_unit()
+
+    def step(self, index, problem):
+        raise NotImplementedError
+
+    def claim(self, fetch, problem, index):
+        raise NotImplementedError
+
+    def finish(self, fetch, problem):
+        pass
+
 
 @dataclass(frozen=True)
-class OneShot(_Policy):
+class OneShot(Policy):
     """One item per CTA, ``grid = total`` (the classic non-persistent launch)."""
 
     persistent = False
+    uses_max_ctas = False
 
     def grid_size(self, total, max_units):
         return cutlass.max(total, 1)
@@ -301,7 +424,7 @@ class OneShot(_Policy):
 
 
 @dataclass(frozen=True)
-class StaticPersistent(_Policy):
+class StaticPersistent(Policy):
     """``min(total, max_ctas)`` CTAs; CTA ``b`` runs ``b, b + grid, b + 2 grid, ...``."""
 
     def step(self, index, problem):
@@ -335,15 +458,16 @@ def _report_finished(workspace, units):
 
 
 @dataclass(frozen=True)
-class DynamicPersistent(_Policy):
+class DynamicPersistent(Policy):
     """``min(total, max_ctas)`` CTAs; after its first item (``blockIdx.x``) a CTA claims
     ``gridDim.x + atomicAdd(workspace[0], 1)``. ``stages``: decoded items buffered ahead of the
     slowest role. Needs an int32 ``[2]`` zeroed workspace (see the module docstring)."""
 
     stages: int = 2
     broadcast = True
+    uses_workspace = True
 
-    def claim(self, fetch, problem):
+    def claim(self, fetch, problem, index):
         return _claim_atomic(problem.workspace, problem.units())
 
     def finish(self, fetch, problem):
@@ -351,7 +475,7 @@ class DynamicPersistent(_Policy):
 
 
 @dataclass(frozen=True)
-class Clc(_Policy):
+class Clc(Policy):
     """Blackwell cluster launch control: ``grid = total``; a running CTA cancels a not-yet-
     launched CTA with ``clusterlaunchcontrol.try_cancel`` and runs its item instead. The hardware
     balances load and yields SMs to other kernels, with no counter to manage. ``stages``: decoded
@@ -360,6 +484,7 @@ class Clc(_Policy):
 
     stages: int = 2
     broadcast = True
+    uses_max_ctas = False
 
     def grid_size(self, total, max_units):
         return cutlass.max(total, 1)
@@ -375,7 +500,7 @@ class Clc(_Policy):
         clc.internal = True  # completed by try_cancel, not by TMA copies
         return {"clc": clc}
 
-    def claim(self, fetch, problem):
+    def claim(self, fetch, problem, index):
         prod, cons = fetch["clc"]
         h = prod.acquire(0)
         with cute.arch.elect_one():
@@ -411,8 +536,8 @@ class TileStream:
     """
 
     order: WorkMapping = field(default_factory=Raster)
-    policy: _Policy = field(default_factory=OneShot)
-    ready: PdlWait | None = None
+    policy: Policy = field(default_factory=OneShot)
+    ready: Readiness | None = None
     scheduler_warp: int | None = None
     record: int = 0
     name: str = field(default="", init=False)
@@ -422,6 +547,22 @@ class TileStream:
     _workspaces: dict = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self):
+        for value, protocol, arg in (
+            (self.order, WorkMapping, "order"),
+            (self.policy, Policy, "policy"),
+            (self.ready, (Readiness, type(None)), "ready"),
+        ):
+            if not isinstance(value, protocol):
+                names = getattr(protocol, "__name__", "Readiness or None")
+                raise TypeError(
+                    f"TileStream.{arg} must be a {names} (subclass the public protocol), "
+                    f"got {type(value).__name__}"
+                )
+        policy = type(self.policy)
+        needed = "claim" if self.policy.broadcast else "step"
+        if getattr(policy, needed) is getattr(Policy, needed):
+            mode = "broadcast" if self.policy.broadcast else "local"
+            raise TypeError(f"{policy.__name__} is a {mode} policy but does not define {needed}()")
         if type(self.order.words) is not int or self.order.words < 1:
             raise ValueError("work items need at least one word (a positive int)")
         if self.scheduler_warp is not None and (
@@ -464,9 +605,9 @@ class TileStream:
 
     def get_key(self) -> str:
         """Compile-key fragment: only compile-time choices (never extents or SM counts)."""
-        p = self.policy
-        key = f"{type(p).__name__.lower()}{p.stages}_{self.order.get_key()}"
-        return key + ("_pdl" if self.ready else "") + (f"_rec{self.record}" if self.record else "")
+        key = f"{self.policy.get_key()}_{self.order.get_key()}"
+        ready = f"_{self.ready.get_key()}" if self.ready else ""
+        return key + ready + (f"_rec{self.record}" if self.record else "")
 
     # ---- host, inside the @cute.jit entry point ---------------------------- #
 
@@ -474,9 +615,42 @@ class TileStream:
         """Bind the runtime space (``Raster``: ``(m_tiles, n_tiles, l)``). ``workspace``: int32
         ``[2]`` zeroed tensor, read only by ``DynamicPersistent``. ``max_ctas``: persistent grid
         cap (runtime, typically the SM count)."""
-        if (isinstance(self.policy, DynamicPersistent) or self.record) and workspace is None:
-            raise ValueError("DynamicPersistent and record need a workspace tensor")
+        if workspace is None and self.policy.uses_workspace:
+            raise ValueError(f"{self.policy.describe()} needs a workspace tensor")
+        if workspace is None and self.record:
+            raise ValueError("TileStream(record=...) needs a workspace tensor")
         return TileProblem(self, self.order.bind(space), workspace, max_ctas)
+
+    # ---- device, inside a raw role ------------------------------------------ #
+
+    def work_item(self):
+        """``valid, item = self.tiles.work_item()``: this CTA's work item for a raw role, which
+        takes no ``Tiles`` cursor. Only for non-persistent policies (``OneShot``), where a unit
+        has at most one item. It runs the readiness hook and the skip predicate like a managed
+        role and reads the item the way the cursor does, so it stays correct on the 1-D
+        fallback grid, a hand-built ``(total, 1, 1)`` grid, a ``CtaPair``, and custom
+        mappings. ``valid`` is false for an empty space or a skipped item. Call it after
+        ``begin_roles``."""
+        if self.policy.persistent or self.policy.broadcast:
+            raise ProtocolError(
+                f"TileStream {self.name or '?'}: work_item() needs a non-persistent local policy "
+                f"(OneShot), not {self.policy.describe()}; a role that runs several items takes "
+                "`tiles: Tiles` and loops"
+            )
+        problems = getattr(self.owner, "_ws_problems", None) or {}
+        if self.name not in problems:
+            raise ProtocolError(
+                f"TileStream {self.name or '?'}: call work_item() inside a role, after "
+                "begin_roles()"
+            )
+        problem = problems[self.name]
+        if self.ready is not None:
+            self.ready.wait()
+        index = Int32(self.policy.first(problem))
+        if self.order.skips:
+            index = Int32(_skip_local(self, index, problem))
+        words = problem.first_words if _tile_grid(self) else _decode(self, index, problem)
+        return index < problem.total, self.order.item(list(words))
 
     # ---- host, plain Python ------------------------------------------------ #
 
@@ -574,7 +748,7 @@ class TileProblem:
         )
 
     def _uses_workspace(self) -> bool:
-        return isinstance(self.stream.policy, DynamicPersistent) or bool(self.stream.record)
+        return self.stream.policy.uses_workspace or bool(self.stream.record)
 
     def __extract_mlir_values__(self):
         values = cutlass.extract_mlir_values(self.space)
@@ -600,12 +774,11 @@ class TileProblem:
         at most ``max_ctas // 2`` clusters. An empty space launches one work unit. A space whose
         ``policy.reach`` exceeds Int32 gets a zero-wide grid, which CUDA rejects at launch."""
         policy = self.stream.policy
-        uses_cap = isinstance(policy, (StaticPersistent, DynamicPersistent))
-        if uses_cap and self.max_ctas is None:
-            raise ValueError(f"{policy.describe()} needs max_ctas")
-        cap = self.max_ctas
-        if uses_cap and self.cs > 1:
-            cap = cutlass.max(cap // self.cs, 1)
+        cap = None
+        if policy.uses_max_ctas:
+            if self.max_ctas is None:
+                raise ValueError(f"{policy.describe()} needs max_ctas")
+            cap = self.max_ctas if self.cs == 1 else cutlass.max(self.max_ctas // self.cs, 1)
         units = policy.grid_size(self.total, cap)
         if _tile_grid(self.stream):
             x, y, z = tile_grid_dims(self.space, self.cs)
@@ -757,7 +930,7 @@ def _tile_grid(stream) -> bool:
     path to its first copy (about 0.2 us on a 512^3 GEMM)."""
     order = stream.order
     return (
-        isinstance(stream.policy, OneShot)
+        type(stream.policy) is OneShot  # a subclass may override first()
         and type(order) is Raster
         and order.along == "m"
         and order.swizzle == 1
@@ -767,7 +940,7 @@ def _tile_grid(stream) -> bool:
 
 
 def _hooked(stream) -> bool:
-    """Hooks can move a CTA's first item off ``blockIdx.x``."""
+    """Hooks can move a CTA's first item off ``policy.first``."""
     return stream.ready is not None or stream.order.skips
 
 
@@ -786,7 +959,7 @@ class TileCursor:
 
     @staticmethod
     def create(stream, problem, end, trace, *, scheduler: bool = False, slot=None):
-        """Local mode: run the hooks and decode here. Broadcast mode: start at ``blockIdx.x``
+        """Local mode: run the hooks and decode here. Broadcast mode: start at ``policy.first``
         decoded locally, or, when hooks may move the first item, receive it from the scheduler
         (which publishes it in ``scheduler_role``)."""
         rec = _CursorRecord(trace.role_name, trace=trace)
@@ -794,7 +967,7 @@ class TileCursor:
         count = Int32(0) if stream.record else None
         iket = trace.role_name if trace.iket else None
         cur = TileCursor(
-            stream, problem, end, Int32(problem.first_unit()), [], rec, count, slot, iket
+            stream, problem, end, Int32(stream.policy.first(problem)), [], rec, count, slot, iket
         )
         if end is None:
             if stream.ready is not None:
@@ -930,8 +1103,8 @@ class _Fetch:
             ends[k] = tuple(new)
         return _Fetch(self._policy, ends, self._problem)
 
-    def claim(self):
-        return Int32(self._policy.claim(self._ends, self._problem))
+    def claim(self, index):
+        return Int32(self._policy.claim(self._ends, self._problem, index))
 
     def finish(self):
         self._policy.finish(self._ends, self._problem)
@@ -988,16 +1161,16 @@ def scheduler_role(kernel, work, tiles: TileCursor, fetch: _Fetch):
             first = tiles.index
             if cutlass.const_expr(order.skips):
                 while _skipped(stream, first, problem):
-                    first = fetch.claim()
+                    first = fetch.claim(first)
             _publish(h0, first, _decode(stream, first, problem), problem.total)
         tiles._receive()
         tiles._first_item()
     while tiles.valid:
         with work.produce() as h:
-            index = fetch.claim()
+            index = fetch.claim(tiles.index)
             if cutlass.const_expr(order.skips):
                 while _skipped(stream, index, problem):
-                    index = fetch.claim()
+                    index = fetch.claim(index)
             _publish(h, index, _decode(stream, index, problem), problem.total)
         tiles.advance()
     fetch.finish()

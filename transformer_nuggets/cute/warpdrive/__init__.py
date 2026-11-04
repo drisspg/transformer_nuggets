@@ -23,7 +23,8 @@ views and raw barrier pointers are not returned.
 The layer uses the returned state directly; no execution state is recovered from Python frames.
 Work scheduling (``scheduling.py``): declare ``self.tiles = TileStream(order=..., policy=...)``
 and give roles ``tiles: Tiles``; the policy (``OneShot``, ``StaticPersistent``,
-``DynamicPersistent``, ``Clc``) is a one-line switch. Clusters (``cluster.py``): declare
+``DynamicPersistent``, ``Clc``, or a ``Policy`` subclass) and the order (``Raster`` or a
+``WorkMapping`` subclass) are one-line switches. Clusters (``cluster.py``): declare
 ``self.cluster = CtaPair()`` and pin the MMA role with ``@role(..., cta="leader")``. See
 ``examples/`` for a GEMM, a persistent GEMM, and an FA4-style attention forward.
 
@@ -105,7 +106,9 @@ from transformer_nuggets.cute.warpdrive.scheduling import (
     DynamicPersistent,
     OneShot,
     PdlWait,
+    Policy,
     Raster,
+    Readiness,
     StaticPersistent,
     TileCursor,
     TileProblem,
@@ -126,10 +129,12 @@ __all__ = [
     "Instance",
     "OneShot",
     "PdlWait",
+    "Policy",
     "Producer",
     "ProtocolError",
     "ProtocolLog",
     "Raster",
+    "Readiness",
     "Ring",
     "RoleConfig",
     "SingleCta",

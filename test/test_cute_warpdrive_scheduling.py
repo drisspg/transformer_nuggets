@@ -276,12 +276,16 @@ class ScheduleToy(WarpSpecialized):
                 tiles.advance()
         return tiles
 
+    def space(self, em, en, el):
+        """The space bound in the entry point (a test mapping may need more than extents)."""
+        return (em, en, el)
+
     @cute.kernel
-    def kernel(self, log: cute.Tensor, hits: cute.Tensor, work):
+    def kernel(self, log: cute.Tensor, hits: cute.Tensor, em: Int32, en: Int32, work):
         smem = self.begin_roles(tiles=work)
         # ~160 KB of SMEM: one CTA per SM, so CLC has unlaunched CTAs to cancel.
         smem.allocate_array(cutlass.Int32, 40000)
-        em, en, _ = work.space
+        # Extents from the arguments, not work.space: external mappings bind other spaces.
         self.run_roles(SimpleNamespace(log=log, hits=hits, em=em, en=en))
 
     @cute.jit
@@ -296,11 +300,11 @@ class ScheduleToy(WarpSpecialized):
         max_ctas: Int32,
         stream: cuda.CUstream,
     ):
-        work = self.tiles.problem((em, en, el), workspace, max_ctas)
+        work = self.tiles.problem(self.space(em, en, el), workspace, max_ctas)
         self.kernel.set_name_prefix(self.get_name())
         # "1d" modes launch a hand-built (total, 1, 1) grid instead of the policy's.
         grid = (work.total, 1, 1) if cutlass.const_expr(self.mode.endswith("1d")) else work.grid()
-        self.kernel(log, hits, work).launch(
+        self.kernel(log, hits, em, en, work).launch(
             grid=grid, block=(self.num_threads, 1, 1), stream=stream
         )
 
@@ -326,11 +330,12 @@ def compile_toy(op: ScheduleToy):
     return _TOYS[key]
 
 
-def run_toy(op, ext, max_ctas, reps=1):
+def run_toy(op, ext, max_ctas, reps=1, items=None):
+    """``items``: the mapping's item count when it differs from the tile count (padding)."""
     em, en, el = ext
     total = em * en * el
-    persistent = isinstance(op.tiles.policy, (StaticPersistent, DynamicPersistent))
-    grid = max(min(total, max_ctas), 1) if persistent else max(total, 1)
+    count = total if items is None else items
+    grid = max(min(count, max_ctas), 1) if op.tiles.policy.uses_max_ctas else max(count, 1)
     log = torch.full((2, grid, ScheduleToy.MAX_ITEMS), -1, dtype=torch.int32, device="cuda")
     hits = torch.zeros(2, max(total, 1), dtype=torch.int32, device="cuda")
     ws, _ = op.tiles.launch_args("cuda")
@@ -471,6 +476,9 @@ class CountToy(WarpSpecialized):
             tiles.advance()
         return tiles
 
+    def space(self, em, en, el):
+        return (em, en, el)
+
     @cute.kernel
     def kernel(self, count: cute.Tensor, work):
         self.begin_roles(tiles=work)
@@ -487,7 +495,7 @@ class CountToy(WarpSpecialized):
         max_ctas: Int32,
         stream: cuda.CUstream,
     ):
-        work = self.tiles.problem((em, en, el), workspace, max_ctas)
+        work = self.tiles.problem(self.space(em, en, el), workspace, max_ctas)
         self.kernel.set_name_prefix(self.get_name())
         self.kernel(count, work).launch(**self.launch_config(work), stream=stream)
 
@@ -662,7 +670,7 @@ GEMM_SHAPES = [
 ]
 
 
-def _check_gemm(policy, m, n, k, max_ctas=None, order=None):
+def _check_gemm(policy, m, n, k, max_ctas=None, order=None, cluster=None):
     from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import persistent_gemm
 
     torch.manual_seed(0)
@@ -673,7 +681,7 @@ def _check_gemm(policy, m, n, k, max_ctas=None, order=None):
     out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
     for _ in range(2):  # the second launch reuses the (self-reset) dynamic counter
         out.fill_(float("nan"))
-        persistent_gemm(a, b, out, policy=policy, order=order, max_ctas=max_ctas)
+        persistent_gemm(a, b, out, policy=policy, order=order, max_ctas=max_ctas, cluster=cluster)
         err = (out.float() - ref).abs().max().item()
         assert err <= 2 * torch_err + 1e-3, (policy, (m, n, k), err, torch_err)
 
