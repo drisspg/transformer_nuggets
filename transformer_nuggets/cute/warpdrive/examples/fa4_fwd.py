@@ -174,6 +174,8 @@ class FlashAttentionForward(WarpSpecialized):
             raise ValueError("use_ldred_rowmax requires an SM103-family target")
         self.roles = roles if roles is not None else Fa4Roles()
         self.cluster = cluster or SingleCta()
+        if self.cluster.size != self.cluster.pair_size:
+            raise ValueError(f"the FA4 example runs on one CTA or a CTA pair, got {self.cluster}")
         self.split_p = split_p
         self.overlap_o_q = overlap_o_q
         self.use_ldred_rowmax = use_ldred_rowmax

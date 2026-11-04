@@ -47,37 +47,42 @@ def fmt_counts(counts) -> str:
     return f"[{', '.join(str(c) for c in counts)}]"
 
 
-def rank_label(rank: int, cluster_size: int) -> str:
+def is_pair(cluster) -> bool:
+    """A lone CTA pair, whose ranks print as leader and peer."""
+    return cluster.pair and cluster.size == 2
+
+
+def rank_label(rank: int, pair: bool = True) -> str:
     """``leader``/``peer`` in a CTA pair, ``rank r`` in any other cluster."""
-    if cluster_size <= 2:
+    if pair:
         return "leader" if rank == 0 else "peer"
     return f"rank {rank}"
 
 
-def fmt_per_cta(per_rank: dict, ranks, by_rank: bool = False) -> str:
+def fmt_per_cta(per_rank: dict, ranks, by_rank: bool = False, pair: bool = True) -> str:
     """Counts of the CTAs ``ranks`` (``{rank: per-slot list}``), labelled by rank when
     ``by_rank`` or when they differ."""
     ranks = list(ranks)
     values = [fmt_counts(per_rank[r]) for r in ranks]
     if not by_rank and len(set(values)) == 1:
         return values[0]
-    size = max(len(per_rank), 2)
-    return ", ".join(f"{rank_label(r, size)} {v}" for r, v in zip(ranks, values))
+    return ", ".join(f"{rank_label(r, pair)} {v}" for r, v in zip(ranks, values))
 
 
-def fmt_mask(mask, cluster_size: int) -> str:
+def fmt_mask(mask, cluster) -> str:
     """A ``tcgen05.commit`` mask (one bit per CTA rank), or each signalling rank's mask."""
-    width = max(cluster_size, 2) + 2
+    width = max(cluster.size, 2) + 2
     if isinstance(mask, int):
         return f"{mask:#0{width}b}"
-    return ", ".join(f"{rank_label(r, cluster_size)} {m:#0{width}b}" for r, m in mask.items())
+    pair = is_pair(cluster)
+    return ", ".join(f"{rank_label(r, pair)} {m:#0{width}b}" for r, m in mask.items())
 
 
-def _fmt_value(key: str, value, cluster_size: int) -> str:
+def _fmt_value(key: str, value, cluster) -> str:
     if key in ("full_counts", "empty_counts"):
-        return fmt_per_cta(value, range(cluster_size))
+        return fmt_per_cta(value, range(cluster.size), pair=is_pair(cluster))
     if key in ("full_mask", "empty_mask"):
-        return fmt_mask(value, cluster_size)
+        return fmt_mask(value, cluster)
     return str(value)
 
 
@@ -173,10 +178,12 @@ def _channels(kernel) -> str:
         sc = ch.scope
         full_ranks = sc.full_ctas if sc.pair else range(cs)
         empty_ranks = sc.empty_ctas if sc.pair else range(cs)
-        full = fmt_per_cta(sc.full_counts, full_ranks, by_rank=sc.pair)
+        pair = is_pair(kernel.cluster)
+        full = fmt_per_cta(sc.full_counts, full_ranks, by_rank=sc.pair, pair=pair)
         if sc.tx is not None:
-            leaders = set(kernel.cluster.ctas("leader"))
-            armed = sc.pair and all(r in leaders for r, cs in sc.full_targets.items() if cs)
+            # Leaders arm for their pair, or rank 0's scheduler for every CTA.
+            armers = [r for r, targets in sc.full_targets.items() if targets]
+            armed = sc.pair and (kernel.cluster.pair or armers == [0])
             full += f", tx {sc.tx} B" + (" (leader-armed)" if armed else "")
         details.append(("signal", f"{_mech(ch.producer)} -> {_mech(ch.consumer)}"))
         if ch.named:
@@ -189,7 +196,8 @@ def _channels(kernel) -> str:
             details.append(("named", named))
         else:
             details.append(("full", full))
-            details.append(("empty", fmt_per_cta(sc.empty_counts, empty_ranks, by_rank=sc.pair)))
+            empty = fmt_per_cta(sc.empty_counts, empty_ranks, by_rank=sc.pair, pair=pair)
+            details.append(("empty", empty))
         for side in ("producer", "consumer"):
             if ch.turns(side) > 1:
                 details.append(
@@ -202,13 +210,13 @@ def _channels(kernel) -> str:
         if cs > 1:
             scope = ["CTA-local"]
             if sc.pair:
-                scope = ["pair-scoped" if cs == 2 else "cross-CTA"]
+                scope = ["pair-scoped" if pair else "cross-CTA"]
                 if isinstance(ch.producer, Tma) and ch.producer.multicast:
                     scope.append(f"multicast {'+'.join(ch.producer.multicast)}")
                 if ch.producer is Umma:
-                    scope.append(f"commit_mask {fmt_mask(sc.full_mask, cs)}")
+                    scope.append(f"commit_mask {fmt_mask(sc.full_mask, kernel.cluster)}")
                 if ch.consumer is Umma:
-                    scope.append(f"release_mask {fmt_mask(sc.empty_mask, cs)}")
+                    scope.append(f"release_mask {fmt_mask(sc.empty_mask, kernel.cluster)}")
                 if Threads in (ch.producer, ch.consumer):
                     scope.append(f"remote_scope {ch.remote_scope}")
                 if sc.tail:
@@ -228,7 +236,7 @@ def _channels(kernel) -> str:
         if extra:
             storage = ch.payload is not None or ch.buffers
             details.append(("storage" if storage else "fences", ", ".join(extra)))
-        details += [("override", o) for o in _overrides(ch, cs)]
+        details += [("override", o) for o in _overrides(ch, kernel.cluster)]
         tma = _tma_status(kernel, name, ch)
         if tma:
             details.append(("tma", tma))
@@ -236,7 +244,7 @@ def _channels(kernel) -> str:
     return "\n".join(lines)
 
 
-def _overrides(ch, cluster_size: int) -> list[str]:
+def _overrides(ch, cluster) -> list[str]:
     """``key derived -> effective`` for every overridden value."""
     out = []
     derived = ch.derived_scope
@@ -244,8 +252,7 @@ def _overrides(ch, cluster_size: int) -> list[str]:
         ours, theirs = getattr(derived, key), getattr(ch.scope, key)
         note = "  (differs from derived)" if ours != theirs else ""
         out.append(
-            f"{key} {_fmt_value(key, ours, cluster_size)} -> "
-            f"{_fmt_value(key, theirs, cluster_size)}{note}"
+            f"{key} {_fmt_value(key, ours, cluster)} -> {_fmt_value(key, theirs, cluster)}{note}"
         )
     if ch.remote_scope_overridden:
         ours, theirs = ch.derived_remote_scope, ch.remote_scope

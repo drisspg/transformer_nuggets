@@ -423,11 +423,17 @@ def derive_scope(chan, cluster, *, internal: bool = False) -> Scope:
                 "which the layer does not derive; run the producer in both CTAs (each loads its "
                 "own half)"
             )
-        else:
+        elif cluster.pair:
             raise ProtocolError(
                 f"channel {chan.name}: TMA producers in both CTAs can only feed leader-only "
                 f"consumers (2-CTA operands complete on the leader's barrier); consumers are "
                 f"{[ri.name + '@' + ri.cta for ri, _ in chan.consumers]}"
+            )
+        else:
+            raise ProtocolError(
+                f"channel {chan.name}: a TMA copy completes on its own CTA's barrier without "
+                "MMA pairs, so producers and consumers must run in the same CTAs; consumers "
+                f"are {[ri.name + '@' + ri.cta for ri, _ in chan.consumers]}"
             )
     if isinstance(chan.consumer, Tma):
         raise ProtocolError(f"channel {chan.name}: TMA is a producer mechanism")

@@ -28,9 +28,10 @@ runs on [larger clusters](#larger-clusters).
 
 ## Which channels cross CTAs?
 
-If all participants have the same placement, the channel is CTA-local: all/all means an
-independent channel in each CTA; leader/leader means one in rank 0. Mixed placements make
-it pair-scoped.
+If all participants have the same placement and nothing is multicast, the channel is
+CTA-local: all/all means an independent channel in each CTA; leader/leader means one in each
+pair leader (rank 0 of a `CtaPair`). Mixed placements or [multicast](#multicast) copies make it
+cross-CTA (pair-scoped in a `CtaPair`).
 
 For the GEMM's A/B channel, the load role runs in both CTAs and the MMA role only on the
 leader. Each CTA issues its TMA copies; the leader arms twice the declared per-CTA byte count.
@@ -131,8 +132,8 @@ past the edge; TMA loads zeros there and clips the stores.
 
 The scheduler warp runs on rank 0 and publishes each item to all four CTAs. Its ring's empty
 barrier on rank 0 counts every stream user of every CTA. `launch_args()` caps a persistent grid
-at the clusters that fit at once (36 4-CTA clusters on a 152-SM GB300, not 38), so the grid
-runs in one wave.
+at the clusters that fit at once (`HardwareInfo().get_max_active_clusters(4)` is 36 on a 152-SM
+GB300, not 38), so the grid runs in one wave.
 
 ### What the 2x2 GEMM derives
 
@@ -185,9 +186,10 @@ inside a pair: rank 0 commits to ranks 0-1, rank 2 to ranks 2-3. The work ring e
 
 ### Limits
 
-- Multicast channels cannot have a `rank0` participant, and cross-CTA TMA still needs
-  producers in every CTA feeding the pair leaders (or a CTA-local channel).
-- A leader-only TMA producer can't fill other CTAs (that would need the leader to arm their
-  barriers).
+- Multicast channels cannot have a `rank0` participant. Mixed-placement TMA still needs
+  producers in every CTA feeding the pair leaders. Same-placement multicast (all/all or
+  leader/leader) arms each CTA's own barrier and releases every CTA its copies reach.
+- A leader-only TMA producer can't fill other CTAs' stages for consumers there (that would
+  need the leader to arm their barriers).
 - Clusters have at most 8 CTAs (the portable limit).
 - The alias diagnostic doesn't model clusters.

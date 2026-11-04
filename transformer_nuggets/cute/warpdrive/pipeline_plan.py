@@ -10,7 +10,7 @@ from transformer_nuggets.cute.profiler.pipeline.plan import (
     Role,
 )
 from transformer_nuggets.cute.warpdrive.channels import Tma, Umma
-from transformer_nuggets.cute.warpdrive.describe import rank_label
+from transformer_nuggets.cute.warpdrive.describe import is_pair, rank_label
 
 ROLE_COLORS = ("#4f9cf9", "#5bc8a5", "#ef6a8a", "#c88bf2", "#f0b35b", "#63c7da", "#a0a0a0")
 
@@ -47,7 +47,7 @@ def plan_from_warpdrive(kernel, *, cta: int = 0, name: str | None = None) -> Pip
         iteration_name="work item" if kernel._ws_streams else "launch",
     )
     for i, r in enumerate(roles):
-        where = f" ({rank_label(cta, cluster.size)})" if cluster.size > 1 else ""
+        where = f" ({rank_label(cta, is_pair(cluster))})" if cluster.size > 1 else ""
         plan.add_role(
             Role(
                 r.name,

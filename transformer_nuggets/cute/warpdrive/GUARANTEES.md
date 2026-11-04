@@ -173,9 +173,9 @@ coordinates except along each declared mode (`Cluster.line`).
 - Ordinary cross-CTA TMA producers in every CTA feed only the pair leaders. Each leader arms
   `2 * Tma.tx_bytes` (both CTAs' SMEM) and only leaders arm; each CTA's copies deliver the
   declared per-CTA bytes using group TWO, multicast or not. A leader-only producer feeding
-  other CTAs is rejected, as is any other cross-CTA TMA shape. All/all local TMA (multicast or
-  not) needs group ONE; leader/leader local accepts either group as far as the layer's
-  channel-group check is concerned.
+  other CTAs is rejected, as is any other mixed-placement TMA shape. Same-placement TMA
+  (multicast or not) arms each CTA's own barrier with unscaled bytes. All/all needs group ONE;
+  leader/leader accepts either group as far as the layer's channel-group check is concerned.
 - `Tma.tx_bytes` is what lands in each CTA's SMEM per stage. A multicast copy delivers its box
   to every CTA of its mask; the layer derives only the release side from the declaration.
   Multicast channels cannot have a `rank0` participant.
@@ -312,9 +312,9 @@ body at `describe()` time.
 | E34 | Slots.n >31 | ValueError |
 | E35 | Barriers.n not a positive Python int | ValueError |
 | E36 | Raw counts not a positive Python int or n positive integer entries | ValueError |
-| E37 | UMMA signaler not leader-only in a cluster with pairs | ProtocolError |
+| E37 | UMMA signaler not leader-only in a cluster with pairs, or missing the leader of a pair the other side runs in | ProtocolError |
 | E38 | Pair turnstile seats have different placements | ProtocolError |
-| E39 | Pair has TMEM users but none runs in both CTAs | ProtocolError |
+| E39 | Cluster has TMEM users but none runs in every CTA | ProtocolError |
 | E40 | User pair-scoped channel has a layer-owned payload | ProtocolError |
 | E41 | Ordinary leader-only TMA producer feeds other CTAs | ProtocolError |
 | E42 | Other cross-CTA TMA shapes: producers not in every CTA, or consumers not exactly the pair leaders | ProtocolError |

@@ -29,10 +29,13 @@ from transformer_nuggets.cute.warpdrive import (
     StaticPersistent,
     Threads,
     Tma,
+    Tmem,
+    TmemPlan,
     Umma,
     WarpSpecialized,
     role,
 )
+from transformer_nuggets.cute.warpdrive.cluster import rank_in, rank_value
 from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import (
     PersistentGemm,
     compile_persistent_gemm,
@@ -172,12 +175,93 @@ class _AllToRank0Tma(_MulticastWithRank0):
         self.ch = Ring(2, Tma(1024), Threads)
 
 
+class _LeaderMulticast(WarpSpecialized):
+    """Leader-only producer and consumer multicasting along N between the two pair leaders."""
+
+    def __init__(self):
+        self.cluster = PAIRS_2X2
+        self.ch = Ring(2, Tma(1024, multicast="n"), Umma)
+
+    @role(warps=0, cta="leader")
+    @cute.jit
+    def load(self, ch: Producer, ctx):
+        return ch
+
+    @role(warps=1, cta="leader")
+    @cute.jit
+    def mma(self, ch: Consumer, ctx):
+        return ch
+
+
+class _Rank0Mma(WarpSpecialized):
+    def __init__(self):
+        self.cluster = PAIRS_2X2
+        self.acc = Ring(2, Umma, Threads)
+
+    @role(warps=0, cta="rank0")
+    @cute.jit
+    def mma(self, acc: Producer, ctx):
+        return acc
+
+    @role(warps=1)
+    @cute.jit
+    def epilogue(self, acc: Consumer, ctx):
+        return acc
+
+
+class _FlatLeaderTmem(WarpSpecialized):
+    def __init__(self):
+        self.cluster = Cluster(2, 2)
+        self.tmem_plan = TmemPlan().region("acc", 32)
+
+    @role(warps=0, cta="leader")
+    @cute.jit
+    def mma(self, tmem: Tmem, ctx):
+        pass
+
+
+def test_same_placement_multicast_arms_locally():
+    """Each leader arms its own barrier for the bytes landing in it and releases both leaders,
+    whose copies reach it."""
+    op = _LeaderMulticast()
+    op.describe()
+    sc = op.ch.scope
+    assert sc.pair and sc.tx == 1024 and sc.tx_ctas == 1
+    assert sc.full_targets == {0: (0,), 2: (2,)} and sc.empty_targets == {0: (0, 2), 2: (0, 2)}
+    assert sc.empty_mask == 0b101 and sc.empty_counts[0] == [2, 2] and sc.tail
+
+
+def test_device_rank_helpers_on_host_ranks():
+    """With a Python rank the helpers evaluate directly; the device forms are exercised by the
+    toys below."""
+    assert rank_in(3, (0, 1, 2, 3), 4) is True
+    assert [rank_in(r, (0, 2), 4) for r in range(4)] == [True, False, True, False]
+    assert [rank_in(r, (1, 3), 4) for r in range(4)] == [False, True, False, True]
+    assert [bool(rank_in(r, (0, 3), 4)) for r in range(4)] == [True, False, False, True]
+    assert rank_value({0: 7, 1: 7}, 1) == 7
+    counts = {0: 160, 1: 128}  # TMEM users of a pair: the leader also runs the MMA warp
+    assert [rank_value(counts, r) for r in (0, 1)] == [160, 128]
+    assert rank_value({0: 9}, lambda: pytest.fail("a constant must not read the rank")) == 9
+
+
 def test_cluster_placement_errors():
     with pytest.raises(ProtocolError, match="multicast TMA channel cannot have a rank0 role"):
         _MulticastWithRank0()._collect()
     # 2-CTA copies of the second pair would complete on rank 2's barrier, which nobody waits on.
     with pytest.raises(ProtocolError, match="can only feed leader-only consumers"):
         _AllToRank0Tma()._collect()
+    # Ranks 2 and 3 would read an accumulator no MMA of their pair wrote.
+    with pytest.raises(ProtocolError, match="led by \\[0, 2\\].*use cta='leader'"):
+        _Rank0Mma()._collect()
+    _FlatLeaderTmem()._collect()  # without pairs every CTA is a leader, so it allocates
+
+
+def test_fa4_rejects_clusters_beyond_a_pair():
+    pytest.importorskip("flash_attn.cute")
+    from transformer_nuggets.cute.warpdrive.examples.fa4_fwd import FlashAttentionForward
+
+    with pytest.raises(ValueError, match="one CTA or a CTA pair"):
+        FlashAttentionForward(cluster=PAIRS_2X2)
 
 
 # --------------------------------------------------------------------------- #
@@ -246,16 +330,71 @@ def test_cluster_toy_scopes():
     assert op.back.scope.empty_targets == {r: (r - r % 2,) for r in range(8)}
 
 
+class ThreadsToy(WarpSpecialized):
+    """Threads on both sides across pairs: ``up`` joins both CTAs of a pair on its leader, which
+    releases both (two targets picked by rank); ``down`` fans the leader back out to both."""
+
+    def __init__(self, cluster):
+        self.cluster = cluster
+        self.up = Ring(2, Threads, Threads)
+        self.down = Ring(2, Threads, Threads)
+
+    @role(warps=0)
+    @cute.jit
+    def src(self, up: Producer, ctx):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            up.acquire().commit()
+        return up
+
+    @role(warps=1, cta="leader")
+    @cute.jit
+    def lead(self, up: Consumer, down: Producer, ctx):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            with up.consume(), down.produce():
+                pass
+        return up, down
+
+    @role(warps=2)
+    @cute.jit
+    def sink(self, down: Consumer, ctx):
+        count = cutlass.Int32(0)
+        for _ in cutlass.range(ctx.n, unroll=1):
+            with down.consume():
+                count = count + 1
+        slot = cute.arch.block_idx()[0] // self.cluster.size * 8 + self.cluster.rank()
+        if cute.arch.lane_idx() == 0:
+            ctx.out[slot] = count
+        return down
+
+    kernel = ClusterToy.kernel
+
+    @cute.jit
+    def __call__(self, out: cute.Tensor, n: cutlass.Int32, stream: cuda.CUstream):
+        self.kernel.set_name_prefix(f"warpdrive_threads_toy_{self.cluster.get_key()}")
+        grid = (3 * self.cluster.size, 1, 1)
+        self.kernel(out, n).launch(**self.launch_config(grid=grid), stream=stream)
+
+
+def test_threads_toy_scopes():
+    op = ThreadsToy(Cluster(4, 2, pair=True))
+    op.describe()
+    assert op.up.scope.empty_targets == {r: (r, r + 1) for r in range(0, 8, 2)}
+    assert op.down.scope.full_targets == {r: (r, r + 1) for r in range(0, 8, 2)}
+    assert op.up.scope.full_counts[4] == [64, 64] and op.down.scope.empty_counts[4] == [64, 64]
+
+
+@pytest.mark.parametrize("toy", [ClusterToy, ThreadsToy])
 @pytest.mark.parametrize("cluster", [PAIRS_2X2, Cluster(4, 2, pair=True), Cluster(2, 2)])
 @pytest.mark.parametrize("n", [1, 5, 64])
-def test_cluster_toy_runs(requires_blackwell, cluster, n):
+def test_cluster_toy_runs(requires_blackwell, toy, cluster, n):
     out = torch.zeros(3 * 8, device="cuda", dtype=torch.int32)
     fake = make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),), assumed_align=4)
-    op = ClusterToy(cluster)
-    compile_tvm_ffi(op, fake, cutlass.Int32(1), name=f"cluster_toy_{cluster.get_key()}")(out, n)
+    name = f"{toy.__name__.lower()}_{cluster.get_key()}"
+    compile_tvm_ffi(toy(cluster), fake, cutlass.Int32(1), name=name)(out, n)
     torch.cuda.synchronize()
     got = out.view(3, 8)[:, : cluster.size]
-    assert (got == 2 * n + 1).all(), got
+    want = 2 * n + 1 if toy is ClusterToy else n
+    assert (got == want).all(), got
 
 
 # --------------------------------------------------------------------------- #
@@ -299,12 +438,19 @@ def test_2x2_gemm(requires_blackwell, tile_n, schedule, m, n, k):
 
 @pytest.mark.parametrize(
     "cluster",
-    [Cluster(4, 1, pair=True), Cluster(2, 2), Cluster(1, 2), Cluster(2, 1)],
-    ids=["4x1_pairs", "2x2", "1x2", "2x1"],
+    [
+        Cluster(4, 1, pair=True),
+        Cluster(4, 2, pair=True),
+        Cluster(2, 2),
+        Cluster(1, 2),
+        Cluster(2, 1),
+    ],
+    ids=["4x1_pairs", "4x2_pairs", "2x2", "1x2", "2x1"],
 )
 @pytest.mark.parametrize("schedule", ["static", "clc"])
 def test_other_cluster_gemms(requires_blackwell, cluster, schedule):
-    """B multicast along M (4x1 pairs, 2x1), A along N (1x2), and both (2x2 without pairs)."""
+    """B multicast along M (4x1 pairs, 2x1), A along N (1x2), and both (2x2 without pairs; 4x2
+    pairs, where each stage is released by three leaders)."""
     for m, n, k in [(300, 520, 136), (3000, 1000, 520)]:
         _check_gemm(cluster, SCHEDULES[schedule], m, n, k)
 

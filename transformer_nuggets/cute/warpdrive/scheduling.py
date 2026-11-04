@@ -807,9 +807,9 @@ class BoundWork:
     def grid(self):
         """Launch grid for this schedule: ``(ctas, 1, 1)``, or the tile space for a ``OneShot``
         over plain ``Raster()`` (``tile_grid_dims``); ``max_ctas`` caps CTAs, so a cluster of
-        ``cs`` CTAs launches at most ``max_ctas // cs`` clusters. An empty space launches one work unit. A space whose
-        ``schedule.index_limit`` exceeds Int32 gets a zero-wide grid, which CUDA rejects at
-        launch."""
+        ``cs`` CTAs launches at most ``max_ctas // cs`` clusters. An empty space launches one
+        work unit. A space whose ``schedule.index_limit`` exceeds Int32 gets a zero-wide grid,
+        which CUDA rejects at launch."""
         schedule = self.stream.schedule
         cap = None
         if schedule.uses_max_ctas:
@@ -970,17 +970,21 @@ MAX_GRID_YZ = 65535  # gridDim.y and gridDim.z limit
 
 @functools.cache
 def resident_ctas(device, cs: int) -> int:
-    """CTAs of the ``cs``-CTA clusters that fit on ``device`` at once, one CTA per SM."""
+    """CTAs of the ``cs``-CTA clusters that fit on ``device`` at once, one CTA per SM. One CTA
+    and CTA pairs use the SM count; larger clusters ask the occupancy calculator, because
+    they need not tile the GPCs (a 152-SM GB300 fits 36 4-CTA clusters, not 38)."""
     import torch
 
     sms = torch.cuda.get_device_properties(device).multi_processor_count
-    if cs == 1:
+    if cs <= 2:
         return sms
     from cutlass.utils import HardwareInfo
 
-    with torch.cuda.device(device):
-        torch.cuda.synchronize()  # makes the device's primary context current for the query
-        return HardwareInfo().get_max_active_clusters(cs) * cs
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    with torch.cuda.device(index):
+        if not torch.cuda.is_current_stream_capturing():
+            torch.cuda.synchronize()  # makes the device's primary context current
+        return HardwareInfo(index).get_max_active_clusters(cs) * cs
 
 
 def tile_grid_dims(space, cs: int = 1):

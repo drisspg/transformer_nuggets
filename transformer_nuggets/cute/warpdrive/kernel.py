@@ -594,8 +594,18 @@ class WarpSpecialized:
                     ("producer", ch.producer, ch.producers),
                     ("consumer", ch.consumer, ch.consumers),
                 ):
+                    other = ch.consumers if side == "producer" else ch.producers
+                    served = {cluster.group(c)[0] for ri, _ in other for c in cluster.ctas(ri.cta)}
                     for ri, _ in bound:
-                        if mech is Umma and not set(cluster.ctas(ri.cta)) <= leaders:
+                        ctas = set(cluster.ctas(ri.cta))
+                        if mech is Umma and ctas <= leaders and not served <= ctas:
+                            raise ProtocolError(
+                                f"role {ri.name} signals channel {name} ({side} side) with "
+                                f"tcgen05.commit from CTAs {sorted(ctas)}, but the other side "
+                                f"runs in the MMA pairs led by {sorted(served)}; their MMAs "
+                                "need a leader of their own: use cta='leader'"
+                            )
+                        if mech is Umma and not ctas <= leaders:
                             raise ProtocolError(
                                 f"role {ri.name} signals channel {name} ({side} side) with "
                                 f"tcgen05.commit, so it issues the MMAs; in a "
@@ -607,10 +617,12 @@ class WarpSpecialized:
                 if len({cluster.ctas(r.cta) for r in ts.parties}) != 1:
                     raise ProtocolError(f"turnstile {name}: seats run in different CTAs")
             tmem_roles = [r for r in roles if r.uses_tmem]
-            if tmem_roles and not any(r.cta == ALL for r in tmem_roles):
+            everywhere = tuple(range(cluster.size))
+            if tmem_roles and not any(cluster.ctas(r.cta) == everywhere for r in tmem_roles):
                 raise ProtocolError(
-                    "TMEM is allocated by one warp in each CTA of the cluster (2-CTA TMEM: of each "
-                    f"pair), but every Tmem role {[r.name for r in tmem_roles]} is leader-only"
+                    "TMEM is allocated by one warp in each CTA of the cluster (2-CTA TMEM: of "
+                    f"each pair), but every Tmem role {[r.name for r in tmem_roles]} is "
+                    "leader-only"
                 )
         for name, ch in chans.items():
             ch.cluster = cluster
@@ -902,7 +914,8 @@ class WarpSpecialized:
             # Every CTA of a cluster allocates (a pair's CTAs together, with
             # tcgen05.alloc.cta_group::2), so the allocator is the first TMEM role that runs in
             # every CTA.
-            alloc_role = next(r for r in tmem_roles if not clustered or r.cta == ALL)
+            everywhere = tuple(range(self.cluster.size))
+            alloc_role = next(r for r in tmem_roles if self.cluster.ctas(r.cta) == everywhere)
             holder = smem.allocate_array(cutlass.Int32, 1)
             dealloc_bar = smem.allocate_array(cutlass.Int64, 1) if two_cta else None
             tmem = memory.TmemAllocator(
