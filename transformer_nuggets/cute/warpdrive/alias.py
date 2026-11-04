@@ -113,6 +113,7 @@ RULES = {
 }
 
 HAZARD = "potential hazard"
+RAW_ONLY = "only a raw signal (signal=False) would order them, and it is not visible"
 UNVERIFIED = "unverified"
 
 
@@ -639,19 +640,24 @@ class _Graph:
             for p, (e, _) in enumerate(self.seq[id(r)]):
                 self.pos.setdefault((id(r), e), []).append(p)
         self.edges: dict = {}  # (role id, pos) -> [(role id, pos)]
+        # The same edges from closes with signal=False: the user signals them, so a pair that
+        # only they would order is unverified, not a potential hazard.
+        self.raw_edges: dict = {}
         self.steps = 0  # search work, bounded by SEARCH_LIMIT
         self.cache: dict = {}  # (access, position, other agent) -> (reachable, failures, any)
         self._link(items)
 
     def _ops(self, role, want):
-        """Per item: positions of ``want`` ("open" or signalling "close") events per
+        """Per item: positions of ``want`` ("open" or "close" but retire) events per
         ``(channel, slot, producer)``."""
         out: dict = {}
         for p, (e, item) in enumerate(self.seq[id(role)]):
             ev = role.events[e]
-            if ev.kind != want or (want == "close" and not ev.data["signal"]):
+            if ev.kind != want:
                 continue
             rec = ev.data["handle"]
+            if ev.data.get("retire"):  # a retired stage publishes nothing
+                continue
             if rec.chan.internal or rec.chan.round_robin:  # see _handoff_handles
                 continue
             key = (rec.chan.name, rec.slot, rec.producer)
@@ -716,11 +722,14 @@ class _Graph:
         return [self.seq[id(role)][p][0] for p in positions]
 
     def _edge(self, src, p, dst, q):
-        self.edges.setdefault((id(src), p), []).append((dst, q))
+        close = src.events[self.seq[id(src)][p][0]]
+        edges = self.edges if close.data["signal"] else self.raw_edges
+        edges.setdefault((id(src), p), []).append((dst, q))
 
-    def reachable(self, a: Access, pos_a: int, check) -> set:
+    def reachable(self, a: Access, pos_a: int, check, raw: bool = False) -> set:
         """``(role id, position)`` of every instance a path from ``a``'s instance reaches after
-        leaving ``a``'s role through a signal at which ``check(pos_e)`` holds."""
+        leaving ``a``'s role through a signal at which ``check(pos_e)`` holds (``raw``: also
+        through closes with ``signal=False``, as if they signalled)."""
         start = (id(a.role), pos_a, False)
         seen, todo = {start}, deque([start])
         while todo:
@@ -731,7 +740,10 @@ class _Graph:
             nxt = []
             if p + 1 < len(self.seq[rid]):
                 nxt.append((rid, p + 1, left))
-            for dst, q in self.edges.get((rid, p), []):
+            edges = self.edges.get((rid, p), [])
+            if raw:
+                edges = edges + self.raw_edges.get((rid, p), [])
+            for dst, q in edges:
                 if not left and rid == id(a.role) and not check(p):
                     continue
                 nxt.append((id(dst), q, True))
@@ -743,7 +755,9 @@ class _Graph:
 
 
 def _cross_channel(graph: _Graph, a: Access, b: Access) -> Finding | None:
-    """Every instance pair of ``a`` and ``b`` in the unrolled window must be ordered one way."""
+    """Every instance pair of ``a`` and ``b`` in the unrolled window must be ordered one way.
+    A potential hazard on any pair wins over an unverified one found earlier."""
+    first = None
     for pa in graph.pos.get((id(a.role), a.index), []):
         for pb in graph.pos.get((id(b.role), b.index), []):
             found = None
@@ -751,23 +765,51 @@ def _cross_channel(graph: _Graph, a: Access, b: Access) -> Finding | None:
                 ordered, failures = _graph_order(graph, x, px, y, py)
                 if ordered:
                     break
-                if failures:
-                    found = found or failures[0]
+                # A direction only a raw signal might order makes the pair unverified at worst.
+                if failures and (found is None or RAW_ONLY in failures[0].text):
+                    found = failures[0]
             else:
                 items = (graph.seq[id(a.role)][pa][1], graph.seq[id(b.role)][pb][1])
-                return found or Finding(
-                    HAZARD,
-                    f"{a.describe()} (work item {items[0]}) and {b.describe()} (work item "
-                    f"{items[1]}): no channel path orders them",
+                # A never-closed handle's own signal might be the missing edge.
+                found = (
+                    _unclosed(graph, a, b)
+                    or found
+                    or Finding(
+                        HAZARD,
+                        f"{a.describe()} (work item {items[0]}) and {b.describe()} (work item "
+                        f"{items[1]}): no channel path orders them",
+                        "channel",
+                    )
+                )
+                if found.severity == HAZARD:
+                    return found
+                first = first or found
+    return first
+
+
+def _unclosed(graph: _Graph, a: Access, b: Access) -> Finding | None:
+    """A handle of either access's channel stage that never closes (``unchecked("unclosed")``):
+    whatever signals it instead is invisible, so a missing path is unverified. Slots match by
+    slot; ring stages are dynamic, so any handle of the ring matches."""
+    stages = {(x.handle.chan.name, x.handle.slot) for x in (a, b) if x.handle is not None}
+    for role in graph.roles:
+        for ev in role.events:
+            rec = ev.data.get("handle") if ev.kind == "open" else None
+            if rec is not None and rec.closed_at is None and (rec.chan.name, rec.slot) in stages:
+                return Finding(
+                    UNVERIFIED,
+                    f"{a.describe()} and {b.describe()}: {rec.chan.name} handle opened at "
+                    f"{ev.site} never closes, so what signals it is not visible",
                     "channel",
                 )
     return None
 
 
-def _reach(graph: _Graph, x: Access, px: int, other: str) -> tuple[set, list, set]:
+def _reach(graph: _Graph, x: Access, px: int, other: str) -> tuple[set, list, set, set]:
     """What a path from instance ``px`` of ``x`` orders it before (for a conflicting ``other``
-    agent), the completion failures of the signals it could not use, and what it would reach
-    ignoring completion. Cached per instance."""
+    agent), the completion failures of the signals it could not use, what it would reach
+    ignoring completion, and what it reaches when closes with ``signal=False`` count as
+    signals. Cached per instance."""
     key = (id(x), px, other)
     if key not in graph.cache:
         seq = [e for e, _ in graph.seq[id(x.role)]]
@@ -782,25 +824,41 @@ def _reach(graph: _Graph, x: Access, px: int, other: str) -> tuple[set, list, se
                     failures.append(verdicts[pos_e])
             return verdicts[pos_e] is None
 
+        def raw_or_check(pos_e):
+            return not x.role.events[seq[pos_e]].data["signal"] or check(pos_e)
+
         ordered = graph.reachable(x, px, check)
         anyway = graph.reachable(x, px, lambda pos_e: True) if failures else ordered
-        graph.cache[key] = (ordered, failures, anyway)
+        raw = graph.reachable(x, px, raw_or_check, raw=True) if graph.raw_edges else ordered
+        graph.cache[key] = (ordered, failures, anyway, raw)
     return graph.cache[key]
 
 
 def _graph_order(graph: _Graph, x: Access, px: int, y: Access, py: int) -> tuple[bool, list]:
     """Does a path order instance ``px`` of ``x`` before ``py`` of ``y``? Also the completion
-    failures of the signals that would have ordered it."""
-    ordered, failures, anyway = _reach(graph, x, px, y.agent)
+    failures of the signals that would have ordered it, or the raw signal that might."""
+    ordered, failures, anyway, raw = _reach(graph, x, px, y.agent)
     target = (id(y.role), py)
-    return target in ordered, failures if target in anyway else []
+    if target in ordered:
+        return True, []
+    if target in raw:
+        return False, [
+            Finding(
+                UNVERIFIED,
+                f"{x.describe()} before {y.describe()}: {RAW_ONLY}",
+                "channel",
+            )
+        ]
+    return False, failures if target in anyway else []
 
 
 def _same_role(graph: _Graph, a: Access, b: Access, warp_pairs) -> Finding | None:
     """One role, every instance order in the unrolled window (loop-carried pairs included):
     program order inside one thread when pipelined (a recorded role barrier across warps), else
-    a round trip through another role that the earlier access completed before."""
+    a round trip through another role that the earlier access completed before. A potential
+    hazard on any pair wins over an unverified one found earlier."""
     seq = graph.seq[id(a.role)]
+    first = None
     for pa in graph.pos.get((id(a.role), a.index), []):
         for pb in graph.pos.get((id(b.role), b.index), []):
             if pa == pb:
@@ -812,8 +870,14 @@ def _same_role(graph: _Graph, a: Access, b: Access, warp_pairs) -> Finding | Non
                 continue
             ordered, failures = _graph_order(graph, x, px, y, py)
             if not ordered:
-                return failures[0] if failures and found.severity != HAZARD else found
-    return None
+                raw = failures and RAW_ONLY in failures[0].text
+                found = failures[0] if failures and (found.severity != HAZARD or raw) else found
+                if found.severity == HAZARD:
+                    found = _unclosed(graph, a, b) or found
+                if found.severity == HAZARD:
+                    return found
+                first = first or found
+    return first
 
 
 def _stage_alignment(kernel, x: str, y: str) -> Finding | str | None:

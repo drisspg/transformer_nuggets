@@ -549,7 +549,9 @@ class Handle:
             )
         trace.closed(self.rec, op)
         trace.record(self._end._chan.name, op, self._label)
-        trace.event("close", handle=self.rec, signal=op in ("commit", "release"))
+        trace.event(
+            "close", handle=self.rec, signal=op in ("commit", "release"), retire=op == "retire"
+        )
         if producer and isinstance(self._end._chan.producer, Tma):
             stage_closed(trace, self.rec)
 

@@ -27,6 +27,7 @@ from transformer_nuggets.cute.warpdrive import (
     WarpSpecialized,
     named_barrier,
     role,
+    unchecked,
 )
 
 
@@ -280,3 +281,222 @@ def test_a_handle_around_the_loop_does_not_hide_the_loop_carried_pair():
     op = LoopInsideHandle()
     compile_quietly(op, "loop_in_handle")
     assert status(op, "P ~ S") == "potential hazard", alias_section(op)
+
+
+# --------------------------------------------------------------------------- #
+# Runtime fuzz finding F-C1: a consumer that releases with signal=False and arrives itself.
+# The reader -> next writer order exists only through that raw signal, which the diagnostic
+# cannot see: unverified (its documented answer for raw signals), not a potential hazard.
+# --------------------------------------------------------------------------- #
+
+
+class RawReleaseOverlap(Model):
+    """The producer writes Q, the consumer reads P (Q overlaps P) in both slots of one
+    channel; ``raw``: the consumer releases with ``signal=False`` plus one elected arrival."""
+
+    def __init__(self, raw: bool):
+        self.raw = raw
+        self.smem_plan = SmemPlan()
+        p = self.smem_plan.buffer("P", cutlass.Int32)
+        q = self.smem_plan.buffer("Q", cutlass.Int32, overlaps=p)
+        override = {"empty_counts": 1} if raw else None
+        self.c = Slots(2, Threads, Threads, buffer={"P": p, "Q": q}, override=override)
+
+    def layouts(self):
+        return {"P": cute.make_layout((32, 2)), "Q": cute.make_layout((32, 2))}
+
+    @role(warps=0)
+    @cute.jit
+    def prod(self, ctx, *, c: Producer):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            for s in cutlass.range_constexpr(2):
+                with c.produce(s) as h:
+                    h.access("Q", write=True)
+        return c
+
+    @role(warps=1)
+    @cute.jit
+    def cons(self, ctx, *, c: Consumer):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            for s in cutlass.range_constexpr(2):
+                h = c.wait(s)
+                h.access("P", read=True)
+                if cutlass.const_expr(self.raw):
+                    cute.arch.sync_warp()
+                    if cute.arch.lane_idx() == 0:
+                        cute.arch.mbarrier_arrive(h.empty_barrier)
+                    h.release(signal=False)
+                else:
+                    h.release()
+        return c
+
+
+class RawCommitBesideTma(Model):
+    """The producer writes Q and publishes it with ``commit(signal=False)`` plus an arrival,
+    after committing a TMA channel the consumer also waits on. The TMA commit does not publish
+    the write (complete_tx), but the raw signal might: unverified, not a potential hazard."""
+
+    def __init__(self):
+        self.smem_plan = SmemPlan()
+        p = self.smem_plan.buffer("P", cutlass.Int32)
+        q = self.smem_plan.buffer("Q", cutlass.Int32, overlaps=p)
+        self.c = Slots(1, Threads, Threads, buffer={"P": p, "Q": q}, override={"full_counts": 1})
+        self.t = Slots(1, Tma(128), Threads)
+
+    def layouts(self):
+        return {"P": cute.make_layout((32, 1)), "Q": cute.make_layout((32, 1))}
+
+    @role(warps=0)
+    @cute.jit
+    def prod(self, ctx, *, c: Producer, t: Producer):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            ht = t.acquire(0)
+            h = c.acquire(0)
+            h.access("Q", write=True)
+            ht.commit()
+            cute.arch.sync_warp()
+            if cute.arch.lane_idx() == 0:
+                cute.arch.mbarrier_arrive(h.full_barrier)
+            h.commit(signal=False)
+        return c, t
+
+    @role(warps=1)
+    @cute.jit
+    def cons(self, ctx, *, c: Consumer, t: Consumer):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            with t.consume(0):
+                pass
+            with c.consume(0) as h:
+                h.access("P", read=True)
+        return c, t
+
+
+class UnclosedRelease(RawReleaseOverlap):
+    """The consumer opens under ``unchecked("unclosed")`` and arrives on the empty barrier
+    itself instead of releasing: the close the order needs is not traced at all."""
+
+    def __init__(self):
+        super().__init__(raw=False)
+
+    @role(warps=1)
+    @cute.jit
+    def cons(self, ctx, *, c: Consumer):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            for s in cutlass.range_constexpr(2):
+                with unchecked("unclosed", reason="released by the arrival below"):
+                    h = c.wait(s)
+                h.access("P", read=True)
+                cute.arch.mbarrier_arrive(h.empty_barrier)
+        return c
+
+
+class UnclosedBesideUmma(UnclosedRelease):
+    """As ``UnclosedRelease``, but the consumer also holds a stage of ``d``, a single-warp Umma
+    consumer channel, around the read: ``d``'s release cannot publish the read (a failed edge),
+    which must not outrank the never-closed handle that might."""
+
+    def __init__(self):
+        super().__init__()
+        self.d = Slots(1, Threads, Umma)
+
+    @role(warps=0)
+    @cute.jit
+    def prod(self, ctx, *, c: Producer, d: Producer):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            with d.produce(0):
+                pass
+            for s in cutlass.range_constexpr(2):
+                with c.produce(s) as h:
+                    h.access("Q", write=True)
+        return c, d
+
+    @role(warps=1)
+    @cute.jit
+    def cons(self, ctx, *, c: Consumer, d: Consumer):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            g = d.wait(0)
+            for s in cutlass.range_constexpr(2):
+                with unchecked("unclosed", reason="released by the arrival below"):
+                    h = c.wait(s)
+                h.access("P", read=True)
+                cute.arch.mbarrier_arrive(h.empty_barrier)
+            g.release()
+        return c, d
+
+
+@pytest.mark.parametrize("model", [UnclosedRelease, UnclosedBesideUmma])
+def test_unclosed_handle_is_unverified_not_a_hazard(model):
+    op = model()
+    op.alias_check = "strict"
+    compile_quietly(op, f"unclosed_{model.__name__.lower()}")
+    assert status(op, "Q ~ P") == "unverified", alias_section(op)
+    assert "never closes" in alias_section(op)
+
+
+class SameRoleRawRoundTrip(Model):
+    """One role TMA-writes Q in one handle of ``t`` and reads P (Q overlaps P) in the next;
+    ``sink`` releases both stages, with ``signal=False`` when ``raw``. The write -> read order
+    is a round trip through that release; the read -> next write order has no edge at all."""
+
+    def __init__(self, raw: bool):
+        self.raw = raw
+        self.smem_plan = SmemPlan()
+        p = self.smem_plan.buffer("P", cutlass.Int32, align=128)
+        q = self.smem_plan.buffer("Q", cutlass.Int32, overlaps=p)
+        override = {"empty_counts": 1} if raw else None
+        self.t = Slots(1, Tma(128), Threads, buffer={"P": p, "Q": q}, override=override)
+
+    def layouts(self):
+        return {"P": cute.make_layout((32, 1)), "Q": cute.make_layout((32, 1))}
+
+    @role(warps=0)
+    @cute.jit
+    def load(self, ctx, *, t: Producer):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            with t.produce(0) as h:
+                h.access("Q", write=True, by="tma")
+            with t.produce(0) as h:
+                h.access("P", read=True)
+        return t
+
+    @role(warps=1)
+    @cute.jit
+    def sink(self, ctx, *, t: Consumer):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            for _k in cutlass.range_constexpr(2):
+                h = t.wait(0)
+                if cutlass.const_expr(self.raw):
+                    if cute.arch.lane_idx() == 0:
+                        cute.arch.mbarrier_arrive(h.empty_barrier)
+                    h.release(signal=False)
+                else:
+                    h.release()
+        return t
+
+
+def test_an_unverified_pair_does_not_hide_a_later_hazard():
+    """The write -> read pair, ordered only through the raw release, is unverified. Reporting it
+    must not end the scan before the read -> next-write pair, a potential hazard."""
+    op = SameRoleRawRoundTrip(raw=True)
+    compile_quietly(op, "same_role_raw")
+    assert status(op, "Q ~ P") == "potential hazard", alias_section(op)
+    assert "[pipelined]" in alias_section(op)
+
+
+def test_raw_commit_beside_a_tma_commit_is_unverified():
+    op = RawCommitBesideTma()
+    op.alias_check = "strict"
+    compile_quietly(op, "raw_commit_beside_tma")
+    assert status(op, "Q ~ P") == "unverified", alias_section(op)
+
+
+@pytest.mark.parametrize("raw, expected", [(False, "no hazard found"), (True, "unverified")])
+def test_raw_release_is_unverified_not_a_hazard(raw, expected):
+    """Once reported ``potential hazard: ... no channel path orders them`` (and raised under
+    ``alias_check="strict"``) because closes with ``signal=False`` were dropped from the graph."""
+    op = RawReleaseOverlap(raw)
+    op.alias_check = "strict"
+    compile_quietly(op, f"raw_release_overlap_{int(raw)}")
+    assert status(op, "Q ~ P") == expected, alias_section(op)
+    if raw:
+        assert "only a raw signal (signal=False) would order them" in alias_section(op)
