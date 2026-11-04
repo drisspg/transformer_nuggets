@@ -14,7 +14,7 @@ from cuda.bindings import driver as cuda
 from cutlass import Int32, cute
 
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
-from transformer_nuggets.cute.warp_roles import (
+from transformer_nuggets.cute.warpdrive import (
     Clc,
     DynamicPersistent,
     OneShot,
@@ -27,7 +27,7 @@ from transformer_nuggets.cute.warp_roles import (
     WarpSpecialized,
     role,
 )
-from transformer_nuggets.cute.warp_roles.scheduling import tile_grid_dims
+from transformer_nuggets.cute.warpdrive.scheduling import tile_grid_dims
 
 POLICIES = {
     "oneshot": OneShot(),
@@ -159,7 +159,7 @@ class ScheduleToy(WarpSpecialized):
         self.regs = regs
 
     def get_name(self) -> str:
-        return f"warp_roles_sched_toy_{self.tiles.get_key()}_{self.mode}"
+        return f"warpdrive_sched_toy_{self.tiles.get_key()}_{self.mode}"
 
     @cute.jit
     def _visit(self, r: int, tiles, count, ctx):
@@ -441,7 +441,7 @@ GEMM_SHAPES = [
 
 
 def _check_gemm(policy, m, n, k, max_ctas=None, order=None):
-    from transformer_nuggets.cute.warp_roles.examples.persistent_gemm import persistent_gemm
+    from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import persistent_gemm
 
     torch.manual_seed(0)
     a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
@@ -477,7 +477,7 @@ def test_persistent_gemm_orders(requires_blackwell, order):
 def test_persistent_gemm_compiles_once_across_shapes(requires_blackwell, monkeypatch):
     """Tile counts, K, and the grid cap are runtime values: one compile per (policy, order)."""
     from transformer_nuggets.cute import cache
-    from transformer_nuggets.cute.warp_roles.examples.persistent_gemm import (
+    from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import (
         PersistentGemm,
         compile_persistent_gemm,
     )
@@ -526,9 +526,9 @@ def test_fa4_fwd_persistent(
     """(8, 16, 1024) has 256 work items, so most CTAs run two (S/O/Q slots reused); with 3 CTAs
     each runs ~85, wrapping every slot and ring. sk=384 is an odd key-block count."""
     pytest.importorskip("flash_attn.cute")
-    from test_cute_warp_roles import fa4_inputs
+    from test_cute_warpdrive import fa4_inputs
 
-    from transformer_nuggets.cute.warp_roles.examples.fa4_fwd import fa4_fwd
+    from transformer_nuggets.cute.warpdrive.examples.fa4_fwd import fa4_fwd
 
     q, k, v = fa4_inputs(b, h, sq, sk, nonuniform)
     qf, kf, vf = (x.float().transpose(1, 2) for x in (q, k, v))
@@ -542,7 +542,7 @@ def test_fa4_fwd_persistent(
 
 
 def test_persistent_gemm_empty_k(requires_blackwell):
-    from transformer_nuggets.cute.warp_roles.examples.persistent_gemm import persistent_gemm
+    from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import persistent_gemm
 
     a = torch.empty(64, 0, device="cuda", dtype=torch.bfloat16)
     b = torch.empty(24, 0, device="cuda", dtype=torch.bfloat16)

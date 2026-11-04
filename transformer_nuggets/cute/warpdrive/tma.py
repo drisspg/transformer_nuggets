@@ -27,8 +27,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from transformer_nuggets.cute.warp_roles.cluster import LEADER
-from transformer_nuggets.cute.warp_roles.protocol import ProtocolError
+from transformer_nuggets.cute.warpdrive.cluster import LEADER
+from transformer_nuggets.cute.warpdrive.protocol import ProtocolError
 
 SET_VALUE = "cute_nvgpu.atom.set_value"
 MAKE_EXEC = "cute_nvgpu.atom.make_exec_tma"

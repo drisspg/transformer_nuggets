@@ -16,7 +16,7 @@ from cutlass import cute
 from cutlass.cute.nvgpu import tcgen05
 
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
-from transformer_nuggets.cute.warp_roles import (
+from transformer_nuggets.cute.warpdrive import (
     Clc,
     Consumer,
     CtaPair,
@@ -39,7 +39,7 @@ from transformer_nuggets.cute.warp_roles import (
     WarpSpecialized,
     role,
 )
-from transformer_nuggets.cute.warp_roles.cluster import check_atoms
+from transformer_nuggets.cute.warpdrive.cluster import check_atoms
 
 POLICIES = {
     "oneshot": OneShot(),
@@ -120,13 +120,13 @@ class PairToy(WarpSpecialized):
 
     @cute.jit
     def __call__(self, out: cute.Tensor, n: cutlass.Int32, stream: cuda.CUstream):
-        self.kernel.set_name_prefix(f"warp_roles_pair_toy_{self.mode}")
+        self.kernel.set_name_prefix(f"warpdrive_pair_toy_{self.mode}")
         self.kernel(out, n).launch(**self.launch_config(grid=(2, 1, 1)), stream=stream)
 
 
 def compile_toy(op):
     out = make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),), assumed_align=4)
-    return compile_tvm_ffi(op, out, cutlass.Int32(1), name=f"warp_roles_pair_toy_{op.mode}")
+    return compile_tvm_ffi(op, out, cutlass.Int32(1), name=f"warpdrive_pair_toy_{op.mode}")
 
 
 def test_pair_toy_derived_scopes():
@@ -269,7 +269,7 @@ def test_pair_placement_errors():
 
 def test_leader_placement_is_a_noop_for_one_cta():
     """The same role source runs on one CTA: `cta="leader"` places it in the only CTA."""
-    from transformer_nuggets.cute.warp_roles.examples.persistent_gemm import PersistentGemm
+    from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import PersistentGemm
 
     op = PersistentGemm()
     text = op.describe()
@@ -279,7 +279,7 @@ def test_leader_placement_is_a_noop_for_one_cta():
 
 
 def test_pair_gemm_declared_graph():
-    from transformer_nuggets.cute.warp_roles.examples.persistent_gemm import PersistentGemm
+    from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import PersistentGemm
 
     op = PersistentGemm(policy=Clc(), cluster=PAIR)
     text = op.describe()
@@ -312,7 +312,7 @@ def test_pair_gemm_declared_graph():
 
 def test_fa4_pair_declared_graph():
     pytest.importorskip("flash_attn.cute")
-    from transformer_nuggets.cute.warp_roles.examples.fa4_fwd import FlashAttentionForward
+    from transformer_nuggets.cute.warpdrive.examples.fa4_fwd import FlashAttentionForward
 
     op = FlashAttentionForward(cluster=PAIR)
     op.describe()
@@ -334,7 +334,7 @@ def _mma_atom_check(cluster: cutlass.Constexpr, group: cutlass.Constexpr):
 
 
 def test_mismatched_mma_atom_is_rejected(requires_blackwell):
-    from transformer_nuggets.cute.warp_roles import SingleCta
+    from transformer_nuggets.cute.warpdrive import SingleCta
 
     cute.compile(_mma_atom_check, PAIR, tcgen05.CtaGroup.TWO)
     with pytest.raises(Exception, match="spans 1 CTA.*declares CtaPair"):
@@ -400,9 +400,7 @@ def test_pair_stream_with_leader_only_users(requires_blackwell, policy):
         return make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),), assumed_align=4)
 
     i32 = cutlass.Int32(1)
-    fn = compile_tvm_ffi(
-        op, fake(), i32, i32, fake(), i32, name=f"warp_roles_pair_stream_{policy}"
-    )
+    fn = compile_tvm_ffi(op, fake(), i32, i32, fake(), i32, name=f"warpdrive_pair_stream_{policy}")
     for m_tiles, n_tiles, cap in [(1, 1, 148), (7, 9, 4), (40, 30, 148)]:
         out = torch.zeros(m_tiles * n_tiles, device="cuda", dtype=torch.int32)
         ws, _ = op.tiles.launch_args("cuda")
@@ -434,7 +432,7 @@ GEMM_SHAPES = [
 
 
 def _check_gemm(policy, m, n, k, max_ctas=None, reps=2, tile_n=256):
-    from transformer_nuggets.cute.warp_roles.examples.persistent_gemm import persistent_gemm
+    from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import persistent_gemm
 
     torch.manual_seed(0)
     a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
@@ -473,7 +471,7 @@ def test_pair_gemm_capped_grid(requires_blackwell, policy, max_ctas):
 
 
 def test_pair_gemm_counter_resets(requires_blackwell):
-    from transformer_nuggets.cute.warp_roles.examples.persistent_gemm import _OPS
+    from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import _OPS
 
     _check_gemm(POLICIES["dynamic"], 1500, 1800, 64, max_ctas=8, reps=3)
     op = _OPS[(POLICIES["dynamic"], None, PAIR, 256)]
@@ -484,7 +482,7 @@ def test_pair_gemm_counter_resets(requires_blackwell):
 
 def test_pair_gemm_compiles_once_across_shapes(requires_blackwell, monkeypatch):
     from transformer_nuggets.cute import cache
-    from transformer_nuggets.cute.warp_roles.examples.persistent_gemm import (
+    from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import (
         PersistentGemm,
         compile_persistent_gemm,
     )
@@ -540,9 +538,9 @@ def test_pair_fa4_three_clusters_turnstile(requires_blackwell, policy):
 
 def _check_fa4(policy, b, h, sq, sk, nonuniform, split_p, max_ctas=None, turnstile=False):
     pytest.importorskip("flash_attn.cute")
-    from test_cute_warp_roles import fa4_inputs
+    from test_cute_warpdrive import fa4_inputs
 
-    from transformer_nuggets.cute.warp_roles.examples.fa4_fwd import fa4_fwd
+    from transformer_nuggets.cute.warpdrive.examples.fa4_fwd import fa4_fwd
 
     q, k, v = fa4_inputs(b, h, sq, sk, nonuniform)
     qf, kf, vf = (x.float().transpose(1, 2) for x in (q, k, v))

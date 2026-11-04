@@ -1,4 +1,4 @@
-# warp_roles
+# warpdrive
 
 Write warp-specialized CuTeDSL kernels as separate methods, with channels for the handoffs:
 
@@ -24,7 +24,7 @@ from dataclasses import dataclass
 
 import cutlass
 from cutlass import cute
-from transformer_nuggets.cute.warp_roles import (
+from transformer_nuggets.cute.warpdrive import (
     Consumer, Producer, Raster, Ring, StaticPersistent, Threads, Tiles, TileStream, Tma, Tmem,
     TmemPlan, Umma, WarpSpecialized, role,
 )
@@ -427,14 +427,14 @@ run-iket -o traces/gemm --clobber profile --postprocess all -- python profile_ke
 ```
 
 ```python
-from transformer_nuggets.cute.warp_roles import plan_from_warp_roles
+from transformer_nuggets.cute.warpdrive import plan_from_warpdrive
 from transformer_nuggets.cute.profiler.pipeline import (
     analyze_pipeline,
     load_iket_capture,
     write_pipeline_perfetto,
 )
 
-plan = plan_from_warp_roles(op, cta=0)  # after a compile, for traced reuse counts
+plan = plan_from_warpdrive(op, cta=0)  # after a compile, for traced reuse counts
 timeline = plan.schedule(iterations=8)
 measured = load_iket_capture("capture.trace.json", timeline, cta=(0, 0, 0))
 analysis = analyze_pipeline(timeline, measured)
@@ -476,7 +476,7 @@ initial layer, CTA-pair and tile-N experiments in the
 not new measurements of this revision. FA4 shapes below are batch x heads x sequence length,
 with head dim 128.
 
-| Workload | Reference | warp_roles |
+| Workload | Reference | warpdrive |
 |---|---:|---:|
 | GEMM 8192^3, 2-CTA persistent | `torch.mm` 694 us | 705 us |
 | GEMM 4096^3, 2-CTA, `tile_n=224` | `torch.mm` 89.9 us | 89.7 us |
@@ -487,7 +487,7 @@ with head dim 128.
 
 ```bash
 pip install -e ".[cute,dev]" pytest-xdist
-pytest -n 6 test/test_cute_warp_roles*.py
+pytest -n 6 test/test_cute_warpdrive*.py
 ```
 
 FA4 tests skip without `flash_attn.cute`. Coverage includes numerical correctness, determinism,

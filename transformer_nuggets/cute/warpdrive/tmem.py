@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from transformer_nuggets.cute.warp_roles.protocol import ProtocolError, ProtocolLog
+from transformer_nuggets.cute.warpdrive.protocol import ProtocolError, ProtocolLog
 
 TMEM_COLS = 512
 

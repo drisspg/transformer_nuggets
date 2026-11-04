@@ -9,8 +9,8 @@ from transformer_nuggets.cute.profiler.pipeline.plan import (
     Resource,
     Role,
 )
-from transformer_nuggets.cute.warp_roles.channels import Tma, Umma
-from transformer_nuggets.cute.warp_roles.cluster import LEADER
+from transformer_nuggets.cute.warpdrive.channels import Tma, Umma
+from transformer_nuggets.cute.warpdrive.cluster import LEADER
 
 ROLE_COLORS = ("#4f9cf9", "#5bc8a5", "#ef6a8a", "#c88bf2", "#f0b35b", "#63c7da", "#a0a0a0")
 
@@ -18,7 +18,7 @@ ROLE_COLORS = ("#4f9cf9", "#5bc8a5", "#ef6a8a", "#c88bf2", "#f0b35b", "#63c7da",
 # --------------------------------------------------------------------------- #
 
 
-def plan_from_warp_roles(kernel, *, cta: int = 0, name: str | None = None) -> PipelinePlan:
+def plan_from_warpdrive(kernel, *, cta: int = 0, name: str | None = None) -> PipelinePlan:
     """The kernel's roles, channels, and handoffs as a ``PipelinePlan`` for CTA rank ``cta``.
 
     Names match the IKET ranges the layer emits: one ``Role`` and one ``Region`` per role

@@ -72,9 +72,9 @@ from dataclasses import dataclass, field
 import cutlass
 from cutlass import Int32, cute
 
-from transformer_nuggets.cute.warp_roles.channels import Ring, Slots, Threads, Tma
-from transformer_nuggets.cute.warp_roles.protocol import ProtocolError, current_block, user_site
-from transformer_nuggets.cute.warp_roles.tracing import pop, push_if
+from transformer_nuggets.cute.warpdrive.channels import Ring, Slots, Threads, Tma
+from transformer_nuggets.cute.warpdrive.protocol import ProtocolError, current_block, user_site
+from transformer_nuggets.cute.warpdrive.tracing import pop, push_if
 
 AXES = ("m", "n", "l")
 

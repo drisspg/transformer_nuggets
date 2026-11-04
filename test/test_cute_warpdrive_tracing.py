@@ -14,12 +14,12 @@ from transformer_nuggets.cute.profiler.pipeline import (
     load_iket_capture,
     write_pipeline_perfetto,
 )
-from transformer_nuggets.cute.warp_roles import Clc, CtaPair, StaticPersistent, tracing
-from transformer_nuggets.cute.warp_roles.examples.persistent_gemm import (
+from transformer_nuggets.cute.warpdrive import Clc, CtaPair, StaticPersistent, tracing
+from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import (
     PersistentGemm,
     compile_persistent_gemm,
 )
-from transformer_nuggets.cute.warp_roles.pipeline_plan import plan_from_warp_roles
+from transformer_nuggets.cute.warpdrive.pipeline_plan import plan_from_warpdrive
 
 
 class _Recorder:
@@ -64,7 +64,7 @@ def test_disabled_emits_no_iket_ops(monkeypatch):
 
 def test_gemm_range_names_match_plan(iket_recorder):
     op = _compile_gemm(PersistentGemm(policy=StaticPersistent()).enable_iket())
-    plan = plan_from_warp_roles(op)
+    plan = plan_from_warpdrive(op)
     names = set(iket_recorder.pushed)
     assert set(plan.roles) == set(plan.regions) == {"epilogue", "load", "mma"}
     assert set(plan.regions) <= names  # every plan region is an emitted range
@@ -88,7 +88,7 @@ def test_pair_plan_per_cta_and_roles_only(iket_recorder):
     op = _compile_gemm(PersistentGemm(policy=Clc(), cluster=CtaPair()).enable_iket(waits=False))
     names = set(iket_recorder.pushed)
     assert names == {"epilogue", "load", "mma", "tiles.scheduler"}  # waits=False: no waits
-    leader, peer = plan_from_warp_roles(op, cta=0), plan_from_warp_roles(op, cta=1)
+    leader, peer = plan_from_warpdrive(op, cta=0), plan_from_warpdrive(op, cta=1)
     assert set(leader.regions) == names
     assert set(peer.regions) == {"epilogue", "load"}  # leader-only roles are not in the peer
     assert (
@@ -99,9 +99,9 @@ def test_pair_plan_per_cta_and_roles_only(iket_recorder):
 
 def test_fa4_pair_names_and_feedback_edges():
     pytest.importorskip("flash_attn.cute")
-    from transformer_nuggets.cute.warp_roles.examples.fa4_fwd import FlashAttentionForward
+    from transformer_nuggets.cute.warpdrive.examples.fa4_fwd import FlashAttentionForward
 
-    plan = plan_from_warp_roles(FlashAttentionForward(policy=Clc(), cluster=CtaPair()))
+    plan = plan_from_warpdrive(FlashAttentionForward(policy=Clc(), cluster=CtaPair()))
     assert list(plan.roles) == [
         "softmax[0]",
         "softmax[1]",
@@ -159,7 +159,7 @@ def _synthetic_capture(path, plan, iterations, warps_per_role):
 
 def test_plan_joins_capture_end_to_end(tmp_path, iket_recorder):
     op = _compile_gemm(PersistentGemm(policy=Clc(), cluster=CtaPair()).enable_iket())
-    plan = plan_from_warp_roles(op, cta=0)
+    plan = plan_from_warpdrive(op, cta=0)
     timeline = plan.schedule(iterations=3)
     trace = tmp_path / "capture.trace.json"
     _synthetic_capture(trace, plan, 3, warps_per_role=2)

@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import textwrap
 
-from transformer_nuggets.cute.warp_roles.channels import Threads, Tma, Umma
-from transformer_nuggets.cute.warp_roles.scheduling import _tile_grid, scheduler_role
+from transformer_nuggets.cute.warpdrive.channels import Threads, Tma, Umma
+from transformer_nuggets.cute.warpdrive.scheduling import _tile_grid, scheduler_role
 
 _RANK = {0: "leader", 1: "peer"}
 WIDTH = 100  # wrap channel flows past this many columns

@@ -6,13 +6,13 @@ layer emits nothing, so the generated code is unchanged. Range names are stable:
 * ``<role>``: one range per work item of a role that loops over a ``TileStream`` (from the
   cursor's start to its ``advance()``), else one range over the whole role. Role instances keep
   their suffix (``softmax[0]``). The CTA of a pair kernel is not in the name: IKET records the
-  CTA of every range, and ``plan_from_warp_roles(kernel, cta=...)`` builds the plan of one CTA.
+  CTA of every range, and ``plan_from_warpdrive(kernel, cta=...)`` builds the plan of one CTA.
 * ``<channel>.acquire`` / ``<channel>.wait`` / ``<channel>.tail``: the blocking mbarrier wait of
   a producer acquire, a consumer wait, and a producer tail, nested inside the role range, so
   waiting is separated from working. ``<turnstile>.turn`` likewise.
 * user regions: ``with self.trace_region("name"):`` inside a role.
 
-``pipeline_plan.plan_from_warp_roles`` exports the layer's structure in the profiler's neutral model
+``pipeline_plan.plan_from_warpdrive`` exports the layer's structure in the profiler's neutral model
 (``transformer_nuggets.cute.profiler.pipeline``): one ``Role`` and one ``Region`` per role
 instance, both named like the role range, one ``Resource`` per channel, and per channel a data
 dependency producer -> consumer plus a reuse dependency back. The plan's iteration is the work

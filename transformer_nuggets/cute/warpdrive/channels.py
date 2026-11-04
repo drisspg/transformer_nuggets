@@ -23,10 +23,10 @@ import cutlass
 from cutlass import Int32, cute
 from cutlass._mlir.dialects import nvvm as _nvvm
 
-from transformer_nuggets.cute.warp_roles.cluster import ALL, LEADER, SCOPE_OVERRIDES
-from transformer_nuggets.cute.warp_roles.protocol import ProtocolError, current_block, user_site
-from transformer_nuggets.cute.warp_roles.tma import TmaUse, stage_closed
-from transformer_nuggets.cute.warp_roles.tracing import wait_range
+from transformer_nuggets.cute.warpdrive.cluster import ALL, LEADER, SCOPE_OVERRIDES
+from transformer_nuggets.cute.warpdrive.protocol import ProtocolError, current_block, user_site
+from transformer_nuggets.cute.warpdrive.tma import TmaUse, stage_closed
+from transformer_nuggets.cute.warpdrive.tracing import wait_range
 
 
 @dataclass(frozen=True)

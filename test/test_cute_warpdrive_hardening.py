@@ -18,7 +18,7 @@ from cutlass import cute, pipeline
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
-from transformer_nuggets.cute.warp_roles import (
+from transformer_nuggets.cute.warpdrive import (
     Barriers,
     Consumer,
     CtaPair,
@@ -38,7 +38,7 @@ from transformer_nuggets.cute.warp_roles import (
     role,
     unchecked,
 )
-from transformer_nuggets.cute.warp_roles.examples.gemm import TILE, Gemm, GemmCtx
+from transformer_nuggets.cute.warpdrive.examples.gemm import TILE, Gemm, GemmCtx
 
 TILE_ROWS = 64  # one 64x64 bf16 TMA tile per stage
 TILE_BYTES = TILE_ROWS * 64 * 2
@@ -49,7 +49,7 @@ def requires_blackwell() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
     if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("warp_roles tests require SM100-family tcgen05 and clusters")
+        pytest.skip("warpdrive tests require SM100-family tcgen05 and clusters")
 
 
 def _raises_protocol(match: str, fn):
@@ -188,7 +188,7 @@ def make_tma_toy(cluster, consumer_cta="all", group="ONE", tx=TILE_BYTES, mode="
 def compile_tma_toy(op):
     src = make_fake_compact_tensor(cutlass.BFloat16, (cute.sym_int(divisibility=64), 64))
     out = make_fake_compact_tensor(cutlass.Float32, (cute.sym_int(),), assumed_align=4)
-    return compile_tvm_ffi(op, src, out, cutlass.Int32(1), name=f"warp_roles_tma_toy_{op.key}")
+    return compile_tvm_ffi(op, src, out, cutlass.Int32(1), name=f"warpdrive_tma_toy_{op.key}")
 
 
 def run_tma_toy(op, n=7, tiles=3):
@@ -233,7 +233,7 @@ def test_tma_check_rejects_mismatched_atom(cluster, consumer_cta, group, message
     err = _raises_protocol(
         message, lambda: compile_tma_toy(make_tma_toy(cluster, consumer_cta, group))
     )
-    assert "test_cute_warp_roles_hardening.py:" in str(err)  # points at the user's copy line
+    assert "test_cute_warpdrive_hardening.py:" in str(err)  # points at the user's copy line
 
 
 @pytest.mark.parametrize("tx", [TILE_BYTES // 2, 2 * TILE_BYTES])
@@ -259,7 +259,7 @@ def test_tma_check_fails_open_on_opaque_barrier(requires_blackwell):
     op = make_tma_toy(SingleCta(), mode="opaque")
     with pytest.warns(UserWarning, match=r"TMA check could not verify channel\(s\) \['ld'\]"):
         run_tma_toy(op)
-    assert "tma       unverified (barrier taken at test_cute_warp_roles_hardening.py:" in (
+    assert "tma       unverified (barrier taken at test_cute_warpdrive_hardening.py:" in (
         op.describe()
     )
 
@@ -292,7 +292,7 @@ def test_tma_opt_out_is_listed(requires_blackwell):
     op = make_tma_toy(SingleCta(), mode="optout")
     run_tma_toy(op)
     text = op.describe()
-    assert "Unchecked opt-outs\n  unchecked tma @ test_cute_warp_roles_hardening.py:" in text
+    assert "Unchecked opt-outs\n  unchecked tma @ test_cute_warpdrive_hardening.py:" in text
     assert "load: 'toy: atom verified by hand' -> ld barrier at" in text
     assert "tma       opted out (unchecked)" in text
 
@@ -344,7 +344,7 @@ def test_raw_state_and_raw_signal(requires_blackwell):
     n = 5
     out = torch.full((4 * n,), -1, device="cuda", dtype=torch.int32)
     fake = make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),), assumed_align=4)
-    compile_tvm_ffi(RawStateToy(), fake, cutlass.Int32(1), name="warp_roles_raw_state")(out, n)
+    compile_tvm_ffi(RawStateToy(), fake, cutlass.Int32(1), name="warpdrive_raw_state")(out, n)
     torch.cuda.synchronize()
     rows = out.view(n, 4).tolist()
     assert rows == [[i % 2, i // 2 % 2, i % 2, i // 2 % 2] for i in range(n)]
@@ -398,7 +398,7 @@ class OptOutToy(WarpSpecialized):
 
 def _compile_opt_out_toy(op):
     fake = make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),), assumed_align=4)
-    name = f"warp_roles_opt_out_{op.mode}_{int(op.opt_out)}"
+    name = f"warpdrive_opt_out_{op.mode}_{int(op.opt_out)}"
     return compile_tvm_ffi(op, fake, cutlass.Int32(1), name=name)
 
 
@@ -414,7 +414,7 @@ def test_opt_out_scopes_one_site(mode, error, listed):
     op = OptOutToy(mode, True)
     _compile_opt_out_toy(op)
     text = op.describe()
-    assert "unchecked " in text and "test_cute_warp_roles_hardening.py:" in text
+    assert "unchecked " in text and "test_cute_warpdrive_hardening.py:" in text
     assert re.search(listed, text), text
 
 
@@ -559,7 +559,7 @@ class MixedGemm(Gemm):
         self.acc_bars = Barriers(2)  # full + empty of a 1-stage PipelineUmmaAsync
 
     def get_name(self) -> str:
-        return "warp_roles_mixed_gemm"
+        return "warpdrive_mixed_gemm"
 
     @role(warps=5, regs=40)
     @cute.jit
@@ -632,7 +632,7 @@ _MIXED = MixedGemm()
 
 @pytest.mark.parametrize("m, n, k", [(128, 256, 64), (300, 520, 136), (1000, 1000, 1000)])
 def test_mixed_managed_and_raw_gemm(requires_blackwell, m, n, k):
-    from transformer_nuggets.cute.warp_roles.examples.gemm import compile_gemm
+    from transformer_nuggets.cute.warpdrive.examples.gemm import compile_gemm
 
     torch.manual_seed(0)
     a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
@@ -657,8 +657,8 @@ def test_raw_role_runs_under_its_budget_branch(monkeypatch):
     raw role is dispatched inside its branch like any role (it does not adjust registers itself),
     and every IKET role range opens after its budget's adjustment (compile only)."""
     from transformer_nuggets.cute import cache
-    from transformer_nuggets.cute.warp_roles import tracing
-    from transformer_nuggets.cute.warp_roles.examples.gemm import compile_gemm
+    from transformer_nuggets.cute.warpdrive import tracing
+    from transformer_nuggets.cute.warpdrive.examples.gemm import compile_gemm
 
     events = []
     for fn in ("setmaxregister_increase", "setmaxregister_decrease"):

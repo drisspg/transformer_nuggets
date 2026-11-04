@@ -1,4 +1,4 @@
-"""warp_roles: authoring code for warp-specialized CuTeDSL kernels.
+"""warpdrive: authoring code for warp-specialized CuTeDSL kernels.
 
 A kernel declares channels (``Ring`` for rotating stages, ``Slots`` for caller-chosen slots),
 turnstiles, and a ``TmemPlan`` as attributes, and writes roles as methods decorated
@@ -56,7 +56,7 @@ Tracing: ``kernel.enable_iket()`` before compiling makes the layer emit IKET ran
 the declarations: ``<role>`` per work item (or per role body), ``<channel>.acquire``/``.wait``/
 ``.tail`` around blocking waits, ``<turnstile>.turn``, and ``with self.trace_region(name)`` user
 regions (``enable_iket(waits=False)``: role ranges only). Disabled, it emits nothing.
-``plan_from_warp_roles(kernel, cta=0)`` exports the matching ``PipelinePlan``, so a ``run-iket``
+``plan_from_warpdrive(kernel, cta=0)`` exports the matching ``PipelinePlan``, so a ``run-iket``
 capture feeds ``load_iket_capture``, ``analyze_pipeline``, and ``write_pipeline_perfetto`` from
 ``transformer_nuggets.cute.profiler.pipeline`` with no hand annotations (``tracing.py``).
 
@@ -67,7 +67,7 @@ outside a layer payload must declare ``remote_scope="cluster"``. The layer canno
 case. The cluster scope costs about 30% on FA4's hot S channel.
 """
 
-from transformer_nuggets.cute.warp_roles.channels import (
+from transformer_nuggets.cute.warpdrive.channels import (
     Barriers,
     Channel,
     Handle,
@@ -78,8 +78,8 @@ from transformer_nuggets.cute.warp_roles.channels import (
     Turnstile,
     Umma,
 )
-from transformer_nuggets.cute.warp_roles.cluster import CtaPair, SingleCta
-from transformer_nuggets.cute.warp_roles.kernel import (
+from transformer_nuggets.cute.warpdrive.cluster import CtaPair, SingleCta
+from transformer_nuggets.cute.warpdrive.kernel import (
     Consumer,
     Instance,
     Producer,
@@ -88,9 +88,9 @@ from transformer_nuggets.cute.warp_roles.kernel import (
     WarpSpecialized,
     role,
 )
-from transformer_nuggets.cute.warp_roles.pipeline_plan import plan_from_warp_roles
-from transformer_nuggets.cute.warp_roles.protocol import ProtocolError, ProtocolLog, unchecked
-from transformer_nuggets.cute.warp_roles.scheduling import (
+from transformer_nuggets.cute.warpdrive.pipeline_plan import plan_from_warpdrive
+from transformer_nuggets.cute.warpdrive.protocol import ProtocolError, ProtocolLog, unchecked
+from transformer_nuggets.cute.warpdrive.scheduling import (
     Clc,
     DynamicPersistent,
     OneShot,
@@ -103,7 +103,7 @@ from transformer_nuggets.cute.warp_roles.scheduling import (
     TileStream,
     WorkMapping,
 )
-from transformer_nuggets.cute.warp_roles.tmem import TmemPlan, TmemView
+from transformer_nuggets.cute.warpdrive.tmem import TmemPlan, TmemView
 
 __all__ = [
     "Barriers",
@@ -138,7 +138,7 @@ __all__ = [
     "Umma",
     "WarpSpecialized",
     "WorkMapping",
-    "plan_from_warp_roles",
+    "plan_from_warpdrive",
     "role",
     "unchecked",
 ]

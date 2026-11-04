@@ -13,7 +13,7 @@ import cutlass
 from cutlass import Int32, cute, memory, pipeline
 from cutlass._mlir.dialects import nvvm
 
-from transformer_nuggets.cute.warp_roles.channels import (
+from transformer_nuggets.cute.warpdrive.channels import (
     Barriers,
     Channel,
     ConsumerEnd,
@@ -24,7 +24,7 @@ from transformer_nuggets.cute.warp_roles.channels import (
     Turnstile,
     Umma,
 )
-from transformer_nuggets.cute.warp_roles.cluster import (
+from transformer_nuggets.cute.warpdrive.cluster import (
     ALL,
     LEADER,
     PLACEMENTS,
@@ -33,24 +33,24 @@ from transformer_nuggets.cute.warp_roles.cluster import (
     check_atoms,
     derive_scope,
 )
-from transformer_nuggets.cute.warp_roles.describe import describe_kernel
-from transformer_nuggets.cute.warp_roles.protocol import (
+from transformer_nuggets.cute.warpdrive.describe import describe_kernel
+from transformer_nuggets.cute.warpdrive.protocol import (
     ProtocolError,
     ProtocolLog,
     RoleTrace,
     take_opt_outs,
 )
-from transformer_nuggets.cute.warp_roles.scheduling import (
+from transformer_nuggets.cute.warpdrive.scheduling import (
     TileCursor,
     Tiles,
     TileStream,
     _Fetch,
     scheduler_role,
 )
-from transformer_nuggets.cute.warp_roles.tma import TmaReport
-from transformer_nuggets.cute.warp_roles.tma import check_role as check_tma
-from transformer_nuggets.cute.warp_roles.tmem import TmemPlan, TmemView
-from transformer_nuggets.cute.warp_roles.tracing import pop, pop_if, push
+from transformer_nuggets.cute.warpdrive.tma import TmaReport
+from transformer_nuggets.cute.warpdrive.tma import check_role as check_tma
+from transformer_nuggets.cute.warpdrive.tmem import TmemPlan, TmemView
+from transformer_nuggets.cute.warpdrive.tracing import pop, pop_if, push
 
 WARP_SIZE = 32
 WARPGROUP = 4
@@ -221,7 +221,7 @@ def role(warps, regs: int | None = None, cta: str = ALL, raw: bool = False):
             raise ValueError(f"role warps must be non-empty unit-step ranges, got {warps!r}")
 
     def deco(fn):
-        fn._warp_roles = (ranges, regs, cta, raw)
+        fn._warpdrive = (ranges, regs, cta, raw)
         return fn
 
     return deco
@@ -292,7 +292,7 @@ class WarpSpecialized:
         ctx_types = {}  # annotated context type -> first "role.param" using it
         for name in dir(type(self)):
             fn = getattr(type(self), name)
-            meta = getattr(fn, "_warp_roles", None)
+            meta = getattr(fn, "_warpdrive", None)
             if meta is None:
                 continue
             ranges, regs, cta, raw = meta
@@ -815,7 +815,7 @@ class WarpSpecialized:
         if unverified:
             details = "; ".join(f"{n}: {self._ws_tma[n].status()}" for n in unverified)
             warnings.warn(
-                f"warp_roles: TMA check could not verify channel(s) {unverified} (no error "
+                f"warpdrive: TMA check could not verify channel(s) {unverified} (no error "
                 f"raised; see describe()): {details}",
                 stacklevel=2,
             )

@@ -1,4 +1,4 @@
-"""Cut-down FlashAttention-4 forward (SM100) written with ``warp_roles``.
+"""Cut-down FlashAttention-4 forward (SM100) written with ``warpdrive``.
 
 Scope: bf16 in/out, fp32 accumulation, head_dim 128, non-causal, no masking, work items of
 (256 query rows, head, batch) scheduled by a ``TileStream`` (``OneShot`` by default, or a
@@ -51,7 +51,7 @@ from quack import copy_utils, layout_utils
 
 from transformer_nuggets.cute.cache import compile_tvm_ffi_and_cache
 from transformer_nuggets.cute.utils import make_fake_compact_tensor
-from transformer_nuggets.cute.warp_roles import (
+from transformer_nuggets.cute.warpdrive import (
     Consumer,
     Instance,
     OneShot,
@@ -169,7 +169,7 @@ class FlashAttentionForward(WarpSpecialized):
     def get_name(self) -> str:
         ts = ("_ts" if self.mufu.enabled else "") + ("_splitp" if self.split_p else "")
         return (
-            f"warp_roles_fa4_fwd_{self.cluster.get_key()}_kv{self.kv_stages}{ts}_"
+            f"warpdrive_fa4_fwd_{self.cluster.get_key()}_kv{self.kv_stages}{ts}_"
             f"{self.tiles.get_key()}{self.iket_key()}"
         )
 

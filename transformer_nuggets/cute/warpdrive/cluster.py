@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from cutlass import cute
 from cutlass.cute.nvgpu import tcgen05
 
-from transformer_nuggets.cute.warp_roles.protocol import ProtocolError
+from transformer_nuggets.cute.warpdrive.protocol import ProtocolError
 
 ALL = "all"
 LEADER = "leader"
@@ -142,7 +142,7 @@ def _ctas(ri, cluster) -> tuple[int, ...]:
 
 def derive_scope(chan, cluster, *, internal: bool = False) -> Scope:
     """Derive ``chan``'s scope from the placement of its bound role instances."""
-    from transformer_nuggets.cute.warp_roles.channels import Threads, Tma, Umma
+    from transformer_nuggets.cute.warpdrive.channels import Threads, Tma, Umma
 
     bound = [*chan.producers, *chan.consumers]
     local = cluster.size == 1 or len({ri.cta for ri, _ in bound}) == 1

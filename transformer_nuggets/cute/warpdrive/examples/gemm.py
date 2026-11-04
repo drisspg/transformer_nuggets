@@ -1,4 +1,4 @@
-"""BF16 ``D = A @ B^T`` (``F.linear`` layout) on SM100, written with ``warp_roles``.
+"""BF16 ``D = A @ B^T`` (``F.linear`` layout) on SM100, written with ``warpdrive``.
 
 One CTA per 128x256 output tile (a ``TileStream`` with the ``OneShot`` policy), K stage 64,
 tcgen05 MMA 128x256x16, three A/B SMEM stages; warps 0-3 epilogue, 4 TMA load, 5 MMA. TMA
@@ -16,7 +16,7 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from transformer_nuggets.cute.cache import compile_tvm_ffi_and_cache
 from transformer_nuggets.cute.utils import make_fake_compact_tensor
-from transformer_nuggets.cute.warp_roles import (
+from transformer_nuggets.cute.warpdrive import (
     Consumer,
     OneShot,
     Producer,
@@ -70,7 +70,7 @@ class Gemm(WarpSpecialized):
         self.trace_protocol = trace
 
     def get_name(self) -> str:
-        return f"warp_roles_gemm_ab{self.ab.n}_acc{self.acc_stages}{self.iket_key()}"
+        return f"warpdrive_gemm_ab{self.ab.n}_acc{self.acc_stages}{self.iket_key()}"
 
     def get_key(self) -> str:
         return self.get_name()

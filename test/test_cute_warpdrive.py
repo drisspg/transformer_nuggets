@@ -14,7 +14,7 @@ from cuda.bindings import driver as cuda
 from cutlass import cute
 
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
-from transformer_nuggets.cute.warp_roles import (
+from transformer_nuggets.cute.warpdrive import (
     Consumer,
     Instance,
     Producer,
@@ -31,8 +31,8 @@ from transformer_nuggets.cute.warp_roles import (
     WarpSpecialized,
     role,
 )
-from transformer_nuggets.cute.warp_roles.examples.gemm import gemm
-from transformer_nuggets.cute.warp_roles.examples.persistent_gemm import persistent_gemm
+from transformer_nuggets.cute.warpdrive.examples.gemm import gemm
+from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import persistent_gemm
 
 
 @pytest.fixture
@@ -40,7 +40,7 @@ def requires_blackwell() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
     if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("warp_roles examples require SM100-family tcgen05")
+        pytest.skip("warpdrive examples require SM100-family tcgen05")
 
 
 # --------------------------------------------------------------------------- #
@@ -55,7 +55,7 @@ class SlotsToy(WarpSpecialized):
         self.ch = Slots(2, Threads, Threads, producer_role="prod", payload=(cutlass.Int32, (32,)))
 
     def get_name(self) -> str:
-        return f"warp_roles_toy_{self.mode}"
+        return f"warpdrive_toy_{self.mode}"
 
     @role(warps=0)
     @cute.jit
@@ -124,7 +124,7 @@ class TurnToy(WarpSpecialized):
 
     @cute.jit
     def __call__(self, log: cute.Tensor, n: cutlass.Int32, stream: cuda.CUstream):
-        self.kernel.set_name_prefix("warp_roles_turn_toy")
+        self.kernel.set_name_prefix("warpdrive_turn_toy")
         self.kernel(log, n).launch(grid=(1, 1, 1), block=(self.num_threads, 1, 1), stream=stream)
 
 
@@ -159,7 +159,7 @@ class BoundToy(WarpSpecialized):
 
     @cute.jit
     def __call__(self, out: cute.Tensor, n: cutlass.Int32, stream: cuda.CUstream):
-        self.kernel.set_name_prefix("warp_roles_bound_toy")
+        self.kernel.set_name_prefix("warpdrive_bound_toy")
         self.kernel(out, n).launch(grid=(1, 1, 1), block=(self.num_threads, 1, 1), stream=stream)
 
 
@@ -203,7 +203,7 @@ class HoleToy(WarpSpecialized):
 
     @cute.jit
     def __call__(self, out: cute.Tensor, n: cutlass.Int32, stream: cuda.CUstream):
-        self.kernel.set_name_prefix("warp_roles_hole_toy")
+        self.kernel.set_name_prefix("warpdrive_hole_toy")
         self.kernel(out, n).launch(grid=(1, 1, 1), block=(self.num_threads, 1, 1), stream=stream)
 
 
@@ -218,7 +218,7 @@ class OverBudgetHoleToy(HoleToy):
 
 def compile_toy(op):
     out = make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),), assumed_align=4)
-    return compile_tvm_ffi(op, out, cutlass.Int32(1), name="warp_roles_toy")
+    return compile_tvm_ffi(op, out, cutlass.Int32(1), name="warpdrive_toy")
 
 
 @pytest.mark.parametrize("n", [1, 2, 7, 64])
@@ -287,7 +287,7 @@ def test_trace_time_wrong_slot(requires_blackwell):
 @pytest.mark.parametrize(
     "mode, message",
     [
-        ("leak", r"handles never closed: ch\[0\] acquire opened at test_cute_warp_roles.py"),
+        ("leak", r"handles never closed: ch\[0\] acquire opened at test_cute_warpdrive.py"),
         ("double", r"ch\[[01]\] acquire closed twice: commit at .*, then commit at"),
         ("cross_region", r"different dynamic region"),
         ("wrong_side", r"release\(\) on a ch\[[01]\] acquire handle"),
@@ -372,7 +372,7 @@ class TypedCtxToy(WarpSpecialized):
 
     @cute.jit
     def __call__(self, out: cute.Tensor, n: cutlass.Int32, stream: cuda.CUstream):
-        self.kernel.set_name_prefix(f"warp_roles_ctx_toy_{self.ctx}")
+        self.kernel.set_name_prefix(f"warpdrive_ctx_toy_{self.ctx}")
         self.kernel(out, n).launch(grid=(1, 1, 1), block=(self.num_threads, 1, 1), stream=stream)
 
 
@@ -701,7 +701,7 @@ def fa4_inputs(b, h, sq, sk, nonuniform):
 )
 def test_fa4_fwd(requires_blackwell, b, h, sq, sk, nonuniform, turnstile):
     pytest.importorskip("flash_attn.cute")
-    from transformer_nuggets.cute.warp_roles.examples.fa4_fwd import fa4_fwd
+    from transformer_nuggets.cute.warpdrive.examples.fa4_fwd import fa4_fwd
 
     q, k, v = fa4_inputs(b, h, sq, sk, nonuniform)
     o, lse = fa4_fwd(q, k, v, turnstile=turnstile)
@@ -717,7 +717,7 @@ def test_fa4_fwd(requires_blackwell, b, h, sq, sk, nonuniform, turnstile):
 
 def test_fa4_declared_graph():
     pytest.importorskip("flash_attn.cute")
-    from transformer_nuggets.cute.warp_roles.examples.fa4_fwd import FlashAttentionForward
+    from transformer_nuggets.cute.warpdrive.examples.fa4_fwd import FlashAttentionForward
 
     op = FlashAttentionForward()
     summary = op.describe()
@@ -733,7 +733,7 @@ def test_fa4_declared_graph():
 
 def test_fa4_rejects_key_tail(requires_blackwell):
     pytest.importorskip("flash_attn.cute")
-    from transformer_nuggets.cute.warp_roles.examples.fa4_fwd import fa4_fwd
+    from transformer_nuggets.cute.warpdrive.examples.fa4_fwd import fa4_fwd
 
     q = torch.randn(1, 128, 1, 128, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(1, 200, 1, 128, device="cuda", dtype=torch.bfloat16)
@@ -744,7 +744,7 @@ def test_fa4_rejects_key_tail(requires_blackwell):
 def test_describe_lists_the_traced_protocol(requires_blackwell):
     """With trace_protocol, describe() after a compile adds each role's channel operations with
     source lines, indented by dynamic region, and the TMEM regions each role touched."""
-    from transformer_nuggets.cute.warp_roles.examples.gemm import Gemm, compile_gemm
+    from transformer_nuggets.cute.warpdrive.examples.gemm import Gemm, compile_gemm
 
     op = Gemm(trace=True)
     assert "Traced protocol" not in op.describe()  # nothing traced before the compile
@@ -759,7 +759,7 @@ def test_describe_lists_the_traced_protocol(requires_blackwell):
 def test_streams_launch_through_their_work_problem():
     """A kernel with a TileStream must take its grid from the problem: a OneShot over plain
     Raster() reads its item from blockIdx.y/z, which a hand-built 1-D grid would not set."""
-    from transformer_nuggets.cute.warp_roles.examples.gemm import Gemm
+    from transformer_nuggets.cute.warpdrive.examples.gemm import Gemm
 
     with pytest.raises(ProtocolError, match=r"TileStream\(s\) \['tiles'\]; pass work="):
         Gemm().launch_config(grid=(4, 1, 1))

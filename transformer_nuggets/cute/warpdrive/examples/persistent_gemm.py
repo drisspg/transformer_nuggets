@@ -36,7 +36,7 @@ from cutlass.utils.gemm.sm100 import (
 
 from transformer_nuggets.cute.cache import compile_tvm_ffi_and_cache
 from transformer_nuggets.cute.utils import make_fake_compact_tensor
-from transformer_nuggets.cute.warp_roles import (
+from transformer_nuggets.cute.warpdrive import (
     Consumer,
     Producer,
     Raster,
@@ -53,7 +53,7 @@ from transformer_nuggets.cute.warp_roles import (
     WarpSpecialized,
     role,
 )
-from transformer_nuggets.cute.warp_roles.examples.gemm import check_gemm_args
+from transformer_nuggets.cute.warpdrive.examples.gemm import check_gemm_args
 
 CTA_TILE_M, TILE_K = 128, 64  # per-CTA output rows and K step; tile N is a constructor argument
 EPI_TILE = (128, 32)  # one TMA store box; tile_n // 32 per CTA output tile
@@ -123,7 +123,7 @@ class PersistentGemm(WarpSpecialized):
 
     def get_name(self) -> str:
         return (
-            f"warp_roles_pgemm_{self.cluster.get_key()}_n{self.tile_n}_ab{self.ab.n}_"
+            f"warpdrive_pgemm_{self.cluster.get_key()}_n{self.tile_n}_ab{self.ab.n}_"
             f"acc{self.acc_stages}_"
             f"{self.tiles.get_key()}{self.iket_key()}"
         )
@@ -370,7 +370,7 @@ def persistent_gemm(
 
 
 if __name__ == "__main__":
-    from transformer_nuggets.cute.warp_roles import Clc, CtaPair, DynamicPersistent, OneShot
+    from transformer_nuggets.cute.warpdrive import Clc, CtaPair, DynamicPersistent, OneShot
 
     for cluster in (None, CtaPair()):
         for policy in (OneShot(), StaticPersistent(), DynamicPersistent(), Clc()):
