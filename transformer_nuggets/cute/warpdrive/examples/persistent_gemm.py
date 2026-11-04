@@ -135,7 +135,7 @@ class PersistentGemm(WarpSpecialized):
 
     @role(warps=4, regs=40)
     @cute.jit
-    def load(self, params: PersistentGemmParams, ab: Producer, tiles: Tiles):
+    def load(self, params: PersistentGemmParams, *, ab: Producer, tiles: Tiles):
         while tiles.valid:
             m, n, _ = tiles.work
             tAgA = params.tAgA[None, m, None]
@@ -160,7 +160,13 @@ class PersistentGemm(WarpSpecialized):
     @role(warps=5, regs=40, cta="leader")
     @cute.jit
     def mma(
-        self, params: PersistentGemmParams, ab: Consumer, acc: Producer, tiles: Tiles, tmem: Tmem
+        self,
+        params: PersistentGemmParams,
+        *,
+        ab: Consumer,
+        acc: Producer,
+        tiles: Tiles,
+        tmem: Tmem,
     ):
         tiled_mma = params.tiled_mma
         tCtAcc = cute.make_tensor(tmem.ptr("acc"), params.acc_layout)
@@ -183,7 +189,7 @@ class PersistentGemm(WarpSpecialized):
 
     @role(warps=range(4), regs=160)
     @cute.jit
-    def epilogue(self, params: PersistentGemmParams, acc: Consumer, tiles: Tiles, tmem: Tmem):
+    def epilogue(self, params: PersistentGemmParams, *, acc: Consumer, tiles: Tiles, tmem: Tmem):
         """TMEM -> registers -> swizzled SMEM -> TMA store, one 128x32 subtile at a time through
         ``C_STAGES`` SMEM buffers. TMA clips the ragged edges, so partial tiles cost the same."""
         tidx, _, _ = cute.arch.thread_idx()

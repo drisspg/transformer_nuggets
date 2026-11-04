@@ -66,6 +66,10 @@ These are conditional guarantees relative to that program, not a theorem about a
 | R17 | A space with any Raster extent <= 0 is empty: `bind` stores `(1,1,0)` (what the kernel's `work.space` reads), `work.grid()` launches one work unit under every policy, single CTA or pair, every role's first `valid` is false, no decode divides by zero (host or device), and the dynamic workspace is left zeroed for the next launch. The check is host code in the jit entry point; kernels pay nothing. |
 | R18 | `work.grid()` admits a space only when `policy.reach` of Raster's saturating Int64 count fits Int32: `total*cs` for OneShot/Clc (the 1-D grid; terminal index `total`), `total + units - 1` for Static/Dynamic (the last unit's terminal index). Within it, no grid extent, index, claim or CLC result wraps. |
 
+Role parameters may be positional or keyword-only. The dispatcher follows each signature,
+while dependency binding remains by parameter name and annotation. The examples use
+`self, params, *, ...state`; keyword-only state is returned in the same way as positional state.
+
 ### Constructor-selected role configurations
 
 `@role(config=selector)` evaluates the host callable with the kernel instance on first
@@ -252,6 +256,7 @@ same dynamic branch is locally accepted; another participant's matching branch i
 | E89 | Static/dynamic grid requested without max_ctas | ValueError |
 | E90 | Producer/Consumer subscript other than Instance | TypeError |
 | E91 | Role-marked function lacks the JIT wrapper | TypeError |
+| E104 | Role signature has variadic positional or keyword parameters | ProtocolError |
 
 TMA checking is **positive evidence only**. It follows recognizable direct SSA uses of
 handed-out barriers and counts static copy boxes in the opening region. A complete mismatch

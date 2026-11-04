@@ -201,7 +201,7 @@ class FlashAttentionForward(WarpSpecialized):
 
     @role(config=lambda kernel: kernel.roles.load)
     @cute.jit
-    def load(self, params: Fa4Params, q: Producer, kv: Producer, tiles: Tiles):
+    def load(self, params: Fa4Params, *, q: Producer, kv: Producer, tiles: Tiles):
         rank = self.cluster.rank()  # this CTA's rows of Q, keys of K, head dims of V
         thr_qk, thr_pv = params.mma_qk.get_slice(rank), params.mma_pv.get_slice(rank)
         mma_m = M_BLOCK * self.cluster.size
@@ -259,6 +259,7 @@ class FlashAttentionForward(WarpSpecialized):
     def mma(
         self,
         params: Fa4Params,
+        *,
         q: Consumer,
         kv: Consumer,
         s: Producer,
@@ -362,6 +363,7 @@ class FlashAttentionForward(WarpSpecialized):
     def softmax(
         self,
         params: Fa4Params,
+        *,
         stage: Instance,
         s: Consumer[Instance],
         p_last: Producer[Instance],
@@ -445,6 +447,7 @@ class FlashAttentionForward(WarpSpecialized):
     def correction(
         self,
         params: Fa4Params,
+        *,
         s: Consumer,
         stats: Consumer,
         epi: Producer,
@@ -545,7 +548,7 @@ class FlashAttentionForward(WarpSpecialized):
 
     @role(config=lambda kernel: kernel.roles.epilogue)
     @cute.jit
-    def epilogue(self, params: Fa4Params, epi: Consumer, tiles: Tiles):
+    def epilogue(self, params: Fa4Params, *, epi: Consumer, tiles: Tiles):
         rank = self.cluster.rank()
         mma_m = M_BLOCK * self.cluster.size
         while tiles.valid:

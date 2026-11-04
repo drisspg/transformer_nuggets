@@ -185,6 +185,7 @@ class RoleInstance:
     uses_tmem: bool = False
     cta: str = ALL  # "all": runs in every CTA of the cluster; "leader": leader CTA only
     raw: bool = False  # dispatched without ends, protocol log, or trace checks
+    keyword_only: frozenset[str] = frozenset()
 
     @property
     def warps(self) -> range:
@@ -377,8 +378,20 @@ class WarpSpecialized:
             ranges, regs, cta, raw = resolved.warps, resolved.regs, resolved.cta, resolved.raw
             if not hasattr(fn, "__wrapped__"):
                 raise TypeError(f"role {name}: put @role(...) directly above @cute.jit")
+            signature = inspect.signature(fn)
+            for p in signature.parameters.values():
+                if p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+                    raise ProtocolError(
+                        f"role {name}: variadic parameter {p.name} cannot be injected; "
+                        "declare each parameter explicitly"
+                    )
+            keyword_only = frozenset(
+                p.name
+                for p in signature.parameters.values()
+                if p.kind is inspect.Parameter.KEYWORD_ONLY
+            )
             params = []
-            for pname, p in list(inspect.signature(fn).parameters.items())[1:]:
+            for pname, p in list(signature.parameters.items())[1:]:
                 ann, ctx_type = _resolve_param(name, pname, p.annotation, fn)
                 if raw and ann not in _RAW_ANNOTATIONS:
                     raise ProtocolError(
@@ -402,7 +415,17 @@ class WarpSpecialized:
             for idx, wr in enumerate(ranges):
                 inst = f"{name}[{idx}]" if len(ranges) > 1 else name
                 ri = RoleInstance(
-                    inst, name, idx, wr.start, len(wr), regs, fn, params, cta=cta, raw=raw
+                    inst,
+                    name,
+                    idx,
+                    wr.start,
+                    len(wr),
+                    regs,
+                    fn,
+                    params,
+                    cta=cta,
+                    raw=raw,
+                    keyword_only=keyword_only,
                 )
                 ri.uses_tmem = any(a is Tmem for _, a in params)
                 roles.append(ri)
@@ -957,7 +980,13 @@ class WarpSpecialized:
         whole_range = self.iket and not any(isinstance(arg, TileCursor) for arg in args)
         if whole_range:
             push(r.name)
-        result = r.fn(self, *args)
+        positional, keywords = [], {}
+        for (name, _), arg in zip(r.params, args):
+            if name in r.keyword_only:
+                keywords[name] = arg
+            else:
+                positional.append(arg)
+        result = r.fn(self, *positional, **keywords)
         if not r.raw:
             state_args = [
                 (pname, arg)

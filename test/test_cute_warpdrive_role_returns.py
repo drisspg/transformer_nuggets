@@ -250,7 +250,7 @@ class ReorderedGemm(Gemm):
     @role(warps=5, regs=40)
     @cute.jit
     def mma(self, params: GemmParams, ab: Consumer, acc: Producer, tiles: Tiles, tmem: Tmem):
-        ab, acc, tiles = Gemm.mma(self, params, ab, acc, tiles, tmem)
+        ab, acc, tiles = Gemm.mma(self, params, ab=ab, acc=acc, tiles=tiles, tmem=tmem)
         return tiles, acc, ab  # state identity, not tuple position, controls cleanup
 
 
@@ -268,7 +268,7 @@ class ReorderedPersistentGemm(PersistentGemm):
     @role(warps=4, regs=40)
     @cute.jit
     def load(self, params: PersistentGemmParams, ab: Producer, tiles: Tiles):
-        ab, tiles = PersistentGemm.load(self, params, ab, tiles)
+        ab, tiles = PersistentGemm.load(self, params, ab=ab, tiles=tiles)
         return tiles, ab
 
 

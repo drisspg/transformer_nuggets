@@ -81,7 +81,7 @@ class Gemm(WarpSpecialized):
 
     @role(warps=4, regs=40)
     @cute.jit
-    def load(self, params: GemmParams, ab: Producer, tiles: Tiles):
+    def load(self, params: GemmParams, *, ab: Producer, tiles: Tiles):
         while tiles.valid:
             m, n, _ = tiles.work
             for k in cutlass.range(params.num_k_tiles, unroll=1):
@@ -103,7 +103,7 @@ class Gemm(WarpSpecialized):
 
     @role(warps=5, regs=40)
     @cute.jit
-    def mma(self, params: GemmParams, ab: Consumer, acc: Producer, tiles: Tiles, tmem: Tmem):
+    def mma(self, params: GemmParams, *, ab: Consumer, acc: Producer, tiles: Tiles, tmem: Tmem):
         tiled_mma = params.tiled_mma
         tCtAcc = cute.make_tensor(tmem.ptr("acc"), params.acc_layout)
         while tiles.valid:
@@ -125,7 +125,7 @@ class Gemm(WarpSpecialized):
 
     @role(warps=range(4), regs=160)
     @cute.jit
-    def epilogue(self, params: GemmParams, acc: Consumer, tiles: Tiles, tmem: Tmem):
+    def epilogue(self, params: GemmParams, *, acc: Consumer, tiles: Tiles, tmem: Tmem):
         tidx, _, _ = cute.arch.thread_idx()
         t2r = tcgen05.make_tmem_copy(
             cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition.x32), cutlass.Float32),

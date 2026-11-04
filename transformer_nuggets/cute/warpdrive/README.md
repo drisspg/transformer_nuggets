@@ -48,7 +48,7 @@ class PersistentGemm(WarpSpecialized):  # abridged: the real one sizes stages pe
 
     @role(warps=4, regs=40)
     @cute.jit
-    def load(self, params: PersistentGemmParams, ab: Producer, tiles: Tiles):
+    def load(self, params: PersistentGemmParams, *, ab: Producer, tiles: Tiles):
         while tiles.valid:
             m, n, _ = tiles.work
             for k in cutlass.range(params.num_k_tiles, unroll=1):
@@ -62,7 +62,7 @@ class PersistentGemm(WarpSpecialized):  # abridged: the real one sizes stages pe
 
     @role(warps=5, regs=40, cta="leader")  # leader-only in a CTA pair
     @cute.jit
-    def mma(self, params: PersistentGemmParams, ab: Consumer, acc: Producer, tiles: Tiles, tmem: Tmem):
+    def mma(self, params: PersistentGemmParams, *, ab: Consumer, acc: Producer, tiles: Tiles, tmem: Tmem):
         tAcc = cute.make_tensor(tmem.ptr("acc"), params.acc_layout)
         while tiles.valid:
             with acc.produce() as a:
@@ -74,7 +74,7 @@ class PersistentGemm(WarpSpecialized):  # abridged: the real one sizes stages pe
 
     @role(warps=range(4), regs=160)
     @cute.jit
-    def epilogue(self, params: PersistentGemmParams, acc: Consumer, tiles: Tiles, tmem: Tmem):
+    def epilogue(self, params: PersistentGemmParams, *, acc: Consumer, tiles: Tiles, tmem: Tmem):
         while tiles.valid:
             m, n, _ = tiles.work
             with acc.consume() as a:
@@ -107,7 +107,10 @@ allocate after the cluster sync in `run_roles`.
 
 ## Roles
 
-Put `@role` directly above `@cute.jit`:
+Put `@role` directly above `@cute.jit`. In the examples, `params` is positional and `*`
+makes the injected dependencies keyword-only. The dispatcher supplies them by name. Positional
+role signatures still work; annotations and names determine binding, not the position of `*`.
+Declare every argument explicitly (`*args` and `**kwargs` are not supported).
 
 - `warps=4` means warp index 4, not four warps. `warps=range(4)` means warps 0-3.
 - `warps=[range(4), range(4, 8)]` creates two instances of the same method.
@@ -162,7 +165,7 @@ class Attention(WarpSpecialized):
 
     @role(config=lambda kernel: kernel.roles.softmax)
     @cute.jit
-    def softmax(self, params, stage: Instance): ...
+    def softmax(self, params, *, stage: Instance): ...
 ```
 
 The selector is an ordinary host callable receiving the kernel and returning a `RoleConfig`.
@@ -214,7 +217,7 @@ counts does not rewrite the math's thread-to-data mapping.
 
 ### Params in, state back out
 
-Use `self, params, ...state` in role signatures. `params` is the kernel-specific frozen
+Use `self, params, *, ...state` in role signatures. `params` is the kernel-specific frozen
 input dataclass; the rest includes the warpdrive objects the role uses.
 
 **Return every stateful argument:** producer endpoints, consumer endpoints, tile cursors and
@@ -224,7 +227,7 @@ single-/two-CTA kernels. No need to work out which endpoints need cleanup:
 ```python
 @role(warps=5, regs=40)
 @cute.jit
-def mma(self, params: GemmParams, ab: Consumer, acc: Producer, tiles: Tiles, tmem: Tmem):
+def mma(self, params: GemmParams, *, ab: Consumer, acc: Producer, tiles: Tiles, tmem: Tmem):
     while tiles.valid:
         ...  # use params, ab, acc, tiles and tmem
         tiles.advance()
@@ -360,7 +363,7 @@ self.tiles = TileStream(order=Raster(swizzle=8), policy=Clc(stages=2))
 
 @role(warps=4, regs=40)
 @cute.jit
-def load(self, params: PersistentGemmParams, ab: Producer, tiles: Tiles):
+def load(self, params: PersistentGemmParams, *, ab: Producer, tiles: Tiles):
     while tiles.valid:
         m, n, _ = tiles.work
         ...
@@ -528,7 +531,7 @@ self.acc_bars = Barriers(2)  # user initializes between begin_roles/run_roles
 
 @role(warps=range(4), regs=160, raw=True)
 @cute.jit
-def epilogue(self, params, acc_bars: Barriers, tmem: Tmem):
+def epilogue(self, params, *, acc_bars: Barriers, tmem: Tmem):
     # acc_bars is a pointer; user code drives the barriers
     ...
 ```

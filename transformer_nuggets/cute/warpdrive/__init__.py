@@ -17,7 +17,9 @@ loop body uses through a method call or reassignment. Helpers that take ends mus
 and the caller must reassign (``s, stats = step(s, stats)``), as with any CuTeDSL value. Managed
 roles return every stateful argument: producer/consumer ends, tile cursors and turnstile seats,
 e.g. ``return ab, acc, tiles``. The kernel-specific input dataclass is called ``params`` in the
-examples; self, params, instance indices, TMEM views and raw barrier pointers are not returned.
+examples, with signatures written as ``self, params, *, ...state``. The dispatcher respects
+keyword-only parameters; positional signatures also work. Self, params, instance indices, TMEM
+views and raw barrier pointers are not returned.
 The layer uses the returned state directly; no execution state is recovered from Python frames.
 Work scheduling (``scheduling.py``): declare ``self.tiles = TileStream(order=..., policy=...)``
 and give roles ``tiles: Tiles``; the policy (``OneShot``, ``StaticPersistent``,
