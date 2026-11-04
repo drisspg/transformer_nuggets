@@ -159,8 +159,7 @@ class Attention(WarpSpecialized):
 
     @role(config=lambda kernel: kernel.roles.softmax)
     @cute.jit
-    def softmax(self, stage: Instance, ctx):
-        ...
+    def softmax(self, stage: Instance, ctx): ...
 ```
 
 The selector is an ordinary host callable receiving the kernel and returning a `RoleConfig`.
