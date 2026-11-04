@@ -434,7 +434,10 @@ Python-int slot accessor behavior; this is not a blanket bounds/ownership check 
 - **G9:** TMA recognition depends on the supported IR and direct context fields. Wider
   late-copy/atom-reuse/mixed-path coverage is still desirable; `verified` remains local evidence.
 - **G10:** FA4 wrapper validation is narrower than its advertised rank/head-dimension/device
-  contract. Wrapper hardening is separate from this layer contract.
+  contract. Wrapper hardening is separate from this layer contract. The example's opt-in
+  `use_ldred_rowmax` checks for an SM103-family compile target; it changes only the unmasked
+  row-max reduction, not any managed channel or the default SM100/software path. See
+  [the example's measurements and tests](docs/examples.md#hardware-row-max-on-sm103).
 
 ## Fuzzing and evidence
 

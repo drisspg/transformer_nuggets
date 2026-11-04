@@ -124,7 +124,7 @@ budgets, every channel's per-CTA arrival counts, masks and TMA bytes, the schedu
 - [CTA pairs](docs/cta_pairs.md): two-CTA MMA and cross-CTA handoffs.
 - [Dropping down](docs/dropping_down.md): raw barriers, count overrides and unchecked sites.
 - [Tracing](docs/tracing.md): inspect the kernel, capture IKET ranges and use the profiler.
-- [Examples](docs/examples.md): persistent GEMM, FA4, input limits and historical timings.
+- [Examples](docs/examples.md): persistent GEMM, FA4, input limits, SM103 hardware row max and timings.
 
 ## Tests
 
