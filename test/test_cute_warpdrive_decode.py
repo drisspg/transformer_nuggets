@@ -82,8 +82,9 @@ class RoundRobinToy(WarpSpecialized):
     def src(self, ctx, *, rr: Producer):
         lane = cute.arch.lane_idx()
         for e in cutlass.range(ctx.n, unroll=1):
-            with rr.produce() as h:
-                h.data[lane] = e * 32 + lane
+            h = rr.produce()
+            h.data[lane] = e * 32 + lane
+            h.commit(wait=self.mode == "wait_mbarrier")
         return rr
 
     @role(warps=[range(1, 2), range(2, 3), range(3, 4)])
@@ -175,6 +176,7 @@ def test_round_robin_and_named_describe():
         ("no_turnstile", r"3 round-robin producers share the barriers of 1 named stage"),
         ("outside_turn", r"mail\.acquire\(\) at .* outside `with turn\.turn\(\):`"),
         ("id_collision", r"named_barrier\(8\) at .* uses a barrier ID owned by channel mail"),
+        ("wait_mbarrier", r"commit\(wait=True\) on rr\[i\] acquire: only a named-barrier"),
     ],
 )
 def test_named_channel_errors(mode, message):

@@ -10,7 +10,8 @@ runs with the same split count and table. Reported per shape:
   port's, plus the whole call (FA4: prepare + decode + combine; port: decode + combine) as graph
   replay time.
 
-Run under ``gpu-run``: ``python scripts/bench_warpdrive_decode.py [--reps 200]``.
+Run under ``gpu-run``:
+``python -m transformer_nuggets.cute.warpdrive.examples.bench_fa4_decode [--reps 200]``.
 """
 
 import argparse
