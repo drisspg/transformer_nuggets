@@ -1,0 +1,381 @@
+"""Round-robin rings, named-barrier channels, and the FA4 swap-AB decode port built on them.
+
+The toy kernel checks each feature on its own: three role instances take a two-stage mbarrier
+ring's epochs in turn (3 does not divide 2: the phases tell the instances apart), forward them
+through a three-stage named ring (one stage per instance), and through a one-stage named mailbox
+that a turnstile serializes. The decode tests compare the port with an fp32 reference and, when
+``flash_attn.cute`` is installed, with FA4's split partials bit for bit.
+"""
+
+import math
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+pytest.importorskip("cutlass.cute")
+
+import cutlass
+from cutlass import cute
+
+from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
+from transformer_nuggets.cute.warpdrive import (
+    Consumer,
+    CtaPair,
+    Instance,
+    Producer,
+    ProtocolError,
+    Ring,
+    Slots,
+    Threads,
+    Turn,
+    Turnstile,
+    Umma,
+    WarpSpecialized,
+    named_barrier,
+    role,
+)
+
+K_MID = 3  # round-robin instances of the toy's middle role
+
+
+@pytest.fixture
+def requires_blackwell() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("warpdrive tests require SM100-family GPUs")
+
+
+def _raises_protocol(match: str, fn):
+    with pytest.raises(Exception, match=match) as info:
+        fn()
+    assert isinstance(info.value, ProtocolError) or "ProtocolError" in repr(info.value)
+
+
+class RoundRobinToy(WarpSpecialized):
+    """src (warp 0) -> rr -> mid[0..2] (warps 1-3) -> nr and mail -> sink (warp 4).
+
+    Epoch e's value is ``e * 32 + lane``. mid[j] takes rr epochs j, j + 3, ...; records which
+    instance saw each epoch; forwards it through ``nr`` (named, 3 stages: one per instance) and
+    ``mail`` (named, 1 stage, taken in turn). ``mode`` injects declaration/trace errors."""
+
+    def __init__(self, mode: str = "ok"):
+        self.mode = mode
+        payload = (cutlass.Int32, (32,))
+        self.rr = Ring(2, Threads, Threads, round_robin=True, payload=payload)
+        self.nr = Ring(K_MID, Threads, Threads, sync="named", round_robin=True, payload=payload)
+        turnstile = None if mode == "no_turnstile" else "turn"
+        self.mail = Ring(
+            1,
+            Threads,
+            Threads,
+            sync="named",
+            round_robin=True,
+            turnstile=turnstile,
+            payload=payload,
+        )
+        self.turn = Turnstile()
+
+    @role(warps=0)
+    @cute.jit
+    def src(self, ctx, *, rr: Producer):
+        lane = cute.arch.lane_idx()
+        for e in cutlass.range(ctx.n, unroll=1):
+            with rr.produce() as h:
+                h.data[lane] = e * 32 + lane
+        return rr
+
+    @role(warps=[range(1, 2), range(2, 3), range(3, 4)])
+    @cute.jit
+    def mid(self, ctx, *, stage: Instance, rr: Consumer, nr: Producer, mail: Producer, turn: Turn):
+        lane = cute.arch.lane_idx()
+        for e in cutlass.range(stage, ctx.n, K_MID, unroll=1):
+            value = cutlass.Int32(0)
+            with rr.consume() as h:
+                value = h.data[lane]
+            ctx.out[e * 32 + lane, 0] = value
+            if lane == 0:
+                ctx.who[e] = stage
+            with nr.produce() as h:
+                h.data[lane] = value
+            if cutlass.const_expr(self.mode == "outside_turn"):
+                with mail.produce() as h:
+                    h.data[lane] = value
+            else:
+                with turn.turn():
+                    with mail.produce() as h:
+                        h.data[lane] = value
+        return rr, nr, mail, turn
+
+    @role(warps=4)
+    @cute.jit
+    def sink(self, ctx, *, nr: Consumer, mail: Consumer):
+        lane = cute.arch.lane_idx()
+        for e in cutlass.range(ctx.n, unroll=1):
+            with nr.consume() as h:
+                ctx.out[e * 32 + lane, 1] = h.data[lane]
+            with mail.consume() as h:
+                ctx.out[e * 32 + lane, 2] = h.data[lane]
+        if cutlass.const_expr(self.mode == "id_collision"):
+            named_barrier(self.named_barrier_ids["mail"][0][0], 32)
+        return nr, mail
+
+    @cute.kernel
+    def kernel(self, out, who, n: cutlass.Int32):
+        self.begin_roles()
+        self.run_roles(SimpleNamespace(out=out, who=who, n=n))
+
+    @cute.jit
+    def __call__(self, out: cute.Tensor, who: cute.Tensor, n: cutlass.Int32, stream):
+        self.kernel.set_name_prefix(f"warpdrive_round_robin_toy_{self.mode}")
+        self.kernel(out, who, n).launch(
+            grid=(1, 1, 1), block=(self.num_threads, 1, 1), stream=stream
+        )
+
+
+def compile_toy(op):
+    out = make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(), 3), assumed_align=4)
+    who = make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),), assumed_align=4)
+    return compile_tvm_ffi(op, out, who, cutlass.Int32(1), name=f"round_robin_toy_{op.mode}")
+
+
+@pytest.mark.parametrize("n", [1, 2, 7, 13])
+def test_round_robin_and_named_channels_deliver_every_epoch(requires_blackwell, n):
+    """Instance j gets epochs j, j + 3, ... of a ring whose stage count 3 does not divide; the
+    named ring and the turn-taking mailbox deliver them to the sink in epoch order."""
+    op = RoundRobinToy()
+    out = torch.full((n * 32, 3), -1, device="cuda", dtype=torch.int32)
+    who = torch.full((n,), -1, device="cuda", dtype=torch.int32)
+    compile_toy(op)(out, who, n)
+    expected = torch.arange(n * 32, device="cuda", dtype=torch.int32)
+    for column in range(3):
+        torch.testing.assert_close(out[:, column], expected)
+    torch.testing.assert_close(who, torch.arange(n, device="cuda", dtype=torch.int32) % K_MID)
+
+
+def test_round_robin_and_named_describe():
+    text = RoundRobinToy().describe()
+    # One instance's arrivals per epoch: 32, not the 96 of a three-instance join.
+    assert "rr    Ring(2)  src -> mid[0], mid[1], mid[2]" in text
+    assert "empty     32 x2" in text
+    assert "consumers round-robin: instance j of 3 takes epochs j, j+3, ..." in text
+    # Named barriers count both sides; IDs come from the top, below the layer's 1 and 2.
+    assert "named     full ids [10, 11, 12], empty ids [13, 14, 15], 64 x3 threads" in text
+    assert "named     full ids [8], empty ids [9], 64 threads, taken in turn (turn)" in text
+    assert RoundRobinToy().named_barrier_ids == {
+        "nr": ([10, 11, 12], [13, 14, 15]),
+        "mail": ([8], [9]),
+    }
+
+
+@pytest.mark.parametrize(
+    "mode, message",
+    [
+        ("no_turnstile", r"3 round-robin producers share the barriers of 1 named stage"),
+        ("outside_turn", r"mail\.acquire\(\) at .* outside `with turn\.turn\(\):`"),
+        ("id_collision", r"named_barrier\(8\) at .* uses a barrier ID owned by channel mail"),
+    ],
+)
+def test_named_channel_errors(mode, message):
+    _raises_protocol(message, lambda: compile_toy(RoundRobinToy(mode)))
+
+
+def _kernel(channels, roles):
+    """A kernel class with the given channel attributes and role functions."""
+    cls = type("Probe", (WarpSpecialized,), dict(roles))
+
+    def init(self):
+        for name, make in channels.items():
+            setattr(self, name, make())
+
+    cls.__init__ = init
+    return cls()
+
+
+def _consumer_pair(width2=1):
+    @role(warps=0)
+    @cute.jit
+    def prod(self, ctx, *, ch: Producer):
+        return ch
+
+    @role(warps=1)
+    @cute.jit
+    def cons_a(self, ctx, *, ch: Consumer):
+        return ch
+
+    @role(warps=range(2, 2 + width2))
+    @cute.jit
+    def cons_b(self, ctx, *, ch: Consumer):
+        return ch
+
+    return {"prod": prod, "cons_a": cons_a, "cons_b": cons_b}
+
+
+def test_round_robin_declaration_errors():
+    with pytest.raises(ValueError, match="round_robin needs a Ring"):
+        Slots(2, Threads, Threads, round_robin=True)
+    with pytest.raises(ValueError, match="both sides must be Threads"):
+        Ring(2, Umma, Threads, sync="named")
+    with pytest.raises(ValueError, match="takes no override"):
+        Ring(2, Threads, Threads, sync="named", override={"empty_counts": 4})
+    with pytest.raises(ValueError, match="sync must be one of"):
+        Ring(2, Threads, Threads, sync="nvbar")
+    with pytest.raises(ValueError, match="turnstile= serializes"):
+        Ring(2, Threads, Threads, turnstile="t")
+
+    @role(warps=0)
+    @cute.jit
+    def prod(self, ctx, *, ch: Producer):
+        return ch
+
+    @role(warps=1)
+    @cute.jit
+    def cons(self, ctx, *, ch: Consumer):
+        return ch
+
+    # No side has several instances: nothing to take turns.
+    op = _kernel(
+        {"ch": lambda: Ring(2, Threads, Threads, round_robin=True)}, {"prod": prod, "cons": cons}
+    )
+    _raises_protocol("round_robin needs several instances of one role", op.describe)
+    # Two different roles, or instances of different widths, cannot alternate one count.
+    op = _kernel({"ch": lambda: Ring(2, Threads, Threads, round_robin=True)}, _consumer_pair())
+    _raises_protocol("must be instances of one role with the same width", op.describe)
+
+
+def test_named_channels_need_free_ids_and_one_cta():
+    @role(warps=0)
+    @cute.jit
+    def prod(self, ctx, *, a: Producer, b: Producer):
+        return a, b
+
+    @role(warps=1)
+    @cute.jit
+    def cons(self, ctx, *, a: Consumer, b: Consumer):
+        return a, b
+
+    roles = {"prod": prod, "cons": cons}
+    # 13 IDs (3-15) are free: 4 + 3 stages need 14.
+    channels = {
+        "a": lambda: Ring(4, Threads, Threads, sync="named"),
+        "b": lambda: Ring(3, Threads, Threads, sync="named"),
+    }
+    _raises_protocol("need 14 barrier IDs; 13 are free", _kernel(channels, roles).describe)
+
+    @role(warps=0, cta="leader")
+    @cute.jit
+    def lead(self, ctx, *, a: Producer):
+        return a
+
+    @role(warps=1)
+    @cute.jit
+    def both(self, ctx, *, a: Consumer):
+        return a
+
+    op = _kernel(
+        {"a": lambda: Ring(1, Threads, Threads, sync="named")}, {"lead": lead, "both": both}
+    )
+    op.cluster = CtaPair()
+    _raises_protocol("named barriers are per CTA", op.describe)
+
+
+# --------------------------------------------------------------------------- #
+# The FA4 swap-AB decode port
+# --------------------------------------------------------------------------- #
+
+decode = pytest.importorskip("transformer_nuggets.cute.warpdrive.examples.fa4_decode_swapab")
+
+
+def reference_partials(q, k, v, splits, used, counts):
+    """fp32 split partials of FA4's split rule; (O, LSE, owned mask)."""
+    b, _, h, d = q.shape
+    qpk = h // k.shape[2]
+    o = torch.zeros(splits, b, h, d, device=q.device)
+    lse = torch.full((splits, b, h), -math.inf, device=q.device)
+    owned = torch.zeros(splits, b, dtype=torch.bool, device=q.device)
+    for i in range(b):
+        n_blocks = -(-used[i] // decode.TILE_N)
+        per_split = -(-n_blocks // counts[i])
+        for s in range(counts[i]):
+            owned[s, i] = True
+            lo, hi = (
+                s * per_split * decode.TILE_N,
+                min((s + 1) * per_split * decode.TILE_N, used[i]),
+            )
+            if hi <= lo:
+                continue
+            kk = k[i, lo:hi].float().repeat_interleave(qpk, 1)
+            vv = v[i, lo:hi].float().repeat_interleave(qpk, 1)
+            scores = torch.einsum("hd,thd->ht", q[i, 0].float(), kk) / math.sqrt(d)
+            lse[s, i] = torch.logsumexp(scores, -1)
+            o[s, i] = torch.einsum("ht,thd->hd", torch.softmax(scores, -1), vv)
+    return o, lse, owned
+
+
+DECODE_CASES = [
+    # (batch, kv len, heads, kv heads, splits, seqused, per-sequence split counts)
+    (2, 1024, 8, 1, 1, None, None),  # one split per sequence
+    (2, 1000, 10, 2, 3, None, None),  # GQA 5 padded to an 8-head tile; ragged last block
+    (3, 2048, 8, 1, 4, [1, 700, 2048], [1, 2, 4]),  # empty splits and per-sequence counts
+    (2, 1500, 32, 1, 8, [300, 1500], [8, 3]),  # 32-head tile with register budgets
+    (1, 768, 1, 1, 2, None, None),  # MQA-free single head: tile 1, MMA N 8
+]
+
+
+@pytest.mark.parametrize("case", DECODE_CASES)
+def test_decode_matches_fp32_reference(requires_blackwell, case):
+    b, s, h, hkv, splits, used, counts = case
+    torch.manual_seed(0)
+    q = torch.randn(b, 1, h, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(b, s, hkv, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(b, s, hkv, 128, device="cuda", dtype=torch.bfloat16)
+    used_t = None if used is None else torch.tensor(used, device="cuda", dtype=torch.int32)
+    counts_t = None if counts is None else torch.tensor(counts, device="cuda", dtype=torch.int32)
+    o, lse = decode.decode_partials(q, k, v, splits, seqused_k=used_t, splits_per_seq=counts_t)
+    ro, rl, owned = reference_partials(q, k, v, splits, used or [s] * b, counts or [splits] * b)
+    o, lse = o[:, :, 0], lse[..., 0]
+    torch.testing.assert_close(o[owned], ro[owned], atol=3e-3, rtol=0)
+    assert torch.equal(torch.isneginf(lse[owned]), torch.isneginf(rl[owned]))
+    finite = owned[..., None] & torch.isfinite(rl)
+    torch.testing.assert_close(lse[finite], rl[finite], atol=1e-4, rtol=0)
+    empty = owned[..., None] & torch.isneginf(rl)
+    assert torch.count_nonzero(o[empty]) == 0, "an empty split must write O = 0"
+
+
+def test_decode_matches_fa4_partials_bitwise(requires_blackwell, monkeypatch):
+    """Same split partials as FA4's swap-AB decode (per-sequence split counts from FA4's prepare
+    kernel, then FA4's combine) bit for bit, and the same combined output."""
+    interface = pytest.importorskip("flash_attn.cute.interface")
+    monkeypatch.setenv("FLASH_ATTENTION_SM100_BACKEND", "swapab")
+    torch.manual_seed(0)
+    b, s, h, hkv = 4, 32768, 8, 1  # FA4 picks per-sequence splits from a 32K capacity
+    q = torch.randn(b, 1, h, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(b, s, hkv, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(b, s, hkv, 128, device="cuda", dtype=torch.bfloat16)
+    used = torch.tensor([300, 32768, 9000, 1], device="cuda", dtype=torch.int32)
+    captured = {}
+    combine = interface._flash_attn_fwd_combine
+
+    def capture(out_partial, lse_partial, *args, **kwargs):
+        captured.update(
+            o=out_partial.clone(), lse=lse_partial.clone(), table=kwargs["num_splits_dynamic_ptr"]
+        )
+        return combine(out_partial, lse_partial, *args, **kwargs)
+
+    capture.compile_cache = combine.compile_cache  # the combine reads it by global name
+    monkeypatch.setattr(interface, "_flash_attn_fwd_combine", capture)
+    out_fa4, lse_fa4, *_ = interface._flash_attn_fwd(
+        q, k, v, seqused_k=used, max_seqlen_k=s, num_splits=0, return_lse=True
+    )
+    monkeypatch.undo()
+    table = captured["table"]
+    assert table is not None, "FA4 did not take per-sequence split counts"
+    splits = captured["o"].shape[0]
+    o, lse = decode.decode_partials(q, k, v, splits, seqused_k=used, splits_per_seq=table)
+    owned = torch.arange(splits, device="cuda")[:, None] < table[None, :]
+    assert torch.equal(o[owned], captured["o"][owned])
+    assert torch.equal(lse[..., 0][owned], captured["lse"][:, :, 0][owned])
+    out, lse_out = decode.fa4_decode(q, k, v, splits, seqused_k=used, splits_per_seq=table)
+    assert torch.equal(out, out_fa4)
+    assert torch.equal(lse_out, lse_fa4)
