@@ -599,6 +599,38 @@ class UndeclaredDrop(CheckedRaster):
         return m >= 0  # a runtime keep from a mapping that does not declare skips
 
 
+@dataclass(frozen=True)
+class ShortDecode(CheckedRaster):
+    def decode(self, index, space):
+        _, (m, n, _) = super().decode(index, space)
+        return True, (m, n)  # two words for a three-word mapping
+
+
+def test_decode_word_count_is_checked(requires_blackwell):
+    op = CountToy(StaticPersistent(), ShortDecode(), SingleCta())
+    with pytest.raises(Exception, match="returned 2 words; its words is 3"):
+        compile_count_toy(op)
+
+
+def test_overriding_decode_drops_the_any_index_opt_in():
+    """A Raster subclass that replaces decode (it might read a table) is decoded only for valid
+    indices unless it opts in again; one that keeps Raster's decode keeps the opt-in."""
+
+    class TableRaster(Raster):
+        def decode(self, index, space):
+            return super().decode(index, space)
+
+    class OptedIn(TableRaster):
+        decodes_any_index = True
+
+    class Renamed(Raster):
+        def get_key(self) -> str:
+            return "renamed"
+
+    assert Raster.decodes_any_index and Renamed.decodes_any_index and OptedIn.decodes_any_index
+    assert not TableRaster.decodes_any_index and not SkipOdd.decodes_any_index
+
+
 def test_runtime_keep_needs_skips(requires_blackwell):
     """Only a mapping that declares ``skips`` may drop items: the layer would otherwise skip
     no index and run a dropped item."""

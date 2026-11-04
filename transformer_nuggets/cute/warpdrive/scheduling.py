@@ -142,10 +142,13 @@ class WorkMap:
       constant ``True``, checked at trace time). The words of a dropped item are ignored.
     * ``decodes_any_index`` (class attribute, default ``False``): set it only when ``decode`` is
       a pure function defined for every nonnegative Int32 index, including ``index >= total``
-      and empty spaces (no table reads, no division by a runtime value that may be zero). The
-      layer may then decode past the end and discard the result, which saves a branch per item
-      on the decoding warps. ``Raster`` and the ``adapters.py`` mappings set it; it is the one
-      exception to "never decoded past the end".
+      and empty spaces, of launch-time data only (no table reads, no division by a runtime
+      value that may be zero). The layer may then decode speculatively (past the end, or before
+      readiness on the tile grid) and discard the result, which saves a branch per item on the
+      decoding warps; ``keep`` of a skipping mapping is still only used for valid indices.
+      ``Raster`` and the ``adapters.py`` mappings set it; it is the one exception to "decoded
+      only for valid indices, after readiness". A subclass that overrides ``decode`` does not
+      inherit it.
     * ``unpack(words)``, device: what ``work.item`` returns (default: the tuple of words).
     * ``get_key()``, host: compile-key fragment naming every compile-time choice (never runtime
       extents), in lowercase letters, digits and underscores (examples put it in kernel names).
@@ -161,6 +164,13 @@ class WorkMap:
     words: int = 1
     skips = False
     decodes_any_index = False
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        # A subclass that replaces decode (e.g. a Raster that reads a table) does not inherit
+        # the opt-in; it must state decodes_any_index again.
+        if "decode" in vars(cls) and "decodes_any_index" not in vars(cls):
+            cls.decodes_any_index = False
 
     def bind(self, space):
         return space
@@ -657,8 +667,11 @@ class WorkStream:
             self.ready.wait()
         index = Int32(self.schedule.first_index(problem))
         if self.mapping.skips:
-            index = Int32(_skip_local(self, index, problem))
-        words = problem.first_words if _tile_grid(self) else _decode(self, index, problem)
+            index, words = _skip_local(self, index, problem)
+        elif _tile_grid(self):
+            words = problem.first_words
+        else:
+            words = _decode(self, index, problem)
         return index < problem.total, self.mapping.unpack(list(words))
 
     # ---- host, plain Python ------------------------------------------------ #
@@ -861,23 +874,29 @@ def _decode_valid(mapping, index, total, space):
 
 
 @cute.jit
-def _skipped(stream, index, problem):
-    """``keep`` is false for a valid index; false past the end (decode may read per-item
-    tables)."""
-    skipped = cutlass.Boolean(False)
-    if index < problem.total:
-        keep, _ = _keep_words(stream.mapping, index, problem.space)
-        skipped = ~cutlass.Boolean(keep)
-    return skipped
+def _decode_kept(mapping, index, total, space):
+    """``(dropped, words)`` of a valid index; ``(False, zeros)`` past the end, which is never
+    decoded (``decode`` may read per-item tables). One decode yields both."""
+    dropped = cutlass.Boolean(False)
+    words = tuple(Int32(0) for _ in range(mapping.words))
+    if index < total:
+        keep, kept_words = _keep_words(mapping, index, space)
+        dropped = ~cutlass.Boolean(keep)
+        words = tuple(kept_words)
+    return dropped, words
 
 
 @cute.jit
 def _skip_local(stream, index, problem):
-    """First index at or after ``index`` (in this CTA's local sequence) the mapping keeps."""
+    """``(index, words)``: the first index at or after ``index`` (in this CTA's local sequence)
+    the mapping keeps, or a terminal index, with the words its last decode returned."""
     step = stream.schedule.next_index  # a method call on `stream` in the loop would carry it
-    while _skipped(stream, index, problem):
+    mapping, total, space = stream.mapping, problem.total, problem.space
+    dropped, words = _decode_kept(mapping, index, total, space)
+    while dropped:
         index = Int32(step(index, problem))
-    return index
+        dropped, words = _decode_kept(mapping, index, total, space)
+    return index, list(words)
 
 
 @cute.jit
@@ -1005,8 +1024,8 @@ class WorkCursor:
     """One role's position in the work stream: ``valid``, ``item``, ``index``, ``advance()``.
 
     Also the role annotation: a role parameter ``work: WorkCursor`` receives the cursor over the
-    stream declared as ``self.work``. A DSL value carrying the linear index, the decoded item words, and, in broadcast mode, the
-    role's consumer end of the work ring.
+    stream declared as ``self.work``. A DSL value carrying the linear index, the decoded item
+    words, and, in broadcast mode, the role's consumer end of the work ring.
     """
 
     def __init__(self, stream, problem, end, index, words, rec, count=None, slot=None, iket=None):
@@ -1030,7 +1049,9 @@ class WorkCursor:
             if stream.ready is not None:
                 stream.ready.wait()
             if stream.mapping.skips:
-                cur.index = Int32(_skip_local(stream, cur.index, problem))
+                cur.index, cur._words = _skip_local(stream, cur.index, problem)
+                cur._first_item()
+                return cur
         elif _hooked(stream):
             if scheduler:
                 # scheduler_role runs the hooks, then publishes and receives the first item
@@ -1123,9 +1144,10 @@ class WorkCursor:
         stream, problem = self._stream, self._problem
         if self._end is None:
             self.index = Int32(stream.schedule.next_index(self.index, problem))
-            if stream.mapping.skips:
-                self.index = Int32(_skip_local(stream, self.index, problem))
-            if stream.schedule.persistent:  # OneShot: the stream has ended, keep the words
+            # OneShot: the stream has ended; keep the words (nothing past the end is decoded).
+            if stream.schedule.persistent and stream.mapping.skips:
+                self.index, self._words = _skip_local(stream, self.index, problem)
+            elif stream.schedule.persistent:
                 self._words = _decode(stream, self.index, problem)
         else:
             self._receive()
@@ -1218,18 +1240,26 @@ def scheduler_role(kernel, ring, cursor: WorkCursor, fetch: _Fetch):
         with ring.produce() as h0:
             first = cursor.index
             if cutlass.const_expr(mapping.skips):
-                while _skipped(stream, first, problem):
+                dropped, words = _decode_kept(mapping, first, problem.total, problem.space)
+                while dropped:
                     first = fetch.claim_next(first)
-            _publish(h0, first, _decode(stream, first, problem), problem.total)
+                    dropped, words = _decode_kept(mapping, first, problem.total, problem.space)
+                _publish(h0, first, list(words), problem.total)
+            else:
+                _publish(h0, first, _decode(stream, first, problem), problem.total)
         cursor._receive()
         cursor._first_item()
     while cursor.valid:
         with ring.produce() as h:
             index = fetch.claim_next(cursor.index)
             if cutlass.const_expr(mapping.skips):
-                while _skipped(stream, index, problem):
+                dropped, words = _decode_kept(mapping, index, problem.total, problem.space)
+                while dropped:
                     index = fetch.claim_next(index)
-            _publish(h, index, _decode(stream, index, problem), problem.total)
+                    dropped, words = _decode_kept(mapping, index, problem.total, problem.space)
+                _publish(h, index, list(words), problem.total)
+            else:
+                _publish(h, index, _decode(stream, index, problem), problem.total)
         cursor.advance()
     fetch.close_claims()
     return ring, cursor

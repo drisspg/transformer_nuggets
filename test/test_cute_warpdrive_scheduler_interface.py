@@ -3,6 +3,7 @@ work-item accessor, swapped into the same kernels with one argument."""
 
 import importlib
 import math
+import os
 import sys
 import warnings
 from dataclasses import dataclass
@@ -653,6 +654,13 @@ def test_persistent_gemm_swaps_schedules(requires_blackwell, case, cluster):
 # --------------------------------------------------------------------------- #
 
 
+def serialized_launches() -> bool:
+    """Launches are serialized by ``CUDA_LAUNCH_BLOCKING`` or an injected CUDA tool."""
+    return os.environ.get("CUDA_LAUNCH_BLOCKING") == "1" or bool(
+        os.environ.get("CUDA_INJECTION64_PATH")
+    )
+
+
 def _packed_keep(m, n, li):
     return (m + 2 * n + 3 * li) % 3 != 0
 
@@ -803,6 +811,10 @@ def test_device_built_list_under_pdl(requires_blackwell, schedule, cluster):
         assert torch.equal(hits[0].cpu(), want) and torch.equal(hits[1].cpu(), want), max_ctas
         assert ws[:2].tolist() == [0, 0]
         # Some consumer CTA entered before the producer's last write: the dependency was real.
+        # Tools that serialize launches (compute-sanitizer, CUTracer, CUDA_LAUNCH_BLOCKING)
+        # remove the overlap, not the correctness checks above.
+        if serialized_launches():
+            continue
         launched = entry[entry != 0].cpu().long()
         early = ((launched - int(stamp)) + 2**31) % 2**32 - 2**31 < 0
         assert early.any(), "the consumer did not overlap the producer; PDL not exercised"
