@@ -32,7 +32,7 @@ FORWARDS_PER_GRAPH = 100
 
 def run_shape(b: int, h: int, s: int, variants: list[str], samples: int, profile: bool) -> dict:
     torch.manual_seed(0)
-    q, k, v = [torch.randn(b, s, h, 128, device="cuda", dtype=torch.bfloat16) for _ in range(3)]
+    q, k, v = (torch.randn(b, s, h, 128, device="cuda", dtype=torch.bfloat16) for _ in range(3))
     ref, ref_lse = flash_attn_func(q, k, v, causal=False, return_lse=True)
     calls = {}
     for label in variants:
