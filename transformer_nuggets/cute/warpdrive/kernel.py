@@ -64,6 +64,9 @@ MAX_WARPS = 32  # CUDA's 1024-thread block limit
 # Named barrier ids owned by the layer; user code must not reuse them.
 TMEM_PTR_BARRIER_ID = 1
 TMEM_TEARDOWN_BARRIER_ID = 2
+# Named-barrier channels take IDs from the top down, so hand-picked user IDs from 3 upward
+# (persistent_gemm's epilogue barrier) stay clear of them.
+MAX_NAMED_BARRIER_ID = 15
 
 
 # --------------------------------------------------------------------------- #
@@ -465,6 +468,7 @@ class WarpSpecialized:
         roles.sort(key=lambda r: r.first_warp)
         self._validate(chans, turns, roles)
         self._validate_placement(chans, turns, roles)
+        self._ws_named = _allocate_named(chans)
         self._ws_chans, self._ws_turns, self._ws_roles = chans, turns, roles
         self._ws_raw_bars = raw_bars
         self._ws_streams = streams
@@ -596,10 +600,16 @@ class WarpSpecialized:
                     "2-CTA TMEM is allocated by one warp in each CTA of the pair, but every "
                     f"Tmem role {[r.name for r in tmem_roles]} is leader-only"
                 )
-        for ch in chans.values():
+        for name, ch in chans.items():
             ch.cluster = cluster
             ch.derived_scope = derive_scope(ch, cluster, internal=ch.internal)
             ch.scope = apply_overrides(ch, ch.derived_scope, cluster)
+            if ch.scope.pair and (ch.named or ch.round_robin):
+                what = "named barriers are per CTA" if ch.named else "round_robin is CTA-local"
+                raise ProtocolError(
+                    f"channel {name}: its roles run in different CTAs of the pair, but {what}; "
+                    "give both sides the same placement"
+                )
 
     def _validate(self, chans, turns, roles):
         if not roles:
@@ -619,10 +629,12 @@ class WarpSpecialized:
                     raise ProtocolError(
                         f"channel {name}: slot {counts.index(0)} has no {side} role"
                     )
+                if chan.round_robin and len(bound) > 1:
+                    _check_turns(name, side, bound)
                 if mech is Threads:
                     continue
                 how = getattr(mech, "__name__", repr(mech))  # Umma, or Tma(tx_bytes=...)
-                if len(bound) > 1:
+                if len(bound) > 1 and not chan.round_robin:
                     raise ProtocolError(
                         f"channel {name}: {side} side signals once ({how}) but has several "
                         f"roles {[r.name for r, _ in bound]}"
@@ -636,6 +648,14 @@ class WarpSpecialized:
                             f"elected thread, but role {r.name} spans {r.num_warps} warps and "
                             "each would signal; issue it from a single-warp role"
                         )
+            if chan.round_robin and chan.turns("producer") == chan.turns("consumer") == 1:
+                raise ProtocolError(
+                    f"channel {name}: round_robin needs several instances of one role on a side "
+                    f"(producers {[r.name for r, _ in chan.producers]}, consumers "
+                    f"{[r.name for r, _ in chan.consumers]})"
+                )
+            if chan.named:
+                _check_named_turns(name, chan, turns)
         for name, ts in turns.items():
             if len(ts.parties) < 2 or len({r.role for r in ts.parties}) != 1:
                 raise ProtocolError(f"turnstile {name} needs >= 2 instances of one role")
@@ -767,6 +787,8 @@ class WarpSpecialized:
         plan, off = [], 0
         ranks = range(self.cluster.size)
         for name, ch in self._ws_chans.items():
+            if ch.named:
+                continue  # hardware named barriers: no SMEM, no initialization
             sc = ch.scope
             plan.append((name, off, {c: sc.full_counts[c] + sc.empty_counts[c] for c in ranks}))
             off += 2 * ch.n
@@ -781,6 +803,14 @@ class WarpSpecialized:
             plan.append((name, off, {c: counts for c in ranks}))
             off += b.n
         return plan, off
+
+    @property
+    def named_barrier_ids(self) -> dict:
+        """``{channel: ([full id per slot], [empty id per slot])}`` of the named-barrier channels.
+        They are allocated from 15 downward, after the layer's IDs 1 and 2; hand-picked IDs in
+        user code must avoid them (``alias.named_barrier`` calls are checked while tracing)."""
+        self._collect()
+        return dict(self._ws_named)
 
     def barrier_ptr(self, name: str):
         """Pointer to the first mbarrier of a channel (full barriers at ``[0, n)``, empty at
@@ -1000,6 +1030,19 @@ class WarpSpecialized:
         """Collect check opt-outs; warn once about TMA channels the check could not verify; run
         the alias diagnostic."""
         self._ws_opt_outs = take_opt_outs()
+        taken = {
+            i: f"channel {name}"
+            for name, ids in self._ws_named.items()
+            for i in (*ids[0], *ids[1])
+        }
+        taken.update({TMEM_PTR_BARRIER_ID: "the layer", TMEM_TEARDOWN_BARRIER_ID: "the layer"})
+        for role_events in self._ws_alias_roles:
+            for ev in role_events.events:
+                if ev.kind == "barrier" and ev.data.get("id") in taken:
+                    raise ProtocolError(
+                        f"{role_events.name}: named_barrier({ev.data['id']}) at {ev.site} uses a "
+                        f"barrier ID owned by {taken[ev.data['id']]}; pick an unused ID"
+                    )
         self._ws_alias = None
         if self.alias_check not in alias.MODES:
             raise ValueError(f"alias_check must be one of {alias.MODES}, got {self.alias_check!r}")
@@ -1110,7 +1153,7 @@ class WarpSpecialized:
             side = ann.side if isinstance(ann, _Bound) else ann
             if side is Producer or side is Consumer:
                 bound = r.index if isinstance(ann, _Bound) else None
-                args.append(self._make_end(pname, side is Producer, bound, trace, r.cta))
+                args.append(self._make_end(pname, side is Producer, bound, trace, r.cta, r))
             elif ann is Tmem:
                 base = self._ws_tmem.retrieve_ptr(cutlass.Float32)
                 args.append(TmemView(base, self.tmem_plan, r.name, trace.log, trace))
@@ -1153,8 +1196,16 @@ class WarpSpecialized:
                 args.append(ctx)
         return args
 
-    def _make_end(self, pname: str, is_prod: bool, bound, trace, cta: str = ALL):
+    def _make_end(self, pname: str, is_prod: bool, bound, trace, cta: str = ALL, ri=None):
         chan = self._ws_chans[pname]
+        side = "producer" if is_prod else "consumer"
+        # Round-robin: instance j of k starts at epoch j and steps k epochs per operation.
+        turns = chan.turns(side)
+        turn = (
+            [r for r, _ in (chan.producers if is_prod else chan.consumers)].index(ri)
+            if (turns > 1)
+            else 0
+        )
         if chan.fixed:
             # Producers start each slot at phase 1 (a fresh empty barrier passes).
             state = Int32((1 << chan.n) - 1 if is_prod else 0)
@@ -1165,10 +1216,24 @@ class WarpSpecialized:
                 else pipeline.PipelineUserType.Consumer,
                 chan.n,
             )
+            for _ in range(turn):
+                state.advance()
         cls = ProducerEnd if is_prod else ConsumerEnd
         end = cls(
-            chan, self._ws_bars[pname], self._ws_buffers.get(pname, {}), trace, bound, state, cta
+            chan,
+            self._ws_bars.get(pname),
+            self._ws_buffers.get(pname, {}),
+            trace,
+            bound,
+            state,
+            cta,
+            stride=turns,
         )
+        if chan.named and not is_prod:
+            if bound is not None:
+                end.seed([bound])
+            else:  # each stage's first acquire needs one consumer token, from its first turn
+                end.seed([j for j in range(chan.n) if j % turns == turn])
         return end
 
 
@@ -1230,6 +1295,54 @@ def _returned_state(role_name: str, result, state_args: list[tuple[str, object]]
             f"(for example, return {names})"
         )
     return final
+
+
+def _check_turns(name: str, side: str, bound):
+    roles = {r.role for r, _ in bound}
+    widths = {r.num_threads for r, _ in bound}
+    if len(roles) != 1 or len(widths) != 1:
+        raise ProtocolError(
+            f"channel {name}: round-robin {side}s {[r.name for r, _ in bound]} must be "
+            "instances of one role with the same width (each epoch counts one instance)"
+        )
+
+
+def _check_named_turns(name: str, chan, turns: dict):
+    """Round-robin instances of a named channel that share a stage barrier need a turnstile."""
+    for side in ("producer", "consumer"):
+        k = chan.turns(side)
+        if k == 1 or chan.n % k == 0:
+            continue
+        bound = {r.name for r, _ in (chan.producers if side == "producer" else chan.consumers)}
+        ts = turns.get(chan.turnstile)
+        if ts is None or not ts.enabled or {r.name for r in ts.parties} != bound:
+            raise ProtocolError(
+                f"channel {name}: {k} round-robin {side}s share the barriers of {chan.n} named "
+                f"stage(s) ({chan.n} % {k} != 0), so two of them could complete a barrier "
+                f"without the other side; declare an enabled Turnstile over {sorted(bound)} and "
+                "pass its name as turnstile=, or use a multiple of the instance count as stages"
+            )
+
+
+def _allocate_named(chans: dict) -> dict:
+    """Assign named barrier IDs to named channels, from ``MAX_NAMED_BARRIER_ID`` down: per
+    channel, ``n`` consecutive full IDs then ``n`` empty IDs (ring stages index them)."""
+    out, top = {}, MAX_NAMED_BARRIER_ID
+    for name, ch in chans.items():
+        if not ch.named:
+            continue
+        base = top - 2 * ch.n + 1
+        if base <= TMEM_TEARDOWN_BARRIER_ID:
+            need = sum(2 * c.n for c in chans.values() if c.named)
+            raise ProtocolError(
+                f"named-barrier channels need {need} barrier IDs; "
+                f"{MAX_NAMED_BARRIER_ID - TMEM_TEARDOWN_BARRIER_ID} are free (0 is "
+                "__syncthreads, 1 and 2 belong to the layer); use mbarrier channels for some"
+            )
+        ch.named_ids = (list(range(base, base + ch.n)), list(range(base + ch.n, top + 1)))
+        out[name] = ch.named_ids
+        top = base - 1
+    return out
 
 
 def _barrier_unaligned(barrier_id: int, num_threads):

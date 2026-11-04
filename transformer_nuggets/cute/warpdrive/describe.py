@@ -162,8 +162,26 @@ def _channels(kernel) -> str:
         if sc.tx is not None:
             full += f", tx {sc.tx} B" + (" (leader-armed)" if sc.pair else "")
         details.append(("signal", f"{_mech(ch.producer)} -> {_mech(ch.consumer)}"))
-        details.append(("full", full))
-        details.append(("empty", fmt_per_cta(sc.empty_counts, empty_ranks, by_rank=sc.pair)))
+        if ch.named:
+            # One hardware barrier per slot and side; producers and consumers both arrive.
+            full_ids, empty_ids = ch.named_ids
+            count = fmt_counts(ch.named_counts())
+            named = f"full ids {full_ids}, empty ids {empty_ids}, {count} threads"
+            if ch.turnstile is not None:
+                named += f", taken in turn ({ch.turnstile})"
+            details.append(("named", named))
+        else:
+            details.append(("full", full))
+            details.append(("empty", fmt_per_cta(sc.empty_counts, empty_ranks, by_rank=sc.pair)))
+        for side in ("producer", "consumer"):
+            if ch.turns(side) > 1:
+                details.append(
+                    (
+                        "turns",
+                        f"{side}s round-robin: instance j of {ch.turns(side)} takes epochs "
+                        f"j, j+{ch.turns(side)}, ...; counts are one instance's",
+                    )
+                )
         if cs > 1:
             scope = ["pair-scoped" if sc.pair else "CTA-local"]
             if sc.pair:

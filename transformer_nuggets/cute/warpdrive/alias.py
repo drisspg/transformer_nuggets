@@ -149,7 +149,8 @@ def named_barrier(barrier_id: int, number_of_threads: int):
     """``cute.arch.barrier(...)``, visible to the diagnostic. Only a barrier over every thread
     of the calling role (``number_of_threads == 32 * warps``) orders the role's warps."""
     cute.arch.barrier(barrier_id=barrier_id, number_of_threads=number_of_threads)
-    _record("barrier", threads=number_of_threads)
+    # The id lets the kernel reject a collision with a named-barrier channel's IDs.
+    _record("barrier", threads=number_of_threads, id=barrier_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -507,7 +508,13 @@ def _handoff_handles(acc: Access) -> list:
     e and e + n, not consecutive ones, so it hands over only storage indexed by its stage."""
     if acc.handle is not None:
         return [acc.handle]
-    return [h for h in acc.handles if not h.chan.internal and (h.chan.fixed or h.chan.n == 1)]
+    # A round-robin ring's epochs do not follow one role's program order, which the model's
+    # epoch matching assumes: it adds no edges (accesses ordered only through it are flagged).
+    return [
+        h
+        for h in acc.handles
+        if not h.chan.internal and not h.chan.round_robin and (h.chan.fixed or h.chan.n == 1)
+    ]
 
 
 def _handle_on(acc: Access, chan, slot):
@@ -643,7 +650,7 @@ class _Graph:
             if ev.kind != want or (want == "close" and not ev.data["signal"]):
                 continue
             rec = ev.data["handle"]
-            if rec.chan.internal:
+            if rec.chan.internal or rec.chan.round_robin:  # see _handoff_handles
                 continue
             key = (rec.chan.name, rec.slot, rec.producer)
             out.setdefault(key, {}).setdefault(item, []).append(p)

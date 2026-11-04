@@ -13,6 +13,25 @@ with several consumer roles (fan-out) has a join barrier that completes only whe
 have released. A ``Tma`` or ``Umma`` side signals once, so it must be bound to one single-warp
 role (the warp that issues the copies or MMAs). ``Channel(override={...})`` replaces any
 derived value; ``Barriers`` reserves mbarriers that user code drives directly.
+
+Two declaration options change how a channel synchronizes:
+
+* ``round_robin=True`` (``Ring`` only): the role instances on a side take the epochs in turn.
+  With ``k`` instances, instance ``j`` handles epochs ``j, j + k, j + 2k, ...``, and each epoch's
+  arrival count is one instance's contribution, not the join of all of them. FA4's decode
+  kernel uses it for two softmax warpgroups that alternate KV blocks.
+* ``sync="named"`` (``Threads`` on both sides): each slot is a pair of CTA named barriers
+  (``bar.sync``/``bar.arrive``, unaligned) instead of mbarriers. A named barrier has no phase:
+  it completes when the producer's and the consumer's threads have all arrived, so its count is
+  their sum. Every consumer instance arrives once on its slots' empty barriers at role start, the
+  equivalent of an mbarrier ring starting empty. IDs are allocated from 15 downward; see
+  ``WarpSpecialized.named_barrier_ids``.
+
+A named barrier cannot tell two instances apart: if round-robin instances share a stage's barrier
+(``n % k != 0``, e.g. a one-stage mailbox written by two warpgroups in turn), their threads could
+complete it together without the other side. Such a channel names a ``Turnstile`` over those
+instances (``turnstile="mufu"``) and acquires/waits only while holding the turn (checked while
+tracing).
 """
 
 from __future__ import annotations
@@ -65,6 +84,7 @@ def _fence(kind: str | None):
 
 
 FENCE_KINDS = (None, "tmem_store", "smem_async")
+SYNC_KINDS = ("mbarrier", "named")
 
 
 @dataclass
@@ -96,6 +116,10 @@ class Channel:
     ``tx`` (bytes armed per full barrier), ``full_mask``/``empty_mask`` (``tcgen05.commit``
     multicast masks). Example: per-warp elected releases need ``empty_counts=4`` for a
     four-warp consumer, with the role signalling via ``handle.release(signal=False)``.
+
+    ``round_robin`` and ``sync`` are described in the module docstring. A named channel takes
+    no override and must stay CTA-local; ``named_ids`` holds its ``(full, empty)`` barrier IDs
+    per slot once the kernel is collected.
     """
 
     n: int
@@ -109,6 +133,9 @@ class Channel:
     release_fence: str | None = None
     remote_scope: str | None = None
     override: dict | None = None
+    round_robin: bool = False
+    sync: str = "mbarrier"
+    turnstile: str | None = None
     name: str = field(default="", init=False)
     fixed: bool = field(default=False, init=False)
     producers: list = field(default_factory=list, init=False)  # (RoleInstance, slot | None)
@@ -124,6 +151,8 @@ class Channel:
     internal: bool = field(default=False, init=False, repr=False)
     # ``buffer`` normalized to {name: SmemBuffer}; a single buffer is keyed by its plan name.
     buffers: dict = field(default_factory=dict, init=False, repr=False)
+    # sync="named": ([full id per slot], [empty id per slot]), assigned by the kernel.
+    named_ids: tuple | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         if type(self.n) is not int:
@@ -164,6 +193,22 @@ class Channel:
                     f"got {self.buffer!r}"
                 )
             self.buffers = dict(named)
+        if type(self.round_robin) is not bool:
+            raise ValueError(f"round_robin must be a bool, got {self.round_robin!r}")
+        if self.sync not in SYNC_KINDS:
+            raise ValueError(f"channel sync must be one of {SYNC_KINDS}, got {self.sync!r}")
+        if self.turnstile is not None and not (self.named and self.round_robin):
+            raise ValueError("turnstile= serializes round-robin instances of a named channel")
+        if self.named:
+            if self.producer is not Threads or self.consumer is not Threads:
+                raise ValueError(
+                    "a named-barrier channel synchronizes threads: both sides must be Threads"
+                )
+            if self.override:
+                raise ValueError(
+                    "a named-barrier channel takes no override: its count is the producer and "
+                    "consumer threads of each slot"
+                )
         unknown = set(self.override or {}) - set(SCOPE_OVERRIDES)
         if unknown:
             raise ValueError(f"unknown override keys {sorted(unknown)}; one of {SCOPE_OVERRIDES}")
@@ -172,13 +217,28 @@ class Channel:
         if self.remote_scope is None:
             self.remote_scope = self.derived_remote_scope
 
+    @property
+    def named(self) -> bool:
+        return self.sync == "named"
+
+    def turns(self, side: str) -> int:
+        """Instances taking turns on ``side``: ``k`` for a round-robin side, else 1."""
+        bound = self.producers if side == "producer" else self.consumers
+        return len(bound) if self.round_robin and len(bound) > 1 else 1
+
     def slot_counts(self, side: str) -> list[int]:
         mech = self.producer if side == "producer" else self.consumer
         bound = self.producers if side == "producer" else self.consumers
+        if self.turns(side) > 1:  # one instance signals each epoch
+            return [arrivals(mech, bound[0][0].num_threads)] * self.n
         return [
             sum(arrivals(mech, ri.num_threads) for ri, slot in bound if slot in (None, j))
             for j in range(self.n)
         ]
+
+    def named_counts(self) -> list[int]:
+        """Per-slot thread count of a named channel's barriers: producers plus consumers."""
+        return [p + c for p, c in zip(self.slot_counts("producer"), self.slot_counts("consumer"))]
 
 
 @dataclass
@@ -192,6 +252,8 @@ class Slots(Channel):
 
     def __post_init__(self):
         super().__post_init__()
+        if self.round_robin:
+            raise ValueError("round_robin needs a Ring: a Slots caller names the slot itself")
         self.fixed = True
         if self.n > 31:
             raise ValueError("Slots supports at most 31 slots (phase bits share one Int32)")
@@ -325,6 +387,7 @@ class Handle:
     def full_barrier(self):
         """This stage's full-barrier pointer. On a TMA producer, pass it as ``tma_bar_ptr``: the
         layer checks the copies that complete on it (``tma.py``)."""
+        self._end._mbarriers("full_barrier")
         return self._end._handed_full(self.index, self.rec if self._is_producer else None)
 
     barrier = full_barrier
@@ -332,6 +395,7 @@ class Handle:
     @property
     def empty_barrier(self):
         """This stage's empty-barrier pointer (escape hatch for raw ``cute.arch`` signalling)."""
+        self._end._mbarriers("empty_barrier")
         return self._end._empty(self.index)
 
     @property
@@ -413,11 +477,24 @@ class Handle:
         if b.storage is not None:
             self._end._trace.event("raw", storage=("smem", b.storage))
 
-    def commit(self, signal: bool = True):
+    def commit(self, signal: bool = True, wait: bool = False):
         """Producer: publish the stage (signal full). ``signal=False``: the caller signals the
-        full barrier itself with the derived (or overridden) counts."""
+        full barrier itself with the derived (or overridden) counts.
+
+        ``wait=True`` (named channels only) makes the commit a rendezvous: the producer threads
+        also wait on the full barrier, so when it returns every producer and consumer thread has
+        arrived, and the producer threads see each other's writes made before the commit."""
+        if wait and not self._end._chan.named:
+            raise ProtocolError(
+                f"{self._end._trace.role_name}: commit(wait=True) on {self.describe()}: only a "
+                "named-barrier channel's producer can wait on its own full barrier"
+            )
+        if wait and not signal:
+            raise ProtocolError("commit(wait=True) signals the full barrier; drop signal=False")
         self._close(True, "commit" if signal else "commit(raw signal)")
-        if signal:
+        if wait:
+            self._end._named_wait(self._end._chan.named_ids[0], self.index, "commit")
+        elif signal:
             self._end._signal(self.index)
 
     def retire(self):
@@ -477,9 +554,20 @@ class _End:
     """
 
     def __init__(
-        self, chan, bars, buffers, trace, bound_slot, state, cta=ALL, rec=None, views=None
+        self,
+        chan,
+        bars,
+        buffers,
+        trace,
+        bound_slot,
+        state,
+        cta=ALL,
+        rec=None,
+        views=None,
+        stride=1,
     ):
         self._chan = chan
+        self._stride = stride  # round-robin: epochs between this end's turns
         self._bars = bars  # full barriers at [0, n), empty barriers at [n, 2n)
         self._buffers = buffers  # {name: StageBuffer}: the payload or the bound plan buffers
         self._trace = trace
@@ -509,6 +597,7 @@ class _End:
             self._cta,
             self._rec,
             self._views,
+            self._stride,
         )
 
     def views(self, **named: StageView):
@@ -543,7 +632,48 @@ class _End:
             self._cta,
             self._rec,
             {**self._views, **named},
+            self._stride,
         )
+
+    def _mbarriers(self, what: str):
+        if self._chan.named:
+            raise ProtocolError(
+                f"{self._trace.role_name}: {self._chan.name} is a named-barrier channel and has no "
+                f"mbarriers ({what}); its barrier IDs are channel.named_ids"
+            )
+
+    def _named_id(self, ids, index):
+        if isinstance(index, int):
+            return ids[index]
+        return Int32(ids[0]) + index  # ring stages have consecutive IDs
+
+    def _named_count(self, index):
+        counts = self._chan.named_counts()
+        return counts[index] if isinstance(index, int) else counts[0]
+
+    def _named_wait(self, ids, index, op):
+        with wait_range(self._trace, f"{self._chan.name}.{op}"):
+            _named_sync(self._named_id(ids, index), self._named_count(index))
+
+    def _named_arrive(self, ids, index):
+        _named_arrive(self._named_id(ids, index), self._named_count(index))
+
+    def _check_turn(self, side: str, op: str):
+        chan = self._chan
+        if chan.turnstile is None or chan.turns(side) == 1:
+            return
+        if chan.turnstile not in self._trace.open_turns:
+            raise ProtocolError(
+                f"{self._trace.role_name}: {chan.name}.{op}() at {user_site()} outside "
+                f"`with {chan.turnstile}.turn():`; round-robin {side}s of this named channel share "
+                "a barrier and must take it in turn"
+            )
+
+    def seed(self, slots):
+        """Named channel, consumer: arrive once on the empty barriers of ``slots`` (layer-emitted
+        at role start; the equivalent of mbarriers starting empty)."""
+        for j in slots:
+            _named_arrive(self._chan.named_ids[1][j], self._chan.named_counts()[j])
 
     def _full(self, index):
         return self._bars + index
@@ -567,10 +697,12 @@ class _End:
     # overridden) counts in ``scope``.
     def full_barrier(self, index):
         """This CTA's full barrier of a stage/slot (a pair's peer: same offset)."""
+        self._mbarriers("full_barrier")
         return self._handed_full(index)
 
     def empty_barrier(self, index):
         """This CTA's empty barrier of a stage/slot (a pair's peer: same offset)."""
+        self._mbarriers("empty_barrier")
         return self._empty(index)
 
     @property
@@ -653,7 +785,8 @@ class _End:
             if slot is not None:
                 raise ProtocolError(f"{who}: ring {chan.name}.{op}() takes no slot")
             index, phase = self._state.index, self._state.phase
-            self._state.advance()
+            for _ in range(self._stride):
+                self._state.advance()
             return index, phase, "i"
         if not isinstance(slot, int):
             raise ProtocolError(
@@ -678,6 +811,10 @@ class ProducerEnd(_End):
         """Wait until the stage is empty; returns a handle to commit or retire."""
         index, phase, label = self._next(slot, "acquire")
         self._trace.record(self._chan.name, "acquire", label)
+        if self._chan.named:
+            self._check_turn("producer", "acquire")
+            self._named_wait(self._chan.named_ids[1], index, "acquire")
+            return Handle(self, index, phase, label, True)
         with wait_range(self._trace, f"{self._chan.name}.acquire"):
             cute.arch.mbarrier_wait(self._empty(index), phase)
         if isinstance(self._chan.producer, Tma):
@@ -703,6 +840,10 @@ class ProducerEnd(_End):
         if isinstance(self._chan.producer, Tma):
             return  # completed by the TMA transaction count
         chan = self._chan
+        if chan.named:
+            _fence(chan.commit_fence)
+            self._named_arrive(chan.named_ids[0], index)
+            return
         self._arrive(chan.producer, self._full(index), chan.commit_fence, chan.scope.full_mask)
 
     def tail(self):
@@ -727,6 +868,10 @@ class ConsumerEnd(_End):
         """Wait until the stage is full; returns a handle to release."""
         index, phase, label = self._next(slot, "wait")
         self._trace.record(self._chan.name, "wait", label)
+        if self._chan.named:
+            self._check_turn("consumer", "wait")
+            self._named_wait(self._chan.named_ids[0], index, "wait")
+            return Handle(self, index, phase, label, False)
         with wait_range(self._trace, f"{self._chan.name}.wait"):
             cute.arch.mbarrier_wait(self._full(index), phase)
         return Handle(self, index, phase, label, False)
@@ -735,7 +880,23 @@ class ConsumerEnd(_End):
 
     def _signal(self, index):
         chan = self._chan
+        if chan.named:
+            _fence(chan.release_fence)
+            self._named_arrive(chan.named_ids[1], index)
+            return
         self._arrive(chan.consumer, self._empty(index), chan.release_fence, chan.scope.empty_mask)
+
+
+def _named_sync(barrier_id, threads: int):
+    """Unaligned ``barrier.cta.sync``: roles reach a channel's barriers from different code
+    sites, and lanes of one warp may arrive from divergent paths."""
+    _nvvm.barrier_cta_sync(
+        Int32(barrier_id).ir_value(), thread_count=Int32(threads).ir_value(), aligned=False
+    )
+
+
+def _named_arrive(barrier_id, threads: int):
+    cute.arch.barrier_arrive(barrier_id=barrier_id, number_of_threads=threads, aligned=False)
 
 
 def _arm_one(full, tx: int, cta: int):
@@ -780,6 +941,7 @@ class _TurnScope:
 
     def __enter__(self):
         e = self._end
+        e._trace.open_turns.add(e._ts.name)
         if e._ts.enabled:
             e._trace.record(e._ts.name, "turn", e._seat)
             with wait_range(e._trace, f"{e._ts.name}.turn"):
@@ -787,6 +949,7 @@ class _TurnScope:
 
     def __exit__(self, exc_type, exc, tb):
         e = self._end
+        e._trace.open_turns.discard(e._ts.name)
         if exc_type is None and e._ts.enabled:
             nxt = (e._seat + 1) % len(e._ts.parties)
             cute.arch.mbarrier_arrive(e._bars + nxt)

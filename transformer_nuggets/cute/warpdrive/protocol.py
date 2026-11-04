@@ -206,6 +206,7 @@ class RoleTrace:
         self.checks: list = []  # end-of-role trace checks (e.g. work cursors)
         self.tma_bars: list = []  # TMA-channel full-barrier pointers handed out (tma.py)
         self.events: list[Event] = []  # alias-diagnostic events, in trace order
+        self.open_turns: set[str] = set()  # turnstiles whose turn this role holds here
         self._blocks: list = []  # (block, key, kind) of every region an event was recorded in
         self.root = current_block()
 
