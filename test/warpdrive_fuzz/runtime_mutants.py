@@ -130,6 +130,90 @@ def no_pair_tail():
     ProducerEnd.tail = lambda self: None
 
 
+def override_ignored():
+    """Count overrides are dropped: barriers keep the derived counts, so per-warp manual
+    arrivals (``signal=False`` plus an override) never complete a phase."""
+    kernel.apply_overrides = lambda chan, scope, clu: scope
+
+
+def signal_false_signals():
+    """``commit(signal=False)``/``release(signal=False)`` still signal: arrivals double."""
+    orig_commit, orig_release = Handle.commit, Handle.release
+
+    def commit(self, signal=True):
+        orig_commit(self, signal)
+        if not signal:
+            self._end._signal(self.index)
+
+    def release(self, signal=True):
+        orig_release(self, signal)
+        if not signal:
+            self._end._signal(self.index)
+
+    Handle.commit, Handle.release = commit, release
+
+
+def decode_unguarded():
+    """Every mapping is decoded at any index, as if it declared ``decodes_any_index``."""
+    scheduling._decode = lambda stream, index, problem: scheduling._keep_words(
+        stream.mapping, index, problem.space
+    )[1]
+
+
+def pdl_no_wait():
+    """``PdlWait`` issues no ``griddepcontrol.wait``: a dependent reads the table early."""
+    scheduling.PdlWait.wait = lambda self: None
+
+
+def raw_counts_wrong():
+    """``Barriers(counts=...)`` initializes each barrier with twice its count."""
+    orig = kernel.WarpSpecialized._barrier_plan
+
+    def _barrier_plan(self):
+        plan, off = orig(self)
+        out = []
+        for name, o, counts in plan:
+            if name in self._ws_raw_bars and self._ws_raw_bars[name].counts:
+                counts = {c: [2 * x for x in v] for c, v in counts.items()}
+            out.append((name, o, counts))
+        return out, off
+
+    kernel.WarpSpecialized._barrier_plan = _barrier_plan
+
+
+def umma_commit_early():
+    """Umma sides signal with a plain elected arrive instead of ``tcgen05.commit``: the
+    accumulator is handed to the epilogue (and A/B stages back to TMA) before the MMAs that
+    write (read) them complete."""
+    orig = _End._arrive
+
+    def _arrive(self, mech, bar, fence, mask):
+        if mech is channels.Umma:
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive(bar)
+            return
+        orig(self, mech, bar, fence, mask)
+
+    _End._arrive = _arrive
+
+
+def view_endpoint_stage():
+    """``h.data``/``h.view`` address the endpoint's next ring stage instead of the handle's
+    own (R21): wrong whenever another handle of the end opened in between."""
+    data, view = Handle.data.fget, Handle.view
+
+    def at_endpoint(h):
+        if h._end._chan.fixed:
+            return h
+        moved = object.__new__(Handle)
+        moved.__dict__.update(h.__dict__)
+        moved.index = h._end._state.index
+        return moved
+
+    Handle.data = property(lambda self: data(at_endpoint(self)))
+    Handle.view = lambda self, *args, **kwargs: view(at_endpoint(self), *args, **kwargs)
+
+
 MUTANTS = {
     "join_short": (join_short, "join"),
     "ring_wait_phase": (ring_wait_phase, "payload"),
@@ -140,6 +224,13 @@ MUTANTS = {
     "receive_early_release": (receive_early_release, "schedule_atomic"),
     "pair_join_short": (pair_join_short, "pair_scoped"),
     "no_pair_tail": (no_pair_tail, "pair_scoped"),
+    "override_ignored": (override_ignored, "override_signal_false"),
+    "signal_false_signals": (signal_false_signals, "override_signal_false"),
+    "decode_unguarded": (decode_unguarded, "mapping_table"),
+    "pdl_no_wait": (pdl_no_wait, "pdl_producer"),
+    "raw_counts_wrong": (raw_counts_wrong, "barriers_auto"),
+    "umma_commit_early": (umma_commit_early, "tcgen05_mma"),
+    "view_endpoint_stage": (view_endpoint_stage, "storage_buffer_threads"),
 }
 
 

@@ -53,7 +53,7 @@ def _covering_seeds(pool: range, limit: int, **force) -> list[int]:
     return sorted(chosen)
 
 
-QUICK_SEEDS = _covering_seeds(range(300), 24)
+QUICK_SEEDS = _covering_seeds(range(300), 32)
 CLUSTERS = {"2x2p": (2, 2, True), "2x2": (2, 2, False)}
 QUICK_SEEDS += [s for s in range(300, 400) if s not in QUICK_SEEDS][
     : max(0, 16 - len(QUICK_SEEDS))
@@ -113,6 +113,18 @@ BLIND_SPOTS = ("receive_early_release", "no_pair_tail")
 DETECTABLE = [m for m in runtime_mutants.MUTANTS if m not in BLIND_SPOTS]
 
 
+# Mutants whose failure is a device fault rather than a mismatch or hang: extra mbarrier
+# arrivals trap.
+FAULTING = ("signal_false_signals",)
+
+
+def _detected(mutant: str, res) -> bool:
+    if res.status in (runtime.FAIL, runtime.HANG):
+        return True
+    fault = res.status in (runtime.ERROR, runtime.CRASH) and "CUDA error" in res.detail
+    return fault and mutant in FAULTING
+
+
 @pytest.mark.parametrize("mutant", DETECTABLE)
 def test_oracle_detects_layer_mutant(requires_blackwell, tmp_path_factory, mutant):
     feature = runtime_mutants.MUTANTS[mutant][1]
@@ -123,7 +135,7 @@ def test_oracle_detects_layer_mutant(requires_blackwell, tmp_path_factory, mutan
     for seed in seeds[:4]:
         res = runtime.run_isolated(gen.generate(seed), workdir, MUTANT_TIMEOUT, env=env)
         seen.append((seed, res.status))
-        if res.status in (runtime.FAIL, runtime.HANG):
+        if _detected(mutant, res):
             return
     pytest.fail(f"mutant {mutant} survived seeds {seen}")
 
@@ -131,6 +143,35 @@ def test_oracle_detects_layer_mutant(requires_blackwell, tmp_path_factory, mutan
 # --------------------------------------------------------------------------- #
 # Host properties (no GPU)
 # --------------------------------------------------------------------------- #
+
+
+def test_mma_operands_are_exact_integer_matmuls():
+    """The MMA subgraph's device check (``runtime_device.mma_check``) recomputes each
+    accumulator from the operand formulas; that equals the matmul of the bf16 source tensors
+    the harness uploads, exactly (small integers, fp32 accumulation)."""
+    from test.warpdrive_fuzz import runtime_device
+
+    spec = next(s for s in map(gen.generate, range(300)) if s.mma is not None)
+    a = runtime.mma_operand(spec, "mma_a", "cpu")
+    b = runtime.mma_operand(spec, "mma_b", "cpu")
+    ab, _ = gen.mma_channels(spec)
+    rows, n, k = gen.MMA_M, spec.mma.n, spec.mma.k
+    for e in range(3):
+        tiles = [(e * ab.mult + j) % ab.tma_tiles for j in range(ab.mult)]
+        got = sum(
+            a[t * rows : (t + 1) * rows].float() @ b[t * n : (t + 1) * n].float().T for t in tiles
+        )
+        r = torch.arange(rows).view(-1, 1, 1)
+        c = torch.arange(n).view(1, -1, 1)
+        kk = torch.arange(k).view(1, 1, -1)
+        want = sum(
+            (
+                runtime_device.mma_a(t, r, kk, spec.mma.salt)
+                * runtime_device.mma_b(t, c, kk, spec.mma.salt)
+            ).sum(-1)
+            for t in tiles
+        )
+        assert torch.equal(got, want.float())
 
 
 def test_raster_decode_matches_documented_order():
