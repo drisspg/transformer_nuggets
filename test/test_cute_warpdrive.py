@@ -746,10 +746,7 @@ def test_describe_lists_the_traced_protocol(requires_blackwell):
     source lines, indented by dynamic region, and the TMEM regions each role touched."""
     from transformer_nuggets.cute.warpdrive.examples.gemm import Gemm, compile_gemm
 
-    class TracedGemm(Gemm):  # its own compile-cache entry: a cache hit would skip the trace
-        pass
-
-    op = TracedGemm(trace=True)
+    op = Gemm(trace=True)
     assert "Traced protocol" not in op.describe()  # nothing traced before the compile
     compile_gemm(op)
     text = op.describe()
@@ -757,12 +754,3 @@ def test_describe_lists_the_traced_protocol(requires_blackwell):
     assert re.search(r"\n  role load:\n +ab\[i\] +acquire +@ gemm\.py:\d+\n", protocol), protocol
     assert re.search(r"\n    epilogue: acc\[0\]", protocol), protocol
     assert all(len(line) <= 100 for line in text.splitlines())
-
-
-def test_streams_launch_through_their_work_problem():
-    """A kernel with a TileStream must take its grid from the problem: a OneShot over plain
-    Raster() reads its item from blockIdx.y/z, which a hand-built 1-D grid would not set."""
-    from transformer_nuggets.cute.warpdrive.examples.gemm import Gemm
-
-    with pytest.raises(ProtocolError, match=r"TileStream\(s\) \['tiles'\]; pass work="):
-        Gemm().launch_config(grid=(4, 1, 1))

@@ -70,7 +70,9 @@ class Gemm(WarpSpecialized):
         self.trace_protocol = trace
 
     def get_name(self) -> str:
-        return f"warpdrive_gemm_ab{self.ab.n}_acc{self.acc_stages}{self.iket_key()}"
+        return (
+            f"warpdrive_gemm_ab{self.ab.n}_acc{self.acc_stages}{self.iket_key()}{self.trace_key()}"
+        )
 
     def get_key(self) -> str:
         return self.get_name()

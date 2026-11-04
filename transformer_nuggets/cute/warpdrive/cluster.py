@@ -64,7 +64,7 @@ class SingleCta:
         return "cta1"
 
     def describe(self) -> str:
-        return "single CTA"
+        return "single CTA, tcgen05 CtaGroup.ONE"
 
 
 @dataclass(frozen=True)
@@ -95,7 +95,7 @@ class CtaPair(SingleCta):
         return "pair"
 
     def describe(self) -> str:
-        return "CTA pair, cluster (2, 1, 1), tcgen05 CtaGroup.TWO, leader = rank 0"
+        return "CTA pair (2, 1, 1), tcgen05 CtaGroup.TWO, leader = rank 0"
 
 
 # --------------------------------------------------------------------------- #

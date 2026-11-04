@@ -271,7 +271,7 @@ class WarpSpecialized:
         streams = {k: v for k, v in vars(self).items() if isinstance(v, TileStream)}
         if len(streams) > 1:
             raise ProtocolError(
-                f"one TileStream per kernel (every role starts at blockIdx.x), got {list(streams)}"
+                f"one TileStream per kernel (every role starts at this CTA's first item), got {list(streams)}"
             )
         cluster = self.cluster
         for name, st in streams.items():
@@ -574,6 +574,11 @@ class WarpSpecialized:
         self.iket, self.iket_waits = enabled, waits
         return self
 
+    def trace_key(self) -> str:
+        """Compile-key suffix of ``trace_protocol``: a cached kernel was never traced, so a
+        traced instance needs its own entry to fill the protocol log."""
+        return "_trace" if self.trace_protocol else ""
+
     def iket_key(self) -> str:
         """Compile-key suffix of the IKET configuration ('' when off)."""
         if not self.iket:
@@ -637,14 +642,8 @@ class WarpSpecialized:
         """``grid``/``block``/``cluster`` for ``kernel(...).launch(**cfg, stream=stream)``.
         Kernels with a ``TileStream`` pass its ``work`` problem: the grid depends on the policy
         (a ``OneShot`` over plain ``Raster()`` launches the tile space)."""
-        self._collect()
         if work is not None:
             grid = work.grid()
-        elif self._ws_streams:
-            raise ProtocolError(
-                f"launch_config: kernel has TileStream(s) {sorted(self._ws_streams)}; pass "
-                "work=self.<stream>.problem(...) so the grid matches how roles read their item"
-            )
         return {
             "grid": grid,
             "block": (self.num_threads, 1, 1),
@@ -981,7 +980,7 @@ class RoleContext(SimpleNamespace):
     """A namespace context as the roles see it; opaque to CuTeDSL control flow.
 
     The preprocessor treats ``ctx.x[i] = v`` inside a dynamic ``if``/``for`` as a write of
-    ``c`` and would carry a plain namespace through the region, rebinding its attributes to
+    ``ctx`` and would carry a plain namespace through the region, rebinding its attributes to
     region results that do not dominate other roles. Context values are defined before role
     dispatch and never rebound, so carrying them is unnecessary: this class carries nothing
     and reconstructs as itself. A frozen dataclass needs no wrapper: its fields cannot be

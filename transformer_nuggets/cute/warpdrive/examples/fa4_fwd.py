@@ -170,7 +170,7 @@ class FlashAttentionForward(WarpSpecialized):
         ts = ("_ts" if self.mufu.enabled else "") + ("_splitp" if self.split_p else "")
         return (
             f"warpdrive_fa4_fwd_{self.cluster.get_key()}_kv{self.kv_stages}{ts}_"
-            f"{self.tiles.get_key()}{self.iket_key()}"
+            f"{self.tiles.get_key()}{self.iket_key()}{self.trace_key()}"
         )
 
     def get_key(self) -> str:

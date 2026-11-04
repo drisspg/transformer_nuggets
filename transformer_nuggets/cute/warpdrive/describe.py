@@ -95,16 +95,10 @@ def _table(rows: list[list[str]], right: set[int] = frozenset(), indent: str = "
 
 
 def _header(kernel) -> str:
-    cluster = kernel.cluster
     lines = [f"{type(kernel).__name__}: {kernel.num_warps} warps, {kernel.num_threads} threads"]
-    if cluster.size > 1:
-        shape = ", ".join(str(s) for s in cluster.shape)
-        where = f"CTA pair ({shape}), tcgen05 CtaGroup.TWO, leader = rank 0"
-    else:
-        where = "single CTA, tcgen05 CtaGroup.ONE"
     ctx = kernel._ws_ctx_type
     rows = [
-        ["cluster", where],
+        ["cluster", kernel.cluster.describe()],
         ["context", ctx.__name__ if ctx is not None else "unannotated (any object)"],
     ]
     return "\n".join(lines + _table(rows))

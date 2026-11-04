@@ -37,7 +37,7 @@ class PersistentGemmCtx:  # prologue values every role reads
     num_k_tiles: cutlass.Int32
     ...
 
-class PersistentGemm(WarpSpecialized):
+class PersistentGemm(WarpSpecialized):  # abridged: the real one sizes stages per cluster
     def __init__(self, policy=None, ab_stages=4, acc_stages=2):
         self.ab = Ring(ab_stages, Tma((128 + 256) * 64 * 2), Umma)   # TMA fills, MMA drains
         self.acc = Ring(acc_stages, Umma, Threads)                   # MMA fills, epilogue drains
@@ -224,8 +224,9 @@ def load(self, ab: Producer, tiles: Tiles, ctx: PersistentGemmCtx):
 - `OneShot()`: one work item per CTA. With the default `Raster()` the launch grid is the tile
   space, `(m_tiles, n_tiles, l)`, and the item is read from `blockIdx`. When `n_tiles` or `l`
   exceeds the 65535 limit of `gridDim.y`/`z`, the launch falls back to a 1-D grid and the
-  kernel decodes the index. The check costs about 25-45 ns on 512^3 to 2048^2 GEMMs (GB300).
-  Launch with `self.launch_config(work)` or `work.grid()`: the grid depends on the policy.
+  kernel decodes the index. The check costs about 25-50 ns on 512^3 to 2048^2 GEMMs (GB300).
+  Launch with `self.launch_config(work)` or `work.grid()` to get the tile grid; a hand-built
+  `(total, 1, 1)` grid also works, through the decode.
 - `StaticPersistent()`: each CTA strides by the persistent grid size.
 - `DynamicPersistent()`: claims work through a global atomic counter.
 - `Clc(stages=2)`: Blackwell cluster launch control.
@@ -331,7 +332,8 @@ TMEM: 512 columns used, 512 allocated
 
 `describe()` returns a string. Set `op.trace_protocol = True` before the first `describe()` or
 compile to include the traced acquire/commit/wait/release sequence and source lines after
-compilation. This is not a runtime history.
+compilation; include `trace_key()` in custom compile-cache keys (the examples do) so a cached
+untraced kernel isn't reused. This is not a runtime history.
 
 Compilation also checks TMA copies using channel barriers against the required CTA group and
 armed byte count. A confirmed mismatch raises `ProtocolError`. Unknown atoms (including

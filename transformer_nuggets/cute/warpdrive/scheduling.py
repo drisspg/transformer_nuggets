@@ -22,12 +22,12 @@ Three independent, compile-time choices:
 * **launch grid**: ``OneShot`` with the default ``Raster()`` (along m, no swizzle or reversal)
   launches the tile space itself, ``(m_tiles, n_tiles, l)`` CTAs (times the cluster size along
   x), and reads the item from ``blockIdx`` with no division. A launch whose ``n_tiles`` or ``l``
-  exceeds the 65535 limit of ``gridDim.y``/``z`` falls back to the 1-D grid; host and kernel
-  make the same runtime choice from the extents, and the kernel decodes the index in a skipped
-  branch of the prologue (about 25-45 ns on 512^3 to 2048^2 GEMMs, measured against reading
+  exceeds the 65535 limit of ``gridDim.y``/``z`` falls back to the 1-D grid; the kernel sees a
+  1-D launch (``gridDim.y = gridDim.z = 1`` with more than one ``(n, l)`` pair) and decodes the
+  index in a skipped branch of the prologue (about 25-50 ns on 512^3 to 2048^2 GEMMs, measured against reading
   ``blockIdx`` unconditionally; the 1-D decode on every launch cost about 200 ns; GB300,
-  CuTeDSL 4.8.0, CUDA-graph replay of examples/gemm.py). Launch with ``work.grid()`` or
-  ``launch_config(work)``. Every other
+  CuTeDSL 4.8.0, CUDA-graph replay of examples/gemm.py). A hand-built ``(total, 1, 1)`` grid is
+  also correct, just not division-free. Every other
   combination launches a 1-D grid and decodes the index.
 * **distribution**, derived by the layer from the policy. Index sequences every role can compute
   (``OneShot``, ``StaticPersistent``) are decoded locally in each role with no synchronization.
@@ -488,7 +488,8 @@ class TileProblem:
         self.cs = stream.cluster_size  # CTAs per work unit
 
     def units(self):
-        """Device-side: launched work units (CTAs, or clusters of a pair)."""
+        """Device-side: launched work units along x (CTAs, or clusters of a pair); the
+        persistent policies' stride. A ``OneShot`` tile grid has more units along y and z."""
         grid = cute.arch.grid_dim()[0]
         return grid if self.cs == 1 else grid // self.cs
 
@@ -538,8 +539,9 @@ class TileProblem:
         return new
 
     def grid(self):
-        """Launch grid for this policy: ``(ctas, 1, 1)``; ``max_ctas`` caps CTAs, so a pair
-        launches at most ``max_ctas // 2`` clusters."""
+        """Launch grid for this policy: ``(ctas, 1, 1)``, or the tile space for a ``OneShot``
+        over plain ``Raster()`` (``tile_grid_dims``); ``max_ctas`` caps CTAs, so a pair launches
+        at most ``max_ctas // 2`` clusters."""
         policy = self.stream.policy
         uses_cap = isinstance(policy, (StaticPersistent, DynamicPersistent))
         if uses_cap and self.max_ctas is None:
@@ -657,11 +659,14 @@ def tile_grid_dims(space, cs: int = 1):
 
 @cute.jit
 def _grid_item(order, space, m, n, l):
-    """Item words of a ``_tile_grid`` stream: ``blockIdx`` as is, or, after the 1-D fallback
-    (where ``m`` is the linear index and ``n = l = 0``), the decoded index."""
+    """Item words of a ``_tile_grid`` stream: ``blockIdx`` as is on a tile-space grid, or the
+    decoded index on any 1-D grid (the fallback, or a hand-built ``(total, 1, 1)`` launch, where
+    ``m`` is the linear index and ``n = l = 0``). The launch shape decides, not the extents, so
+    both launches are correct; with ``n_tiles = l = 1`` the two grids coincide."""
     decode = order.decode  # a method call on `order` in the branch would carry it
     _, en, el = space
-    if (en > MAX_GRID_YZ) | (el > MAX_GRID_YZ):
+    _, gdy, gdz = cute.arch.grid_dim()
+    if (gdy * gdz == 1) & (en * el > 1):
         dm, dn, dl = decode(m, space)
         m, n, l = Int32(dm), Int32(dn), Int32(dl)
     return m, n, l

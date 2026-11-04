@@ -165,7 +165,10 @@ class ScheduleToy(WarpSpecialized):
     def _visit(self, r: int, tiles, count, ctx):
         m, n, l = tiles.work
         tile = (l * ctx.en + n) * ctx.em + m
-        if cute.arch.lane_idx() == 0 and cute.arch.warp_idx() == r:
+        # Out-of-range coordinates (a misread launch grid) never count, even when their linear
+        # id happens to land on a real tile.
+        in_range = (m < ctx.em) & (n < ctx.en)
+        if cute.arch.lane_idx() == 0 and cute.arch.warp_idx() == r and in_range:
             bidx, _, _ = cute.arch.block_idx()
             if count < self.MAX_ITEMS:
                 ctx.log[r, bidx, count] = tile
@@ -220,8 +223,10 @@ class ScheduleToy(WarpSpecialized):
     ):
         work = self.tiles.problem((em, en, el), workspace, max_ctas)
         self.kernel.set_name_prefix(self.get_name())
+        # "1d" modes launch a hand-built (total, 1, 1) grid instead of the policy's.
+        grid = (work.total, 1, 1) if cutlass.const_expr(self.mode.endswith("1d")) else work.grid()
         self.kernel(log, hits, work).launch(
-            grid=work.grid(), block=(self.num_threads, 1, 1), stream=stream
+            grid=grid, block=(self.num_threads, 1, 1), stream=stream
         )
 
 
@@ -309,12 +314,14 @@ def test_tile_grid_dims_respect_the_grid_limit(space, cs, grid):
     assert tile_grid_dims(space, cs) == grid
 
 
+@pytest.mark.parametrize("launch", ["policy", "1d"])
 @pytest.mark.parametrize("ext", [(1, 1, 1), (5, 3, 1), (13, 29, 3), (1, 65536, 1)])
-def test_oneshot_launches_the_tile_grid(requires_blackwell, ext):
+def test_oneshot_launches_the_tile_grid(requires_blackwell, ext, launch):
     """OneShot over plain Raster() launches (m_tiles, n_tiles, l) CTAs and reads each item from
-    blockIdx, or a 1-D grid it decodes once n_tiles exceeds gridDim.y; every tile still reaches
-    every role once."""
-    op = ScheduleToy(OneShot(), order=Raster(), mode="tile_grid")
+    blockIdx, or a 1-D grid it decodes once n_tiles exceeds gridDim.y. A hand-built 1-D launch
+    is decoded the same way; every tile still reaches every role once."""
+    mode = "tile_grid_1d" if launch == "1d" else "tile_grid"
+    op = ScheduleToy(OneShot(), order=Raster(), mode=mode)
     _, hits, _ = run_toy(op, ext, 148, reps=2)
     assert (hits == 1).all(), f"tiles missed or repeated: {hits}"
 
