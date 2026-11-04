@@ -22,6 +22,7 @@ from cutlass_static_persistent_tile_scheduler import (
 from test_cute_warpdrive_scheduling import (
     EMPTY_SPACES,
     OVERFLOWING_SPACES,
+    CheckedRaster,
     CountToy,
     ScheduleToy,
     SkipOdd,
@@ -34,21 +35,21 @@ from test_cute_warpdrive_scheduling import (
 
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
+    AtomicPersistent,
     ClusterLaunchControl,
     CtaPair,
     CutlassRaster,
-    AtomicPersistent,
     Fa4Mapping,
-    OneShot,
     IndexSchedule,
+    OneShot,
     ProtocolError,
     Raster,
-    SingleCta,
     Readiness,
+    SingleCta,
     StaticPersistent,
+    WarpSpecialized,
     WorkCursor,
     WorkStream,
-    WarpSpecialized,
     role,
 )
 
@@ -569,9 +570,12 @@ class RawItemToy(WarpSpecialized):
         (SkipOdd(swizzle=2), "grid", (9, 7, 2), SingleCta()),
         (CutlassRaster(swizzle=4), "grid", (7, 5, 2), SingleCta()),
         (Raster(), "grid", (0, 3, 1), SingleCta()),  # empty: one unit, no valid item
+        # A default WorkMap traps if decoded past the end: one CTA per item, plus drops.
+        (CheckedRaster(drop_odd=True), "grid", (9, 7, 2), CtaPair()),
+        (CheckedRaster(), "grid", (0, 3, 1), SingleCta()),
     ],
     ids=["tile_grid", "fallback", "hand_1d", "pair_fallback", "pair_swizzle", "skip", "cutlass",
-         "empty"],
+         "empty", "checked_skip", "checked_empty"],
 )  # fmt: skip
 def test_raw_role_single_item(requires_blackwell, mapping, mode, ext, cluster):
     op = RawItemToy(mapping, mode, cluster)
@@ -591,7 +595,7 @@ def test_raw_role_single_item(requires_blackwell, mapping, mode, ext, cluster):
     hits = hits.cpu()[:, :total]
     kept = torch.tensor(
         [
-            0 if isinstance(mapping, SkipOdd) and mapping.skip((m, n, li), ext) else cluster.size
+            0 if hasattr(mapping, "kept") and not mapping.kept((m, n, li)) else cluster.size
             for li in range(el)
             for n in range(en)
             for m in range(em)

@@ -18,9 +18,9 @@ from cutlass import cute
 from test.warpdrive_fuzz import gen, runtime, runtime_mutants, sched
 from transformer_nuggets.cute.warpdrive import (
     AtomicPersistent,
+    WarpSpecialized,
     WorkCursor,
     WorkStream,
-    WarpSpecialized,
     role,
 )
 

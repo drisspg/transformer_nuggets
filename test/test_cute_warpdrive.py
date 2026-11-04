@@ -22,13 +22,13 @@ from transformer_nuggets.cute.warpdrive import (
     Ring,
     Slots,
     Threads,
-    WorkStream,
     Tma,
     TmemPlan,
     Turn,
     Turnstile,
     Umma,
     WarpSpecialized,
+    WorkStream,
     role,
 )
 from transformer_nuggets.cute.warpdrive.examples.gemm import gemm

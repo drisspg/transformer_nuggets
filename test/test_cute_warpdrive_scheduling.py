@@ -15,18 +15,19 @@ from cutlass import Int32, cute
 
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
+    AtomicPersistent,
     ClusterLaunchControl,
     CtaPair,
-    AtomicPersistent,
     OneShot,
     PdlWait,
     ProtocolError,
     Raster,
     SingleCta,
     StaticPersistent,
-    WorkCursor,
-    WorkStream,
     WarpSpecialized,
+    WorkCursor,
+    WorkMap,
+    WorkStream,
     role,
 )
 from transformer_nuggets.cute.warpdrive.scheduling import tile_grid_dims
@@ -56,7 +57,7 @@ def requires_blackwell() -> None:
 
 def _all_coords(mapping, ext):
     total = ext[0] * ext[1] * ext[2]
-    return [mapping.decode(i, ext) for i in range(total)]
+    return [mapping.decode(i, ext)[1] for i in range(total)]
 
 
 EXTENTS = [(1, 1, 1), (1, 7, 1), (7, 1, 2), (5, 3, 1), (16, 16, 1), (13, 29, 3), (3, 100, 1)]
@@ -142,7 +143,8 @@ EMPTY_SPACES = [
 @pytest.mark.parametrize("mapping", MAPPINGS, ids=lambda o: o.get_key())
 def test_bound_empty_space_has_no_items_and_decodes(mapping, space):
     """Host Int32 arithmetic folds like the device's (and raises on division by zero): a bound
-    empty space counts no items, and decode, which runs past the end, never divides by zero."""
+    empty space counts no items, and decode, which runs past the end (``decodes_any_index``),
+    never divides by zero."""
     bound = mapping.bind(space)
     assert int(mapping.count64(bound)) == 0
     for index in range(4):
@@ -191,8 +193,8 @@ def test_swizzled_decode_does_not_overflow_int32(mapping):
     bound = mapping.bind(ext)
     total = 3 * 2**29
     for index in [0, 5, 2**29 + 7, total - 2**29 - 1, total - 1]:
-        got = tuple(int(w) for w in mapping.decode(Int32(index), bound))
-        assert got == mapping.decode(index, ext)
+        got = tuple(int(w) for w in mapping.decode(Int32(index), bound)[1])
+        assert got == mapping.decode(index, ext)[1]
 
 
 def test_stream_keys_exclude_runtime_values():
@@ -210,16 +212,64 @@ def test_stream_keys_exclude_runtime_values():
 
 @dataclass(frozen=True)
 class SkipOdd(Raster):
-    """Raster that skips tiles whose m + n is odd (an empty-item test mapping)."""
+    """Raster that drops tiles whose m + n is odd (an empty-item test mapping)."""
 
     skips = True
 
-    def skip(self, item, space):
+    def decode(self, index, space):
+        _, item = super().decode(index, space)
+        return self.kept(item), item
+
+    def kept(self, item):
         m, n, _ = item
-        return (m + n) % 2 == 1
+        return (m + n) % 2 == 0
 
     def get_key(self) -> str:
         return "skipodd_" + super().get_key()
+
+
+SWIZZLED = Raster(along="n", swizzle=3, reverse=("m", "l"))
+
+
+@cute.jit
+def _trap_outside(index, count):
+    if (index < 0) | (index >= count):
+        cute.arch.inline_ptx("trap;", read_only_args=[])
+
+
+@dataclass(frozen=True)
+class CheckedRaster(WorkMap):
+    """A default ``WorkMap`` (no ``decodes_any_index``) over a swizzled Raster space whose decode
+    traps on an index outside ``[0, count)``: the layer must never decode past the end, on an
+    empty space, or after a dropped item. ``drop_odd`` drops tiles whose m + n is odd."""
+
+    drop_odd: bool = False
+    words = 3
+
+    @property
+    def skips(self) -> bool:
+        return self.drop_odd
+
+    def bind(self, space):
+        return Raster().bind(space)
+
+    def count64(self, space):
+        return Raster().count64(space)
+
+    def decode(self, index, space):
+        em, en, el = space
+        _trap_outside(index, em * en * el)
+        _, item = SWIZZLED.decode(index, space)
+        return self.kept(item), item
+
+    def kept(self, item):
+        if not self.drop_odd:
+            return True
+        m, n, _ = item
+        return (m + n) % 2 == 0
+
+    def get_key(self) -> str:
+        return f"checked{int(self.drop_odd)}"
 
 
 class ScheduleToy(WarpSpecialized):
@@ -384,7 +434,7 @@ def test_every_role_sees_every_tile_once(requires_blackwell, schedule, ext, max_
         mapping = op.work.mapping
         for b in range(grid):
             for k in range(min(ScheduleToy.MAX_ITEMS, len(range(b, total, grid)))):
-                m, n, li = mapping.decode(b + k * grid, ext)
+                _, (m, n, li) = mapping.decode(b + k * grid, ext)
                 assert log[0, b, k] == (li * ext[1] + n) * ext[0] + m
     assert ws[:2].tolist() == [0, 0], "atomic counter must self-reset"
 
@@ -445,9 +495,9 @@ def test_skip_hook_hides_items_from_every_role(requires_blackwell, schedule, rea
 
 @dataclass(frozen=True)
 class SkipAll(SkipOdd):
-    def skip(self, item, space):
+    def kept(self, item):
         m, _, _ = item
-        return m >= 0
+        return m < 0
 
 
 @pytest.mark.parametrize("schedule", ["oneshot", "static", "atomic", "clc"])
@@ -521,7 +571,6 @@ def compile_count_toy(op: CountToy):
     return _TOYS[key]
 
 
-SWIZZLED = Raster(along="n", swizzle=3, reverse=("m", "l"))
 COUNT_CASES = {
     "oneshot_tile_grid": (OneShot(), Raster()),
     "oneshot_1d": (OneShot(), SWIZZLED),
@@ -531,8 +580,31 @@ COUNT_CASES = {
     # Skip hooks: local skipping, and the scheduler publishing the first item itself.
     "static_skip": (StaticPersistent(), SkipOdd(swizzle=2)),
     "clc_skip": (ClusterLaunchControl(stages=2), SkipOdd(swizzle=2)),
+    # A default WorkMap traps when decoded outside [0, count): no schedule decodes past the end.
+    "oneshot_checked": (OneShot(), CheckedRaster()),
+    "static_checked": (StaticPersistent(), CheckedRaster()),
+    "atomic_checked": (AtomicPersistent(stages=2), CheckedRaster()),
+    "clc_checked": (ClusterLaunchControl(stages=2), CheckedRaster()),
+    "static_checked_skip": (StaticPersistent(), CheckedRaster(drop_odd=True)),
+    "atomic_checked_skip": (AtomicPersistent(stages=1), CheckedRaster(drop_odd=True)),
+    "clc_checked_skip": (ClusterLaunchControl(stages=2), CheckedRaster(drop_odd=True)),
 }
 PAIR_IDS = ["single", "pair"]
+
+
+@dataclass(frozen=True)
+class UndeclaredDrop(CheckedRaster):
+    def kept(self, item):
+        m, _, _ = item
+        return m >= 0  # a runtime keep from a mapping that does not declare skips
+
+
+def test_runtime_keep_needs_skips(requires_blackwell):
+    """Only a mapping that declares ``skips`` may drop items: the layer would otherwise skip
+    no index and run a dropped item."""
+    op = CountToy(StaticPersistent(), UndeclaredDrop(), SingleCta())
+    with pytest.raises(Exception, match="sets skips = True"):
+        compile_count_toy(op)
 
 
 def _count_items(fn, ws, space, max_ctas):
@@ -548,7 +620,7 @@ def _check_valid_launch(op, fn, ws):
     space = (5, 3, 2)
     mapping = op.work.mapping
     kept = sum(
-        not (mapping.skips and mapping.skip(item, space))
+        not mapping.skips or mapping.kept(item)
         for item in itertools.product(*(range(e) for e in space))
     )
     want = kept * op.cluster.size

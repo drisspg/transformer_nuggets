@@ -45,14 +45,14 @@ from transformer_nuggets.cute.warpdrive import (
     SingleCta,
     StaticPersistent,
     Threads,
-    WorkCursor,
-    WorkStream,
     Tma,
     Tmem,
     TmemPlan,
     Umma,
     WarpSpecialized,
+    WorkCursor,
     WorkMap,
+    WorkStream,
     role,
 )
 from transformer_nuggets.cute.warpdrive.examples.gemm import check_gemm_args
@@ -396,9 +396,9 @@ def persistent_gemm(
 
 if __name__ == "__main__":
     from transformer_nuggets.cute.warpdrive import (
+        AtomicPersistent,
         ClusterLaunchControl,
         CtaPair,
-        AtomicPersistent,
         OneShot,
     )
 

@@ -53,7 +53,7 @@ def raster_of(s: gen.StreamSpec):
 def check_raster(s: gen.StreamSpec) -> list[str]:
     order = raster_of(s)
     want = oracle.raster_order(s)
-    got = [tuple(order.decode(i, s.extents)) for i in range(s.total)]
+    got = [tuple(order.decode(i, s.extents)[1]) for i in range(s.total)]
     if got != want:
         bad = next(i for i, (a, b) in enumerate(zip(got, want, strict=True)) if a != b)
         return [
@@ -64,9 +64,9 @@ def check_raster(s: gen.StreamSpec) -> list[str]:
 
 def check_grid(s: gen.StreamSpec, cs: int) -> list[str]:
     from transformer_nuggets.cute.warpdrive import (
+        AtomicPersistent,
         ClusterLaunchControl,
         CtaPair,
-        AtomicPersistent,
         OneShot,
         SingleCta,
         StaticPersistent,

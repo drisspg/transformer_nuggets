@@ -73,14 +73,15 @@ class CutlassRaster(WorkMap):
     replaces the deprecated ``cutlass.utils`` copy): its problem layout pads the banded axis to a
     multiple of ``swizzle``, and on that padded space its order is exactly ``Raster(along,
     swizzle)``, whose bands are then all full. CUTLASS hands the padded tiles to the kernel; this
-    adapter skips them, so roles only see tiles inside the space. The tests check the order
-    against the helper itself. ``bind`` normalizes extents like ``Raster`` (an empty space has
-    no items).
+    adapter drops them (``keep = False``), so roles only see tiles inside the space. The tests
+    check the order against the helper itself. ``bind`` normalizes extents like ``Raster`` (an
+    empty space has no items), so ``decode`` is defined for any index.
     """
 
     swizzle: int = 1
     along: str = "m"
     words = 3
+    decodes_any_index = True
 
     def __post_init__(self):
         if self.along not in ("m", "n"):
@@ -116,13 +117,11 @@ class CutlassRaster(WorkMap):
         return Raster().count64(self._pad(extents, lambda e: _round_up(e, self.swizzle)))
 
     def decode(self, index, space):
-        padded, _ = space
-        return self._raster.decode(index, padded)
-
-    def skip(self, item, space):
-        _, (em, en, _) = space
-        m, n, _ = item
-        return (m >= em) | (n >= en)
+        padded, (em, en, _) = space
+        _, (m, n, li) = self._raster.decode(index, padded)
+        if self.swizzle == 1:  # no padding: every tile is inside the space
+            return True, (m, n, li)
+        return (m < em) & (n < en), (m, n, li)
 
     def get_key(self) -> str:
         return f"cutlasssp{self.along}{self.swizzle}"
@@ -162,6 +161,8 @@ class Fa4Mapping(WorkMap):
     head_dim_v: int = 128
     element_size: int = 2
     words = 3
+    # The params are built over at least one tile and one key, so FA4's divisions never see 0.
+    decodes_any_index = True
 
     def __post_init__(self):
         ts = _fa4_tile_scheduler()
@@ -219,7 +220,7 @@ class Fa4Mapping(WorkMap):
             scheduler = self.scheduler(params, Int32(index))
         else:
             scheduler = self.scheduler(params, Int32(index), Int32(0))
-        return tuple(scheduler.get_current_work().tile_idx[:3])
+        return True, tuple(scheduler.get_current_work().tile_idx[:3])
 
     def get_key(self) -> str:
         if self._persistent:

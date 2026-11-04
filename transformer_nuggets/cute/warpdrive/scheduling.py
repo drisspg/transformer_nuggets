@@ -18,8 +18,9 @@ Three independent, compile-time choices:
 * **mapping** (a ``WorkMap``): ``index -> work item``, a tuple of Int32 words that ``unpack()``
   turns into whatever the roles consume. ``Raster`` is the tile mapping (row/column raster, L2
   swizzle bands, reversed axes for longest-processing-time-first). The mapping owns its runtime
-  ``space`` (``Raster``: tile extents), the item count, and an optional ``skip(item)`` predicate
-  for empty items.
+  ``space`` (``Raster``: tile extents), the item count (``count64``), and ``decode``, which
+  returns ``(keep, words)``: a mapping that declares ``skips`` may drop empty items with
+  ``keep = False``.
 * **launch grid**: ``OneShot`` with the default ``Raster()`` (along m, no swizzle or reversal)
   launches the tile space itself, ``(m_tiles, n_tiles, l)`` CTAs (times the cluster size along
   x), and reads the item from ``blockIdx`` with no division. A launch whose ``n_tiles`` or ``l``
@@ -42,7 +43,8 @@ Three independent, compile-time choices:
 
 Wherever decoding happens (each role in local mode, the scheduler warp in broadcast mode) the
 stream first runs its readiness hook once (``ready=PdlWait()``) and steps past items the mapping
-skips, so every role sees the same item sequence.
+drops (``keep = False``), so every role sees the same item sequence. Only valid indices are
+decoded (``WorkMap.decodes_any_index`` is the one exception, for pure total decoders).
 
 A kernel declares ``self.work = WorkStream(mapping=Raster(swizzle=8),
 schedule=ClusterLaunchControl())``; roles take ``work: WorkCursor`` and loop::
@@ -69,7 +71,7 @@ launches ordered on one stream (including CUDA-graph replays) reuse one workspac
 reset. A workspace must not be shared by concurrently running launches.
 
 Custom schedules subclass the same public protocols as the built-ins: ``IndexSchedule`` (next
-index), ``WorkMap`` (index -> item, optional ``skip``), and ``Readiness`` (wait before the first
+index), ``WorkMap`` (index -> ``(keep, item)``), and ``Readiness`` (wait before the first
 decode). Their docstrings say which methods run on the host (in the ``@cute.jit`` entry point)
 and which on the device, and what each must guarantee. ``adapters.py`` wraps external schedulers
 (CUTLASS, FA4) as mappings.
@@ -132,24 +134,33 @@ class WorkMap:
       ``BoundWork.total`` the kernel receives; a count the launch cannot index in Int32 is
       rejected at launch (``BoundWork.grid``), so the narrowing never truncates a launched
       count. An empty space counts 0 and runs no items.
-    * ``decode(index, space)``, device: ``words`` Int32-convertible values. It may be called with
-      ``index >= count`` (the result is then ignored), including on an empty space, and must not
-      fault or divide by zero there.
+    * ``decode(index, space)``, device: ``(keep, words)``, a boolean and ``words``
+      Int32-convertible values. The layer calls it only for valid indices, ``0 <= index <
+      total``, after the readiness hook, so it may read per-item tables and a device-written
+      length there. ``keep = False`` removes the item permanently for every role; only a mapping
+      that sets ``skips = True`` may return a runtime ``keep`` (any other must return the
+      constant ``True``, checked at trace time). The words of a dropped item are ignored.
+    * ``decodes_any_index`` (class attribute, default ``False``): set it only when ``decode`` is
+      a pure function defined for every nonnegative Int32 index, including ``index >= total``
+      and empty spaces (no table reads, no division by a runtime value that may be zero). The
+      layer may then decode past the end and discard the result, which saves a branch per item
+      on the decoding warps. ``Raster`` and the ``adapters.py`` mappings set it; it is the one
+      exception to "never decoded past the end".
     * ``unpack(words)``, device: what ``work.item`` returns (default: the tuple of words).
-    * ``skips`` and ``skip(item, space)`` (optional), device: with ``skips = True``, items whose
-      ``skip`` is true are removed permanently for every role. Only called for valid indices; it
-      is not a readiness wait. It must give the same answer in every role and CTA.
     * ``get_key()``, host: compile-key fragment naming every compile-time choice (never runtime
       extents), in lowercase letters, digits and underscores (examples put it in kernel names).
       ``describe()`` (optional): text for ``describe()``.
 
-    Every method sees the bound space. ``decode`` and ``skip`` must be pure functions of their
-    arguments (plus tables written before the launch, or before ``ready`` returns), so every role
-    that decodes an index gets the same item.
+    Every method sees the bound space. ``decode`` must be a pure function of its arguments (plus
+    tables written before the launch, or before ``ready`` returns), so every role that decodes an
+    index gets the same item; ``keep`` must give the same answer in every role and CTA. A
+    device-built work list binds a host-visible capacity as the count and reads its true length
+    in ``decode`` (``examples/packed_work.py``); the host never reads device memory.
     """
 
     words: int = 1
     skips = False
+    decodes_any_index = False
 
     def bind(self, space):
         return space
@@ -162,9 +173,6 @@ class WorkMap:
 
     def unpack(self, words):
         return tuple(words)
-
-    def skip(self, item, space):
-        raise NotImplementedError
 
     def get_key(self) -> str:
         raise NotImplementedError
@@ -186,7 +194,8 @@ class Raster(WorkMap):
     so it does not overflow for any index of a space the launch admits (``BoundWork.grid``).
 
     ``bind`` treats a negative extent as zero and maps an empty space to ``(1, 1, 0)``: no
-    items, and every divisor in ``decode`` is 1. It runs in the host part of the jit entry
+    items, and every divisor in ``decode`` is 1. ``decode`` is therefore defined for any index
+    (``decodes_any_index``) and keeps every item. It runs in the host part of the jit entry
     point, so kernels pay nothing for it.
     """
 
@@ -194,6 +203,7 @@ class Raster(WorkMap):
     swizzle: int = 1
     reverse: tuple[str, ...] = ()
     words = 3
+    decodes_any_index = True
 
     def __post_init__(self):
         if self.along not in ("m", "n"):
@@ -250,7 +260,7 @@ class Raster(WorkMap):
             n = en - 1 - n
         if "l" in self.reverse:
             li = el - 1 - li
-        return m, n, li
+        return True, (m, n, li)
 
     def get_key(self) -> str:
         return f"{self.along}{self.swizzle}" + (
@@ -274,7 +284,7 @@ class Raster(WorkMap):
 class Readiness:
     """Public protocol for ``WorkStream(ready=...)``: ``wait()`` runs on the device once,
     wherever the stream decodes (each role in local mode, the scheduler warp in broadcast mode),
-    before the first ``decode``/``skip``. It must return in every warp that calls it.
+    before the first ``decode``. It must return in every warp that calls it.
     ``get_key()`` (host) names it in the compile key."""
 
     def wait(self):
@@ -622,7 +632,7 @@ class WorkStream:
     def single_item(self):
         """``valid, item = self.work.single_item()``: this CTA's work item for a raw role, which
         takes no ``WorkCursor``. Only for non-persistent local schedules (``OneShot``), where a
-        unit has at most one item. It runs the readiness hook and the skip predicate like a managed
+        unit has at most one item. It runs the readiness hook and drops items like a managed
         role and reads the item the way the cursor does, so it stays correct on the 1-D
         fallback grid, a hand-built ``(total, 1, 1)`` grid, a ``CtaPair``, and custom
         mappings. ``valid`` is false for an empty space or a skipped item. Call it after
@@ -813,19 +823,48 @@ def _narrow(count):
     return Int32(cutlass.min(Int64(count), Int64(INT32_MAX)))
 
 
+def _keep_words(mapping, index, space):
+    """``(keep, words)`` of ``mapping.decode``, with the words as Int32 values."""
+    keep, words = mapping.decode(index, space)
+    words = [Int32(w) for w in words]
+    if len(words) != mapping.words:
+        raise ProtocolError(
+            f"{type(mapping).__name__}.decode returned {len(words)} words; its words is "
+            f"{mapping.words}"
+        )
+    if not mapping.skips and keep is not True:
+        raise ProtocolError(
+            f"{type(mapping).__name__}.decode returned keep={keep!r}; a mapping that drops items "
+            "sets skips = True (any other returns the constant True)"
+        )
+    return keep, words
+
+
 def _decode(stream, index, problem):
-    return [Int32(w) for w in stream.mapping.decode(index, problem.space)]
+    """Item words of ``index``: decoded for a valid index, zeros past the end. Only a mapping
+    with ``decodes_any_index`` is evaluated unconditionally (no branch)."""
+    mapping = stream.mapping
+    if mapping.decodes_any_index:
+        return _keep_words(mapping, index, problem.space)[1]
+    return list(_decode_valid(mapping, index, problem.total, problem.space))
+
+
+@cute.jit
+def _decode_valid(mapping, index, total, space):
+    words = tuple(Int32(0) for _ in range(mapping.words))
+    if index < total:
+        words = tuple(_keep_words(mapping, index, space)[1])
+    return words
 
 
 @cute.jit
 def _skipped(stream, index, problem):
-    """``skip(item)`` for a valid index; false past the end (skip may read per-item tables)."""
+    """``keep`` is false for a valid index; false past the end (decode may read per-item
+    tables)."""
     skipped = cutlass.Boolean(False)
     if index < problem.total:
-        mapping = stream.mapping
-        skipped = cutlass.Boolean(
-            mapping.skip(mapping.unpack(_decode(stream, index, problem)), problem.space)
-        )
+        keep, _ = _keep_words(stream.mapping, index, problem.space)
+        skipped = ~cutlass.Boolean(keep)
     return skipped
 
 
@@ -934,7 +973,7 @@ def _grid_item(mapping, space, m, n, li):
     _, en, el = space
     _, gdy, gdz = cute.arch.grid_dim()
     if (gdy * gdz == 1) & (en * el > 1):
-        dm, dn, dl = decode(m, space)
+        _, (dm, dn, dl) = decode(m, space)
         m, n, li = Int32(dm), Int32(dn), Int32(dl)
     return m, n, li
 

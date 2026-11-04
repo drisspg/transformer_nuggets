@@ -15,22 +15,22 @@ from cutlass import cute
 
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
+    AtomicPersistent,
     ClusterLaunchControl,
     Consumer,
     CtaPair,
-    AtomicPersistent,
     Instance,
     Producer,
     Slots,
     StaticPersistent,
     Threads,
-    WorkCursor,
-    WorkStream,
     Tmem,
     Turn,
     Turnstile,
     Umma,
     WarpSpecialized,
+    WorkCursor,
+    WorkStream,
     role,
 )
 from transformer_nuggets.cute.warpdrive.examples.gemm import Gemm, GemmParams, compile_gemm

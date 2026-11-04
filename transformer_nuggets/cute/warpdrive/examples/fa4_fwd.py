@@ -62,8 +62,6 @@ from transformer_nuggets.cute.warpdrive import (
     SingleCta,
     Slots,
     Threads,
-    WorkCursor,
-    WorkStream,
     Tma,
     Tmem,
     TmemPlan,
@@ -71,6 +69,8 @@ from transformer_nuggets.cute.warpdrive import (
     Turnstile,
     Umma,
     WarpSpecialized,
+    WorkCursor,
+    WorkStream,
     role,
 )
 

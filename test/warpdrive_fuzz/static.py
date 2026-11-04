@@ -15,11 +15,11 @@ from types import FunctionType
 from cutlass import cute
 
 from transformer_nuggets.cute.warpdrive import (
+    AtomicPersistent,
     Barriers,
     ClusterLaunchControl,
     Consumer,
     CtaPair,
-    AtomicPersistent,
     Instance,
     Producer,
     ProtocolError,
@@ -28,8 +28,6 @@ from transformer_nuggets.cute.warpdrive import (
     SingleCta,
     Slots,
     Threads,
-    WorkCursor,
-    WorkStream,
     Tma,
     Tmem,
     TmemPlan,
@@ -37,6 +35,8 @@ from transformer_nuggets.cute.warpdrive import (
     Turnstile,
     Umma,
     WarpSpecialized,
+    WorkCursor,
+    WorkStream,
     role,
     unchecked,
 )
