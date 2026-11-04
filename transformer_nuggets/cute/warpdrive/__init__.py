@@ -25,8 +25,8 @@ Work scheduling (``scheduling.py``): declare ``self.work = WorkStream(mapping=..
 schedule=...)`` and give roles ``work: WorkCursor``; the index schedule (``OneShot``,
 ``StaticPersistent``, ``AtomicPersistent``, ``ClusterLaunchControl``, or an ``IndexSchedule``
 subclass) and the mapping (``Raster``, a ``WorkMap`` subclass, or an ``adapters.py`` wrapper
-around a CUTLASS/FA4 scheduler's tile order) are one-line switches. Clusters (``cluster.py``): declare
-``self.cluster = CtaPair()`` and pin the MMA role with ``@role(..., cta="leader")``. See
+around a CUTLASS/FA4 scheduler's tile order) are one-line switches. Clusters
+(``cluster.py``): declare ``self.cluster = CtaPair()`` and pin the MMA role with ``@role(..., cta="leader")``. See
 ``examples/`` for a GEMM, a persistent GEMM, and an FA4-style attention forward.
 
 Design principles

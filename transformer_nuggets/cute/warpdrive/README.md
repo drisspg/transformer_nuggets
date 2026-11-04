@@ -221,7 +221,7 @@ counts does not rewrite the math's thread-to-data mapping.
 Use `self, params, *, ...state` in role signatures. `params` is the kernel-specific frozen
 input dataclass; the rest includes the warpdrive objects the role uses.
 
-**Return every stateful argument:** producer endpoints, consumer endpoints, tile cursors and
+**Return every stateful argument:** producer endpoints, consumer endpoints, work cursors and
 turnstile seats. This is the same rule for every configuration, including IKET on/off and
 single-/two-CTA kernels. No need to work out which endpoints need cleanup:
 
@@ -501,11 +501,13 @@ class ReverseM(WorkMap):
   total`, after `ready`, so it may read per-item tables. `keep = False` drops the item for
   every role; only a mapping that sets `skips = True` may return a runtime `keep` (any other
   returns the constant `True`, checked at trace time).
-- `decodes_any_index = True` is the one exception to "never decoded past the end": set it only
-  when `decode` is a pure function defined for every nonnegative Int32 index, including empty
-  spaces (no table reads, no division by a runtime value that may be zero). The layer then
-  decodes unconditionally after each step and discards terminal results, which keeps a branch
-  off the decoding warps. `Raster`, `CutlassRaster` and `Fa4Mapping` set it.
+- `decodes_any_index = True` is the one exception: set it only when `decode` is a pure function
+  of launch-time data defined for every nonnegative Int32 index, including empty spaces (no
+  table reads, no division by a runtime value that may be zero). The layer may then decode
+  speculatively (past the end, or before `ready` on the tile grid) and discard the words, which
+  keeps a branch off the decoding warps; a skipping mapping's `keep` is still only used for
+  valid indices. `Raster`, `CutlassRaster` and `Fa4Mapping` set it; a subclass that overrides
+  `decode` must set it again.
 - A work list built on the device binds its host-visible capacity as the count and reads the
   true length in `decode`'s `keep`; the host never reads device memory.
   [packed_work.py](examples/packed_work.py) is such a mapping (`PackedWork`, rows of an int32
@@ -775,7 +777,7 @@ See the [pipeline profiler](../profiler/README.md#declarative-pipeline-analysis)
 
 ## Gotchas
 
-- Helpers taking channel ends, turnstile seats or tile cursors must return them; reassign at the
+- Helpers taking channel ends, turnstile seats or work cursors must return them; reassign at the
   call site (`s, stats = step(s, stats)`) so CuTeDSL carries their state through loops.
 - Define kernels in source files. CuTeDSL re-reads them for AST preprocessing.
 

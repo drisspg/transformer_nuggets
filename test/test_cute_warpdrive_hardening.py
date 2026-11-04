@@ -600,7 +600,7 @@ class MixedGemm(Gemm):
             cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition.x32), cutlass.Float32),
             cute.zipped_divide(ctx.acc_fake, ctx.epi_tiler)[None, 0],
         ).get_slice(tidx)
-        # A raw role takes no tile cursor; work_item() reads the OneShot item the way the cursor
+        # A raw role takes no work cursor; single_item() reads the OneShot item the way the cursor
         # does (blockIdx on the tile grid, decoded on the 1-D fallback). The wrapper never
         # launches an empty space, so the item is valid.
         _, (m, n, _) = self.work.single_item()

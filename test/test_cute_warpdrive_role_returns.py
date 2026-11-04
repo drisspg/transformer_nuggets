@@ -116,7 +116,7 @@ def test_returned_renamed_producer_drains_final_state(requires_blackwell, n):
         ("missing", "return all warpdrive state arguments; missing ch"),
         ("missing_consumer", "return all warpdrive state arguments; missing ch"),
         ("duplicate", "returned the same state argument"),
-        ("wrong_type", "return channel endpoints, tile cursors and turnstile seats"),
+        ("wrong_type", "return channel endpoints, work cursors and turnstile seats"),
     ],
 )
 def test_bad_role_result_rejected_before_launch(requires_blackwell, mode, message):

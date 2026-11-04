@@ -3,12 +3,13 @@
 The roles of ``gemm.py`` wrapped in a tile loop: warps 0-3 epilogue, 4 TMA load, 5 MMA, and
 (for the broadcast schedules) the layer's scheduler warp in padding warp 6. Two TMEM accumulator
 stages (2 x 256 columns) let the MMA warp run tile i+1's mainloop while the epilogue drains
-tile i; the epilogue stores through SMEM with TMA, which also clips ragged edges. The scheduling
-schedule and the cluster are constructor arguments::
+tile i; the epilogue stores through SMEM with TMA, which also clips ragged edges. The schedule,
+mapping and cluster are constructor arguments::
 
-    PersistentGemm(schedule=StaticPersistent())      # or OneShot(), AtomicPersistent(), ClusterLaunchControl()
+    PersistentGemm(schedule=StaticPersistent())  # or OneShot(), AtomicPersistent()
+    PersistentGemm(schedule=ClusterLaunchControl())  # or your own IndexSchedule
     PersistentGemm(mapping=CutlassRaster(swizzle=8))  # any WorkMap, or an adapter
-    PersistentGemm(cluster=CtaPair())              # 2-CTA: 256x256 MMA tiles, CtaGroup.TWO
+    PersistentGemm(cluster=CtaPair())  # 2-CTA: 256x256 MMA tiles, CtaGroup.TWO
 
 With ``CtaPair`` the MMA tile is 256x256x64: each CTA of the pair loads its 128 rows of A and
 its 128 rows of B, the leader's MMA warp issues 2-CTA MMAs reading both CTAs' SMEM, and each

@@ -764,8 +764,8 @@ def fa4_fwd(
 
     ``LSE`` is ``(batch, heads, seqlen_q)`` fp32 (natural log), as in FA4. ``schedule``: work
     scheduling (default ``OneShot()``; ``StaticPersistent()``, ``AtomicPersistent()``,
-    ``ClusterLaunchControl()`` run several (Q block, head, batch) items per CTA). ``max_ctas`` caps the
-    static/atomic persistent grid in CTAs (default: the SM count). ``cluster=CtaPair()``
+    ``ClusterLaunchControl()`` run several (Q block, head, batch) items per CTA). ``max_ctas``
+    caps the static/atomic persistent grid in CTAs (default: the SM count). ``cluster=CtaPair()``
     runs FA4's default 2-CTA schedule (512-row work items, 6 KV stages by default).
     ``mapping``: the order of the ``(query block, head, batch)`` items (default
     ``Raster(along="m")``; e.g. ``Raster(reverse="m")`` or ``Fa4Mapping(...)``).

@@ -264,7 +264,7 @@ def role(
     A list of warp ranges instantiates the method once per range; an Instance parameter receives
     its index. ``cta="leader"`` restricts execution to the leader of a pair; "all" is the default.
     ``raw=True`` accepts Instance, Tmem, Barriers and a context, but no managed channel ends or
-    tile cursors. Raw roles still take part in register allocation and TMEM teardown. Put this
+    work cursors. Raw roles still take part in register allocation and TMEM teardown. Put this
     decorator directly above ``@cute.jit``; CuTeDSL re-applies it when preprocessing the source.
     """
     if config is not None:
@@ -471,8 +471,9 @@ class WarpSpecialized:
             if idle:
                 raise ProtocolError(
                     f"{st.schedule.describe()} runs several work items per CTA, but roles {idle} "
-                    f"do not take `{name}: WorkCursor`; every role must loop over the stream (a "
-                    f"role with no per-item work drains it: `while {name}.valid: {name}.advance()`)"
+                    f"do not take `{name}: WorkCursor`; every role must loop over the stream "
+                    "(a role with no per-item work drains it: "
+                    f"`while {name}.valid: {name}.advance()`)"
                 )
         if not st.schedule.broadcast:
             return
@@ -1139,7 +1140,7 @@ def _returned_state(role_name: str, result, state_args: list[tuple[str, object]]
     for value in values:
         if not isinstance(value, _ROLE_STATE_TYPES):
             raise ProtocolError(
-                f"{role_name}: return channel endpoints, tile cursors and turnstile seats "
+                f"{role_name}: return channel endpoints, work cursors and turnstile seats "
                 f"(a single value or tuple), not {type(value).__name__}"
             )
         key = _state_identity(value)

@@ -2,7 +2,7 @@
 
 warpdrive derives synchronization for your declared roles. It does not prove that your
 algorithm is live. A successful `describe()` checks declarations; a successful compile also
-checks local handle lifetimes, tile-loop structure and recognizable TMA copies. Neither means
+checks local handle lifetimes, work-loop structure and recognizable TMA copies. Neither means
 that arbitrary accepted role bodies cannot deadlock.
 
 This contract is for CuTeDSL 4.8 on Blackwell SM100/SM103, with `SingleCta()` or `CtaPair()`.
@@ -19,7 +19,7 @@ unseeded wait cycle, and terminating user work. Specifically:
   CTA/cluster code; every participating thread reaches initialization and exit. Named barrier
   IDs **1 and 2** are reserved. Initialize `Barriers(counts=None)` before `run_roles`.
 - Carry ends, cursors and turnstile state through loops/helpers: return and reassign them.
-  Managed roles return every stateful argument: producer/consumer endpoints, tile cursors and
+  Managed roles return every stateful argument: producer/consumer endpoints, work cursors and
   turnstile seats (one object or a tuple). Self, params, instance indices, TMEM views and raw
   barrier pointers are input-only. Local names and tuple order do not matter; a stale snapshot
   is not detected and violates the state-carry obligation.
@@ -64,10 +64,10 @@ These are conditional guarantees relative to that program, not a theorem about a
 | R11 | Pair scope, barrier targets/counts, UMMA masks, TMA byte scaling and producer tails follow the placement rules below. Pair TMEM allocation/free uses the two-CTA handshake. |
 | R12 | For a correctly launched, drained stream, each kept linear index belongs to exactly one CTA/cluster work unit. Every participating role in that unit observes the same ordered sequence. All-CTA pair roles see it in each CTA; leader roles only in rank 0. This is not "every CTA sees every item." |
 | R13 | Raster is a bijection over positive `(m,n,l)` extents, l slowest, with selected raster, bands and reversals; decode intermediates stay within max(index, item count), so it is exact for every index R18 admits. Plain OneShot Raster uses `(m*cs,n,l)` when n/l <=65535, otherwise a 1-D grid. Device decoding follows the actual grid, so the supported hand-built `(total*cs,1,1)` grid preserves item identity too. |
-| R14 | `decode` runs only for valid indices `[0,total)`, after the readiness hook, for every mapping without `decodes_any_index` (local cursors, the scheduler warp, skip loops and `single_item()` alike); a mapping with `decodes_any_index` may also be evaluated at terminal indices and the result is discarded. Only a mapping with `skips` may return a runtime `keep` (trace-time check). Broadcast schedulers acquire a free work slot before claiming, bounding lookahead by stages. CLC waits every response and issues none after failure. `AtomicPersistent` reports once in `close_claims`; the last report fences and zeros `[claims,finished]` for sequential launches/graph replay. |
+| R14 | `decode` runs only for valid indices `[0,total)`, after the readiness hook, for every mapping without `decodes_any_index` (local cursors, the scheduler warp, skip loops and `single_item()` alike); a mapping with `decodes_any_index` may also be evaluated speculatively (at terminal indices, or before readiness in the tile-grid prologue) and the words are discarded; a skipping mapping's `keep` is only used for valid indices. A subclass that overrides `decode` does not inherit `decodes_any_index`. Only a mapping with `skips` may return a runtime `keep` (trace-time check), and a skipping mapping is decoded once per visited index. Broadcast schedulers acquire a free work slot before claiming, bounding lookahead by stages. CLC waits every response and issues none after failure. `AtomicPersistent` reports once in `close_claims`; the last report fences and zeros `[claims,finished]` for sequential launches/graph replay. |
 | R15 | Generated synchronization must implement the finite, live abstract protocol without extra waits, premature reuse, lost publications or added deadlock. Compilation alone does not establish that precondition; a timeout is a candidate failure requiring attribution, not proof of a layer bug. |
 | R16 | `describe()` reports derived/effective structure, not runtime correctness. Protocol logs are static traced sites, not execution histories. IKET off emits no IKET ops; cache keys must include IKET/protocol trace choices. Exported plans are per-CTA, work-item-granular approximations, not deadlock proofs. |
-| R17 | A space with any Raster extent <= 0 is empty: `bind` stores `(1,1,0)` (what the kernel's `bound.space` reads), `count64` is 0, `bound.grid()` launches one work unit under every schedule, single CTA or pair, every role's first `valid` is false, no index is decoded and no decode divides by zero (host or device), and the atomic workspace is left zeroed for the next launch. The check is host code in the jit entry point; kernels pay nothing. |
+| R17 | A space with any Raster extent <= 0 is empty: `bind` stores `(1,1,0)` (what the kernel's `bound.space` reads), `count64` is 0, `bound.grid()` launches one work unit under every schedule, single CTA or pair, every role's first `valid` is false, no mapping without `decodes_any_index` is decoded (Raster and the adapters may evaluate and discard index 0), no decode divides by zero (host or device), and the atomic workspace is left zeroed for the next launch. The check is host code in the jit entry point; kernels pay nothing. |
 | R18 | The mapping's `count64` (Int64, saturating at 2^31; Raster's never wraps) is evaluated once on the host and narrowed to the Int32 `total` the kernel receives. `bound.grid()` admits a space only when `schedule.index_limit` of that count fits Int32: `total*cs` for OneShot/ClusterLaunchControl (the 1-D grid; terminal index `total`), `total + units - 1` for Static/Atomic (the last unit's terminal index). Within it, no grid extent, index, claim or CLC result wraps, and the narrowing never truncates a launched count. |
 | R19 | For any `IndexSchedule`/`WorkMap`/`Readiness` subclass meeting U15, the layer calls the protocol exactly as documented (below) and keeps owning distribution. Built-in schedules go through the same protocol. Normalized SASS of seven example configurations (gemm OneShot; persistent GEMM static single/pair and 2-CTA CLC; FA4 single, 2-CTA CLC, 2-CTA CLC split-P; CuTeDSL 4.8.0, GB300) was unchanged by making the protocol public and by the `(keep, words)` decode; host-side counting changed it only by reading `total` from a kernel parameter instead of recomputing the extent product, with neutral CUDA-graph timings. |
 | R20 | `self.work.single_item()` returns, in a raw role under a non-persistent local schedule, the item and validity a managed role's cursor would start with: the same `first_index`, readiness hook, dropped items and tile-grid/1-D decoding, so it is correct on the 65535 fallback, hand-built 1-D grids, pairs and custom mappings. |
@@ -167,8 +167,9 @@ What the layer does for any schedule, mapping and readiness hook:
   still be computing earlier items (consumers release ring slots on receipt), so it is not a
   teardown, fixup or reduction point. Split-K/stream-K partials need a separate reduction or an
   explicit synchronization of their own.
-- `decode` returns `(keep, words)` and runs only for valid indices (R14), except that a mapping
-  declaring `decodes_any_index` may be evaluated past the end and discarded. `unpack(words)` is
+- `decode` returns `(keep, words)` and runs only for valid indices, after readiness (R14),
+  except that a mapping declaring `decodes_any_index` may be evaluated speculatively and the
+  result discarded. `unpack(words)` is
   what `work.item` returns.
 
 What it does not check (U15): that indices are in range, that `first_index`/`next_index` agree
@@ -280,7 +281,7 @@ body at `describe()` time.
 | E71 | Cursor has no traced advance | ProtocolError |
 | E72 | Cursor has more than one traced advance site | ProtocolError |
 | E73 | Advance is not directly in the body of the while whose condition reads valid | ProtocolError |
-| E74 | Managed role does not return its final tile cursor (IKET on or off) | ProtocolError |
+| E74 | Managed role does not return its final work cursor (IKET on or off) | ProtocolError |
 | E75 | Managed role does not return a producer/consumer endpoint or turnstile seat | ProtocolError |
 | E103 | Managed role returns an unsupported value, state from another role, or duplicate endpoint/cursor state | ProtocolError |
 | E76 | Unknown unchecked check (allowed: unclosed/cross_region/tma) | ValueError |
@@ -334,7 +335,7 @@ recognized group/byte accounting, not descriptor legality, disjoint writes or as
 | E97 | Alias names an unknown parent | ProtocolError / tmem.py |
 | E98 | Two attributes reference the same channel/turnstile/barrier/stream object, or a generated scheduler name overwrites an attribute | ProtocolError / kernel.py |
 | E99 | scheduler_warp not None or int in [0,32); record not a nonnegative int; broadcast stages not positive int | ValueError / scheduling.py |
-| E100 | Tile-loop yielded condition is not exactly the cursor's valid SSA value | ProtocolError / scheduling.py |
+| E100 | Work-loop yielded condition is not exactly the cursor's valid SSA value | ProtocolError / scheduling.py |
 | E101 | work.item read after advance in the same iteration's block or descendant block (this also rejects lookahead reads of the next item; read it on the next iteration instead) | ProtocolError / scheduling.py |
 | E102 | Space whose `schedule.index_limit` exceeds Int32 (R18), launched through `launch_config(bound)`/`bound.grid()` | CUDA launch error (`CUDA_LAUNCH_INVALID_CONFIG`; zero-wide grid, raised at the call) / scheduling.py |
 
@@ -359,7 +360,7 @@ Python-int slot accessor behavior; this is not a blanket bounds/ownership check 
 | U7 | Overrides, signal=False, raw state/pointers/barriers. Validly typed masks may name nonexistent targets; tx=0 is still permitted as an override. |
 | U8 | unchecked suppresses only its selected property/site: unclosed at open, cross_region at close, tma at barrier access. Tracing-global opt-out lists are not a thread-safe compilation API. |
 | U9 | Raw roles get placement/regs/init/annotated TMEM teardown, not managed end/cursor/turnstile checks or the persistent-drain requirement. |
-| U10 | State return/reassignment, coherent `keep`/maps, workspace ABI/zeros, and avoiding concurrent workspace reuse. A custom mapping's `count64` must be exact up to 2^31 and never wrap (saturate instead), and its `decode` must be safe for every valid index of a bound space; with `decodes_any_index` it must also be safe past the end and on empty spaces. A device-built list must not change after readiness. `record` log offsets and launch resources other than the grid extent must fit Int32 and CUDA limits. The strict tile-loop checks do not recognize stale state restoration or prove all per-item work is correct. |
+| U10 | State return/reassignment, coherent `keep`/maps, workspace ABI/zeros, and avoiding concurrent workspace reuse. A custom mapping's `count64` must be exact up to 2^31 and never wrap (saturate instead), and its `decode` must be safe for every valid index of a bound space; with `decodes_any_index` it must also be safe past the end and on empty spaces. A device-built list must not change after readiness. `record` log offsets and launch resources other than the grid extent must fit Int32 and CUDA limits. The strict work-loop checks do not recognize stale state restoration or prove all per-item work is correct. |
 | U11 | Frozen contexts are shallow: referenced tensors/lists/objects remain mutable. Namespaces are not made immutable. |
 | U12 | No declaration mutation/recollection promise after first collection. Fresh compile keys must include all static choices, IKET and protocol tracing. |
 | U13 | No post-close payload/pointer ownership check; raw barrier accessors and Slots phase range/binding are not bounds-checked. |

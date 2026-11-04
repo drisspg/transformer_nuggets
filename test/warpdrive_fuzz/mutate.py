@@ -1,4 +1,4 @@
-"""Compile-only source mutations of locally valid channel and tile-loop templates.
+"""Compile-only source mutations of locally valid channel and work-loop templates.
 
 No compiled callable is ever invoked. Source files are kept in ``MUTATIONS_DIR`` so a finding
 is independently reproducible; an isolated process should bound long campaigns.

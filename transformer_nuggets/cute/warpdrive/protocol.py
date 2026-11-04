@@ -157,9 +157,9 @@ class RoleTrace:
         self.iket = iket  # emit IKET work-item/role ranges (tracing.py)
         self.iket_waits = iket and iket_waits  # and ranges around blocking waits
         self.ops: list = []  # (channel, op, enclosing blocks innermost first) per recorded op
-        self.item_block = None  # the work-item loop body (set by the TileCursor's advance())
+        self.item_block = None  # the work-item loop body (set by the WorkCursor's advance())
         self.open: list = []
-        self.checks: list = []  # end-of-role trace checks (e.g. tile cursors)
+        self.checks: list = []  # end-of-role trace checks (e.g. work cursors)
         self.tma_bars: list = []  # TMA-channel full-barrier pointers handed out (tma.py)
         self.root = current_block()
 
