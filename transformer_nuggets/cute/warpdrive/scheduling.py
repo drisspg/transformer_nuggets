@@ -148,8 +148,8 @@ class Raster(WorkMapping):
     visited high to low (``reverse="m"`` is longest-processing-time-first for causal attention).
 
     ``decode`` uses only ``+ - * // %`` and ``min``, so it runs on Python ints (tests) and on
-    device ``Int32`` values alike. Its intermediates are bounded by the item count, so any space
-    whose count fits Int32 decodes without overflow.
+    device ``Int32`` values alike. Its intermediates are bounded by ``max(index, item count)``,
+    so it does not overflow for any index of a space the launch admits (``TileProblem.grid``).
 
     ``bind`` treats a negative extent as zero and maps an empty space to ``(1, 1, 0)``: no
     items, and every divisor in ``decode`` is 1. It runs in the host part of the jit entry

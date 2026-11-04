@@ -254,8 +254,8 @@ smem = self.begin_roles(tiles=work)
 Static/dynamic policies need `max_ctas`. The dynamic int32 counter starts zeroed and resets after
 each launch; don't share its workspace across concurrent launches.
 
-Extents are runtime Int32 values, so the space is checked in the entry point's host code, not in
-the kernel:
+Extents are runtime values converted to Int32, so the space is checked in the entry point's host
+code, not in the kernel:
 
 - A zero or negative extent is an empty space. Every policy launches one work unit (one
   cluster for a pair), every role's `tiles.valid` is false at once, and the dynamic counter is

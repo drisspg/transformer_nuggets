@@ -158,6 +158,26 @@ def test_size64_is_exact_within_int32_and_never_wraps(space):
     assert size == exact if exact <= 2**31 - 1 else size > 2**31 - 1
 
 
+@pytest.mark.parametrize(
+    "policy, units, cs, largest, too_large",
+    [
+        # Static/dynamic: the terminal index total + units - 1.
+        (StaticPersistent(), 148, 1, (2**31 - 148, 1, 1), (2**31 - 147, 1, 1)),
+        (DynamicPersistent(), 74, 2, (2**31 - 74, 1, 1), (2**31 - 73, 1, 1)),
+        # OneShot/Clc: the 1-D grid, total * cluster size.
+        (OneShot(), 2**31 - 1, 1, (2**31 - 1, 1, 1), (2**30, 2, 1)),
+        (Clc(), 2**30 - 1, 2, (2**30 - 1, 1, 1), (2**29, 2, 1)),
+    ],
+    ids=["static", "dynamic_pair", "oneshot", "clc_pair"],
+)
+def test_launch_admits_spaces_exactly_up_to_int32(policy, units, cs, largest, too_large):
+    """The largest admitted space leaves every index and grid extent at most INT32_MAX; one
+    more item would not."""
+    for space, admitted in [(largest, True), (too_large, False)]:
+        count = Raster().size64(Raster().bind(space))
+        assert (int(policy.reach(count, units, cs)) <= 2**31 - 1) == admitted, space
+
+
 @pytest.mark.parametrize("ext", EXTENTS)
 def test_bind_keeps_nonempty_spaces(ext):
     assert tuple(int(e) for e in Raster().bind(ext)) == ext
