@@ -8,7 +8,7 @@ Three independent, compile-time choices:
   ============================  ========================================  =======================
   policy                        next index                                launch grid
   ============================  ========================================  =======================
-  ``OneShot()``                 none (one item per CTA)                   ``total``
+  ``OneShot()``                 none (one item per CTA)                   ``total`` (see below)
   ``StaticPersistent()``        ``index + gridDim.x``                     ``min(total, max_ctas)``
   ``DynamicPersistent(stages)`` ``gridDim.x + atomicAdd(counter, 1)``     ``min(total, max_ctas)``
   ``Clc(stages)``               ``clusterlaunchcontrol.try_cancel``       ``total``
@@ -19,6 +19,10 @@ Three independent, compile-time choices:
   swizzle bands, reversed axes for longest-processing-time-first). The mapping owns its runtime
   ``space`` (``Raster``: tile extents), the item count, and an optional ``skip(item)`` predicate
   for empty items.
+* **launch grid**: ``OneShot`` with the default ``Raster()`` (along m, no swizzle or reversal)
+  launches the tile space itself, ``(m_tiles, n_tiles, l)`` CTAs (times the cluster size along
+  x), and reads the item from ``blockIdx`` with no division; ``n_tiles`` and ``l`` are then
+  limited to 65535. Every other combination launches a 1-D grid and decodes the index.
 * **distribution**, derived by the layer from the policy. Index sequences every role can compute
   (``OneShot``, ``StaticPersistent``) are decoded locally in each role with no synchronization.
   Claimed indices (``DynamicPersistent``, ``Clc``) are claimed by a layer-owned scheduler warp,
@@ -482,9 +486,18 @@ class TileProblem:
         return grid if self.cs == 1 else grid // self.cs
 
     def first_unit(self):
-        """Device-side: this CTA's work unit (the cluster index of a pair)."""
-        bidx, _, _ = cute.arch.block_idx()
-        return bidx if self.cs == 1 else bidx // self.cs
+        """Device-side: this CTA's work unit (the cluster index of a pair), as a linear index."""
+        bidx, bidy, bidz = cute.arch.block_idx()
+        unit = bidx if self.cs == 1 else bidx // self.cs
+        if _tile_grid(self.stream):
+            em, en, _ = self.space
+            unit = unit + em * (bidy + en * bidz)
+        return unit
+
+    def grid_item_words(self):
+        """Device-side: this CTA's item words read from a tile-space grid (``_tile_grid``)."""
+        bidx, bidy, bidz = cute.arch.block_idx()
+        return [Int32(bidx if self.cs == 1 else bidx // self.cs), Int32(bidy), Int32(bidz)]
 
     def _uses_workspace(self) -> bool:
         return isinstance(self.stream.policy, DynamicPersistent) or bool(self.stream.record)
@@ -514,6 +527,9 @@ class TileProblem:
         cap = self.max_ctas
         if uses_cap and self.cs > 1:
             cap = cutlass.max(cap // self.cs, 1)
+        if _tile_grid(self.stream):
+            em, en, el = self.space
+            return (em * self.cs, en, el)
         return (policy.grid_size(self.total, cap) * self.cs, 1, 1)
 
 
@@ -599,6 +615,21 @@ def _is_while_body(block, cond_block) -> bool:
     )
 
 
+def _tile_grid(stream) -> bool:
+    """One item per CTA in plain raster order: launch the tile space as the grid and take the item
+    from ``blockIdx``. Decoding a 1-D index divides by the extents, which sits on the load warp's
+    path to its first copy (about 0.2 us on a 512^3 GEMM)."""
+    order = stream.order
+    return (
+        isinstance(stream.policy, OneShot)
+        and type(order) is Raster
+        and order.along == "m"
+        and order.swizzle == 1
+        and not order.reverse
+        and not stream.record  # the recording log indexes CTAs by blockIdx.x
+    )
+
+
 def _hooked(stream) -> bool:
     """Hooks can move a CTA's first item off ``blockIdx.x``."""
     return stream.ready is not None or stream.order.skips
@@ -643,7 +674,10 @@ class TileCursor:
             cur._receive()
             cur._first_item()
             return cur
-        cur._words = _decode(stream, cur.index, problem)
+        if end is None and _tile_grid(stream):
+            cur._words = problem.grid_item_words()
+        else:
+            cur._words = _decode(stream, cur.index, problem)
         cur._first_item()
         return cur
 
@@ -712,7 +746,8 @@ class TileCursor:
             self.index = Int32(stream.policy.step(self.index, problem))
             if stream.order.skips:
                 self.index = Int32(_skip_local(stream, self.index, problem))
-            self._words = _decode(stream, self.index, problem)
+            if stream.policy.persistent:  # OneShot: the stream has ended, keep the words
+                self._words = _decode(stream, self.index, problem)
         else:
             self._receive()
         self._log()

@@ -293,6 +293,15 @@ def test_every_role_sees_every_tile_once(requires_blackwell, policy, ext, max_ct
     assert ws[:2].tolist() == [0, 0], "dynamic counter must self-reset"
 
 
+@pytest.mark.parametrize("ext", [(1, 1, 1), (5, 3, 1), (13, 29, 3)])
+def test_oneshot_launches_the_tile_grid(requires_blackwell, ext):
+    """OneShot over plain Raster() launches (m_tiles, n_tiles, l) CTAs and reads each item from
+    blockIdx; every tile still reaches every role once."""
+    op = ScheduleToy(OneShot(), order=Raster(), mode="tile_grid")
+    _, hits, _ = run_toy(op, ext, 148, reps=2)
+    assert (hits == 1).all(), f"tiles missed or repeated: {hits}"
+
+
 @pytest.mark.parametrize("ready", [False, True])
 @pytest.mark.parametrize("policy", ["oneshot", "static", "dynamic", "clc"])
 def test_skip_hook_hides_items_from_every_role(requires_blackwell, policy, ready):
