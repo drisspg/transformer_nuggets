@@ -548,8 +548,23 @@ counts, placement, per-unit item sequences and coverage, and bitwise determinism
   slot phases, static over-stride, atomic counter never reset, turnstile without waits.
   Blind spots: a work-ring consumer releasing before it reads (window too narrow) and a dropped
   pair tail (no value changes).
-- Not covered: real MMA/TMEM data (the example tests cover those), raw roles, `Barriers`,
-  overrides, `unchecked`, IKET, concurrent launches sharing a workspace, real PDL.
+- Coverage-gap knobs (later campaign, 3,971 kernels over 54 minutes): raw roles over
+  `Barriers` (layer- and kernel-initialized, `single_item()`, raw TMEM users), count overrides
+  closed with `signal=False` and per-warp arrivals, `unchecked` unclosed/cross_region/tma/alias
+  sites, SmemPlan `buffer=` storage with `StageView`s and overlaps under all three
+  `alias_check` modes, IKET builds (run, not captured), concurrent launches on two streams with
+  `launch_args()` workspaces, a TMA -> tcgen05 MMA -> TMEM epilogue checked against exact
+  integer products, custom local and broadcast `IndexSchedule`s, a table `WorkMap` without
+  `decodes_any_index` that counts out-of-range decodes, and `PackedWork` filled by a real PDL
+  producer. Found and fixed: F-C1, the alias diagnostic reported orderings only a raw signal
+  or never-closed handle provides as potential hazards instead of `unverified`; F-C2, budgets
+  up to 65536 were accepted although the launch holds only `default_regs` per thread (R9, a
+  `setmaxnreg.inc` hang). The 35-minute run (2,709 kernels) had no hangs or mismatches; on
+  the final code 867 more kernels passed but one F-C1 variant, and 1,327 on 2x2 clusters (with
+  and without MMA pairs) passed but two generator bugs, fixed (manual signals on multicast).
+  Seven more mutants are caught (ignored overrides, `signal=False` still signalling, any-index
+  decoding, `PdlWait` without a wait, wrong `Barriers` counts, `tcgen05.commit` replaced by an
+  arrive, stage views off the handle's stage).
 - Larger clusters (`--cluster 2x2p` and friends): roles in all CTAs, pair leaders or rank 0,
   2-CTA and multicast TMA channels, the rank-0 scheduler, whole-cluster grids. 640 generated
   declarations (8 shapes x seeds 0-79) matched the fuzzer's scope model (a restatement of the
@@ -561,6 +576,9 @@ counts, placement, per-unit item sequences and coverage, and bitwise determinism
   capped grids): compute-sanitizer racecheck and synccheck clean, and CUTracer random delays
   (5k/20k/100k ns, about 70-90 enabled sites per kernel including mbarrier waits, 2-CTA MMA, TMA
   loads and commits) kept every result correct and bitwise repeatable.
+- Not covered: 2-CTA tcgen05 MMA data in generated kernels (the example tests cover it), IKET
+  captures, launches deliberately sharing one workspace (outside the contract), round-robin and
+  named-barrier channels, and manual signals on multicast channels.
 
 Run `pytest -m fuzz test/test_cute_warpdrive_fuzz_*.py` for the fixed-seed quick mode and
 `python scripts/fuzz_warpdrive.py {runtime,static,mutate} --help` for long campaigns.
