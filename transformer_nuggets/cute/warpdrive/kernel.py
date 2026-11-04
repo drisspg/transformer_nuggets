@@ -290,14 +290,29 @@ class WarpSpecialized:
                 "one TileStream per kernel (every role starts at this CTA's first item), got "
                 f"{list(streams)}"
             )
+        seen = {}
+        for name, obj in (*chans.items(), *turns.items(), *raw_bars.items(), *streams.items()):
+            if id(obj) in seen:
+                raise ProtocolError(
+                    f"attributes {seen[id(obj)]!r} and {name!r} use the same declaration; "
+                    "give each channel, turnstile, barrier set, and stream its own object"
+                )
+            seen[id(obj)] = name
         cluster = self.cluster
         for name, st in streams.items():
             st.name = name
             st.owner = self
             if st.policy.broadcast:
-                chans[f"{name}_work"] = st.channel()
-                for k, ch in st.policy.fetch_channels().items():
-                    chans[f"{name}_{k}"] = ch
+                generated = {f"{name}_work": st.channel()}
+                generated.update(
+                    {f"{name}_{k}": ch for k, ch in st.policy.fetch_channels().items()}
+                )
+                for k, ch in generated.items():
+                    if k in vars(self):
+                        raise ProtocolError(
+                            f"TileStream {name}: attribute {k!r} is reserved for its scheduler"
+                        )
+                    chans[k] = ch
         for name, obj in (*chans.items(), *turns.items()):
             obj.name = name
             if isinstance(obj, Channel):
@@ -326,6 +341,8 @@ class WarpSpecialized:
                     )
                 if ann is Barriers and pname not in raw_bars:
                     raise ProtocolError(f"role {name}: no Barriers named {pname!r}")
+                if ann is Tiles and pname not in streams:
+                    raise ProtocolError(f"role {name}: no TileStream named {pname!r}")
                 if ctx_type is not None:
                     ctx_types.setdefault(ctx_type, f"{name}.{pname}")
                 params.append((pname, ann))

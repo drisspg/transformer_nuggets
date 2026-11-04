@@ -7,10 +7,15 @@ pytest.importorskip("cutlass.cute")
 from test.warpdrive_fuzz.static import collect_pair, collect_roles, declaration_role
 from transformer_nuggets.cute.warpdrive import (
     Barriers,
+    Clc,
+    Consumer,
+    DynamicPersistent,
+    Producer,
     ProtocolError,
     Raster,
     Ring,
     Threads,
+    Tiles,
     TileStream,
     Tma,
     TmemPlan,
@@ -118,3 +123,26 @@ def test_raster_swizzle_rejects_bool():
 def test_overrides_reject_noninteger_counts_and_masks(override):
     with pytest.raises(ProtocolError, match="override"):
         collect_pair(Ring(1, override=override))
+
+
+def test_tiles_annotation_requires_stream_declaration():
+    with pytest.raises(ProtocolError, match="no TileStream named"):
+        collect_roles({"worker": declaration_role(params=(("tiles", Tiles),))})
+
+
+@pytest.mark.parametrize("policy", [DynamicPersistent(), Clc()])
+def test_stream_does_not_overwrite_user_channel(policy):
+    with pytest.raises(ProtocolError, match="reserved"):
+        collect_roles(
+            {"worker": declaration_role(params=(("tiles", Tiles),))},
+            {"tiles": TileStream(policy=policy), "tiles_work": Ring(1)},
+        )
+
+
+def test_shared_channel_attributes_are_rejected_before_binding():
+    ch = Ring(1)
+    with pytest.raises(ProtocolError, match="same declaration"):
+        collect_roles(
+            {"worker": declaration_role(params=(("a", Producer), ("b", Consumer)))},
+            {"a": ch, "b": ch},
+        )
