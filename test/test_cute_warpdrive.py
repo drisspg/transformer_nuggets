@@ -223,6 +223,36 @@ class OverBudgetHoleToy(HoleToy):
         return ch
 
 
+class FullPoolToy(HoleToy):
+    """232 + 232 + ``idle`` registers per thread over three warpgroups: with 40 the budgets use
+    exactly the 168 x 384 registers 12 warps start with (CUTLASS's split)."""
+
+    @role(warps=0, regs=232)
+    @cute.jit
+    def prod(self, ch: Producer, ctx):
+        lane = cute.arch.lane_idx()
+        for i in cutlass.range(ctx.n, unroll=1):
+            with ch.produce(0) as h:
+                h.data[lane] = i * 32 + lane
+        return ch
+
+    @role(warps=range(8, 12), regs=40)
+    @cute.jit
+    def idle(self, ctx):
+        pass
+
+
+class PoolOverflowToy(FullPoolToy):
+    """Runtime fuzz finding F-C2: 48 for the idle group totals 65536, which the layer accepted,
+    but 12 warps start with 168 x 384 = 64512 and setmaxnreg.inc only takes registers other
+    warps released, so the consumer's increase waited forever."""
+
+    @role(warps=range(8, 12), regs=48)
+    @cute.jit
+    def idle(self, ctx):
+        pass
+
+
 def compile_toy(op):
     out = make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),), assumed_align=4)
     return compile_tvm_ffi(op, out, cutlass.Int32(1), name="warpdrive_toy")
@@ -262,9 +292,20 @@ def test_register_holes_run(requires_blackwell, n):
     assert torch.equal(out.cpu(), 32 * n * (n - 1) // 2 + n * lane)
 
 
+def test_register_budgets_fit_the_registers_the_launch_starts_with(requires_blackwell):
+    """F-C2: the budgets share the default budget of every launched warp, not 65536."""
+    with pytest.raises(ValueError, match=r"need 65536 registers, but 12 warps start with 168"):
+        PoolOverflowToy().describe()
+    out = torch.full((32,), -1, device="cuda", dtype=torch.int32)
+    compile_toy(FullPoolToy())(out, 9)  # exactly the pool: runs
+    torch.cuda.synchronize()
+    lane = torch.arange(32, dtype=torch.int32)
+    assert torch.equal(out.cpu(), 32 * 9 * 8 // 2 + 9 * lane)
+
+
 def test_register_holes_take_their_warpgroup_budget():
     # 232 x 32 x (4 + 4) + 56 x 32 x 4 = 66560: counting warp 0 alone would accept it.
-    with pytest.raises(ValueError, match="register budgets need 66560 > 65536"):
+    with pytest.raises(ValueError, match="register budgets need 66560 registers"):
         OverBudgetHoleToy().describe()
     op = HoleToy()
     assert "  1-3    (padding)    56\n" in op.describe()

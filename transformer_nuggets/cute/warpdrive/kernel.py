@@ -737,8 +737,16 @@ class WarpSpecialized:
                 (regs if regs is not None else self.default_regs) * len(warps) * WARP_SIZE
                 for warps, regs in [*((r.warps, r.regs) for r in roles), *self._ws_padding]
             )
-            if total > REGS_PER_SM:
-                raise ValueError(f"register budgets need {total} > {REGS_PER_SM}")
+            # Every warp starts at default_regs and setmaxnreg.inc only takes registers other
+            # warps released, so the budgets share default_regs per launched thread, which is
+            # below REGS_PER_SM when 65536 / threads is not a multiple of 8 (12, 20, 24, 28
+            # warps). A larger total compiles but its setmaxnreg.inc waits forever.
+            pool = self.default_regs * self.num_warps * WARP_SIZE
+            if total > pool:
+                raise ValueError(
+                    f"register budgets need {total} registers, but {self.num_warps} warps start "
+                    f"with {self.default_regs} each ({pool} in all; setmaxnreg can only move them)"
+                )
         # (regs, warpgroups, role indices): one dispatch branch per register budget.
         wg_of = [w // WARPGROUP for w in range(self.num_warps)]
         if self._ws_wg_regs:
