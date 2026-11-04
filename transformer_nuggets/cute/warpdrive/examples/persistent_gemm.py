@@ -1,13 +1,13 @@
-"""Persistent BF16 ``D = A @ B^T`` (``F.linear`` layout) on SM100 with a ``TileStream``.
+"""Persistent BF16 ``D = A @ B^T`` (``F.linear`` layout) on SM100 with a ``WorkStream``.
 
 The roles of ``gemm.py`` wrapped in a tile loop: warps 0-3 epilogue, 4 TMA load, 5 MMA, and
-(for the broadcast policies) the layer's scheduler warp in padding warp 6. Two TMEM accumulator
+(for the broadcast schedules) the layer's scheduler warp in padding warp 6. Two TMEM accumulator
 stages (2 x 256 columns) let the MMA warp run tile i+1's mainloop while the epilogue drains
 tile i; the epilogue stores through SMEM with TMA, which also clips ragged edges. The scheduling
-policy and the cluster are constructor arguments::
+schedule and the cluster are constructor arguments::
 
-    PersistentGemm(policy=StaticPersistent())      # or OneShot(), DynamicPersistent(), Clc()
-    PersistentGemm(order=CutlassStaticPersistent(swizzle=8))  # any WorkMapping, or an adapter
+    PersistentGemm(schedule=StaticPersistent())      # or OneShot(), AtomicPersistent(), ClusterLaunchControl()
+    PersistentGemm(mapping=CutlassRaster(swizzle=8))  # any WorkMap, or an adapter
     PersistentGemm(cluster=CtaPair())              # 2-CTA: 256x256 MMA tiles, CtaGroup.TWO
 
 With ``CtaPair`` the MMA tile is 256x256x64: each CTA of the pair loads its 128 rows of A and
@@ -16,8 +16,8 @@ CTA's epilogue stores its 128x256 half from its own TMEM. The only source differ
 ``self.cluster`` declaration, ``cta="leader"`` on the MMA role (a no-op for one CTA), and the tile
 shapes derived from ``self.cluster.size``; the layer derives every cross-CTA barrier.
 
-One compile serves every M, N, K: tile counts, the persistent grid cap, and the dynamic counter
-are runtime values; policy, order, cluster, and stage counts are compile-time.
+One compile serves every M, N, K: tile counts, the persistent grid cap, and the atomic counter
+are runtime values; schedule, mapping, cluster, and stage counts are compile-time.
 """
 
 from dataclasses import dataclass
@@ -45,14 +45,14 @@ from transformer_nuggets.cute.warpdrive import (
     SingleCta,
     StaticPersistent,
     Threads,
-    Tiles,
-    TileStream,
+    WorkCursor,
+    WorkStream,
     Tma,
     Tmem,
     TmemPlan,
     Umma,
     WarpSpecialized,
-    WorkMapping,
+    WorkMap,
     role,
 )
 from transformer_nuggets.cute.warpdrive.examples.gemm import check_gemm_args
@@ -87,8 +87,8 @@ class PersistentGemmParams:
 class PersistentGemm(WarpSpecialized):
     def __init__(
         self,
-        policy=None,
-        order: WorkMapping | None = None,
+        schedule=None,
+        mapping: WorkMap | None = None,
         ab_stages: int | None = None,
         acc_stages: int = 2,
         trace: bool = False,
@@ -118,8 +118,8 @@ class PersistentGemm(WarpSpecialized):
         self.ab = Ring(ab_stages, Tma(stage_bytes), Umma)
         self.acc = Ring(acc_stages, Umma, Threads)
         self.tmem_plan = TmemPlan().region("acc", cta_tile[1], acc_stages)
-        self.tiles = TileStream(
-            order=order or Raster(swizzle=8), policy=policy or StaticPersistent()
+        self.work = WorkStream(
+            mapping=mapping or Raster(swizzle=8), schedule=schedule or StaticPersistent()
         )
         self.trace_protocol = trace
 
@@ -127,7 +127,7 @@ class PersistentGemm(WarpSpecialized):
         return (
             f"warpdrive_pgemm_{self.cluster.get_key()}_n{self.tile_n}_ab{self.ab.n}_"
             f"acc{self.acc_stages}_"
-            f"{self.tiles.get_key()}{self.iket_key()}{self.trace_key()}"
+            f"{self.work.get_key()}{self.iket_key()}{self.trace_key()}"
         )
 
     def get_key(self) -> str:
@@ -137,9 +137,9 @@ class PersistentGemm(WarpSpecialized):
 
     @role(warps=4, regs=40)
     @cute.jit
-    def load(self, params: PersistentGemmParams, *, ab: Producer, tiles: Tiles):
-        while tiles.valid:
-            m, n, _ = tiles.work
+    def load(self, params: PersistentGemmParams, *, ab: Producer, work: WorkCursor):
+        while work.valid:
+            m, n, _ = work.item
             tAgA = params.tAgA[None, m, None]
             tBgB = params.tBgB[None, n, None]
             for k in cutlass.range(params.num_k_tiles, unroll=1):
@@ -156,8 +156,8 @@ class PersistentGemm(WarpSpecialized):
                         params.tBsB[None, s.index],
                         tma_bar_ptr=s.barrier,
                     )
-            tiles.advance()
-        return ab, tiles
+            work.advance()
+        return ab, work
 
     @role(warps=5, regs=40, cta="leader")
     @cute.jit
@@ -167,12 +167,12 @@ class PersistentGemm(WarpSpecialized):
         *,
         ab: Consumer,
         acc: Producer,
-        tiles: Tiles,
+        work: WorkCursor,
         tmem: Tmem,
     ):
         tiled_mma = params.tiled_mma
         tCtAcc = cute.make_tensor(tmem.ptr("acc"), params.acc_layout)
-        while tiles.valid:
+        while work.valid:
             with acc.produce() as a:
                 tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
                 for k in cutlass.range(params.num_k_tiles, unroll=1):
@@ -186,12 +186,14 @@ class PersistentGemm(WarpSpecialized):
                                 tCtAcc[None, None, None, a.index],
                             )
                             tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-            tiles.advance()
-        return ab, acc, tiles
+            work.advance()
+        return ab, acc, work
 
     @role(warps=range(4), regs=160)
     @cute.jit
-    def epilogue(self, params: PersistentGemmParams, *, acc: Consumer, tiles: Tiles, tmem: Tmem):
+    def epilogue(
+        self, params: PersistentGemmParams, *, acc: Consumer, work: WorkCursor, tmem: Tmem
+    ):
         """TMEM -> registers -> swizzled SMEM -> TMA store, one 128x32 subtile at a time through
         ``C_STAGES`` SMEM buffers. TMA clips the ragged edges, so partial tiles cost the same."""
         tidx, _, _ = cute.arch.thread_idx()
@@ -223,8 +225,8 @@ class PersistentGemm(WarpSpecialized):
         )
         tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc) - 1)  # (..., SUB, STAGE)
         subtiles = cute.size(tTR_tAcc, mode=[3])
-        while tiles.valid:
-            m, n, _ = tiles.work
+        while work.valid:
+            m, n, _ = work.item
             dst = cute.group_modes(bSG_gC[None, None, None, m, n], 1, 3)  # (TMA, SUB)
             with acc.consume() as a:
                 for i in cutlass.range_constexpr(subtiles):
@@ -241,18 +243,18 @@ class PersistentGemm(WarpSpecialized):
                         # C_STAGES - 1 stores still reading SMEM.
                         cute.arch.cp_async_bulk_wait_group(C_STAGES - 1, read=True)
                     cute.arch.barrier(barrier_id=EPI_BARRIER_ID, number_of_threads=128)
-            tiles.advance()
+            work.advance()
         if warp == 0:
             cute.arch.cp_async_bulk_wait_group(0, read=True)
-        return acc, tiles
+        return acc, work
 
     # ----------------------------------------------------------------- kernel
 
     @cute.kernel
     def kernel(
-        self, tiled_mma, tma_a, mA, tma_b, mB, tma_c, mC_tma, a_layout, b_layout, c_layout, work
+        self, tiled_mma, tma_a, mA, tma_b, mB, tma_c, mC_tma, a_layout, b_layout, c_layout, bound
     ):
-        smem = self.begin_roles(tiles=work)
+        smem = self.begin_roles(work=bound)
         sA = smem.allocate_tensor(self.dtype, a_layout.outer, 1024, a_layout.inner)
         sB = smem.allocate_tensor(self.dtype, b_layout.outer, 1024, b_layout.inner)
         sC = smem.allocate_tensor(self.dtype, c_layout.outer, 128, c_layout.inner)
@@ -335,11 +337,11 @@ class PersistentGemm(WarpSpecialized):
             cpasync.CopyBulkTensorTileS2GOp(), c, cute.select(c_layout, mode=[0, 1]), EPI_TILE
         )
         m_tiles, n_tiles = cute.ceil_div(c.layout.shape, self.mma_tile[:2])
-        work = self.tiles.problem((m_tiles, n_tiles, 1), workspace, max_ctas)
+        bound = self.work.bind((m_tiles, n_tiles, 1), workspace, max_ctas)
         self.kernel.set_name_prefix(self.get_name())
         self.kernel(
-            tiled_mma, tma_a, mA, tma_b, mB, tma_c, mC_tma, a_layout, b_layout, c_layout, work
-        ).launch(**self.launch_config(work), stream=stream)
+            tiled_mma, tma_a, mA, tma_b, mB, tma_c, mC_tma, a_layout, b_layout, c_layout, bound
+        ).launch(**self.launch_config(bound), stream=stream)
 
 
 def compile_persistent_gemm(op: PersistentGemm):
@@ -366,13 +368,13 @@ def persistent_gemm(
     a: torch.Tensor,
     b: torch.Tensor,
     out: torch.Tensor | None = None,
-    policy=None,
-    order: WorkMapping | None = None,
+    schedule=None,
+    mapping: WorkMap | None = None,
     max_ctas: int | None = None,
     cluster=None,
     tile_n: int = 256,
 ) -> torch.Tensor:
-    """``a @ b.T`` for row-major bf16 ``a: (M, K)``, ``b: (N, K)``. ``policy`` defaults to
+    """``a @ b.T`` for row-major bf16 ``a: (M, K)``, ``b: (N, K)``. ``schedule`` defaults to
     ``StaticPersistent()``; ``max_ctas`` caps the persistent grid in CTAs (default: the SM
     count); ``cluster=CtaPair()`` runs 2-CTA 256x256 tiles."""
     out = check_gemm_args(a, b, out)
@@ -380,26 +382,38 @@ def persistent_gemm(
         return out
     if a.shape[1] == 0:  # no K tiles: the MMA would publish an unwritten accumulator
         return out.zero_()
-    key = (policy, order, cluster, tile_n)
+    key = (schedule, mapping, cluster, tile_n)
     op = _OPS.get(key)
     if op is None:
-        op = _OPS[key] = PersistentGemm(policy=policy, order=order, cluster=cluster, tile_n=tile_n)
+        op = _OPS[key] = PersistentGemm(
+            schedule=schedule, mapping=mapping, cluster=cluster, tile_n=tile_n
+        )
     fn = compile_persistent_gemm(op)
-    workspace, sms = op.tiles.launch_args(a.device)
+    workspace, sms = op.work.launch_args(a.device)
     fn(a, b, out, workspace, max_ctas or sms)
     return out
 
 
 if __name__ == "__main__":
-    from transformer_nuggets.cute.warpdrive import Clc, CtaPair, DynamicPersistent, OneShot
+    from transformer_nuggets.cute.warpdrive import (
+        ClusterLaunchControl,
+        CtaPair,
+        AtomicPersistent,
+        OneShot,
+    )
 
     for cluster in (None, CtaPair()):
-        for policy in (OneShot(), StaticPersistent(), DynamicPersistent(), Clc()):
+        for schedule in (
+            OneShot(),
+            StaticPersistent(),
+            AtomicPersistent(),
+            ClusterLaunchControl(),
+        ):
             for m, n, k in [(512, 512, 512), (300, 520, 136), (4097, 2056, 4104)]:
                 a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
                 b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
                 ref = torch.nn.functional.linear(a.float(), b.float())
-                out = persistent_gemm(a, b, policy=policy, cluster=cluster)
+                out = persistent_gemm(a, b, schedule=schedule, cluster=cluster)
                 err = (out.float() - ref).abs().max().item()
-                print(f"{cluster} {policy.describe():<28} M={m} N={n} K={k}: err {err:.4g}")
-    print(PersistentGemm(policy=Clc(), cluster=CtaPair()).describe())
+                print(f"{cluster} {schedule.describe():<28} M={m} N={n} K={k}: err {err:.4g}")
+    print(PersistentGemm(schedule=ClusterLaunchControl(), cluster=CtaPair()).describe())

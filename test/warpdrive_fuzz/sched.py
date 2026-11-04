@@ -2,7 +2,7 @@
 
 * Raster decoding equals an explicit enumeration of the documented visiting order (not only a
   bijection), over random extents, orders and the 1-D fallback boundary.
-* Launch grids (``TileProblem.grid``, ``tile_grid_dims``) equal the R12/R13 formulas.
+* Launch grids (``BoundWork.grid``, ``tile_grid_dims``) equal the R12/R13 formulas.
 * Every channel scope of a generated kernel (per-rank, per-slot full/empty counts, target CTAs,
   commit masks, armed TMA bytes, tails), the scheduler's warp and work-ring counts, the
   warpgroup register budgets and padding, and the barrier initialization counts equal a
@@ -30,7 +30,7 @@ def random_stream(rng: random.Random) -> gen.StreamSpec:
     if rng.random() < 0.1:
         em, en, el = rng.choice([(1, 1, 1), (1, 9, 1), (9, 1, 1), (1, 1, 5)])
     return gen.StreamSpec(
-        policy=rng.choice(["oneshot", "static", "dynamic", "clc"]),
+        schedule=rng.choice(["oneshot", "static", "atomic", "clc"]),
         stages=rng.randint(1, 4),
         along=rng.choice("mn"),
         swizzle=rng.choice([1, 2, 3, 4, 5, 8, 13, 64]),
@@ -64,30 +64,30 @@ def check_raster(s: gen.StreamSpec) -> list[str]:
 
 def check_grid(s: gen.StreamSpec, cs: int) -> list[str]:
     from transformer_nuggets.cute.warpdrive import (
-        Clc,
+        ClusterLaunchControl,
         CtaPair,
-        DynamicPersistent,
+        AtomicPersistent,
         OneShot,
         SingleCta,
         StaticPersistent,
-        TileStream,
+        WorkStream,
     )
-    from transformer_nuggets.cute.warpdrive.scheduling import TileProblem
+    from transformer_nuggets.cute.warpdrive.scheduling import BoundWork
 
-    policy = {
+    schedule = {
         "oneshot": OneShot(),
         "static": StaticPersistent(),
-        "dynamic": DynamicPersistent(s.stages),
-        "clc": Clc(s.stages),
-    }[s.policy]
-    stream = TileStream(order=raster_of(s), policy=policy)
+        "atomic": AtomicPersistent(s.stages),
+        "clc": ClusterLaunchControl(s.stages),
+    }[s.schedule]
+    stream = WorkStream(mapping=raster_of(s), schedule=schedule)
     stream.owner = SimpleNamespace(cluster=CtaPair() if cs == 2 else SingleCta())
-    got = tuple(TileProblem(stream, stream.order.bind(s.extents), None, s.max_ctas).grid())
+    got = tuple(BoundWork(stream, stream.mapping.bind(s.extents), None, s.max_ctas).grid())
     want = oracle.expected_grid(SimpleNamespace(cs=cs, stream=s, units=1))
     return (
         []
         if got == want
-        else [f"{s.policy} {s.extents} cs={cs} cap={s.max_ctas}: grid {got}, want {want}"]
+        else [f"{s.schedule} {s.extents} cs={cs} cap={s.max_ctas}: grid {got}, want {want}"]
     )
 
 
@@ -252,14 +252,14 @@ def expected_scopes(spec: gen.KernelSpec) -> dict[str, WantScope]:
             ch.tma_bytes if ch.producer == "tma" else None,
         )
     s = spec.stream
-    if s is not None and s.policy in ("dynamic", "clc"):
-        sched = Inst("tiles.scheduler", 32, "leader" if cs > 1 else "all", None)
+    if s is not None and s.schedule in ("atomic", "clc"):
+        sched = Inst("work.scheduler", 32, "leader" if cs > 1 else "all", None)
         users = [
             Inst(f"{r.name}[{i}]", r.threads, r.cta, None)
             for r in spec.roles
             for i in range(r.instances)
         ]
-        out["tiles_work"] = want_scope(
+        out["work_ring"] = want_scope(
             s.stages,
             "tma" if cs > 1 else "threads",
             "threads",
@@ -268,8 +268,8 @@ def expected_scopes(spec: gen.KernelSpec) -> dict[str, WantScope]:
             cs,
             16 if cs > 1 else None,
         )
-        if s.policy == "clc":
-            out["tiles_clc"] = want_scope(1, "tma", "threads", [sched], [sched], cs, 16)
+        if s.schedule == "clc":
+            out["work_clc"] = want_scope(1, "tma", "threads", [sched], [sched], cs, 16)
     return out
 
 
@@ -286,13 +286,13 @@ def expected_regs(spec: gen.KernelSpec) -> tuple[int, list, dict] | None:
     s = spec.stream
     if not any(r.regs is not None for r in spec.roles):
         return None
-    if s is not None and s.policy in ("dynamic", "clc"):
+    if s is not None and s.schedule in ("atomic", "clc"):
         w = scheduler_warp(spec)
         group = {budget[x] for x in range(w // 4 * 4, w // 4 * 4 + 4) if x in budget}
         numeric = [r.regs for r in spec.roles if r.regs is not None]
         regs = group.pop() if len(group) == 1 else min(numeric)
         budget[w] = regs
-        names["tiles.scheduler"] = regs
+        names["work.scheduler"] = regs
     nw = -(-(max(budget) + 1) // 4) * 4
     holes = []
     for g in range(nw // 4):
@@ -359,7 +359,7 @@ def check_declared(spec: gen.KernelSpec, workdir: Path) -> ScopeReport:
                     f"{name}.{f}: layer {getattr(got, f)!r}, model {getattr(want, f)!r}"
                 )
     s = spec.stream
-    if s is not None and s.policy in ("dynamic", "clc"):
+    if s is not None and s.schedule in ("atomic", "clc"):
         warp = scheduler_warp(spec)
         if f"scheduler warp {warp} broadcasts" not in text:
             rep.failures.append(f"scheduler not at warp {warp}:\n{text}")

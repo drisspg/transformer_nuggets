@@ -15,29 +15,29 @@ from cutlass import Int32, cute
 
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
-    Clc,
+    ClusterLaunchControl,
     CtaPair,
-    DynamicPersistent,
+    AtomicPersistent,
     OneShot,
     PdlWait,
     ProtocolError,
     Raster,
     SingleCta,
     StaticPersistent,
-    Tiles,
-    TileStream,
+    WorkCursor,
+    WorkStream,
     WarpSpecialized,
     role,
 )
 from transformer_nuggets.cute.warpdrive.scheduling import tile_grid_dims
 
-POLICIES = {
+SCHEDULES = {
     "oneshot": OneShot(),
     "static": StaticPersistent(),
-    "dynamic": DynamicPersistent(stages=2),
-    "dynamic1": DynamicPersistent(stages=1),
-    "clc": Clc(stages=2),
-    "clc1": Clc(stages=1),
+    "atomic": AtomicPersistent(stages=2),
+    "atomic1": AtomicPersistent(stages=1),
+    "clc": ClusterLaunchControl(stages=2),
+    "clc1": ClusterLaunchControl(stages=1),
 }
 
 
@@ -50,17 +50,17 @@ def requires_blackwell() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# CPU: order mappings
+# CPU: mappings
 # --------------------------------------------------------------------------- #
 
 
-def _all_coords(order, ext):
+def _all_coords(mapping, ext):
     total = ext[0] * ext[1] * ext[2]
-    return [order.decode(i, ext) for i in range(total)]
+    return [mapping.decode(i, ext) for i in range(total)]
 
 
 EXTENTS = [(1, 1, 1), (1, 7, 1), (7, 1, 2), (5, 3, 1), (16, 16, 1), (13, 29, 3), (3, 100, 1)]
-ORDERS = [
+MAPPINGS = [
     Raster(),
     Raster(along="n"),
     Raster(swizzle=2),
@@ -72,9 +72,9 @@ ORDERS = [
 
 
 @pytest.mark.parametrize("ext", EXTENTS)
-@pytest.mark.parametrize("order", ORDERS, ids=lambda o: o.get_key())
-def test_raster_is_a_bijection(order, ext):
-    coords = _all_coords(order, ext)
+@pytest.mark.parametrize("mapping", MAPPINGS, ids=lambda o: o.get_key())
+def test_raster_is_a_bijection(mapping, ext):
+    coords = _all_coords(mapping, ext)
     assert sorted(coords) == sorted(itertools.product(*(range(e) for e in ext)))
     assert len(set(coords)) == len(coords)
 
@@ -139,14 +139,14 @@ EMPTY_SPACES = [
 
 
 @pytest.mark.parametrize("space", EMPTY_SPACES, ids=str)
-@pytest.mark.parametrize("order", ORDERS, ids=lambda o: o.get_key())
-def test_bound_empty_space_has_no_items_and_decodes(order, space):
+@pytest.mark.parametrize("mapping", MAPPINGS, ids=lambda o: o.get_key())
+def test_bound_empty_space_has_no_items_and_decodes(mapping, space):
     """Host Int32 arithmetic folds like the device's (and raises on division by zero): a bound
     empty space counts no items, and decode, which runs past the end, never divides by zero."""
-    bound = order.bind(space)
-    assert int(order.size(bound)) == 0
+    bound = mapping.bind(space)
+    assert int(mapping.size(bound)) == 0
     for index in range(4):
-        order.decode(Int32(index), bound)
+        mapping.decode(Int32(index), bound)
 
 
 @pytest.mark.parametrize(
@@ -159,23 +159,23 @@ def test_size64_is_exact_within_int32_and_never_wraps(space):
 
 
 @pytest.mark.parametrize(
-    "policy, units, cs, largest, too_large",
+    "schedule, units, cs, largest, too_large",
     [
-        # Static/dynamic: the terminal index total + units - 1.
+        # Static/atomic: the terminal index total + units - 1.
         (StaticPersistent(), 148, 1, (2**31 - 148, 1, 1), (2**31 - 147, 1, 1)),
-        (DynamicPersistent(), 74, 2, (2**31 - 74, 1, 1), (2**31 - 73, 1, 1)),
-        # OneShot/Clc: the 1-D grid, total * cluster size.
+        (AtomicPersistent(), 74, 2, (2**31 - 74, 1, 1), (2**31 - 73, 1, 1)),
+        # OneShot/ClusterLaunchControl: the 1-D grid, total * cluster size.
         (OneShot(), 2**31 - 1, 1, (2**31 - 1, 1, 1), (2**30, 2, 1)),
-        (Clc(), 2**30 - 1, 2, (2**30 - 1, 1, 1), (2**29, 2, 1)),
+        (ClusterLaunchControl(), 2**30 - 1, 2, (2**30 - 1, 1, 1), (2**29, 2, 1)),
     ],
-    ids=["static", "dynamic_pair", "oneshot", "clc_pair"],
+    ids=["static", "atomic_pair", "oneshot", "clc_pair"],
 )
-def test_launch_admits_spaces_exactly_up_to_int32(policy, units, cs, largest, too_large):
+def test_launch_admits_spaces_exactly_up_to_int32(schedule, units, cs, largest, too_large):
     """The largest admitted space leaves every index and grid extent at most INT32_MAX; one
     more item would not."""
     for space, admitted in [(largest, True), (too_large, False)]:
         count = Raster().size64(Raster().bind(space))
-        assert (int(policy.reach(count, units, cs)) <= 2**31 - 1) == admitted, space
+        assert (int(schedule.index_limit(count, units, cs)) <= 2**31 - 1) == admitted, space
 
 
 @pytest.mark.parametrize("ext", EXTENTS)
@@ -183,22 +183,24 @@ def test_bind_keeps_nonempty_spaces(ext):
     assert tuple(int(e) for e in Raster().bind(ext)) == ext
 
 
-@pytest.mark.parametrize("order", [Raster(swizzle=8), Raster(along="n", swizzle=8)])
-def test_swizzled_decode_does_not_overflow_int32(order):
+@pytest.mark.parametrize("mapping", [Raster(swizzle=8), Raster(along="n", swizzle=8)])
+def test_swizzled_decode_does_not_overflow_int32(mapping):
     """``swizzle * along-extent`` exceeds Int32 although the item count fits; Int32 decoding
     still matches exact Python-int decoding."""
-    ext = (2**29, 3, 1) if order.along == "m" else (3, 2**29, 1)
-    bound = order.bind(ext)
+    ext = (2**29, 3, 1) if mapping.along == "m" else (3, 2**29, 1)
+    bound = mapping.bind(ext)
     total = 3 * 2**29
     for index in [0, 5, 2**29 + 7, total - 2**29 - 1, total - 1]:
-        got = tuple(int(w) for w in order.decode(Int32(index), bound))
-        assert got == order.decode(index, ext)
+        got = tuple(int(w) for w in mapping.decode(Int32(index), bound))
+        assert got == mapping.decode(index, ext)
 
 
 def test_stream_keys_exclude_runtime_values():
-    keys = {TileStream(order=Raster(swizzle=8), policy=p).get_key() for p in POLICIES.values()}
-    assert len(keys) == len(POLICIES)
-    assert TileStream().get_key() == "oneshot0_m1"
+    keys = {
+        WorkStream(mapping=Raster(swizzle=8), schedule=p).get_key() for p in SCHEDULES.values()
+    }
+    assert len(keys) == len(SCHEDULES)
+    assert WorkStream().get_key() == "oneshot0_m1"
 
 
 # --------------------------------------------------------------------------- #
@@ -226,17 +228,19 @@ class ScheduleToy(WarpSpecialized):
 
     MAX_ITEMS = 64
 
-    def __init__(self, policy, order=None, mode: str = "ok", regs: bool = False, ready=None):
+    def __init__(self, schedule, mapping=None, mode: str = "ok", regs: bool = False, ready=None):
         self.mode = mode
-        self.tiles = TileStream(order=order or Raster(swizzle=3), policy=policy, ready=ready)
+        self.work = WorkStream(
+            mapping=mapping or Raster(swizzle=3), schedule=schedule, ready=ready
+        )
         self.regs = regs
 
     def get_name(self) -> str:
-        return f"warpdrive_sched_toy_{self.tiles.get_key()}_{self.mode}"
+        return f"warpdrive_sched_toy_{self.work.get_key()}_{self.mode}"
 
     @cute.jit
-    def _visit(self, r: int, tiles, count, ctx):
-        m, n, li = tiles.work
+    def _visit(self, r: int, work, count, ctx):
+        m, n, li = work.item
         tile = (li * ctx.en + n) * ctx.em + m
         # Out-of-range coordinates (a misread launch grid) never count, even when their linear
         # id happens to land on a real tile.
@@ -249,43 +253,43 @@ class ScheduleToy(WarpSpecialized):
 
     @role(warps=0)
     @cute.jit
-    def a(self, tiles: Tiles, ctx):
+    def a(self, work: WorkCursor, ctx):
         count = Int32(0)
-        while tiles.valid:
-            self._visit(0, tiles, count, ctx)
+        while work.valid:
+            self._visit(0, work, count, ctx)
             count += 1
             if cutlass.const_expr(self.mode == "conditional_advance"):
                 if count < self.MAX_ITEMS:  # a runtime predicate: some iterations skip it
-                    tiles.advance()
+                    work.advance()
             else:
-                tiles.advance()
+                work.advance()
             if cutlass.const_expr(self.mode == "double_advance"):
-                tiles.advance()
-        return tiles
+                work.advance()
+        return work
 
     @role(warps=range(1, 3))
     @cute.jit
-    def b(self, tiles: Tiles, ctx):
+    def b(self, work: WorkCursor, ctx):
         count = Int32(0)
         if cutlass.const_expr(self.mode == "no_advance"):
-            self._visit(1, tiles, count, ctx)
+            self._visit(1, work, count, ctx)
         else:
-            while tiles.valid:
-                self._visit(1, tiles, count, ctx)
+            while work.valid:
+                self._visit(1, work, count, ctx)
                 count += 1
-                tiles.advance()
-        return tiles
+                work.advance()
+        return work
 
     def space(self, em, en, el):
         """The space bound in the entry point (a test mapping may need more than extents)."""
         return (em, en, el)
 
     @cute.kernel
-    def kernel(self, log: cute.Tensor, hits: cute.Tensor, em: Int32, en: Int32, work):
-        smem = self.begin_roles(tiles=work)
+    def kernel(self, log: cute.Tensor, hits: cute.Tensor, em: Int32, en: Int32, bound):
+        smem = self.begin_roles(work=bound)
         # ~160 KB of SMEM: one CTA per SM, so CLC has unlaunched CTAs to cancel.
         smem.allocate_array(cutlass.Int32, 40000)
-        # Extents from the arguments, not work.space: external mappings bind other spaces.
+        # Extents from the arguments, not bound.space: external mappings bind other spaces.
         self.run_roles(SimpleNamespace(log=log, hits=hits, em=em, en=en))
 
     @cute.jit
@@ -300,11 +304,13 @@ class ScheduleToy(WarpSpecialized):
         max_ctas: Int32,
         stream: cuda.CUstream,
     ):
-        work = self.tiles.problem(self.space(em, en, el), workspace, max_ctas)
+        bound = self.work.bind(self.space(em, en, el), workspace, max_ctas)
         self.kernel.set_name_prefix(self.get_name())
-        # "1d" modes launch a hand-built (total, 1, 1) grid instead of the policy's.
-        grid = (work.total, 1, 1) if cutlass.const_expr(self.mode.endswith("1d")) else work.grid()
-        self.kernel(log, hits, em, en, work).launch(
+        # "1d" modes launch a hand-built (total, 1, 1) grid instead of the schedule's.
+        grid = (
+            (bound.total, 1, 1) if cutlass.const_expr(self.mode.endswith("1d")) else bound.grid()
+        )
+        self.kernel(log, hits, em, en, bound).launch(
             grid=grid, block=(self.num_threads, 1, 1), stream=stream
         )
 
@@ -335,10 +341,10 @@ def run_toy(op, ext, max_ctas, reps=1, items=None):
     em, en, el = ext
     total = em * en * el
     count = total if items is None else items
-    grid = max(min(count, max_ctas), 1) if op.tiles.policy.uses_max_ctas else max(count, 1)
+    grid = max(min(count, max_ctas), 1) if op.work.schedule.uses_max_ctas else max(count, 1)
     log = torch.full((2, grid, ScheduleToy.MAX_ITEMS), -1, dtype=torch.int32, device="cuda")
     hits = torch.zeros(2, max(total, 1), dtype=torch.int32, device="cuda")
-    ws, _ = op.tiles.launch_args("cuda")
+    ws, _ = op.work.launch_args("cuda")
     fn = compile_toy(op)
     for _ in range(reps):
         log.fill_(-1)
@@ -352,31 +358,35 @@ TOY_CASES = [
     ((1, 1, 1), 148),  # one tile
     ((5, 3, 1), 148),  # tiles < SMs
     ((13, 29, 3), 148),  # tiles >> SMs
-    ((40, 40, 1), 7),  # capped grid: ~229 tiles per CTA for persistent policies
+    ((40, 40, 1), 7),  # capped grid: ~229 tiles per CTA for persistent schedules
 ]
 
 
 @pytest.mark.parametrize("ext,max_ctas", TOY_CASES)
-@pytest.mark.parametrize("policy", list(POLICIES), ids=str)
-def test_every_role_sees_every_tile_once(requires_blackwell, policy, ext, max_ctas):
-    op = ScheduleToy(POLICIES[policy])
+@pytest.mark.parametrize("schedule", list(SCHEDULES), ids=str)
+def test_every_role_sees_every_tile_once(requires_blackwell, schedule, ext, max_ctas):
+    op = ScheduleToy(SCHEDULES[schedule])
     log, hits, ws = run_toy(op, ext, max_ctas, reps=3)
     total = ext[0] * ext[1] * ext[2]
     assert (hits == 1).all(), f"tiles missed or repeated: {hits}"
     # Both roles of a CTA see the same sequence (for the first MAX_ITEMS items).
     assert torch.equal(log[0], log[1])
-    if POLICIES[policy].persistent and total > max_ctas and not isinstance(op.tiles.policy, Clc):
+    if (
+        SCHEDULES[schedule].persistent
+        and total > max_ctas
+        and not isinstance(op.work.schedule, ClusterLaunchControl)
+    ):
         assert (log[0][:, 1] >= 0).all(), "persistent CTAs should run several tiles"
-    if isinstance(op.tiles.policy, Clc) and total > 4 * 148:
+    if isinstance(op.work.schedule, ClusterLaunchControl) and total > 4 * 148:
         assert (log[0][:, 1] >= 0).any(), "no CLC cancellation succeeded"
-    if policy == "static":
+    if schedule == "static":
         grid = min(total, max_ctas)
-        order = op.tiles.order
+        mapping = op.work.mapping
         for b in range(grid):
             for k in range(min(ScheduleToy.MAX_ITEMS, len(range(b, total, grid)))):
-                m, n, li = order.decode(b + k * grid, ext)
+                m, n, li = mapping.decode(b + k * grid, ext)
                 assert log[0, b, k] == (li * ext[1] + n) * ext[0] + m
-    assert ws[:2].tolist() == [0, 0], "dynamic counter must self-reset"
+    assert ws[:2].tolist() == [0, 0], "atomic counter must self-reset"
 
 
 @pytest.mark.parametrize(
@@ -396,24 +406,27 @@ def test_tile_grid_dims_respect_the_grid_limit(space, cs, grid):
     assert tile_grid_dims(space, cs) == grid
 
 
-@pytest.mark.parametrize("launch", ["policy", "1d"])
+@pytest.mark.parametrize("launch", ["schedule", "1d"])
 @pytest.mark.parametrize("ext", [(1, 1, 1), (5, 3, 1), (13, 29, 3), (1, 65536, 1)])
 def test_oneshot_launches_the_tile_grid(requires_blackwell, ext, launch):
     """OneShot over plain Raster() launches (m_tiles, n_tiles, l) CTAs and reads each item from
     blockIdx, or a 1-D grid it decodes once n_tiles exceeds gridDim.y. A hand-built 1-D launch
     is decoded the same way; every tile still reaches every role once."""
     mode = "tile_grid_1d" if launch == "1d" else "tile_grid"
-    op = ScheduleToy(OneShot(), order=Raster(), mode=mode)
+    op = ScheduleToy(OneShot(), mapping=Raster(), mode=mode)
     _, hits, _ = run_toy(op, ext, 148, reps=2)
     assert (hits == 1).all(), f"tiles missed or repeated: {hits}"
 
 
 @pytest.mark.parametrize("ready", [False, True])
-@pytest.mark.parametrize("policy", ["oneshot", "static", "dynamic", "clc"])
-def test_skip_hook_hides_items_from_every_role(requires_blackwell, policy, ready):
+@pytest.mark.parametrize("schedule", ["oneshot", "static", "atomic", "clc"])
+def test_skip_hook_hides_items_from_every_role(requires_blackwell, schedule, ready):
     """Skip (and the readiness hook, a no-op wait outside PDL) in local and broadcast mode."""
     op = ScheduleToy(
-        POLICIES[policy], order=SkipOdd(swizzle=2), mode="skip", ready=PdlWait() if ready else None
+        SCHEDULES[schedule],
+        mapping=SkipOdd(swizzle=2),
+        mode="skip",
+        ready=PdlWait() if ready else None,
     )
     ext = (9, 7, 2)
     log, hits, _ = run_toy(op, ext, 16, reps=2)
@@ -437,9 +450,9 @@ class SkipAll(SkipOdd):
         return m >= 0
 
 
-@pytest.mark.parametrize("policy", ["oneshot", "static", "dynamic", "clc"])
-def test_all_items_skipped_terminates(requires_blackwell, policy):
-    op = ScheduleToy(POLICIES[policy], order=SkipAll(), mode="skipall")
+@pytest.mark.parametrize("schedule", ["oneshot", "static", "atomic", "clc"])
+def test_all_items_skipped_terminates(requires_blackwell, schedule):
+    op = ScheduleToy(SCHEDULES[schedule], mapping=SkipAll(), mode="skipall")
     _, hits, ws = run_toy(op, (5, 4, 1), 3, reps=2)
     assert (hits == 0).all() and ws[:2].tolist() == [0, 0]
 
@@ -448,12 +461,12 @@ class CountToy(WarpSpecialized):
     """Roles ``a`` (warp 0) and ``b`` (warps 1-2), in every CTA of the cluster, count the work
     items they see in ``count[role]``."""
 
-    def __init__(self, policy, order, cluster):
+    def __init__(self, schedule, mapping, cluster):
         self.cluster = cluster
-        self.tiles = TileStream(order=order, policy=policy)
+        self.work = WorkStream(mapping=mapping, schedule=schedule)
 
     def get_name(self) -> str:
-        return f"warpdrive_count_toy_{self.tiles.get_key()}_cs{self.cluster.size}"
+        return f"warpdrive_count_toy_{self.work.get_key()}_cs{self.cluster.size}"
 
     @cute.jit
     def _count(self, r: int, ctx):
@@ -462,26 +475,26 @@ class CountToy(WarpSpecialized):
 
     @role(warps=0)
     @cute.jit
-    def a(self, tiles: Tiles, ctx):
-        while tiles.valid:
+    def a(self, work: WorkCursor, ctx):
+        while work.valid:
             self._count(0, ctx)
-            tiles.advance()
-        return tiles
+            work.advance()
+        return work
 
     @role(warps=range(1, 3))
     @cute.jit
-    def b(self, tiles: Tiles, ctx):
-        while tiles.valid:
+    def b(self, work: WorkCursor, ctx):
+        while work.valid:
             self._count(1, ctx)
-            tiles.advance()
-        return tiles
+            work.advance()
+        return work
 
     def space(self, em, en, el):
         return (em, en, el)
 
     @cute.kernel
-    def kernel(self, count: cute.Tensor, work):
-        self.begin_roles(tiles=work)
+    def kernel(self, count: cute.Tensor, bound):
+        self.begin_roles(work=bound)
         self.run_roles(SimpleNamespace(count=count))
 
     @cute.jit
@@ -495,9 +508,9 @@ class CountToy(WarpSpecialized):
         max_ctas: Int32,
         stream: cuda.CUstream,
     ):
-        work = self.tiles.problem(self.space(em, en, el), workspace, max_ctas)
+        bound = self.work.bind(self.space(em, en, el), workspace, max_ctas)
         self.kernel.set_name_prefix(self.get_name())
-        self.kernel(count, work).launch(**self.launch_config(work), stream=stream)
+        self.kernel(count, bound).launch(**self.launch_config(bound), stream=stream)
 
 
 def compile_count_toy(op: CountToy):
@@ -513,11 +526,11 @@ COUNT_CASES = {
     "oneshot_tile_grid": (OneShot(), Raster()),
     "oneshot_1d": (OneShot(), SWIZZLED),
     "static": (StaticPersistent(), SWIZZLED),
-    "dynamic": (DynamicPersistent(stages=2), SWIZZLED),
-    "clc": (Clc(stages=2), SWIZZLED),
+    "atomic": (AtomicPersistent(stages=2), SWIZZLED),
+    "clc": (ClusterLaunchControl(stages=2), SWIZZLED),
     # Skip hooks: local skipping, and the scheduler publishing the first item itself.
     "static_skip": (StaticPersistent(), SkipOdd(swizzle=2)),
-    "clc_skip": (Clc(stages=2), SkipOdd(swizzle=2)),
+    "clc_skip": (ClusterLaunchControl(stages=2), SkipOdd(swizzle=2)),
 }
 PAIR_IDS = ["single", "pair"]
 
@@ -531,11 +544,11 @@ def _count_items(fn, ws, space, max_ctas):
 
 def _check_valid_launch(op, fn, ws):
     """30 items over a capped grid (persistent units run several each): every role in every
-    CTA of a unit counts each kept item, and the dynamic counter is zeroed again."""
+    CTA of a unit counts each kept item, and the atomic counter is zeroed again."""
     space = (5, 3, 2)
-    order = op.tiles.order
+    mapping = op.work.mapping
     kept = sum(
-        not (order.skips and order.skip(item, space))
+        not (mapping.skips and mapping.skip(item, space))
         for item in itertools.product(*(range(e) for e in space))
     )
     want = kept * op.cluster.size
@@ -547,10 +560,10 @@ def _check_valid_launch(op, fn, ws):
 @pytest.mark.parametrize("case", list(COUNT_CASES))
 def test_empty_space_runs_no_items(requires_blackwell, case, cluster):
     """An empty (or negative) space launches one work unit, every role sees no item, and the
-    launch leaves the dynamic counter zeroed, so a later nonempty launch covers its space."""
+    launch leaves the atomic counter zeroed, so a later nonempty launch covers its space."""
     op = CountToy(*COUNT_CASES[case], cluster)
     fn = compile_count_toy(op)
-    ws, _ = op.tiles.launch_args("cuda")
+    ws, _ = op.work.launch_args("cuda")
     for space in EMPTY_SPACES:
         for max_ctas in (148, 1):
             assert _count_items(fn, ws, space, max_ctas) == [0, 0], (space, max_ctas)
@@ -571,12 +584,12 @@ OVERFLOWING_SPACES = [
 def test_space_overflowing_int32_is_rejected(requires_blackwell, case, cluster):
     """An item count, grid, or persistent terminal index past Int32 makes the launch fail (no
     partial or wrapped coverage), and the next valid launch is unaffected."""
-    policy, order = COUNT_CASES[case]
-    op = CountToy(policy, order, cluster)
+    schedule, mapping = COUNT_CASES[case]
+    op = CountToy(schedule, mapping, cluster)
     fn = compile_count_toy(op)
-    ws, _ = op.tiles.launch_args("cuda")
+    ws, _ = op.work.launch_args("cuda")
     spaces = list(OVERFLOWING_SPACES)
-    if isinstance(policy, (StaticPersistent, DynamicPersistent)):
+    if isinstance(schedule, (StaticPersistent, AtomicPersistent)):
         # Fits Int32, but the last unit's terminal index (total - 1 + units) does not.
         spaces.append((2**31 - 50, 1, 1))
     for space in spaces:
@@ -586,26 +599,26 @@ def test_space_overflowing_int32_is_rejected(requires_blackwell, case, cluster):
 
 
 def test_record_needs_a_bound_stream(requires_blackwell):
-    stream = TileStream(policy=StaticPersistent(), record=4)
+    stream = WorkStream(schedule=StaticPersistent(), record=4)
     with pytest.raises(ValueError, match="before launch_args"):
         stream.launch_args("cuda")
 
 
 def test_describe_places_scheduler_and_counts(requires_blackwell):
-    op = ScheduleToy(Clc(stages=3))
+    op = ScheduleToy(ClusterLaunchControl(stages=3))
     op._collect()
     chans = op._ws_chans
-    work = chans["tiles_work"]
+    work = chans["work_ring"]
     # consumers: a (32) + b (64) + scheduler (32) threads; producer: scheduler warp.
     assert work.slot_counts("consumer") == [128] * 3
     assert work.slot_counts("producer") == [32] * 3
-    assert chans["tiles_clc"].slot_counts("producer") == [1]
-    sched = next(r for r in op._ws_roles if r.name == "tiles.scheduler")
+    assert chans["work_clc"].slot_counts("producer") == [1]
+    sched = next(r for r in op._ws_roles if r.name == "work.scheduler")
     assert sched.first_warp == 3
     assert "scheduler warp 3" in op.describe()
     local = ScheduleToy(StaticPersistent())
     local._collect()
-    assert "tiles_work" not in local._ws_chans
+    assert "work_ring" not in local._ws_chans
     assert "decoded locally" in local.describe()
 
 
@@ -624,12 +637,12 @@ def test_cursor_protocol_errors(requires_blackwell, mode, message):
 
 class _IdleRole(WarpSpecialized):
     def __init__(self):
-        self.tiles = TileStream(policy=StaticPersistent())
+        self.work = WorkStream(schedule=StaticPersistent())
 
     @role(warps=0)
     @cute.jit
-    def a(self, tiles: Tiles, ctx):
-        return tiles
+    def a(self, work: WorkCursor, ctx):
+        return work
 
     @role(warps=1)
     @cute.jit
@@ -638,7 +651,7 @@ class _IdleRole(WarpSpecialized):
 
 
 def test_persistent_requires_every_role_to_loop():
-    with pytest.raises(ProtocolError, match="do not take `tiles: Tiles`"):
+    with pytest.raises(ProtocolError, match="do not take `work: WorkCursor`"):
         _IdleRole()._collect()
 
 
@@ -646,18 +659,18 @@ def test_random_extents_bijection_fuzz():
     rng = random.Random(0)
     for _ in range(200):
         ext = (rng.randint(1, 40), rng.randint(1, 40), rng.randint(1, 3))
-        order = Raster(
+        mapping = Raster(
             along=rng.choice("mn"),
             swizzle=rng.randint(1, 12),
             reverse=rng.choice([(), ("m",), ("n",)]),
         )
-        coords = _all_coords(order, ext)
+        coords = _all_coords(mapping, ext)
         assert len(set(coords)) == len(coords) == ext[0] * ext[1] * ext[2]
         assert all(0 <= c < e for xyz in coords for c, e in zip(xyz, ext, strict=True))
 
 
 # --------------------------------------------------------------------------- #
-# Persistent GEMM example: every policy, ragged shapes, tiles < SMs and >> SMs.
+# Persistent GEMM example: every schedule, ragged shapes, tiles < SMs and >> SMs.
 # --------------------------------------------------------------------------- #
 
 GEMM_SHAPES = [
@@ -670,7 +683,7 @@ GEMM_SHAPES = [
 ]
 
 
-def _check_gemm(policy, m, n, k, max_ctas=None, order=None, cluster=None):
+def _check_gemm(schedule, m, n, k, max_ctas=None, mapping=None, cluster=None):
     from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import persistent_gemm
 
     torch.manual_seed(0)
@@ -679,33 +692,35 @@ def _check_gemm(policy, m, n, k, max_ctas=None, order=None, cluster=None):
     ref = torch.nn.functional.linear(a.float(), b.float())
     torch_err = (torch.nn.functional.linear(a, b).float() - ref).abs().max().item()
     out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
-    for _ in range(2):  # the second launch reuses the (self-reset) dynamic counter
+    for _ in range(2):  # the second launch reuses the (self-reset) atomic counter
         out.fill_(float("nan"))
-        persistent_gemm(a, b, out, policy=policy, order=order, max_ctas=max_ctas, cluster=cluster)
+        persistent_gemm(
+            a, b, out, schedule=schedule, mapping=mapping, max_ctas=max_ctas, cluster=cluster
+        )
         err = (out.float() - ref).abs().max().item()
-        assert err <= 2 * torch_err + 1e-3, (policy, (m, n, k), err, torch_err)
+        assert err <= 2 * torch_err + 1e-3, (schedule, (m, n, k), err, torch_err)
 
 
 @pytest.mark.parametrize("m,n,k", GEMM_SHAPES)
-@pytest.mark.parametrize("policy", ["oneshot", "static", "dynamic", "clc"])
-def test_persistent_gemm(requires_blackwell, policy, m, n, k):
-    _check_gemm(POLICIES[policy], m, n, k)
+@pytest.mark.parametrize("schedule", ["oneshot", "static", "atomic", "clc"])
+def test_persistent_gemm(requires_blackwell, schedule, m, n, k):
+    _check_gemm(SCHEDULES[schedule], m, n, k)
 
 
-@pytest.mark.parametrize("policy", ["static", "dynamic", "dynamic1", "clc1"])
+@pytest.mark.parametrize("schedule", ["static", "atomic", "atomic1", "clc1"])
 @pytest.mark.parametrize("max_ctas", [1, 5])
-def test_persistent_gemm_capped_grid(requires_blackwell, policy, max_ctas):
+def test_persistent_gemm_capped_grid(requires_blackwell, schedule, max_ctas):
     """A tiny grid makes every CTA wrap the work, A/B, and accumulator rings many times."""
-    _check_gemm(POLICIES[policy], 1100, 1032, 200, max_ctas=max_ctas)
+    _check_gemm(SCHEDULES[schedule], 1100, 1032, 200, max_ctas=max_ctas)
 
 
-@pytest.mark.parametrize("order", [Raster(), Raster(along="n", swizzle=3, reverse=("m", "n"))])
-def test_persistent_gemm_orders(requires_blackwell, order):
-    _check_gemm(POLICIES["dynamic"], 1500, 1800, 64, order=order)
+@pytest.mark.parametrize("mapping", [Raster(), Raster(along="n", swizzle=3, reverse=("m", "n"))])
+def test_persistent_gemm_mappings(requires_blackwell, mapping):
+    _check_gemm(SCHEDULES["atomic"], 1500, 1800, 64, mapping=mapping)
 
 
 def test_persistent_gemm_compiles_once_across_shapes(requires_blackwell, monkeypatch):
-    """Tile counts, K, and the grid cap are runtime values: one compile per (policy, order)."""
+    """Tile counts, K, and the grid cap are runtime values: one compile per (schedule, mapping)."""
     from transformer_nuggets.cute import cache
     from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import (
         PersistentGemm,
@@ -717,7 +732,7 @@ def test_persistent_gemm_compiles_once_across_shapes(requires_blackwell, monkeyp
     monkeypatch.setattr(
         cache, "compile_tvm_ffi", lambda *a, **kw: compiles.append(1) or real(*a, **kw)
     )
-    op = PersistentGemm(policy=DynamicPersistent(stages=3), ab_stages=3)
+    op = PersistentGemm(schedule=AtomicPersistent(stages=3), ab_stages=3)
     fns = set()
     # m: 1, multiple of 16, odd, tile edge, multi-wave; n, k: multiples of 8 on both sides of 16.
     for m, n, k, cap in [
@@ -732,7 +747,7 @@ def test_persistent_gemm_compiles_once_across_shapes(requires_blackwell, monkeyp
         out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
         fn = compile_persistent_gemm(op)
         fns.add(id(fn))
-        ws, _ = op.tiles.launch_args("cuda")
+        ws, _ = op.work.launch_args("cuda")
         fn(a, b, out, ws, cap)
         ref = torch.nn.functional.linear(a.float(), b.float())
         assert (out.float() - ref).abs().max().item() < 0.05 * ref.abs().max().item() + 1e-2
@@ -740,7 +755,7 @@ def test_persistent_gemm_compiles_once_across_shapes(requires_blackwell, monkeyp
 
 
 # --------------------------------------------------------------------------- #
-# FA4-style forward on the same primitive: persistent policies.
+# FA4-style forward on the same primitive: persistent schedules.
 # --------------------------------------------------------------------------- #
 
 
@@ -749,9 +764,9 @@ def test_persistent_gemm_compiles_once_across_shapes(requires_blackwell, monkeyp
 )
 @pytest.mark.parametrize("nonuniform", [False, True])
 @pytest.mark.parametrize("b,h,sq,sk", [(2, 3, 640, 512), (8, 16, 1024, 384)])
-@pytest.mark.parametrize("policy", ["static", "dynamic", "clc"])
+@pytest.mark.parametrize("schedule", ["static", "atomic", "clc"])
 def test_fa4_fwd_persistent(
-    requires_blackwell, policy, b, h, sq, sk, nonuniform, max_ctas, turnstile
+    requires_blackwell, schedule, b, h, sq, sk, nonuniform, max_ctas, turnstile
 ):
     """(8, 16, 1024) has 256 work items, so most CTAs run two (S/O/Q slots reused); with 3 CTAs
     each runs ~85, wrapping every slot and ring. sk=384 is an odd key-block count."""
@@ -766,7 +781,9 @@ def test_fa4_fwd_persistent(
     ref_lse = torch.logsumexp((qf @ kf.transpose(-1, -2)) / math.sqrt(128), dim=-1)
     tol = 2**-7 * ref.abs().max().item() + 4e-3
     for _ in range(2):
-        o, lse = fa4_fwd(q, k, v, policy=POLICIES[policy], max_ctas=max_ctas, turnstile=turnstile)
+        o, lse = fa4_fwd(
+            q, k, v, schedule=SCHEDULES[schedule], max_ctas=max_ctas, turnstile=turnstile
+        )
         assert (o.float() - ref).abs().max().item() <= tol
         torch.testing.assert_close(lse, ref_lse, atol=1e-3, rtol=1e-4)
 

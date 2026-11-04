@@ -22,7 +22,7 @@ from transformer_nuggets.cute.warpdrive import (
     Ring,
     Slots,
     Threads,
-    TileStream,
+    WorkStream,
     Tma,
     TmemPlan,
     Turn,
@@ -465,11 +465,11 @@ class TypoAnnotationToy(WarpSpecialized):
 
 class LookalikeToy(WarpSpecialized):
     def __init__(self):
-        self.tiles = TileStream()
+        self.work = WorkStream()
 
     @role(warps=0)
     @cute.jit
-    def work(self, tiles: TileStream, ctx):
+    def worker(self, work: WorkStream, ctx):
         pass
 
 
@@ -501,7 +501,10 @@ class TwoUnannotatedToy(TypedCtxToy):
             TypoAnnotationToy,
             r"role mma: parameter ab is annotated 'Consumr', which does not resolve",
         ),
-        (LookalikeToy, r"parameter tiles is annotated TileStream.*did you mean `tiles: Tiles`"),
+        (
+            LookalikeToy,
+            r"parameter work is annotated WorkStream.*did you mean `work: WorkCursor`",
+        ),
         (TwoContextTypesToy, r"unrelated types \(cons\.ctx: OtherCtx, prod\.ctx: ToyCtx\)"),
         (TwoUnannotatedToy, r"role cons: parameters \['extra', 'ctx'\] would all receive"),
         (MutableAnnotationToy, r"cons\.ctx is annotated MutableToyCtx, which is not a frozen"),

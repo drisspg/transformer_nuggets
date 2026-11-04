@@ -15,17 +15,17 @@ from cutlass import cute
 
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
-    Clc,
+    ClusterLaunchControl,
     Consumer,
     CtaPair,
-    DynamicPersistent,
+    AtomicPersistent,
     Instance,
     Producer,
     Slots,
     StaticPersistent,
     Threads,
-    Tiles,
-    TileStream,
+    WorkCursor,
+    WorkStream,
     Tmem,
     Turn,
     Turnstile,
@@ -125,17 +125,17 @@ def test_bad_role_result_rejected_before_launch(requires_blackwell, mode, messag
 
 
 class ReturnedCursor(WarpSpecialized):
-    def __init__(self, policy, *, missing=False):
-        self.tiles = TileStream(policy=policy)
+    def __init__(self, schedule, *, missing=False):
+        self.work = WorkStream(schedule=schedule)
         self.missing = missing
 
     @role(warps=0)
     @cute.jit
-    def count(self, tiles: Tiles, ctx):
-        live = tiles
-        tiles = None
+    def count(self, work: WorkCursor, ctx):
+        live = work
+        work = None
         while live.valid:
-            i, _, _ = live.work
+            i, _, _ = live.item
             if cute.arch.lane_idx() == 0:
                 ctx.out[i] = i + 1
             live = self.next_item(live)
@@ -144,20 +144,20 @@ class ReturnedCursor(WarpSpecialized):
         return live
 
     @cute.jit
-    def next_item(self, tiles):
-        tiles.advance()
-        return tiles
+    def next_item(self, work):
+        work.advance()
+        return work
 
     @cute.kernel
-    def kernel(self, out: cute.Tensor, work):
-        self.begin_roles(tiles=work)
+    def kernel(self, out: cute.Tensor, bound):
+        self.begin_roles(work=bound)
         self.run_roles(SimpleNamespace(out=out))
 
     @cute.jit
     def __call__(self, out: cute.Tensor, workspace: cute.Tensor, stream: cuda.CUstream):
-        work = self.tiles.problem((out.shape[0], 1, 1), workspace, 2)
+        bound = self.work.bind((out.shape[0], 1, 1), workspace, 2)
         self.kernel.set_name_prefix("warpdrive_returned_cursor")
-        self.kernel(out, work).launch(**self.launch_config(work), stream=stream)
+        self.kernel(out, bound).launch(**self.launch_config(bound), stream=stream)
 
 
 def compile_cursor(op):
@@ -169,11 +169,13 @@ def compile_cursor(op):
     )
 
 
-@pytest.mark.parametrize("policy", [StaticPersistent(), DynamicPersistent(), Clc()])
-def test_returned_cursor_from_helper(requires_blackwell, policy):
-    op = ReturnedCursor(policy)
+@pytest.mark.parametrize(
+    "schedule", [StaticPersistent(), AtomicPersistent(), ClusterLaunchControl()]
+)
+def test_returned_cursor_from_helper(requires_blackwell, schedule):
+    op = ReturnedCursor(schedule)
     fn = compile_cursor(op)
-    workspace, _ = op.tiles.launch_args("cuda")
+    workspace, _ = op.work.launch_args("cuda")
     for n in (1, 19, 33):
         out = torch.zeros(n, device="cuda", dtype=torch.int32)
         fn(out, workspace)
@@ -183,7 +185,7 @@ def test_returned_cursor_from_helper(requires_blackwell, policy):
 @pytest.mark.parametrize("iket", [False, True])
 def test_cursor_return_required_independently_of_tracing(requires_blackwell, iket):
     op = ReturnedCursor(StaticPersistent(), missing=True).enable_iket(iket)
-    with pytest.raises(Exception, match="return all warpdrive state arguments; missing tiles"):
+    with pytest.raises(Exception, match="return all warpdrive state arguments; missing work"):
         compile_cursor(op)
 
 
@@ -249,9 +251,9 @@ def test_turnstile_must_be_returned(requires_blackwell):
 class ReorderedGemm(Gemm):
     @role(warps=5, regs=40)
     @cute.jit
-    def mma(self, params: GemmParams, ab: Consumer, acc: Producer, tiles: Tiles, tmem: Tmem):
-        ab, acc, tiles = Gemm.mma(self, params, ab=ab, acc=acc, tiles=tiles, tmem=tmem)
-        return tiles, acc, ab  # state identity, not tuple position, controls cleanup
+    def mma(self, params: GemmParams, ab: Consumer, acc: Producer, work: WorkCursor, tmem: Tmem):
+        ab, acc, tiles = Gemm.mma(self, params, ab=ab, acc=acc, work=work, tmem=tmem)
+        return work, acc, ab  # state identity, not tuple position, controls cleanup
 
 
 def test_return_order_does_not_change_bindings(requires_blackwell):
@@ -267,9 +269,9 @@ def test_return_order_does_not_change_bindings(requires_blackwell):
 class ReorderedPersistentGemm(PersistentGemm):
     @role(warps=4, regs=40)
     @cute.jit
-    def load(self, params: PersistentGemmParams, ab: Producer, tiles: Tiles):
-        ab, tiles = PersistentGemm.load(self, params, ab=ab, tiles=tiles)
-        return tiles, ab
+    def load(self, params: PersistentGemmParams, ab: Producer, work: WorkCursor):
+        ab, tiles = PersistentGemm.load(self, params, ab=ab, work=work)
+        return work, ab
 
 
 def test_reordered_state_drives_pair_producer_tail(requires_blackwell):
@@ -280,9 +282,9 @@ def test_reordered_state_drives_pair_producer_tail(requires_blackwell):
     b = torch.randn(1000, 200, device="cuda", dtype=torch.bfloat16)
     outputs = []
     for cls in (PersistentGemm, ReorderedPersistentGemm):
-        op = cls(cluster=CtaPair(), policy=StaticPersistent())
+        op = cls(cluster=CtaPair(), schedule=StaticPersistent())
         fn = compile_persistent_gemm(op)
-        workspace, _ = op.tiles.launch_args(a.device)
+        workspace, _ = op.work.launch_args(a.device)
         out = torch.full((900, 1000), float("nan"), device="cuda", dtype=torch.bfloat16)
         fn(a, b, out, workspace, 2)
         torch.cuda.synchronize()

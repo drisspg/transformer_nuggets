@@ -1,4 +1,4 @@
-"""The public scheduler interface: custom policies, external scheduler adapters, and the raw-role
+"""The public scheduler interface: custom schedules, external scheduler adapters, and the raw-role
 work-item accessor, swapped into the same kernels with one argument."""
 
 import importlib
@@ -34,20 +34,20 @@ from test_cute_warpdrive_scheduling import (
 
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
-    Clc,
+    ClusterLaunchControl,
     CtaPair,
-    CutlassStaticPersistent,
-    DynamicPersistent,
-    Fa4Scheduler,
+    CutlassRaster,
+    AtomicPersistent,
+    Fa4Mapping,
     OneShot,
-    Policy,
+    IndexSchedule,
     ProtocolError,
     Raster,
     SingleCta,
     Readiness,
     StaticPersistent,
-    Tiles,
-    TileStream,
+    WorkCursor,
+    WorkStream,
     WarpSpecialized,
     role,
 )
@@ -71,7 +71,7 @@ def fa4_tile_scheduler():
 
 
 # --------------------------------------------------------------------------- #
-# Custom policies, written against the public protocol only.
+# Custom schedules, written against the public protocol only.
 # --------------------------------------------------------------------------- #
 
 
@@ -82,29 +82,29 @@ def _countdown(index, problem):
 
 
 @dataclass(frozen=True)
-class ReverseStatic(Policy):
+class ReverseStatic(IndexSchedule):
     """Static persistent from the back: unit ``b`` runs ``total-1-b, total-1-b-U, ...``.
     Computed locally in every role."""
 
-    def first(self, problem):
+    def first_index(self, problem):
         return _countdown(problem.total - 1 - problem.first_unit(), problem)
 
-    def step(self, index, problem):
+    def next_index(self, index, problem):
         return _countdown(index - problem.units(), problem)
 
 
 @dataclass(frozen=True)
-class ReverseBroadcast(Policy):
+class ReverseBroadcast(IndexSchedule):
     """The same sequence, claimed on the scheduler warp and broadcast (stateful through the
-    previous index ``claim`` receives)."""
+    previous index ``claim_next`` receives)."""
 
     stages: int = 2
     broadcast = True
 
-    def first(self, problem):
+    def first_index(self, problem):
         return _countdown(problem.total - 1 - problem.first_unit(), problem)
 
-    def claim(self, fetch, problem, index):
+    def claim_next(self, fetch, problem, index):
         return _countdown(index - problem.units(), problem)
 
 
@@ -118,34 +118,36 @@ def reverse_static_items(total: int, units: int, unit: int) -> list[int]:
 
 
 def test_custom_protocol_errors_at_declaration():
-    class NoStep(Policy):
+    class NoStep(IndexSchedule):
         pass
 
-    class NoClaim(Policy):
+    class NoClaim(IndexSchedule):
         broadcast = True
         stages = 2
 
-    with pytest.raises(TypeError, match="local policy but does not define step"):
-        TileStream(policy=NoStep())
-    with pytest.raises(TypeError, match="broadcast policy but does not define claim"):
-        TileStream(policy=NoClaim())
-    with pytest.raises(TypeError, match="TileStream.policy must be a Policy"):
-        TileStream(policy=SimpleNamespace(step=None))
-    with pytest.raises(TypeError, match="TileStream.order must be a WorkMapping"):
-        TileStream(order=SimpleNamespace(words=3))
-    with pytest.raises(TypeError, match="TileStream.ready must be a Readiness"):
-        TileStream(ready=object())
-    with pytest.raises(ValueError, match="broadcast policy stages"):
-        TileStream(policy=ReverseBroadcast(stages=0))
+    with pytest.raises(TypeError, match="local schedule but does not define next_index"):
+        WorkStream(schedule=NoStep())
+    with pytest.raises(TypeError, match="broadcast schedule but does not define claim_next"):
+        WorkStream(schedule=NoClaim())
+    with pytest.raises(
+        TypeError, match="WorkStream.schedule: expected an instance of IndexSchedule"
+    ):
+        WorkStream(schedule=SimpleNamespace(next_index=None))
+    with pytest.raises(TypeError, match="WorkStream.mapping: expected an instance of WorkMap"):
+        WorkStream(mapping=SimpleNamespace(words=3))
+    with pytest.raises(TypeError, match="WorkStream.ready: expected an instance of Readiness"):
+        WorkStream(ready=object())
+    with pytest.raises(ValueError, match="broadcast schedule stages"):
+        WorkStream(schedule=ReverseBroadcast(stages=0))
 
 
 @dataclass(frozen=True)
-class Strided(Policy):
-    """A policy with a compile-time field: the default key must name it."""
+class Strided(IndexSchedule):
+    """A schedule with a compile-time field: the default key must name it."""
 
     stride: int = 1
 
-    def step(self, index, problem):
+    def next_index(self, index, problem):
         return index + self.stride * problem.units()
 
 
@@ -157,63 +159,62 @@ class NoWait(Readiness):
         pass
 
 
-def test_custom_policy_keys_and_launch_needs():
-    assert TileStream(policy=ReverseStatic()).get_key() == "reversestatic0_m1"
-    assert TileStream(policy=ReverseBroadcast(3)).get_key() == "reversebroadcast3_m1"
-    assert TileStream(policy=Strided(2)).get_key() == "strided0_stride2_m1"
-    assert TileStream(ready=NoWait()).get_key() == "oneshot0_m1_nowait"
-    # Built-in keys are unchanged by the protocol (compile caches and kernel names).
-    assert TileStream(order=Raster(swizzle=8), policy=Clc()).get_key() == "clc2_m8"
+def test_custom_schedule_keys_and_launch_needs():
+    assert WorkStream(schedule=ReverseStatic()).get_key() == "reversestatic0_m1"
+    assert WorkStream(schedule=ReverseBroadcast(3)).get_key() == "reversebroadcast3_m1"
+    assert WorkStream(schedule=Strided(2)).get_key() == "strided0_stride2_m1"
+    assert WorkStream(ready=NoWait()).get_key() == "oneshot0_m1_nowait"
+    # Built-ins take the same default key as custom schedules.
+    stream = WorkStream(mapping=Raster(swizzle=8), schedule=ClusterLaunchControl())
+    assert stream.get_key() == "clusterlaunchcontrol2_m8"
     assert ReverseStatic().uses_max_ctas and not ReverseStatic().uses_workspace
-    with pytest.raises(ValueError, match="DynamicPersistent.*workspace"):
-        TileStream(policy=DynamicPersistent()).problem((1, 1, 1))
+    with pytest.raises(ValueError, match="AtomicPersistent.*workspace"):
+        WorkStream(schedule=AtomicPersistent()).bind((1, 1, 1))
 
 
 def test_adapters_import_without_flash_attn(monkeypatch):
-    """warpdrive imports without flash_attn; only constructing Fa4Scheduler needs it."""
+    """warpdrive imports without flash_attn; only constructing Fa4Mapping needs it."""
     monkeypatch.setitem(sys.modules, "flash_attn", None)
     monkeypatch.setitem(sys.modules, "flash_attn.cute", None)
     monkeypatch.setitem(sys.modules, "flash_attn.cute.tile_scheduler", None)
     for name in [m for m in sys.modules if m.startswith("transformer_nuggets.cute.warpdrive")]:
         monkeypatch.delitem(sys.modules, name)
     warpdrive = importlib.import_module("transformer_nuggets.cute.warpdrive")
-    warpdrive.TileStream(order=warpdrive.CutlassStaticPersistent(swizzle=4))
+    warpdrive.WorkStream(mapping=warpdrive.CutlassRaster(swizzle=4))
     with pytest.raises(ImportError, match="flash-attn-4"):
-        warpdrive.Fa4Scheduler(object)
+        warpdrive.Fa4Mapping(object)
 
 
 def test_adapter_validation():
     with pytest.raises(ValueError, match="along"):
-        CutlassStaticPersistent(along="k")
+        CutlassRaster(along="k")
     with pytest.raises(ValueError, match="swizzle"):
-        CutlassStaticPersistent(swizzle=0)
-    assert CutlassStaticPersistent(swizzle=8).skips and not CutlassStaticPersistent().skips
+        CutlassRaster(swizzle=0)
+    assert CutlassRaster(swizzle=8).skips and not CutlassRaster().skips
     ts = fa4_tile_scheduler()
     with pytest.raises(ValueError, match="one linear index"):
-        Fa4Scheduler(ts.SingleTileScheduler)
-    assert Fa4Scheduler(ts.StaticPersistentTileScheduler).native_policy == StaticPersistent()
-    assert Fa4Scheduler(ts.SingleTileLPTScheduler).native_policy == OneShot()
+        Fa4Mapping(ts.SingleTileScheduler)
 
 
-def test_work_item_rejects_persistent_policies():
-    stream = TileStream(policy=StaticPersistent())
-    with pytest.raises(ProtocolError, match="non-persistent local policy"):
-        stream.work_item()
+def test_single_item_rejects_persistent_schedules():
+    stream = WorkStream(schedule=StaticPersistent())
+    with pytest.raises(ProtocolError, match="non-persistent local schedule"):
+        stream.single_item()
     with pytest.raises(ProtocolError, match="after begin_roles"):
-        TileStream().work_item()
+        WorkStream().single_item()
 
 
 # --------------------------------------------------------------------------- #
-# GPU: custom policies on the schedule toy (single CTA) and the count toy (pairs)
+# GPU: custom schedules on the schedule toy (single CTA) and the count toy (pairs)
 # --------------------------------------------------------------------------- #
 
 CUSTOM = {"reverse_static": ReverseStatic(), "reverse_broadcast": ReverseBroadcast(stages=2)}
 
 
 @pytest.mark.parametrize("ext,max_ctas", [((5, 3, 1), 148), ((13, 29, 3), 148), ((40, 40, 1), 7)])
-@pytest.mark.parametrize("policy", list(CUSTOM))
-def test_custom_policy_runs_its_sequence(requires_blackwell, policy, ext, max_ctas):
-    op = ScheduleToy(CUSTOM[policy], order=Raster())
+@pytest.mark.parametrize("schedule", list(CUSTOM))
+def test_custom_schedule_runs_its_sequence(requires_blackwell, schedule, ext, max_ctas):
+    op = ScheduleToy(CUSTOM[schedule], mapping=Raster())
     log, hits, _ = run_toy(op, ext, max_ctas, reps=2)
     assert (hits == 1).all(), f"tiles missed or repeated: {hits}"
     assert torch.equal(log[0], log[1])
@@ -225,9 +226,9 @@ def test_custom_policy_runs_its_sequence(requires_blackwell, policy, ext, max_ct
 
 
 @pytest.mark.parametrize("ready", [None, NoWait()], ids=["no_ready", "custom_ready"])
-@pytest.mark.parametrize("policy", list(CUSTOM))
-def test_custom_policy_with_skips(requires_blackwell, policy, ready):
-    op = ScheduleToy(CUSTOM[policy], order=SkipOdd(swizzle=2), mode="skip", ready=ready)
+@pytest.mark.parametrize("schedule", list(CUSTOM))
+def test_custom_schedule_with_skips(requires_blackwell, schedule, ready):
+    op = ScheduleToy(CUSTOM[schedule], mapping=SkipOdd(swizzle=2), mode="skip", ready=ready)
     ext = (9, 7, 2)
     log, hits, _ = run_toy(op, ext, 16, reps=2)
     assert torch.equal(log[0], log[1])
@@ -336,7 +337,7 @@ def reference_sequences(ref: ExternalReference, ext, units: int) -> list[list[in
     return out
 
 
-def padded_count(adapter: CutlassStaticPersistent, ext) -> int:
+def padded_count(adapter: CutlassRaster, ext) -> int:
     em, en, el = ext
     s = adapter.swizzle
     if adapter.along == "m":
@@ -352,7 +353,7 @@ def check_external_order(op, ref, ext, max_ctas, items):
     log, hits, _ = run_toy(op, ext, max_ctas, items=items)
     assert (hits == 1).all(), f"tiles missed or repeated: {hits}"
     assert torch.equal(log[0], log[1])
-    units = max(min(items, max_ctas), 1) if op.tiles.policy.uses_max_ctas else max(items, 1)
+    units = max(min(items, max_ctas), 1) if op.work.schedule.uses_max_ctas else max(items, 1)
     for b, want in enumerate(reference_sequences(ref, ext, units)):
         want = want[:MAX_REF]
         got = [t for t in log[0, b].tolist() if t >= 0]
@@ -366,15 +367,15 @@ EXTERNAL_SHAPES = [((5, 3, 1), 148), ((13, 29, 3), 148), ((7, 17, 2), 5)]
 @pytest.mark.parametrize(
     "adapter",
     [
-        CutlassStaticPersistent(),
-        CutlassStaticPersistent(along="n"),
-        CutlassStaticPersistent(swizzle=3),
-        CutlassStaticPersistent(swizzle=8, along="n"),
+        CutlassRaster(),
+        CutlassRaster(along="n"),
+        CutlassRaster(swizzle=3),
+        CutlassRaster(swizzle=8, along="n"),
     ],
     ids=lambda a: a.get_key(),
 )
 def test_cutlass_static_persistent_order(requires_blackwell, adapter, ext, max_ctas):
-    op = ScheduleToy(adapter.native_policy, order=adapter, mode="ext")
+    op = ScheduleToy(StaticPersistent(), mapping=adapter, mode="ext")
     ref = ExternalReference(adapter, "cutlass")
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -386,8 +387,8 @@ def test_cutlass_static_persistent_order(requires_blackwell, adapter, ext, max_c
 @pytest.mark.parametrize("ext,max_ctas", EXTERNAL_SHAPES)
 def test_fa4_static_persistent_order(requires_blackwell, ext, max_ctas):
     ts = fa4_tile_scheduler()
-    adapter = Fa4Scheduler(ts.StaticPersistentTileScheduler)
-    op = ScheduleToy(adapter.native_policy, order=adapter, mode="ext")
+    adapter = Fa4Mapping(ts.StaticPersistentTileScheduler)
+    op = ScheduleToy(StaticPersistent(), mapping=adapter, mode="ext")
     ref = ExternalReference(adapter, "fa4")
     check_external_order(op, ref, ext, max_ctas, ext[0] * ext[1] * ext[2])
 
@@ -421,8 +422,8 @@ class EmptyKvCountToy(LptCountToy):
 @pytest.mark.parametrize("ext", [(5, 3, 1), (13, 29, 3), (2, 40, 1)])
 def test_fa4_lpt_order(requires_blackwell, ext, lpt):
     ts = fa4_tile_scheduler()
-    adapter = Fa4Scheduler(ts.SingleTileLPTScheduler, lpt=lpt[0], lpt_global=lpt[1])
-    op = LptToy(adapter.native_policy, order=adapter, mode="ext")
+    adapter = Fa4Mapping(ts.SingleTileLPTScheduler, lpt=lpt[0], lpt_global=lpt[1])
+    op = LptToy(OneShot(), mapping=adapter, mode="ext")
     ref = ExternalReference(adapter, "fa4", SEQLEN_K, lpt)
     check_external_order(op, ref, ext, 148, ext[0] * ext[1] * ext[2])
 
@@ -430,32 +431,32 @@ def test_fa4_lpt_order(requires_blackwell, ext, lpt):
 def test_fa4_adapter_spaces_and_keys():
     ts = fa4_tile_scheduler()
     with pytest.raises(ValueError, match="seqlen_k"):
-        Fa4Scheduler(ts.SingleTileLPTScheduler).bind((1, 2, 3))
+        Fa4Mapping(ts.SingleTileLPTScheduler).bind((1, 2, 3))
     with pytest.raises(ValueError, match="num_batch\\)"):
-        Fa4Scheduler(ts.StaticPersistentTileScheduler).bind((1, 2, 3, 4))
+        Fa4Mapping(ts.StaticPersistentTileScheduler).bind((1, 2, 3, 4))
     with pytest.raises(ValueError, match="head_dim"):
-        Fa4Scheduler(ts.SingleTileLPTScheduler, head_dim=0)
+        Fa4Mapping(ts.SingleTileLPTScheduler, head_dim=0)
     # Every compile-time argument of the LPT scheduler is in the key.
     keys = {
-        Fa4Scheduler(ts.SingleTileLPTScheduler, **kw).get_key()
+        Fa4Mapping(ts.SingleTileLPTScheduler, **kw).get_key()
         for kw in [{}, {"lpt": False}, {"lpt_global": True}, {"head_dim": 64}, {"element_size": 1}]
     }
     assert len(keys) == 5
 
 
-@pytest.mark.parametrize("policy", ["dynamic", "clc", "reverse_broadcast"])
-def test_external_mapping_under_other_policies(requires_blackwell, policy):
-    """An adapter is a mapping: any policy distributes its items."""
-    policies = {"dynamic": DynamicPersistent(), "clc": Clc(), **CUSTOM}
-    adapter = CutlassStaticPersistent(swizzle=8)
-    op = ScheduleToy(policies[policy], order=adapter, mode="ext")
+@pytest.mark.parametrize("schedule", ["atomic", "clc", "reverse_broadcast"])
+def test_external_mapping_under_other_schedules(requires_blackwell, schedule):
+    """An adapter is a mapping: any schedule distributes its items."""
+    schedules = {"atomic": AtomicPersistent(), "clc": ClusterLaunchControl(), **CUSTOM}
+    adapter = CutlassRaster(swizzle=8)
+    op = ScheduleToy(schedules[schedule], mapping=adapter, mode="ext")
     ext = (13, 29, 3)
     _, hits, ws = run_toy(op, ext, 16, reps=2, items=padded_count(adapter, ext))
     assert (hits == 1).all() and ws[:2].tolist() == [0, 0]
 
 
 # --------------------------------------------------------------------------- #
-# Pairs, empty spaces and overflow for custom policies and adapters
+# Pairs, empty spaces and overflow for custom schedules and adapters
 # --------------------------------------------------------------------------- #
 
 
@@ -467,19 +468,19 @@ def fa4_or_none():
 
 
 def count_cases():
-    """name -> (toy class, policy, order)."""
+    """name -> (toy class, schedule, mapping)."""
     cases = {
         "reverse_static": (CountToy, ReverseStatic(), Raster(along="n", swizzle=3)),
         "reverse_broadcast": (CountToy, ReverseBroadcast(), Raster(along="n", swizzle=3)),
-        "cutlass_static": (CountToy, StaticPersistent(), CutlassStaticPersistent(swizzle=4)),
-        "cutlass_clc": (CountToy, Clc(), CutlassStaticPersistent(swizzle=4, along="n")),
+        "cutlass_static": (CountToy, StaticPersistent(), CutlassRaster(swizzle=4)),
+        "cutlass_clc": (CountToy, ClusterLaunchControl(), CutlassRaster(swizzle=4, along="n")),
     }
     ts = fa4_or_none()
     if ts is not None:
-        static = Fa4Scheduler(ts.StaticPersistentTileScheduler)
-        lpt_global = Fa4Scheduler(ts.SingleTileLPTScheduler, lpt_global=True)
-        lpt = Fa4Scheduler(ts.SingleTileLPTScheduler)
-        cases["fa4_static"] = (CountToy, static.native_policy, static)
+        static = Fa4Mapping(ts.StaticPersistentTileScheduler)
+        lpt_global = Fa4Mapping(ts.SingleTileLPTScheduler, lpt_global=True)
+        lpt = Fa4Mapping(ts.SingleTileLPTScheduler)
+        cases["fa4_static"] = (CountToy, StaticPersistent(), static)
         cases["fa4_lpt_global"] = (LptCountToy, OneShot(), lpt_global)
         cases["fa4_lpt_empty_kv"] = (EmptyKvCountToy, OneShot(), lpt)
     return cases
@@ -490,11 +491,11 @@ def count_cases():
 def test_swapped_schedules_cover_empty_and_overflowing_spaces(requires_blackwell, case, cluster):
     """Every CTA of a unit sees each item; empty spaces (and an empty KV) run nothing or never
     divide by zero in the entry point; spaces past Int32 are rejected at launch (custom
-    ``reach`` default and the adapters' Int64 ``size64``)."""
-    toy, policy, order = count_cases()[case]
-    op = toy(policy, order, cluster)
+    ``index_limit`` default and the adapters' Int64 ``size64``)."""
+    toy, schedule, mapping = count_cases()[case]
+    op = toy(schedule, mapping, cluster)
     fn = compile_count_toy(op)
-    ws, _ = op.tiles.launch_args("cuda")
+    ws, _ = op.work.launch_args("cuda")
     for space in EMPTY_SPACES:
         assert _count_items(fn, ws, space, 148) == [0, 0], space
     for space in OVERFLOWING_SPACES:
@@ -511,14 +512,14 @@ def test_swapped_schedules_cover_empty_and_overflowing_spaces(requires_blackwell
 
 class RawItemToy(WarpSpecialized):
     """A managed role (warp 0) loops the stream; a raw role (warps 1-2) reads its work item with
-    ``self.tiles.work_item()``. Both count each tile in ``hits[role, tile]``."""
+    ``self.work.single_item()``. Both count each tile in ``hits[role, tile]``."""
 
-    def __init__(self, order, mode: str, cluster=None):
+    def __init__(self, mapping, mode: str, cluster=None):
         self.mode, self.cluster = mode, cluster or SingleCta()
-        self.tiles = TileStream(order=order, policy=OneShot())
+        self.work = WorkStream(mapping=mapping, schedule=OneShot())
 
     def get_name(self) -> str:
-        return f"warpdrive_raw_item_{self.tiles.get_key()}_{self.mode}_cs{self.cluster.size}"
+        return f"warpdrive_raw_item_{self.work.get_key()}_{self.mode}_cs{self.cluster.size}"
 
     @cute.jit
     def _hit(self, r: int, item, ctx):
@@ -529,36 +530,36 @@ class RawItemToy(WarpSpecialized):
 
     @role(warps=0)
     @cute.jit
-    def managed(self, tiles: Tiles, ctx):
-        while tiles.valid:
-            self._hit(0, tiles.work, ctx)
-            tiles.advance()
-        return tiles
+    def managed(self, work: WorkCursor, ctx):
+        while work.valid:
+            self._hit(0, work.item, ctx)
+            work.advance()
+        return work
 
     @role(warps=range(1, 3), raw=True)
     @cute.jit
     def raw(self, ctx):
-        valid, item = self.tiles.work_item()
+        valid, item = self.work.single_item()
         if valid:
             self._hit(1, item, ctx)
 
     @cute.kernel
-    def kernel(self, hits: cute.Tensor, em: Int32, en: Int32, work):
-        self.begin_roles(tiles=work)
+    def kernel(self, hits: cute.Tensor, em: Int32, en: Int32, bound):
+        self.begin_roles(work=bound)
         self.run_roles(SimpleNamespace(hits=hits, em=em, en=en))
 
     @cute.jit
     def __call__(self, hits: cute.Tensor, em: Int32, en: Int32, el: Int32, stream: cuda.CUstream):
-        work = self.tiles.problem((em, en, el))
+        bound = self.work.bind((em, en, el))
         self.kernel.set_name_prefix(self.get_name())
-        cfg = self.launch_config(work)
+        cfg = self.launch_config(bound)
         if cutlass.const_expr(self.mode == "1d"):  # a hand-built (total * cs, 1, 1) grid
-            cfg["grid"] = (cutlass.max(work.total, 1) * self.cluster.size, 1, 1)
-        self.kernel(hits, em, en, work).launch(**cfg, stream=stream)
+            cfg["grid"] = (cutlass.max(bound.total, 1) * self.cluster.size, 1, 1)
+        self.kernel(hits, em, en, bound).launch(**cfg, stream=stream)
 
 
 @pytest.mark.parametrize(
-    "order, mode, ext, cluster",
+    "mapping, mode, ext, cluster",
     [
         (Raster(), "grid", (5, 3, 2), SingleCta()),
         (Raster(), "grid", (2, 65536, 1), SingleCta()),  # n_tiles past gridDim.y: 1-D fallback
@@ -566,14 +567,14 @@ class RawItemToy(WarpSpecialized):
         (Raster(), "grid", (3, 70000, 1), CtaPair()),
         (Raster(swizzle=3, reverse="m"), "grid", (7, 5, 2), CtaPair()),
         (SkipOdd(swizzle=2), "grid", (9, 7, 2), SingleCta()),
-        (CutlassStaticPersistent(swizzle=4), "grid", (7, 5, 2), SingleCta()),
+        (CutlassRaster(swizzle=4), "grid", (7, 5, 2), SingleCta()),
         (Raster(), "grid", (0, 3, 1), SingleCta()),  # empty: one unit, no valid item
     ],
     ids=["tile_grid", "fallback", "hand_1d", "pair_fallback", "pair_swizzle", "skip", "cutlass",
          "empty"],
 )  # fmt: skip
-def test_raw_role_work_item(requires_blackwell, order, mode, ext, cluster):
-    op = RawItemToy(order, mode, cluster)
+def test_raw_role_single_item(requires_blackwell, mapping, mode, ext, cluster):
+    op = RawItemToy(mapping, mode, cluster)
     em, en, el = ext
     total = max(em * en * el, 0)
     hits = torch.zeros(2, max(total, 1), dtype=torch.int32, device="cuda")
@@ -590,7 +591,7 @@ def test_raw_role_work_item(requires_blackwell, order, mode, ext, cluster):
     hits = hits.cpu()[:, :total]
     kept = torch.tensor(
         [
-            0 if isinstance(order, SkipOdd) and order.skip((m, n, li), ext) else cluster.size
+            0 if isinstance(mapping, SkipOdd) and mapping.skip((m, n, li), ext) else cluster.size
             for li in range(el)
             for n in range(en)
             for m in range(em)
@@ -610,17 +611,17 @@ def gemm_schedules():
     schedules = {
         "oneshot": (OneShot(), None),
         "static": (StaticPersistent(), None),
-        "dynamic": (DynamicPersistent(), None),
-        "clc": (Clc(), None),
+        "atomic": (AtomicPersistent(), None),
+        "clc": (ClusterLaunchControl(), None),
         "reverse_static": (ReverseStatic(), None),
         "reverse_broadcast": (ReverseBroadcast(), None),
-        "cutlass_native": (StaticPersistent(), CutlassStaticPersistent(swizzle=8)),
-        "cutlass_clc": (Clc(), CutlassStaticPersistent(swizzle=2, along="n")),
+        "cutlass_static": (StaticPersistent(), CutlassRaster(swizzle=8)),
+        "cutlass_clc": (ClusterLaunchControl(), CutlassRaster(swizzle=2, along="n")),
     }
     if ts is not None:
-        adapter = Fa4Scheduler(ts.StaticPersistentTileScheduler)
-        schedules["fa4_native"] = (adapter.native_policy, adapter)
-        schedules["fa4_dynamic"] = (DynamicPersistent(), adapter)
+        adapter = Fa4Mapping(ts.StaticPersistentTileScheduler)
+        schedules["fa4_static"] = (StaticPersistent(), adapter)
+        schedules["fa4_atomic"] = (AtomicPersistent(), adapter)
     return schedules
 
 
@@ -628,12 +629,12 @@ GEMM_SCHEDULES = list(gemm_schedules())
 
 
 @pytest.mark.parametrize("cluster", [None, CtaPair()], ids=["single", "pair"])
-@pytest.mark.parametrize("schedule", GEMM_SCHEDULES)
-def test_persistent_gemm_swaps_schedules(requires_blackwell, schedule, cluster):
-    policy, order = gemm_schedules()[schedule]
+@pytest.mark.parametrize("case", GEMM_SCHEDULES)
+def test_persistent_gemm_swaps_schedules(requires_blackwell, case, cluster):
+    schedule, mapping = gemm_schedules()[case]
     for m, n, k, max_ctas in [
         (300, 520, 136, None),
         (4097, 2056, 520, None),
         (1100, 1032, 200, 5),
     ]:
-        _check_gemm(policy, m, n, k, max_ctas=max_ctas, order=order, cluster=cluster)
+        _check_gemm(schedule, m, n, k, max_ctas=max_ctas, mapping=mapping, cluster=cluster)

@@ -22,7 +22,7 @@ Validity (the contract's "valid managed program", section 1) is by construction:
 * Payloads only ride on CTA-local channels with ``Threads`` or ``Tma`` producers and ``Threads``
   consumers; ``Umma`` and pair-scoped channels are tokens (counts only). TMA stages read by
   threads declare ``release_fence="smem_async"`` (the U4 user obligation).
-* With a ``TileStream`` every role drains it (``while tiles.valid: ...; tiles.advance()``) and
+* With a ``WorkStream`` every role drains it (``while work.valid: ...; work.advance()``) and
   runs ``rounds(item)`` iterations per item, computed identically by every role.
 """
 
@@ -113,7 +113,7 @@ class ChannelSpec:
 
 @dataclass(frozen=True)
 class StreamSpec:
-    policy: str  # "oneshot" | "static" | "dynamic" | "clc"
+    schedule: str  # "oneshot" | "static" | "atomic" | "clc"
     stages: int
     along: str
     swizzle: int
@@ -125,7 +125,7 @@ class StreamSpec:
     scheduler_warp: int | None
     rounds: tuple[int, int, int, int, int]  # (base, spread, a, b, c)
     launch_1d: bool = False  # OneShot: a hand-built (total * cs, 1, 1) grid (R13)
-    record: int = 0  # TileStream(record=k): the timeline must match the item logs (R16)
+    record: int = 0  # WorkStream(record=k): the timeline must match the item logs (R16)
 
     @property
     def total(self) -> int:
@@ -139,7 +139,7 @@ class StreamSpec:
     @property
     def tile_grid(self) -> bool:
         """The layer launches the tile space itself (R13: OneShot, plain Raster, no record)."""
-        return self.policy == "oneshot" and self.plain_raster and not self.record
+        return self.schedule == "oneshot" and self.plain_raster and not self.record
 
     def item_rounds(self, m: int, n: int, li: int) -> int:
         base, spread, a, b, c = self.rounds
@@ -405,7 +405,7 @@ def generate(
     seed: int, *, pair: bool | None = None, stream: bool | None = None, empty: bool = False
 ) -> KernelSpec:
     """A random valid kernel. ``pair``/``stream`` force those knobs; otherwise random.
-    ``empty``: the zero-work boundary corpus (a TileStream whose space has a zero extent; the
+    ``empty``: the zero-work boundary corpus (a WorkStream whose space has a zero extent; the
     contract treats it separately from the nonempty corpus, G6)."""
     if empty:
         stream = True
@@ -569,7 +569,7 @@ def generate(
 
     stream_spec = None
     if use_stream:
-        policy = rng.choice(["oneshot", "static", "dynamic", "clc"])
+        schedule = rng.choice(["oneshot", "static", "atomic", "clc"])
         stages = rng.randint(1, 4)
         along = rng.choice(["m", "m", "n"])
         swizzle = rng.choice([1, 1, 2, 3, 8])
@@ -577,9 +577,9 @@ def generate(
         skip = None
         if rng.random() < 0.2:
             skip = (rng.randint(0, 3), rng.randint(0, 3), rng.randint(0, 3), rng.randint(1, 4))
-        if policy == "oneshot" and rng.random() < 0.5:
+        if schedule == "oneshot" and rng.random() < 0.5:
             along, swizzle, reverse, skip = "m", 1, (), None  # the tile-grid launch
-        big = policy == "oneshot" and along == "m" and swizzle == 1 and not reverse and not skip
+        big = schedule == "oneshot" and along == "m" and swizzle == 1 and not reverse and not skip
         if big and rng.random() < 0.08:
             extents = (rng.randint(1, 2), 65535 + rng.randint(0, 2), 1)  # y-limit fallback edge
         else:
@@ -595,7 +595,7 @@ def generate(
                 for i, e in enumerate(extents)
             )
         stream_spec = StreamSpec(
-            policy=policy,
+            schedule=schedule,
             stages=stages,
             along=along,
             swizzle=swizzle,
@@ -612,13 +612,13 @@ def generate(
                 rng.randint(0, 3),
                 rng.randint(0, 3),
             ),
-            launch_1d=policy == "oneshot" and rng.random() < 0.3,
+            launch_1d=schedule == "oneshot" and rng.random() < 0.3,
             record=rng.randint(1, 4) if extents[1] < 65535 and rng.random() < 0.15 else 0,
         )
 
     # Registers: random warpgroup-uniform budgets that fit, including the scheduler warp.
     sched = None
-    if stream_spec is not None and stream_spec.policy in ("dynamic", "clc"):
+    if stream_spec is not None and stream_spec.schedule in ("atomic", "clc"):
         owned = sorted({w for r in roles for f in r["warps"] for w in range(f, f + r["width"])})
         holes = [w for w in range(max(owned) + 2) if w not in owned]
         explicit = rng.choice(holes) if rng.random() < 0.3 else None
@@ -673,13 +673,13 @@ def generate(
     else:
         units = 1
         s = stream_spec
-        if s.policy in ("static", "dynamic"):
+        if s.schedule in ("static", "atomic"):
             grid_rows = max(1, min(s.total, max(s.max_ctas // (2 if pair else 1), 1)))
         else:
             grid_rows = max(s.total, 1)
     big_grid = grid_rows > 4096
     smem_pad = 0
-    if stream_spec is not None and stream_spec.policy == "clc" and rng.random() < 0.5:
+    if stream_spec is not None and stream_spec.schedule == "clc" and rng.random() < 0.5:
         smem_pad = 40000  # ~160 KB: one CTA per SM, so try_cancel has CTAs to cancel
     used = 0
     for ch in channels:  # barriers, layer payloads and TMA stages, 16-byte aligned
@@ -783,11 +783,11 @@ class _Src:
 
 
 _MECH = {"threads": "Threads", "umma": "Umma"}
-_POLICY = {
+_SCHEDULE = {
     "oneshot": "OneShot()",
     "static": "StaticPersistent()",
-    "dynamic": "DynamicPersistent(stages={})",
-    "clc": "Clc(stages={})",
+    "atomic": "AtomicPersistent(stages={})",
+    "clc": "ClusterLaunchControl(stages={})",
 }
 
 
@@ -820,7 +820,7 @@ def _role_params(spec: KernelSpec, r: RoleSpec) -> list[str]:
     if spec.turn_role == r.name:
         params.append("ts: Turn")
     if spec.stream is not None:
-        params.append("tiles: Tiles")
+        params.append("work: WorkCursor")
     if r.tmem:
         params.append("tmem: Tmem")
     params.append("ctx")
@@ -1010,19 +1010,19 @@ def _emit_role(src: _Src, spec: KernelSpec, r: RoleSpec):
         items = _by_stage(tuple(lay.role_items[(r.name, i)] for i in range(r.instances)), r)
         base_r, spread, a, b, c = s.rounds
         src("nitems = Int32(0)")
-        src.block("while tiles.valid:")
-        src("m, n, l = tiles.work")
-        src(f"hit = ({ordinal} * {spec.cs} + rank) * ctx.total + tiles.index")
+        src.block("while work.valid:")
+        src("m, n, l = work.item")
+        src(f"hit = ({ordinal} * {spec.cs} + rank) * ctx.total + work.index")
         src(
             f"D.log_item(ctx.clog, ctx.hits, base + {items} + 1, nitems, {spec.item_cap}, "
-            "tiles.index, (m, n, l), hit, lead)"
+            "work.index, (m, n, l), hit, lead)"
         )
         src("nitems = nitems + 1")
         src(f"rounds = (Int32(m) * {a} + Int32(n) * {b} + Int32(l) * {c}) % {spread} + {base_r}")
         src.block("for _ in cutlass.range(rounds, unroll=1):")
         iteration()
         src.end()
-        src("tiles.advance()")
+        src("work.advance()")
         src.end()
         src(f"D.put(ctx.clog, base + {items}, nitems, lead)")
     _emit_body(src, spec, r, extra=True)
@@ -1038,7 +1038,7 @@ def _emit_role(src: _Src, spec: KernelSpec, r: RoleSpec):
     if spec.turn_role == r.name:
         returned.append("ts")
     if spec.stream is not None:
-        returned.append("tiles")
+        returned.append("work")
     if returned:
         src(f"return {', '.join(returned)}")
     src.end()
@@ -1061,10 +1061,10 @@ def emit(spec: KernelSpec) -> str:
     src("from test.warpdrive_fuzz import runtime_device as D")
     src("from transformer_nuggets.cute.warpdrive import (")
     for name in (
-        "Clc",
+        "ClusterLaunchControl",
         "Consumer",
         "CtaPair",
-        "DynamicPersistent",
+        "AtomicPersistent",
         "Instance",
         "OneShot",
         "PdlWait",
@@ -1074,8 +1074,8 @@ def emit(spec: KernelSpec) -> str:
         "Slots",
         "StaticPersistent",
         "Threads",
-        "Tiles",
-        "TileStream",
+        "WorkCursor",
+        "WorkStream",
         "Tma",
         "Tmem",
         "TmemPlan",
@@ -1130,13 +1130,15 @@ def emit(spec: KernelSpec) -> str:
         plan = "TmemPlan()" + "".join(f'.region("{n}", {c}, {k})' for n, c, k in spec.tmem_regions)
         src(f"self.tmem_plan = {plan}")
     if s is not None:
-        order = "SkipMod" if s.skip is not None else "Raster"
-        order += f'(along="{s.along}", swizzle={s.swizzle}, reverse={tuple(s.reverse)!r})'
-        policy = _POLICY[s.policy].format(s.stages)
+        mapping = "SkipMod" if s.skip is not None else "Raster"
+        mapping += f'(along="{s.along}", swizzle={s.swizzle}, reverse={tuple(s.reverse)!r})'
+        schedule = _SCHEDULE[s.schedule].format(s.stages)
         extra = f", scheduler_warp={s.scheduler_warp}" if s.scheduler_warp is not None else ""
         ready = ", ready=PdlWait()" if s.ready else ""
         record = f", record={s.record}" if s.record else ""
-        src(f"self.tiles = TileStream(order={order}, policy={policy}{ready}{extra}{record})")
+        src(
+            f"self.work = WorkStream(mapping={mapping}, schedule={schedule}{ready}{extra}{record})"
+        )
     src.end()
     src()
     src.block("def get_name(self):")
@@ -1151,12 +1153,12 @@ def emit(spec: KernelSpec) -> str:
     for ch in tma:
         kargs += [f"tma_{ch.name}", f"tg_{ch.name}"]
     if s is not None:
-        kargs.append("work")
+        kargs.append("bound")
     src("@cute.kernel")
     src.block(f"def kernel({', '.join(kargs)}):")
-    src("smem = self.begin_roles(tiles=work)" if s is not None else "smem = self.begin_roles()")
+    src("smem = self.begin_roles(work=bound)" if s is not None else "smem = self.begin_roles()")
     ctx = ["clog=clog", "hits=hits", "iters=iters"]
-    ctx.append("total=work.total" if s is not None else "total=Int32(0)")
+    ctx.append("total=bound.total" if s is not None else "total=Int32(0)")
     for ch in tma:
         c = ch.name
         src(
@@ -1204,11 +1206,11 @@ def emit(spec: KernelSpec) -> str:
         src(f"tiles_{c} = cute.local_tile(tgt_{c}, ({ch.tma_rows}, {TMA_COLS}), (None, 0))")
         launch_args += [f"tma_{c}", f"tiles_{c}"]
     if s is not None:
-        src("work = self.tiles.problem((em, en, el), ws, max_ctas)")
-        launch_args.append("work")
-        cfg = "**self.launch_config(work)"
+        src("bound = self.work.bind((em, en, el), ws, max_ctas)")
+        launch_args.append("bound")
+        cfg = "**self.launch_config(bound)"
         if s.launch_1d:
-            cfg = f"**self.launch_config(grid=(cutlass.max(work.total, 1) * {spec.cs}, 1, 1))"
+            cfg = f"**self.launch_config(grid=(cutlass.max(bound.total, 1) * {spec.cs}, 1, 1))"
     else:
         cfg = f"**self.launch_config(grid=({spec.units * spec.cs}, 1, 1))"
     src(f"self.kernel({', '.join(launch_args)}).launch({cfg}, stream=stream)")
@@ -1220,7 +1222,7 @@ def features(spec: KernelSpec) -> set[str]:
     """Knob classes a spec exercises (for campaign coverage summaries)."""
     out = {"pair" if spec.pair else "single", f"roles{len(spec.roles)}"}
     s = spec.stream
-    out.add(f"policy_{s.policy}" if s else "no_stream")
+    out.add(f"schedule_{s.schedule}" if s else "no_stream")
     if s is not None:
         if s.skip:
             out.add("skip")
@@ -1230,7 +1232,7 @@ def features(spec: KernelSpec) -> set[str]:
             out.add("grid_yz_edge")
         if s.scheduler_warp is not None:
             out.add("explicit_scheduler_warp")
-        if s.policy in ("static", "dynamic") and s.max_ctas < SMS:
+        if s.schedule in ("static", "atomic") and s.max_ctas < SMS:
             out.add("capped_grid")
     if spec.smem_pad:
         out.add("one_cta_per_sm")

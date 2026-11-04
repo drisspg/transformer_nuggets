@@ -32,7 +32,7 @@ TOOL = "tool"  # a wrapper (compute-sanitizer --error-exitcode) reported a findi
 # Confirmed findings (test/warpdrive_fuzz/FINDINGS.md, runtime section): a non-passing case
 # whose status and detail match is reported under the finding's id instead of as new.
 KNOWN = {
-    "F-A1": (REJECT, re.compile(r"mixed register budgets \{[^}]*tiles\.scheduler")),
+    "F-A1": (REJECT, re.compile(r"mixed register budgets \{[^}]*work\.scheduler")),
 }
 
 
@@ -177,7 +177,7 @@ def _launch_and_check(spec, op, fn, device, srcs, tag: str):
     hits_len = max(n_inst * spec.cs * total, 1)
     hits = torch.zeros(hits_len + 64, dtype=torch.int32, device=device)
     if s is not None:
-        ws, _ = op.tiles.launch_args(device)
+        ws, _ = op.work.launch_args(device)
         extents, max_ctas = s.extents, s.max_ctas
     else:
         ws = torch.zeros(4, dtype=torch.int32, device=device)
@@ -192,7 +192,7 @@ def _launch_and_check(spec, op, fn, device, srcs, tag: str):
             clog.cpu().numpy().reshape(rows, lay.per_cta).copy(),
             hits.cpu().numpy().copy(),
             ws.cpu().numpy().copy(),
-            op.tiles.timeline(ws, gx) if s is not None and s.record else None,
+            op.work.timeline(ws, gx) if s is not None and s.record else None,
         )
 
     def launch():
@@ -203,7 +203,7 @@ def _launch_and_check(spec, op, fn, device, srcs, tag: str):
     runs = []
     for k in range(spec.launches):
         if s is not None and s.record:  # refills the log with -1; [claims, finished] stay
-            ws, _ = op.tiles.launch_args(device, max_ctas=gx)
+            ws, _ = op.work.launch_args(device, max_ctas=gx)
         torch.cuda.synchronize()
         _phase(f"launch {prefix}{k}")
         launch()

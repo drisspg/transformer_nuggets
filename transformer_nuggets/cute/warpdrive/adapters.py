@@ -1,14 +1,15 @@
 """External tile schedulers as warpdrive work mappings.
 
 An adapter reuses an external scheduler's ``index -> tile`` mapping and leaves distribution to
-the warpdrive policy, so it swaps in with one line and runs under every policy::
+the warpdrive index schedule, so it swaps in with one line and runs under every schedule::
 
-    self.tiles = TileStream(order=CutlassStaticPersistent(swizzle=8), policy=StaticPersistent())
-    self.tiles = TileStream(order=CutlassStaticPersistent(swizzle=8), policy=Clc())
+    self.work = WorkStream(mapping=CutlassRaster(swizzle=8), schedule=StaticPersistent())
+    self.work = WorkStream(mapping=CutlassRaster(swizzle=8), schedule=ClusterLaunchControl())
 
-Each adapter's ``native_policy`` is the built-in policy that reproduces the external scheduler's
-own per-CTA sequence. The kernel keeps binding the same ``(m_tiles, n_tiles, l)`` space; the
-adapter derives the external space (FA4: its ``Params``) from it in the entry point.
+Composing the adapter with ``StaticPersistent()`` (``Fa4Mapping`` of ``SingleTileLPTScheduler``:
+``OneShot()``) reproduces the external scheduler's own per-CTA index sequence, not its
+lifecycle. The kernel keeps binding the same ``(m_tiles, n_tiles, l)`` space; the adapter derives
+the external space (FA4: its ``Params``) from it in the entry point.
 
 What carries over and what does not:
 
@@ -20,7 +21,7 @@ What carries over and what does not:
   CLC/dynamic schedulers own their own pipelines, SMEM and barriers, which would duplicate the
   layer's distribution.
 * The external ``initial_work_tile_info``/``advance_to_next_work``/``prefetch_next_work``/
-  ``producer_tail`` and ``get_grid_shape`` are not called: the warpdrive policy picks indices
+  ``producer_tail`` and ``get_grid_shape`` are not called: the warpdrive schedule picks indices
   and launches its own grid.
 * Indices count warpdrive work units, so a ``CtaPair`` maps one item per cluster: tiles are
   work-unit tiles (FA4's params use a ``(1, 1)`` cluster shape).
@@ -39,13 +40,7 @@ from dataclasses import dataclass
 import cutlass
 from cutlass import Int32, Int64
 
-from transformer_nuggets.cute.warpdrive.scheduling import (
-    OneShot,
-    Policy,
-    Raster,
-    StaticPersistent,
-    WorkMapping,
-)
+from transformer_nuggets.cute.warpdrive.scheduling import Raster, WorkMap
 
 
 def _at_least_one(value):
@@ -70,7 +65,7 @@ def _round_up(extent, multiple: int):
 
 
 @dataclass(frozen=True)
-class CutlassStaticPersistent(WorkMapping):
+class CutlassRaster(WorkMap):
     """The tile order of CUTLASS's ``StaticPersistentTileScheduler`` over
     ``space = (m_tiles, n_tiles, l)``: ``along`` is the raster axis (CUTLASS ``raster_along_m``)
     and ``swizzle`` the band width in tiles (CUTLASS ``swizzle_size``).
@@ -88,17 +83,12 @@ class CutlassStaticPersistent(WorkMapping):
     swizzle: int = 1
     along: str = "m"
     words = 3
-    native_policy = StaticPersistent()
 
     def __post_init__(self):
         if self.along not in ("m", "n"):
-            raise ValueError(
-                f"CutlassStaticPersistent.along must be 'm' or 'n', got {self.along!r}"
-            )
+            raise ValueError(f"CutlassRaster.along must be 'm' or 'n', got {self.along!r}")
         if type(self.swizzle) is not int or self.swizzle < 1:
-            raise ValueError(
-                f"CutlassStaticPersistent.swizzle must be a positive int, got {self.swizzle!r}"
-            )
+            raise ValueError(f"CutlassRaster.swizzle must be a positive int, got {self.swizzle!r}")
 
     @property
     def skips(self) -> bool:
@@ -144,7 +134,7 @@ class CutlassStaticPersistent(WorkMapping):
         return f"cutlasssp{self.along}{self.swizzle}"
 
     def describe(self) -> str:
-        return f"CutlassStaticPersistent(along={self.along}, swizzle={self.swizzle})"
+        return f"CutlassRaster(along={self.along}, swizzle={self.swizzle})"
 
 
 def _fa4_tile_scheduler():
@@ -152,12 +142,12 @@ def _fa4_tile_scheduler():
         return importlib.import_module("flash_attn.cute.tile_scheduler")
     except ImportError as exc:
         raise ImportError(
-            "Fa4Scheduler needs flash_attn.cute (FlashAttention 4, package flash-attn-4)"
+            "Fa4Mapping needs flash_attn.cute (FlashAttention 4, package flash-attn-4)"
         ) from exc
 
 
 @dataclass(frozen=True)
-class Fa4Scheduler(WorkMapping):
+class Fa4Mapping(WorkMap):
     """The tile mapping of a FlashAttention 4 scheduler class from
     ``flash_attn.cute.tile_scheduler``: ``StaticPersistentTileScheduler`` or
     ``SingleTileLPTScheduler`` (``STATIC`` mode). Items are ``(block, head, batch)``.
@@ -183,24 +173,20 @@ class Fa4Scheduler(WorkMapping):
         ts = _fa4_tile_scheduler()
         if self.scheduler not in (ts.StaticPersistentTileScheduler, ts.SingleTileLPTScheduler):
             raise ValueError(
-                "Fa4Scheduler adapts StaticPersistentTileScheduler or SingleTileLPTScheduler, "
+                "Fa4Mapping adapts StaticPersistentTileScheduler or SingleTileLPTScheduler, "
                 f"whose tile is a function of one linear index; got {self.scheduler!r}"
             )
         for name in ("head_dim", "head_dim_v", "element_size"):
             value = getattr(self, name)
             if type(value) is not int or value < 1:
-                raise ValueError(f"Fa4Scheduler.{name} must be a positive int, got {value!r}")
+                raise ValueError(f"Fa4Mapping.{name} must be a positive int, got {value!r}")
         for name in ("lpt", "lpt_global"):
             if type(getattr(self, name)) is not bool:
-                raise ValueError(f"Fa4Scheduler.{name} must be a bool")
+                raise ValueError(f"Fa4Mapping.{name} must be a bool")
 
     @property
     def _persistent(self) -> bool:
         return self.scheduler is _fa4_tile_scheduler().StaticPersistentTileScheduler
-
-    @property
-    def native_policy(self) -> Policy:
-        return StaticPersistent() if self._persistent else OneShot()
 
     def bind(self, space):
         rank = 3 if self._persistent else 4
@@ -253,4 +239,4 @@ class Fa4Scheduler(WorkMapping):
         return f"fa4single{flags}_{sizes}"
 
     def describe(self) -> str:
-        return f"Fa4Scheduler({self.scheduler.__name__})"
+        return f"Fa4Mapping({self.scheduler.__name__})"

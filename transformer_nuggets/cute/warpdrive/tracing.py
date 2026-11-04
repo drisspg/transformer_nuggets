@@ -3,7 +3,7 @@
 ``kernel.enable_iket()`` (before compiling) makes the layer emit IKET ranges; with it off the
 layer emits nothing, so the generated code is unchanged. Range names are stable:
 
-* ``<role>``: one range per work item of a role that loops over a ``TileStream`` (from the
+* ``<role>``: one range per work item of a role that loops over a ``WorkStream`` (from the
   cursor's start to its ``advance()``), else one range over the whole role. Role instances keep
   their suffix (``softmax[0]``). The CTA of a pair kernel is not in the name: IKET records the
   CTA of every range, and ``plan_from_warpdrive(kernel, cta=...)`` builds the plan of one CTA.

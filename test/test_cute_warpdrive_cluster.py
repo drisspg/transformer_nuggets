@@ -1,5 +1,5 @@
 """2-CTA (CtaPair) support in the warp-role layer: derived scopes, trace-time checks, a toy pair
-protocol, and the 2-CTA persistent GEMM and FA4 examples under every scheduling policy."""
+protocol, and the 2-CTA persistent GEMM and FA4 examples under every scheduling schedule."""
 
 import math
 from types import SimpleNamespace
@@ -17,10 +17,10 @@ from cutlass.cute.nvgpu import tcgen05
 
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
-    Clc,
+    ClusterLaunchControl,
     Consumer,
     CtaPair,
-    DynamicPersistent,
+    AtomicPersistent,
     Instance,
     OneShot,
     Producer,
@@ -30,8 +30,8 @@ from transformer_nuggets.cute.warpdrive import (
     Slots,
     StaticPersistent,
     Threads,
-    Tiles,
-    TileStream,
+    WorkCursor,
+    WorkStream,
     Tma,
     Tmem,
     TmemPlan,
@@ -41,13 +41,13 @@ from transformer_nuggets.cute.warpdrive import (
 )
 from transformer_nuggets.cute.warpdrive.cluster import check_atoms
 
-POLICIES = {
+SCHEDULES = {
     "oneshot": OneShot(),
     "static": StaticPersistent(),
-    "dynamic": DynamicPersistent(stages=2),
-    "dynamic1": DynamicPersistent(stages=1),
-    "clc": Clc(stages=2),
-    "clc1": Clc(stages=1),
+    "atomic": AtomicPersistent(stages=2),
+    "atomic1": AtomicPersistent(stages=1),
+    "clc": ClusterLaunchControl(stages=2),
+    "clc1": ClusterLaunchControl(stages=1),
 }
 PAIR = CtaPair()
 
@@ -284,7 +284,7 @@ def test_leader_placement_is_a_noop_for_one_cta():
 def test_pair_gemm_declared_graph():
     from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import PersistentGemm
 
-    op = PersistentGemm(policy=Clc(), cluster=PAIR)
+    op = PersistentGemm(schedule=ClusterLaunchControl(), cluster=PAIR)
     text = op.describe()
     chans = op._ws_chans
     # Both CTAs' TMA bytes (2 x 32 KB) complete on the leader, armed once by its producer.
@@ -297,20 +297,18 @@ def test_pair_gemm_declared_graph():
     # The leader's scheduler publishes into both CTAs (st.async bytes), and every consumer
     # releases the leader's slot: epilogue and load in both CTAs, the leader-only MMA and
     # scheduler once: 2 x (128 + 32) + 32 + 32.
-    sched = next(r for r in op._ws_roles if r.name == "tiles.scheduler")
+    sched = next(r for r in op._ws_roles if r.name == "work.scheduler")
     assert (sched.first_warp, sched.regs, sched.cta) == (6, 40, "leader")
-    work = chans["tiles_work"].scope
+    work = chans["work_ring"].scope
     assert work.full_counts == {0: [1, 1], 1: [1, 1]} and work.tx == 16
     assert work.empty_ctas == (0,) and work.empty_counts[0] == [384, 384]
-    clc = chans["tiles_clc"].scope
+    clc = chans["work_clc"].scope
     assert not clc.pair and clc.full_counts[0] == [1]
     # Golden lines.
-    assert "  6      tiles.scheduler    40  leader\n" in text
+    assert "  6      work.scheduler    40  leader\n" in text
     assert "full      leader 1 x6, tx 65536 B (leader-armed)\n" in text
     assert "scope     pair-scoped, release_mask 0b11, tail\n" in text
-    assert (
-        "  tiles_work  Ring(2)  tiles.scheduler -> epilogue, load, mma, tiles.scheduler\n" in text
-    )
+    assert "  work_ring  Ring(2)  work.scheduler -> epilogue, load, mma, work.scheduler\n" in text
 
 
 def test_fa4_pair_declared_graph():
@@ -347,38 +345,38 @@ def test_mismatched_mma_atom_is_rejected(requires_blackwell):
 
 
 # --------------------------------------------------------------------------- #
-# TileStream in a pair: work units are clusters
+# WorkStream in a pair: work units are clusters
 # --------------------------------------------------------------------------- #
 
 
 class PairStream(WarpSpecialized):
     """Every stream user counts the items it sees; ``cta`` places them."""
 
-    def __init__(self, policy, cta: str):
+    def __init__(self, schedule, cta: str):
         self.cluster = PAIR
         self.cta = cta
-        self.tiles = TileStream(order=Raster(), policy=policy)
+        self.work = WorkStream(mapping=Raster(), schedule=schedule)
 
     @role(warps=0, cta="leader")
     @cute.jit
-    def lead(self, tiles: Tiles, ctx):
-        while tiles.valid:
-            m, n, _ = tiles.work
+    def lead(self, work: WorkCursor, ctx):
+        while work.valid:
+            m, n, _ = work.item
             if cute.arch.lane_idx() == 0:
                 cute.arch.atomic_add(ctx.out.iterator + m * ctx.n_tiles + n, cutlass.Int32(1))
-            tiles.advance()
-        return tiles
+            work.advance()
+        return work
 
     @role(warps=1, cta="leader")
     @cute.jit
-    def other(self, tiles: Tiles, ctx):
-        while tiles.valid:
-            tiles.advance()
-        return tiles
+    def other(self, work: WorkCursor, ctx):
+        while work.valid:
+            work.advance()
+        return work
 
     @cute.kernel
-    def kernel(self, out: cute.Tensor, n_tiles: cutlass.Int32, work):
-        self.begin_roles(tiles=work)
+    def kernel(self, out: cute.Tensor, n_tiles: cutlass.Int32, bound):
+        self.begin_roles(work=bound)
         self.run_roles(SimpleNamespace(out=out, n_tiles=n_tiles))
 
     @cute.jit
@@ -391,24 +389,26 @@ class PairStream(WarpSpecialized):
         max_ctas: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        work = self.tiles.problem((m_tiles, n_tiles, 1), workspace, max_ctas)
-        self.kernel(out, n_tiles, work).launch(**self.launch_config(work), stream=stream)
+        bound = self.work.bind((m_tiles, n_tiles, 1), workspace, max_ctas)
+        self.kernel(out, n_tiles, bound).launch(**self.launch_config(bound), stream=stream)
 
 
-@pytest.mark.parametrize("policy", ["oneshot", "static", "dynamic", "clc"])
-def test_pair_stream_with_leader_only_users(requires_blackwell, policy):
+@pytest.mark.parametrize("schedule", ["oneshot", "static", "atomic", "clc"])
+def test_pair_stream_with_leader_only_users(requires_blackwell, schedule):
     """All stream users leader-only: the broadcast ring is CTA-local to the leader, and its
     TMA-like publication still completes (st.async to the leader itself)."""
-    op = PairStream(POLICIES[policy], "leader")
+    op = PairStream(SCHEDULES[schedule], "leader")
 
     def fake():
         return make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),), assumed_align=4)
 
     i32 = cutlass.Int32(1)
-    fn = compile_tvm_ffi(op, fake(), i32, i32, fake(), i32, name=f"warpdrive_pair_stream_{policy}")
+    fn = compile_tvm_ffi(
+        op, fake(), i32, i32, fake(), i32, name=f"warpdrive_pair_stream_{schedule}"
+    )
     for m_tiles, n_tiles, cap in [(1, 1, 148), (7, 9, 4), (40, 30, 148)]:
         out = torch.zeros(m_tiles * n_tiles, device="cuda", dtype=torch.int32)
-        ws, _ = op.tiles.launch_args("cuda")
+        ws, _ = op.work.launch_args("cuda")
         fn(out, m_tiles, n_tiles, ws, cap)
         torch.cuda.synchronize()
         assert out.tolist() == [1] * (m_tiles * n_tiles), (m_tiles, n_tiles, cap)
@@ -416,10 +416,10 @@ def test_pair_stream_with_leader_only_users(requires_blackwell, policy):
 
 def test_pair_record_workspace_covers_whole_clusters(requires_blackwell):
     op = PairStream(OneShot(), "leader")
-    op.tiles = TileStream(order=Raster(), policy=StaticPersistent(), record=3)
+    op.work = WorkStream(mapping=Raster(), schedule=StaticPersistent(), record=3)
     op.describe()  # binds the roles the log is sized by
-    ws, cap = op.tiles.launch_args("cuda", max_ctas=1)
-    roles = len(op.tiles.roles)
+    ws, cap = op.work.launch_args("cuda", max_ctas=1)
+    roles = len(op.work.roles)
     assert cap == 1 and ws.numel() >= 4 + roles * 2 * 3 * 2  # one cluster = two CTAs
 
 
@@ -436,7 +436,7 @@ GEMM_SHAPES = [
 ]
 
 
-def _check_gemm(policy, m, n, k, max_ctas=None, reps=2, tile_n=256):
+def _check_gemm(schedule, m, n, k, max_ctas=None, reps=2, tile_n=256):
     from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import persistent_gemm
 
     torch.manual_seed(0)
@@ -445,42 +445,44 @@ def _check_gemm(policy, m, n, k, max_ctas=None, reps=2, tile_n=256):
     ref = torch.nn.functional.linear(a.float(), b.float())
     torch_err = (torch.nn.functional.linear(a, b).float() - ref).abs().max().item()
     first = None
-    for _ in range(reps):  # later launches reuse the (self-reset) dynamic counter
+    for _ in range(reps):  # later launches reuse the (self-reset) atomic counter
         out = torch.full((m, n), float("nan"), device="cuda", dtype=torch.bfloat16)
-        persistent_gemm(a, b, out, policy=policy, max_ctas=max_ctas, cluster=PAIR, tile_n=tile_n)
+        persistent_gemm(
+            a, b, out, schedule=schedule, max_ctas=max_ctas, cluster=PAIR, tile_n=tile_n
+        )
         err = (out.float() - ref).abs().max().item()
-        assert err <= 2 * torch_err + 1e-3, (policy, (m, n, k), err, torch_err)
+        assert err <= 2 * torch_err + 1e-3, (schedule, (m, n, k), err, torch_err)
         if first is None:
             first = out
         assert torch.equal(out, first), "2-CTA GEMM is not bitwise deterministic"
 
 
 @pytest.mark.parametrize("m,n,k", GEMM_SHAPES)
-@pytest.mark.parametrize("policy", ["oneshot", "static", "dynamic", "clc"])
-def test_pair_gemm(requires_blackwell, policy, m, n, k):
-    _check_gemm(POLICIES[policy], m, n, k)
+@pytest.mark.parametrize("schedule", ["oneshot", "static", "atomic", "clc"])
+def test_pair_gemm(requires_blackwell, schedule, m, n, k):
+    _check_gemm(SCHEDULES[schedule], m, n, k)
 
 
 @pytest.mark.parametrize("tile_n", [224, 192, 128])
-@pytest.mark.parametrize("policy", ["static", "clc"])
-def test_pair_gemm_tile_n(requires_blackwell, policy, tile_n):
+@pytest.mark.parametrize("schedule", ["static", "clc"])
+def test_pair_gemm_tile_n(requires_blackwell, schedule, tile_n):
     """Narrower MMA tiles: each CTA loads tile_n / 2 rows of B; ragged M and N edges."""
-    _check_gemm(POLICIES[policy], 3000, 1000, 520, tile_n=tile_n)
+    _check_gemm(SCHEDULES[schedule], 3000, 1000, 520, tile_n=tile_n)
 
 
-@pytest.mark.parametrize("policy", ["static", "dynamic", "dynamic1", "clc1"])
+@pytest.mark.parametrize("schedule", ["static", "atomic", "atomic1", "clc1"])
 @pytest.mark.parametrize("max_ctas", [2, 3, 10])
-def test_pair_gemm_capped_grid(requires_blackwell, policy, max_ctas):
+def test_pair_gemm_capped_grid(requires_blackwell, schedule, max_ctas):
     """2 and 3 CTAs launch one cluster, so its rings and the work ring wrap many times."""
-    _check_gemm(POLICIES[policy], 1100, 1032, 200, max_ctas=max_ctas, reps=3)
+    _check_gemm(SCHEDULES[schedule], 1100, 1032, 200, max_ctas=max_ctas, reps=3)
 
 
 def test_pair_gemm_counter_resets(requires_blackwell):
     from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import _OPS
 
-    _check_gemm(POLICIES["dynamic"], 1500, 1800, 64, max_ctas=8, reps=3)
-    op = _OPS[(POLICIES["dynamic"], None, PAIR, 256)]
-    ws, _ = op.tiles.launch_args("cuda")
+    _check_gemm(SCHEDULES["atomic"], 1500, 1800, 64, max_ctas=8, reps=3)
+    op = _OPS[(SCHEDULES["atomic"], None, PAIR, 256)]
+    ws, _ = op.work.launch_args("cuda")
     torch.cuda.synchronize()
     assert ws[:2].tolist() == [0, 0]
 
@@ -497,7 +499,7 @@ def test_pair_gemm_compiles_once_across_shapes(requires_blackwell, monkeypatch):
     monkeypatch.setattr(
         cache, "compile_tvm_ffi", lambda *a, **kw: compiles.append(1) or real(*a, **kw)
     )
-    op = PersistentGemm(policy=DynamicPersistent(stages=3), cluster=PAIR, ab_stages=5)
+    op = PersistentGemm(schedule=AtomicPersistent(stages=3), cluster=PAIR, ab_stages=5)
     fns = set()
     for m, n, k, cap in [
         (1, 8, 8, 148),
@@ -511,7 +513,7 @@ def test_pair_gemm_compiles_once_across_shapes(requires_blackwell, monkeypatch):
         out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
         fn = compile_persistent_gemm(op)
         fns.add(id(fn))
-        ws, _ = op.tiles.launch_args("cuda")
+        ws, _ = op.work.launch_args("cuda")
         fn(a, b, out, ws, cap)
         ref = torch.nn.functional.linear(a.float(), b.float())
         assert (out.float() - ref).abs().max().item() < 0.05 * ref.abs().max().item() + 1e-2
@@ -528,20 +530,20 @@ def test_pair_gemm_compiles_once_across_shapes(requires_blackwell, monkeypatch):
 @pytest.mark.parametrize(
     "b,h,sq,sk", [(1, 1, 256, 128), (1, 1, 384, 256), (2, 3, 640, 512), (8, 16, 1024, 384)]
 )
-@pytest.mark.parametrize("policy", ["oneshot", "static", "dynamic", "clc"])
-def test_pair_fa4(requires_blackwell, policy, b, h, sq, sk, nonuniform, split_p):
+@pytest.mark.parametrize("schedule", ["oneshot", "static", "atomic", "clc"])
+def test_pair_fa4(requires_blackwell, schedule, b, h, sq, sk, nonuniform, split_p):
     """sq=256/384: the second Q tile of the only item is (partly) out of bounds; (8, 16, 1024)
     has 128 items, so persistent clusters run several; sk=384 is an odd key-block count."""
-    _check_fa4(POLICIES[policy], b, h, sq, sk, nonuniform, split_p)
+    _check_fa4(SCHEDULES[schedule], b, h, sq, sk, nonuniform, split_p)
 
 
-@pytest.mark.parametrize("policy", ["static", "dynamic", "clc"])
-def test_pair_fa4_three_clusters_turnstile(requires_blackwell, policy):
+@pytest.mark.parametrize("schedule", ["static", "atomic", "clc"])
+def test_pair_fa4_three_clusters_turnstile(requires_blackwell, schedule):
     """6 CTAs = 3 clusters, each running ~43 items: every slot and ring wraps."""
-    _check_fa4(POLICIES[policy], 8, 16, 1024, 384, True, True, max_ctas=6, turnstile=True)
+    _check_fa4(SCHEDULES[schedule], 8, 16, 1024, 384, True, True, max_ctas=6, turnstile=True)
 
 
-def _check_fa4(policy, b, h, sq, sk, nonuniform, split_p, max_ctas=None, turnstile=False):
+def _check_fa4(schedule, b, h, sq, sk, nonuniform, split_p, max_ctas=None, turnstile=False):
     pytest.importorskip("flash_attn.cute")
     from test_cute_warpdrive import fa4_inputs
 
@@ -558,7 +560,7 @@ def _check_fa4(policy, b, h, sq, sk, nonuniform, split_p, max_ctas=None, turnsti
             q,
             k,
             v,
-            policy=policy,
+            schedule=schedule,
             max_ctas=max_ctas,
             turnstile=turnstile,
             cluster=PAIR,

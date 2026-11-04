@@ -61,7 +61,7 @@ def expected_grid(spec: KernelSpec) -> tuple[int, int, int]:
         if en <= GRID_YZ_LIMIT and el <= GRID_YZ_LIMIT:
             return (max(em, 1) * cs, max(en, 1), max(el, 1))
         return (max(s.total, 1) * cs, 1, 1)
-    if s.policy in ("static", "dynamic"):
+    if s.schedule in ("static", "atomic"):
         cap = max(s.max_ctas // cs, 1) if cs > 1 else s.max_ctas
         return (max(1, min(s.total, cap)) * cs, 1, 1)
     return (max(s.total, 1) * cs, 1, 1)
@@ -96,12 +96,12 @@ def ctas(spec: KernelSpec) -> list[Cta]:
 
 
 def static_items(spec: KernelSpec, unit: int, units: int) -> list[int] | None:
-    """The unit's kept indices for OneShot/StaticPersistent; None for claimed policies."""
+    """The unit's kept indices for OneShot/StaticPersistent; None for claimed schedules."""
     s = spec.stream
     order = raster_order(s)
-    if s.policy == "oneshot":
+    if s.schedule == "oneshot":
         seq = [unit] if unit < s.total else []
-    elif s.policy == "static":
+    elif s.schedule == "static":
         seq = list(range(unit, s.total, units))
     else:
         return None
@@ -158,7 +158,7 @@ class Launch:
     clog: np.ndarray  # (rows, per_cta) int32, rows >= expected CTA count
     hits: np.ndarray  # flat int32
     ws: np.ndarray
-    timeline: dict | None = None  # TileStream.timeline(): {role: [[(index, t), ...] per CTA]}
+    timeline: dict | None = None  # WorkStream.timeline(): {role: [[(index, t), ...] per CTA]}
 
 
 @dataclass
@@ -226,7 +226,7 @@ def check_launch(spec: KernelSpec, run: Launch, tag: str) -> Report:
                 np.array_equal(row, init[cta.b]), f"{tag}: cta {cta.b} has no roles but wrote logs"
             )
             continue
-        if s is not None and s.policy == "clc" and np.array_equal(row, init[cta.b]):
+        if s is not None and s.schedule == "clc" and np.array_equal(row, init[cta.b]):
             # try_cancel took this cluster's launch: it never ran, another unit ran its item.
             absent.setdefault(cta.unit, set()).add(cta.rank)
             continue
@@ -268,7 +268,9 @@ def check_launch(spec: KernelSpec, run: Launch, tag: str) -> Report:
             if len({(k, tuple(v)) for _, k, v, _ in seqs}) > 1:
                 rep.fail(f"{tag}: cta {cta.b} roles saw different item sequences: {seqs[:4]}")
             expect = (
-                static_items(spec, cta.unit, units) if s.policy in ("oneshot", "static") else None
+                static_items(spec, cta.unit, units)
+                if s.schedule in ("oneshot", "static")
+                else None
             )
             if cta.unit in unit_items and unit_items[cta.unit] is not None and seqs:
                 prev = unit_items[cta.unit]
@@ -299,7 +301,7 @@ def check_launch(spec: KernelSpec, run: Launch, tag: str) -> Report:
                     role_name = name.split("[")[0]
                     runs_here = (
                         cta.rank == 0 or not spec.pair
-                        if name == "tiles.scheduler"
+                        if name == "work.scheduler"
                         else placed(spec, role_name, cta.rank)
                     )
                     if not runs_here:
@@ -391,16 +393,16 @@ def check_launch(spec: KernelSpec, run: Launch, tag: str) -> Report:
                             f"{tag}: {r.name}[{i}] rank {rank} item hits wrong at {bad}: "
                             f"{seg[bad].tolist()} (want {want[bad].tolist()})"
                         )
-        if s.policy == "dynamic":
+        if s.schedule == "atomic":
             rep.expect(
                 run.ws[:2].tolist() == [0, 0],
-                f"{tag}: dynamic workspace not reset: {run.ws[:2].tolist()}",
+                f"{tag}: atomic workspace not reset: {run.ws[:2].tolist()}",
             )
     return rep
 
 
 def deterministic(spec: KernelSpec) -> bool:
-    return spec.stream is None or spec.stream.policy in ("oneshot", "static")
+    return spec.stream is None or spec.stream.schedule in ("oneshot", "static")
 
 
 def check(spec: KernelSpec, runs: list[Launch]) -> Report:

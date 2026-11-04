@@ -13,16 +13,16 @@ from test.warpdrive_fuzz.static import (
 )
 from transformer_nuggets.cute.warpdrive import (
     Barriers,
-    Clc,
+    ClusterLaunchControl,
     Consumer,
-    DynamicPersistent,
+    AtomicPersistent,
     Producer,
     ProtocolError,
     Raster,
     Ring,
     Threads,
-    Tiles,
-    TileStream,
+    WorkCursor,
+    WorkStream,
     Tma,
     TmemPlan,
     Umma,
@@ -103,13 +103,13 @@ def test_kernel_without_roles_has_clear_declaration_error():
 @pytest.mark.parametrize("warp", [-1, 32, True, 1.5])
 def test_stream_scheduler_warp_has_cuda_block_domain(warp):
     with pytest.raises(ValueError, match="scheduler_warp"):
-        TileStream(scheduler_warp=warp)
+        WorkStream(scheduler_warp=warp)
 
 
 @pytest.mark.parametrize("record", [-1, True, 1.5])
 def test_stream_record_is_nonnegative_integer(record):
     with pytest.raises(ValueError, match="record"):
-        TileStream(record=record)
+        WorkStream(record=record)
 
 
 def test_raster_swizzle_rejects_bool():
@@ -131,17 +131,17 @@ def test_overrides_reject_noninteger_counts_and_masks(override):
         collect_pair(Ring(1, override=override))
 
 
-def test_tiles_annotation_requires_stream_declaration():
-    with pytest.raises(ProtocolError, match="no TileStream named"):
-        collect_roles({"worker": declaration_role(params=(("tiles", Tiles),))})
+def test_work_cursor_annotation_requires_stream_declaration():
+    with pytest.raises(ProtocolError, match="no WorkStream named"):
+        collect_roles({"worker": declaration_role(params=(("work", WorkCursor),))})
 
 
-@pytest.mark.parametrize("policy", [DynamicPersistent(), Clc()])
-def test_stream_does_not_overwrite_user_channel(policy):
+@pytest.mark.parametrize("schedule", [AtomicPersistent(), ClusterLaunchControl()])
+def test_stream_does_not_overwrite_user_channel(schedule):
     with pytest.raises(ProtocolError, match="reserved"):
         collect_roles(
-            {"worker": declaration_role(params=(("tiles", Tiles),))},
-            {"tiles": TileStream(policy=policy), "tiles_work": Ring(1)},
+            {"worker": declaration_role(params=(("work", WorkCursor),))},
+            {"work": WorkStream(schedule=schedule), "work_ring": Ring(1)},
         )
 
 
@@ -157,7 +157,7 @@ def test_shared_channel_attributes_are_rejected_before_binding():
 @pytest.mark.parametrize(
     "name,message", [("compound_condition", "condition"), ("advance_before_work", "after advance")]
 )
-@pytest.mark.parametrize("seed", range(4), ids=["oneshot", "static", "dynamic", "clc"])
+@pytest.mark.parametrize("seed", range(4), ids=["oneshot", "static", "atomic", "clc"])
 def test_tile_cursor_rejects_undrained_condition_and_next_item_reads(name, message, seed):
     mutation = next(m for m in mutations() if m.name == name)
     with pytest.raises(Exception, match=message) as info:

@@ -14,7 +14,12 @@ from transformer_nuggets.cute.profiler.pipeline import (
     load_iket_capture,
     write_pipeline_perfetto,
 )
-from transformer_nuggets.cute.warpdrive import Clc, CtaPair, StaticPersistent, tracing
+from transformer_nuggets.cute.warpdrive import (
+    ClusterLaunchControl,
+    CtaPair,
+    StaticPersistent,
+    tracing,
+)
 from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import (
     PersistentGemm,
     compile_persistent_gemm,
@@ -58,12 +63,12 @@ def test_disabled_emits_no_iket_ops(monkeypatch):
 
     monkeypatch.setattr(tracing, "load_iket", forbidden)
     cache._kernel_cache.clear()
-    op = _compile_gemm(PersistentGemm(policy=Clc(), cluster=CtaPair()))
+    op = _compile_gemm(PersistentGemm(schedule=ClusterLaunchControl(), cluster=CtaPair()))
     assert op.iket_key() == "" and "iket" not in op.get_name()
 
 
 def test_gemm_range_names_match_plan(iket_recorder):
-    op = _compile_gemm(PersistentGemm(policy=StaticPersistent()).enable_iket())
+    op = _compile_gemm(PersistentGemm(schedule=StaticPersistent()).enable_iket())
     plan = plan_from_warpdrive(op)
     names = set(iket_recorder.pushed)
     assert set(plan.roles) == set(plan.regions) == {"epilogue", "load", "mma"}
@@ -85,9 +90,11 @@ def test_gemm_range_names_match_plan(iket_recorder):
 
 
 def test_pair_plan_per_cta_and_roles_only(iket_recorder):
-    op = _compile_gemm(PersistentGemm(policy=Clc(), cluster=CtaPair()).enable_iket(waits=False))
+    op = _compile_gemm(
+        PersistentGemm(schedule=ClusterLaunchControl(), cluster=CtaPair()).enable_iket(waits=False)
+    )
     names = set(iket_recorder.pushed)
-    assert names == {"epilogue", "load", "mma", "tiles.scheduler"}  # waits=False: no waits
+    assert names == {"epilogue", "load", "mma", "work.scheduler"}  # waits=False: no waits
     leader, peer = plan_from_warpdrive(op, cta=0), plan_from_warpdrive(op, cta=1)
     assert set(leader.regions) == names
     assert set(peer.regions) == {"epilogue", "load"}  # leader-only roles are not in the peer
@@ -101,7 +108,9 @@ def test_fa4_pair_names_and_feedback_edges():
     pytest.importorskip("flash_attn.cute")
     from transformer_nuggets.cute.warpdrive.examples.fa4_fwd import FlashAttentionForward
 
-    plan = plan_from_warpdrive(FlashAttentionForward(policy=Clc(), cluster=CtaPair()))
+    plan = plan_from_warpdrive(
+        FlashAttentionForward(schedule=ClusterLaunchControl(), cluster=CtaPair())
+    )
     assert list(plan.roles) == [
         "softmax[0]",
         "softmax[1]",
@@ -109,7 +118,7 @@ def test_fa4_pair_names_and_feedback_edges():
         "mma",
         "epilogue",
         "load",
-        "tiles.scheduler",
+        "work.scheduler",
     ]
     feedback = {(d.source, d.target) for d in plan.dependencies if d.kind == "state"}
     assert ("softmax[0]", "mma") in feedback and ("softmax[1]", "mma") in feedback  # p_last
@@ -122,10 +131,10 @@ def test_fa4_pair_names_and_feedback_edges():
     assert reuse[("correction", "softmax[0]", "stats")] == 1
     # The work ring's join completes with its last consumer in data order (epilogue); slots
     # are released on receipt, one item before the holding region ends (2 stages + 1).
-    assert [k for k in reuse if k[2] == "tiles_work"] == [
-        ("epilogue", "tiles.scheduler", "tiles_work")
+    assert [k for k in reuse if k[2] == "work_ring"] == [
+        ("epilogue", "work.scheduler", "work_ring")
     ]
-    assert reuse[("epilogue", "tiles.scheduler", "tiles_work")] == 3
+    assert reuse[("epilogue", "work.scheduler", "work_ring")] == 3
     plan.schedule(iterations=4)  # no same-iteration cycle
 
 
@@ -158,7 +167,9 @@ def _synthetic_capture(path, plan, iterations, warps_per_role):
 
 
 def test_plan_joins_capture_end_to_end(tmp_path, iket_recorder):
-    op = _compile_gemm(PersistentGemm(policy=Clc(), cluster=CtaPair()).enable_iket())
+    op = _compile_gemm(
+        PersistentGemm(schedule=ClusterLaunchControl(), cluster=CtaPair()).enable_iket()
+    )
     plan = plan_from_warpdrive(op, cta=0)
     timeline = plan.schedule(iterations=3)
     trace = tmp_path / "capture.trace.json"

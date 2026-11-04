@@ -1,8 +1,8 @@
 """Cut-down FlashAttention-4 forward (SM100) written with ``warpdrive``.
 
 Scope: bf16 in/out, fp32 accumulation, head_dim 128, non-causal, no masking, work items of
-(256 query rows, head, batch) scheduled by a ``TileStream`` (``OneShot`` by default, or a
-persistent policy), 1-CTA MMAs. ``seqlen_k`` must be a multiple
+(256 query rows, head, batch) scheduled by a ``WorkStream`` (``OneShot`` by default, or a
+persistent schedule), 1-CTA MMAs. ``seqlen_k`` must be a multiple
 of 128 (no key masking); ``seqlen_q`` may be any length because TMA zero-fills the loads of
 the last Q tile and clips its O store. Returns O and the log-sum-exp (natural log).
 
@@ -62,8 +62,8 @@ from transformer_nuggets.cute.warpdrive import (
     SingleCta,
     Slots,
     Threads,
-    Tiles,
-    TileStream,
+    WorkCursor,
+    WorkStream,
     Tma,
     Tmem,
     TmemPlan,
@@ -148,7 +148,7 @@ class FlashAttentionForward(WarpSpecialized):
         kv_stages: int | None = None,
         turnstile: bool = False,
         trace: bool = False,
-        policy=None,
+        schedule=None,
         cluster=None,
         split_p: bool = False,
         roles: Fa4Roles | None = None,
@@ -184,14 +184,14 @@ class FlashAttentionForward(WarpSpecialized):
         )
         # Work items: (256-row Q block, head, batch); all Q blocks of a head run back to back so
         # its K/V stays in L2.
-        self.tiles = TileStream(order=Raster(along="m"), policy=policy or OneShot())
+        self.work = WorkStream(mapping=Raster(along="m"), schedule=schedule or OneShot())
         self.trace_protocol = trace
 
     def get_name(self) -> str:
         ts = ("_ts" if self.mufu.enabled else "") + ("_splitp" if self.split_p else "")
         return (
             f"warpdrive_fa4_fwd_{self.cluster.get_key()}_kv{self.kv_stages}{ts}_"
-            f"{self.tiles.get_key()}{self.iket_key()}{self.trace_key()}"
+            f"{self.work.get_key()}{self.iket_key()}{self.trace_key()}"
         )
 
     def get_key(self) -> str:
@@ -201,12 +201,12 @@ class FlashAttentionForward(WarpSpecialized):
 
     @role(config=lambda kernel: kernel.roles.load)
     @cute.jit
-    def load(self, params: Fa4Params, *, q: Producer, kv: Producer, tiles: Tiles):
+    def load(self, params: Fa4Params, *, q: Producer, kv: Producer, work: WorkCursor):
         rank = self.cluster.rank()  # this CTA's rows of Q, keys of K, head dims of V
         thr_qk, thr_pv = params.mma_qk.get_slice(rank), params.mma_pv.get_slice(rank)
         mma_m = M_BLOCK * self.cluster.size
-        while tiles.valid:
-            m_blk, head, batch = tiles.work
+        while work.valid:
+            m_blk, head, batch = work.item
             gQ = cute.local_tile(
                 params.mQ[None, None, head, batch], (Q_STAGE * mma_m, HEAD_DIM), (m_blk, 0)
             )
@@ -251,8 +251,8 @@ class FlashAttentionForward(WarpSpecialized):
                     cute.copy(
                         params.tma_v, tVgV[None, i], tVsV[None, h.index], tma_bar_ptr=h.barrier
                     )
-            tiles.advance()
-        return q, kv, tiles
+            work.advance()
+        return q, kv, work
 
     @role(config=lambda kernel: kernel.roles.mma)
     @cute.jit
@@ -264,7 +264,7 @@ class FlashAttentionForward(WarpSpecialized):
         kv: Consumer,
         s: Producer,
         p_last: Consumer,
-        tiles: Tiles,
+        work: WorkCursor,
         tmem: Tmem,
     ):
         thr_qk, thr_pv = params.mma_qk.get_slice(0), params.mma_pv.get_slice(0)
@@ -279,7 +279,7 @@ class FlashAttentionForward(WarpSpecialized):
             cute.make_tensor(tOrP0.iterator + tmem.cols("P", j) * 2, tOrP0.layout)
             for j in range(Q_STAGE)
         ]
-        while tiles.valid:
+        while work.valid:
             # S_j(0) = Q_j K_0^T. Q handles stay open across the KV loop.
             k0 = kv.wait()
             qh = []
@@ -342,8 +342,8 @@ class FlashAttentionForward(WarpSpecialized):
                         params,
                     )
             v_last.release()
-            tiles.advance()
-        return q, kv, s, p_last, tiles
+            work.advance()
+        return q, kv, s, p_last, work
 
     def pv(self, p_last, j, tO, tOrP, tOrV, accumulate, params: Fa4Params):
         """O_j (+)= P_j V. With split-P the last quarter of the K blocks waits for p_last[j]
@@ -369,7 +369,7 @@ class FlashAttentionForward(WarpSpecialized):
         p_last: Producer[Instance],
         stats: Producer[Instance],
         mufu: Turn,
-        tiles: Tiles,
+        work: WorkCursor,
         tmem: Tmem,
     ):
         tidx = cute.arch.thread_idx()[0] % 128
@@ -398,7 +398,7 @@ class FlashAttentionForward(WarpSpecialized):
             rS_shape=thr_ld.partition_D(tScS).shape,
             rP_shape=thr_st.partition_S(cute.make_identity_tensor((M_BLOCK, N_BLOCK // 2))).shape,
         )
-        while tiles.valid:
+        while work.valid:
             sm = SoftmaxSm100.create(params.scale_log2, rescale_threshold=RESCALE_THRESHOLD)
             sm.reset()
             s, p_last, stats, mufu = self.softmax_step(stage, s, p_last, stats, mufu, sm, t, True)
@@ -411,8 +411,8 @@ class FlashAttentionForward(WarpSpecialized):
                 st.data[tidx, 1] = sm.row_max[0]
             with s.consume(stage):  # the final "O_j done" commit; nothing to read
                 pass
-            tiles.advance()
-        return s, p_last, stats, mufu, tiles
+            work.advance()
+        return s, p_last, stats, mufu, work
 
     def softmax_step(self, stage, s, p_last, stats, mufu, sm, t, is_first):
         """One KV block for one Q tile (plain Python: inlined into the role at trace time).
@@ -451,15 +451,15 @@ class FlashAttentionForward(WarpSpecialized):
         s: Consumer,
         stats: Consumer,
         epi: Producer,
-        tiles: Tiles,
+        work: WorkCursor,
         tmem: Tmem,
     ):
         tidx = cute.arch.thread_idx()[0] % 128
         rank = self.cluster.rank()
         thr_pv = params.mma_pv.get_slice(rank)
         tO = [cute.make_tensor(tmem.ptr("O", j), params.o_layout) for j in range(Q_STAGE)]
-        while tiles.valid:
-            m_blk, head, batch = tiles.work
+        while work.valid:
+            m_blk, head, batch = work.item
             for _ in cutlass.range(params.n_blocks, unroll=1):
                 for j in cutlass.range_constexpr(Q_STAGE):
                     with stats.consume(j) as st:
@@ -486,8 +486,8 @@ class FlashAttentionForward(WarpSpecialized):
                         row_max * params.scale_log2 + cute.math.log2(row_sum, fastmath=True)
                     ) * LN2
                     params.mLSE[batch, head, row] = lse if not empty_row else -Float32.inf
-            tiles.advance()
-        return s, stats, epi, tiles
+            work.advance()
+        return s, stats, epi, work
 
     @cute.jit
     def rescale_o(self, thr_pv, tO, tidx, scale):
@@ -548,11 +548,11 @@ class FlashAttentionForward(WarpSpecialized):
 
     @role(config=lambda kernel: kernel.roles.epilogue)
     @cute.jit
-    def epilogue(self, params: Fa4Params, *, epi: Consumer, tiles: Tiles):
+    def epilogue(self, params: Fa4Params, *, epi: Consumer, work: WorkCursor):
         rank = self.cluster.rank()
         mma_m = M_BLOCK * self.cluster.size
-        while tiles.valid:
-            m_blk, head, batch = tiles.work
+        while work.valid:
+            m_blk, head, batch = work.item
             gO = cute.local_tile(
                 params.mO[None, None, head, batch], (Q_STAGE * mma_m, HEAD_DIM), (m_blk, 0)
             )
@@ -570,8 +570,8 @@ class FlashAttentionForward(WarpSpecialized):
             for j in cutlass.range_constexpr(Q_STAGE):
                 cute.arch.cp_async_bulk_wait_group(Q_STAGE - 1 - j, read=True)
                 eh[j].release()
-            tiles.advance()
-        return epi, tiles
+            work.advance()
+        return epi, work
 
     # ----------------------------------------------------------------- kernel
 
@@ -595,9 +595,9 @@ class FlashAttentionForward(WarpSpecialized):
         sV_layout,
         p_layout,
         sO_layout,
-        work,
+        bound,
     ):
-        smem = self.begin_roles(tiles=work)
+        smem = self.begin_roles(work=bound)
         sO = smem.allocate_tensor(cutlass.BFloat16, sO_layout.outer, 1024, sO_layout.inner)
         sQ = smem.allocate_tensor(cutlass.BFloat16, sQ_layout.outer, 1024, sQ_layout.inner)
         sK = smem.allocate_tensor(cutlass.BFloat16, sK_layout.outer, 1024, sK_layout.inner)
@@ -694,7 +694,7 @@ class FlashAttentionForward(WarpSpecialized):
             (M_BLOCK, HEAD_DIM),
         )
         m_blocks = cute.ceil_div(mQ.shape[0], Q_STAGE * mma_m)
-        work = self.tiles.problem((m_blocks, mQ.shape[2], mQ.shape[3]), workspace, max_ctas)
+        bound = self.work.bind((m_blocks, mQ.shape[2], mQ.shape[3]), workspace, max_ctas)
         self.kernel.set_name_prefix(self.get_name())
         self.kernel(
             mma_qk,
@@ -714,8 +714,8 @@ class FlashAttentionForward(WarpSpecialized):
             sV_layout,
             p_layout,
             sO_layout,
-            work,
-        ).launch(**self.launch_config(work), stream=stream, min_blocks_per_mp=1)
+            bound,
+        ).launch(**self.launch_config(bound), stream=stream, min_blocks_per_mp=1)
 
 
 def compile_fa4_fwd(op: FlashAttentionForward):
@@ -748,7 +748,7 @@ def fa4_fwd(
     *,
     kv_stages: int | None = None,
     turnstile: bool = False,
-    policy=None,
+    schedule=None,
     max_ctas: int | None = None,
     cluster=None,
     split_p: bool = False,
@@ -756,10 +756,10 @@ def fa4_fwd(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Attention forward for ``(batch, seqlen, heads, 128)`` bf16 tensors; returns (O, LSE).
 
-    ``LSE`` is ``(batch, heads, seqlen_q)`` fp32 (natural log), as in FA4. ``policy``: work
-    scheduling (default ``OneShot()``; ``StaticPersistent()``, ``DynamicPersistent()``,
-    ``Clc()`` run several (Q block, head, batch) items per CTA). ``max_ctas`` caps the
-    static/dynamic persistent grid in CTAs (default: the SM count). ``cluster=CtaPair()``
+    ``LSE`` is ``(batch, heads, seqlen_q)`` fp32 (natural log), as in FA4. ``schedule``: work
+    scheduling (default ``OneShot()``; ``StaticPersistent()``, ``AtomicPersistent()``,
+    ``ClusterLaunchControl()`` run several (Q block, head, batch) items per CTA). ``max_ctas`` caps the
+    static/atomic persistent grid in CTAs (default: the SM count). ``cluster=CtaPair()``
     runs FA4's default 2-CTA schedule (512-row work items, 6 KV stages by default).
     """
     if any(t.dtype != torch.bfloat16 for t in (q, k, v)):
@@ -775,14 +775,14 @@ def fa4_fwd(
     scale = softmax_scale if softmax_scale is not None else HEAD_DIM**-0.5
     out = torch.empty_like(q)
     lse = torch.empty(q.shape[0], q.shape[2], q.shape[1], device=q.device, dtype=torch.float32)
-    key = (kv_stages, turnstile, policy, cluster, split_p, roles)
+    key = (kv_stages, turnstile, schedule, cluster, split_p, roles)
     op = _OPS.get(key)
     if op is None:
         op = _OPS[key] = FlashAttentionForward(
-            kv_stages, turnstile, policy=policy, cluster=cluster, split_p=split_p, roles=roles
+            kv_stages, turnstile, schedule=schedule, cluster=cluster, split_p=split_p, roles=roles
         )
     fn = compile_fa4_fwd(op)
-    workspace, sms = op.tiles.launch_args(q.device)
+    workspace, sms = op.work.launch_args(q.device)
     fn(q, k, v, out, lse, scale * LOG2_E, workspace, max_ctas or sms)
     return out, lse
 

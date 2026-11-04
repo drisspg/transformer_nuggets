@@ -29,8 +29,8 @@ from transformer_nuggets.cute.warpdrive import (
     Slots,
     StaticPersistent,
     Threads,
-    Tiles,
-    TileStream,
+    WorkCursor,
+    WorkStream,
     Tma,
     Tmem,
     Umma,
@@ -448,13 +448,13 @@ class _RawWithEnd(WarpSpecialized):
 
 class _RawInPersistent(WarpSpecialized):
     def __init__(self):
-        self.tiles = TileStream(policy=StaticPersistent())
+        self.work = WorkStream(schedule=StaticPersistent())
         self.bars = Barriers(2, counts=[32, 1])
 
     @role(warps=0)
     @cute.jit
-    def work(self, tiles: Tiles, ctx):
-        return tiles
+    def work(self, work: WorkCursor, ctx):
+        return work
 
     @role(warps=range(4, 8), regs=200, raw=True)
     @cute.jit
@@ -603,7 +603,7 @@ class MixedGemm(Gemm):
         # A raw role takes no tile cursor; work_item() reads the OneShot item the way the cursor
         # does (blockIdx on the tile grid, decoded on the 1-D fallback). The wrapper never
         # launches an empty space, so the item is valid.
-        _, (m, n, _) = self.tiles.work_item()
+        _, (m, n, _) = self.work.single_item()
         tDgC = t2r.partition_D(cute.zipped_divide(ctx.tCgC[None, None, None, m, n], ctx.epi_tiler))
         tDcC = t2r.partition_D(cute.zipped_divide(ctx.tCcC[None, None, None, m, n], ctx.epi_tiler))
         rAcc = cute.make_rmem_tensor(tDgC[None, None, 0].shape, cutlass.Float32)

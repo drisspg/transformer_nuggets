@@ -248,7 +248,7 @@ def _streams(kernel) -> str:
         lines.append(f"  {name}  {st.describe()}")
         sched = next((r for r in kernel._ws_roles if r.fn is scheduler_role), None)
         if sched is not None:
-            lines.append(f"{pad}scheduler warp {sched.first_warp} broadcasts over {name}_work")
+            lines.append(f"{pad}scheduler warp {sched.first_warp} broadcasts over {name}_ring")
         else:
             grid = (
                 "; launch grid = tile space (1-D past 65535 n_tiles or l)"

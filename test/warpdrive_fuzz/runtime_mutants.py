@@ -67,7 +67,7 @@ def slots_shared_phase():
 
 def static_stride():
     """StaticPersistent strides one unit too far: items are skipped."""
-    scheduling.StaticPersistent.step = lambda self, index, problem: index + problem.units() + 1
+    scheduling.StaticPersistent.next_index = lambda self, index, problem: index + problem.units() + 1
 
 
 @cute.jit
@@ -75,8 +75,8 @@ def _no_report(workspace, units):
     pass
 
 
-def dynamic_no_reset():
-    """DynamicPersistent never reports or resets its counter: the next launch starts dirty."""
+def atomic_no_reset():
+    """AtomicPersistent never reports or resets its counter: the next launch starts dirty."""
     scheduling._report_finished = _no_report
 
 
@@ -98,9 +98,9 @@ def receive_early_release():
         h = self._end.wait()
         h.release()
         self.index = Int32(h.data[0])
-        self._words = [Int32(h.data[1 + i]) for i in range(self._stream.order.words)]
+        self._words = [Int32(h.data[1 + i]) for i in range(self._stream.mapping.words)]
 
-    scheduling.TileCursor._receive = _receive
+    scheduling.WorkCursor._receive = _receive
 
 
 def pair_join_short():
@@ -132,10 +132,10 @@ MUTANTS = {
     "join_short": (join_short, "join"),
     "ring_wait_phase": (ring_wait_phase, "payload"),
     "slots_shared_phase": (slots_shared_phase, "slots_threads_threads"),
-    "static_stride": (static_stride, "policy_static"),
-    "dynamic_no_reset": (dynamic_no_reset, "policy_dynamic"),
+    "static_stride": (static_stride, "schedule_static"),
+    "atomic_no_reset": (atomic_no_reset, "schedule_atomic"),
     "turn_no_wait": (turn_no_wait, "turnstile"),
-    "receive_early_release": (receive_early_release, "policy_dynamic"),
+    "receive_early_release": (receive_early_release, "schedule_atomic"),
     "pair_join_short": (pair_join_short, "pair_scoped"),
     "no_pair_tail": (no_pair_tail, "pair_scoped"),
 }

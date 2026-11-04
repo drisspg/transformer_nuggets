@@ -17,9 +17,9 @@ from cutlass import cute
 
 from test.warpdrive_fuzz import gen, runtime, runtime_mutants, sched
 from transformer_nuggets.cute.warpdrive import (
-    DynamicPersistent,
-    Tiles,
-    TileStream,
+    AtomicPersistent,
+    WorkCursor,
+    WorkStream,
     WarpSpecialized,
     role,
 )
@@ -74,7 +74,7 @@ def _explain(spec, res) -> str:
 def test_generated_kernel_matches_model(requires_blackwell, tmp_path_factory, seed):
     """Every payload epoch reaches every consumer once, in channel order and intact; each kept
     work item reaches each placed role once with identical per-CTA sequences; launches are
-    bitwise repeatable for deterministic policies; nothing hangs."""
+    bitwise repeatable for deterministic schedules; nothing hangs."""
     spec = gen.generate(seed)
     res = runtime.run_isolated(spec, tmp_path_factory.getbasetemp() / "wdfuzz", CASE_TIMEOUT)
     assert res.status == runtime.PASS, _explain(spec, res)
@@ -147,31 +147,31 @@ def test_declared_scopes_match_independent_model(tmp_path_factory, chunk):
 
 class _SchedulerInDefaultBudgetGroup(WarpSpecialized):
     """F-A1: warpgroup 0 is declared with the default budget (regs=None) and warp 1 is a hole,
-    so the dynamic scheduler lands there; another warpgroup sets regs=160."""
+    so the atomic scheduler lands there; another warpgroup sets regs=160."""
 
     def __init__(self):
-        self.tiles = TileStream(policy=DynamicPersistent())
+        self.work = WorkStream(schedule=AtomicPersistent())
 
     @role(warps=0)
     @cute.jit
-    def a(self, tiles: Tiles, ctx):
-        while tiles.valid:
-            tiles.advance()
-        return tiles
+    def a(self, work: WorkCursor, ctx):
+        while work.valid:
+            work.advance()
+        return work
 
     @role(warps=range(4, 8), regs=160)
     @cute.jit
-    def b(self, tiles: Tiles, ctx):
-        while tiles.valid:
-            tiles.advance()
-        return tiles
+    def b(self, work: WorkCursor, ctx):
+        while work.valid:
+            work.advance()
+        return work
 
 
 def test_scheduler_takes_its_warpgroups_default_budget():
     """F-A1: once raised ``warpgroup 0 has mixed register budgets {'a': None,
-    'tiles.scheduler': 160}``; the scheduler now inherits its warpgroup's (default) budget."""
+    'work.scheduler': 160}``; the scheduler now inherits its warpgroup's (default) budget."""
     op = _SchedulerInDefaultBudgetGroup()
     text = op.describe()
     assert "scheduler warp 1 broadcasts" in text
     rows = {name: regs for _, name, regs in sched.described_roles(text)}
-    assert rows["tiles.scheduler"] == rows["a"]
+    assert rows["work.scheduler"] == rows["a"]

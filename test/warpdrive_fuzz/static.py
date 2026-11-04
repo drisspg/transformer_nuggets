@@ -16,10 +16,10 @@ from cutlass import cute
 
 from transformer_nuggets.cute.warpdrive import (
     Barriers,
-    Clc,
+    ClusterLaunchControl,
     Consumer,
     CtaPair,
-    DynamicPersistent,
+    AtomicPersistent,
     Instance,
     Producer,
     ProtocolError,
@@ -28,8 +28,8 @@ from transformer_nuggets.cute.warpdrive import (
     SingleCta,
     Slots,
     Threads,
-    Tiles,
-    TileStream,
+    WorkCursor,
+    WorkStream,
     Tma,
     Tmem,
     TmemPlan,
@@ -200,19 +200,19 @@ def declaration_cases(seed: int) -> list[DeclarationCase]:
         ProtocolError,
     )
     add(
-        "missing Tiles",
+        "missing WorkCursor",
         "E68/G7",
-        lambda: collect_roles({"a": declaration_role(params=(("tiles", Tiles),))}),
+        lambda: collect_roles({"a": declaration_role(params=(("work", WorkCursor),))}),
         ProtocolError,
     )
-    for policy in (DynamicPersistent(), Clc()):
-        name = type(policy).__name__
+    for schedule in (AtomicPersistent(), ClusterLaunchControl()):
+        name = type(schedule).__name__
         add(
             f"{name} channel collision",
             "G7",
-            lambda p=policy: collect_roles(
-                {"a": declaration_role(params=(("tiles", Tiles),))},
-                {"tiles": TileStream(policy=p), "tiles_work": Ring(1)},
+            lambda p=schedule: collect_roles(
+                {"a": declaration_role(params=(("work", WorkCursor),))},
+                {"work": WorkStream(schedule=p), "work_ring": Ring(1)},
             ),
             ProtocolError,
         )
@@ -227,9 +227,9 @@ def declaration_cases(seed: int) -> list[DeclarationCase]:
         ProtocolError,
     )
     for value in (-1, 32, True, 1.5):
-        add(f"scheduler_warp={value!r}", "G2", lambda v=value: TileStream(scheduler_warp=v))
+        add(f"scheduler_warp={value!r}", "G2", lambda v=value: WorkStream(scheduler_warp=v))
     for value in (-1, True, 1.5):
-        add(f"record={value!r}", "G6", lambda v=value: TileStream(record=v))
+        add(f"record={value!r}", "G6", lambda v=value: WorkStream(record=v))
     add("bad along", "E82", lambda: Raster(along="k"))
     for value in (0, 1.5, True):
         add(f"swizzle={value!r}", "E83", lambda v=value: Raster(swizzle=v))
@@ -317,7 +317,7 @@ def declaration_cases(seed: int) -> list[DeclarationCase]:
     add(
         "implementation annotation",
         "E08",
-        lambda: collect_roles({"a": declaration_role(params=(("tiles", TileStream),))}),
+        lambda: collect_roles({"a": declaration_role(params=(("work", WorkStream),))}),
         ProtocolError,
     )
     add(

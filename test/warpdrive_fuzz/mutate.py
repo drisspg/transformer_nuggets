@@ -83,34 +83,34 @@ PRODUCER_BODY
         self.kernel(out, n).launch(**self.launch_config(grid=(1, 1, 1)), stream=stream)
 """
 
-TILES_TEMPLATE = """\
+WORK_TEMPLATE = """\
 import cutlass
 from cutlass import cute
 from types import SimpleNamespace
 from transformer_nuggets.cute.warpdrive import (
-    WarpSpecialized, TileStream, OneShot, StaticPersistent, DynamicPersistent, Clc, Tiles, role,
+    WarpSpecialized, WorkStream, OneShot, StaticPersistent, AtomicPersistent, ClusterLaunchControl, WorkCursor, role,
 )
 
 class Probe(WarpSpecialized):
     def __init__(self):
-        self.tiles = TileStream(policy=POLICY)
+        self.work = WorkStream(schedule=SCHEDULE)
 
     @role(warps=0)
     @cute.jit
-    def worker(self, tiles: Tiles, ctx):
+    def worker(self, work: WorkCursor, ctx):
 BODY
-        return tiles
+        return work
 
     @cute.kernel
-    def kernel(self, out: cute.Tensor, work):
-        self.begin_roles(tiles=work)
-        self.run_roles(SimpleNamespace(out=out, n=work.total))
+    def kernel(self, out: cute.Tensor, bound):
+        self.begin_roles(work=bound)
+        self.run_roles(SimpleNamespace(out=out, n=bound.total))
 
     @cute.jit
     def __call__(self, out: cute.Tensor, n: cutlass.Int32, workspace: cute.Tensor, stream):
-        work = self.tiles.problem((n, 1, 1), workspace, max_ctas=cutlass.Int32(1))
+        bound = self.work.bind((n, 1, 1), workspace, max_ctas=cutlass.Int32(1))
         self.kernel.set_name_prefix("NAME")
-        self.kernel(out, work).launch(**self.launch_config(work), stream=stream)
+        self.kernel(out, bound).launch(**self.launch_config(bound), stream=stream)
 """
 
 
@@ -201,50 +201,50 @@ def mutations() -> list[Mutation]:
         Mutation(
             "missing_advance",
             "E71",
-            "m, n, l = tiles.work",
-            kind="tiles",
+            "m, n, l = work.item",
+            kind="work",
             message="never calls advance",
         ),
         Mutation(
             "double_advance",
             "E72",
-            "while tiles.valid:\n    tiles.advance()\n    tiles.advance()",
-            kind="tiles",
+            "while work.valid:\n    work.advance()\n    work.advance()",
+            kind="work",
             message="traced 2 times",
         ),
         Mutation(
             "conditional_advance",
             "E73",
-            "while tiles.valid:\n    if ctx.n > 0:\n        tiles.advance()",
-            kind="tiles",
+            "while work.valid:\n    if ctx.n > 0:\n        work.advance()",
+            kind="work",
             message="directly in that loop",
         ),
         Mutation(
             "nested_loop_advance",
             "E73",
-            "while tiles.valid:\n    for i in cutlass.range(ctx.n, unroll=1):\n        tiles.advance()",
-            kind="tiles",
+            "while work.valid:\n    for i in cutlass.range(ctx.n, unroll=1):\n        work.advance()",
+            kind="work",
             message="directly in that loop",
         ),
         Mutation(
             "compound_condition",
             "G1",
-            "count = cutlass.Int32(0)\nwhile tiles.valid & (count < ctx.n):\n    count += 1\n    tiles.advance()",
-            kind="tiles",
+            "count = cutlass.Int32(0)\nwhile work.valid & (count < ctx.n):\n    count += 1\n    work.advance()",
+            kind="work",
             message="condition",
         ),
         Mutation(
             "advance_before_work",
             "G1",
-            "while tiles.valid:\n    tiles.advance()\n    m, n, l = tiles.work\n    ctx.out[0] = m",
-            kind="tiles",
+            "while work.valid:\n    work.advance()\n    m, n, l = work.item\n    ctx.out[0] = m",
+            kind="work",
             message="after advance",
         ),
         Mutation(
-            "valid_tiles",
+            "valid_work",
             "R12",
-            "while tiles.valid:\n    m, n, l = tiles.work\n    ctx.out[0] = m\n    tiles.advance()",
-            kind="tiles",
+            "while work.valid:\n    m, n, l = work.item\n    ctx.out[0] = m\n    work.advance()",
+            kind="work",
             error=None,
         ),
     ]
@@ -308,17 +308,17 @@ def mutations() -> list[Mutation]:
 
 def source_for(mutation: Mutation, seed: int, depth: int = 2) -> str:
     name = f"warpdrive_mutation_{seed}_{mutation.name}"
-    if mutation.kind == "tiles":
-        policy = (
+    if mutation.kind == "work":
+        schedule = (
             "OneShot()",
             "StaticPersistent()",
-            "DynamicPersistent(stages=1)",
-            "Clc(stages=2)",
+            "AtomicPersistent(stages=1)",
+            "ClusterLaunchControl(stages=2)",
         )[seed % 4]
         return (
-            TILES_TEMPLATE.replace("BODY", textwrap.indent(mutation.body, "        "))
+            WORK_TEMPLATE.replace("BODY", textwrap.indent(mutation.body, "        "))
             .replace("NAME", name)
-            .replace("POLICY", policy)
+            .replace("SCHEDULE", schedule)
         )
     fixed = mutation.kind in ("slots", "bound")
     if mutation.kind == "bound":
@@ -384,7 +384,7 @@ def compile_mutation(mutation: Mutation, seed: int, depth: int = 2):
         spec.loader.exec_module(module)
         out = make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),), assumed_align=4)
         args = [out, cutlass.Int32(1)]
-        if mutation.kind == "tiles":
+        if mutation.kind == "work":
             args.append(make_fake_compact_tensor(cutlass.Int32, (2,), assumed_align=4))
         return compile_tvm_ffi(module.Probe(), *args, name=module_name)
     finally:

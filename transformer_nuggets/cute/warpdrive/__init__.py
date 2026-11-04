@@ -15,17 +15,17 @@ annotation is a ``ProtocolError``.
 Ends are DSL values: dynamic loops carry their phases when the end is a local name that the
 loop body uses through a method call or reassignment. Helpers that take ends must return them
 and the caller must reassign (``s, stats = step(s, stats)``), as with any CuTeDSL value. Managed
-roles return every stateful argument: producer/consumer ends, tile cursors and turnstile seats,
-e.g. ``return ab, acc, tiles``. The kernel-specific input dataclass is called ``params`` in the
+roles return every stateful argument: producer/consumer ends, work cursors and turnstile seats,
+e.g. ``return ab, acc, work``. The kernel-specific input dataclass is called ``params`` in the
 examples, with signatures written as ``self, params, *, ...state``. The dispatcher respects
 keyword-only parameters; positional signatures also work. Self, params, instance indices, TMEM
 views and raw barrier pointers are not returned.
 The layer uses the returned state directly; no execution state is recovered from Python frames.
-Work scheduling (``scheduling.py``): declare ``self.tiles = TileStream(order=..., policy=...)``
-and give roles ``tiles: Tiles``; the policy (``OneShot``, ``StaticPersistent``,
-``DynamicPersistent``, ``Clc``, or a ``Policy`` subclass) and the order (``Raster``, a
-``WorkMapping`` subclass, or an ``adapters.py`` wrapper around a CUTLASS/FA4 scheduler) are
-one-line switches. Clusters (``cluster.py``): declare
+Work scheduling (``scheduling.py``): declare ``self.work = WorkStream(mapping=...,
+schedule=...)`` and give roles ``work: WorkCursor``; the index schedule (``OneShot``,
+``StaticPersistent``, ``AtomicPersistent``, ``ClusterLaunchControl``, or an ``IndexSchedule``
+subclass) and the mapping (``Raster``, a ``WorkMap`` subclass, or an ``adapters.py`` wrapper
+around a CUTLASS/FA4 scheduler's tile order) are one-line switches. Clusters (``cluster.py``): declare
 ``self.cluster = CtaPair()`` and pin the MMA role with ``@role(..., cta="leader")``. See
 ``examples/`` for a GEMM, a persistent GEMM, and an FA4-style attention forward.
 
@@ -78,7 +78,7 @@ outside a layer payload must declare ``remote_scope="cluster"``. The layer canno
 case. The cluster scope costs about 30% on FA4's hot S channel.
 """
 
-from transformer_nuggets.cute.warpdrive.adapters import CutlassStaticPersistent, Fa4Scheduler
+from transformer_nuggets.cute.warpdrive.adapters import CutlassRaster, Fa4Mapping
 from transformer_nuggets.cute.warpdrive.channels import (
     Barriers,
     Channel,
@@ -104,36 +104,36 @@ from transformer_nuggets.cute.warpdrive.kernel import (
 from transformer_nuggets.cute.warpdrive.pipeline_plan import plan_from_warpdrive
 from transformer_nuggets.cute.warpdrive.protocol import ProtocolError, ProtocolLog, unchecked
 from transformer_nuggets.cute.warpdrive.scheduling import (
-    Clc,
-    DynamicPersistent,
+    AtomicPersistent,
+    BoundWork,
+    ClusterLaunchControl,
+    IndexSchedule,
     OneShot,
     PdlWait,
-    Policy,
     Raster,
     Readiness,
     StaticPersistent,
-    TileCursor,
-    TileProblem,
-    Tiles,
-    TileStream,
-    WorkMapping,
+    WorkCursor,
+    WorkMap,
+    WorkStream,
 )
 from transformer_nuggets.cute.warpdrive.tmem import TmemPlan, TmemView
 
 __all__ = [
+    "AtomicPersistent",
     "Barriers",
+    "BoundWork",
     "Channel",
-    "Clc",
+    "ClusterLaunchControl",
     "Consumer",
     "CtaPair",
-    "CutlassStaticPersistent",
-    "DynamicPersistent",
-    "Fa4Scheduler",
+    "CutlassRaster",
+    "Fa4Mapping",
     "Handle",
+    "IndexSchedule",
     "Instance",
     "OneShot",
     "PdlWait",
-    "Policy",
     "Producer",
     "ProtocolError",
     "ProtocolLog",
@@ -145,10 +145,6 @@ __all__ = [
     "Slots",
     "StaticPersistent",
     "Threads",
-    "TileCursor",
-    "TileProblem",
-    "TileStream",
-    "Tiles",
     "Tma",
     "Tmem",
     "TmemPlan",
@@ -157,7 +153,9 @@ __all__ = [
     "Turnstile",
     "Umma",
     "WarpSpecialized",
-    "WorkMapping",
+    "WorkCursor",
+    "WorkMap",
+    "WorkStream",
     "plan_from_warpdrive",
     "role",
     "unchecked",

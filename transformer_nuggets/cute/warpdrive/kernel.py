@@ -42,9 +42,8 @@ from transformer_nuggets.cute.warpdrive.protocol import (
     take_opt_outs,
 )
 from transformer_nuggets.cute.warpdrive.scheduling import (
-    TileCursor,
-    Tiles,
-    TileStream,
+    WorkCursor,
+    WorkStream,
     _Fetch,
     scheduler_role,
 )
@@ -102,12 +101,12 @@ class Turn:
     """Annotation: the role receives its seat at the turnstile with the parameter's name."""
 
 
-class _SchedulerTiles:
+class _SchedulerCursor:
     """Internal annotation: the scheduler warp's own cursor (it decodes and publishes)."""
 
 
 class _SchedulerFetch:
-    """Internal annotation: the scheduler warp's private policy channels (both ends)."""
+    """Internal annotation: the scheduler warp's private schedule channels (both ends)."""
 
 
 class _Context:
@@ -120,7 +119,7 @@ _ANNOTATIONS = {
     "Tmem": Tmem,
     "Instance": Instance,
     "Turn": Turn,
-    "Tiles": Tiles,
+    "WorkCursor": WorkCursor,
     "Barriers": Barriers,
 }
 # Parameters a raw role may take: no channel ends, cursors, or seats (they carry protocol state).
@@ -130,8 +129,7 @@ _LOOKALIKES = (
     (ProducerEnd, "Producer"),
     (ConsumerEnd, "Consumer"),
     (Channel, "Producer or Consumer"),
-    (TileStream, "Tiles"),
-    (TileCursor, "Tiles"),
+    (WorkStream, "WorkCursor"),
     (TmemPlan, "Tmem"),
     (TmemView, "Tmem"),
     (Turnstile, "Turn"),
@@ -312,7 +310,7 @@ class WarpSpecialized:
     cluster: SingleCta = SingleCta()  # or CtaPair(): one line switches to 2-CTA MMAs
 
     def __setattr__(self, name, value):
-        if isinstance(value, TileStream):
+        if isinstance(value, WorkStream):
             value.owner = self  # the stream's work unit follows this kernel's cluster
         super().__setattr__(name, value)
 
@@ -326,10 +324,10 @@ class WarpSpecialized:
         raw_bars = {k: v for k, v in vars(self).items() if isinstance(v, Barriers)}
         for name, b in raw_bars.items():
             b.name = name
-        streams = {k: v for k, v in vars(self).items() if isinstance(v, TileStream)}
+        streams = {k: v for k, v in vars(self).items() if isinstance(v, WorkStream)}
         if len(streams) > 1:
             raise ProtocolError(
-                "one TileStream per kernel (every role starts at this CTA's first item), got "
+                "one WorkStream per kernel (every role starts at this CTA's first item), got "
                 f"{list(streams)}"
             )
         seen = {}
@@ -344,15 +342,15 @@ class WarpSpecialized:
         for name, st in streams.items():
             st.name = name
             st.owner = self
-            if st.policy.broadcast:
-                generated = {f"{name}_work": st.channel()}
+            if st.schedule.broadcast:
+                generated = {f"{name}_ring": st.channel()}
                 generated.update(
-                    {f"{name}_{k}": ch for k, ch in st.policy.fetch_channels().items()}
+                    {f"{name}_{k}": ch for k, ch in st.schedule.fetch_channels().items()}
                 )
                 for k, ch in generated.items():
                     if k in vars(self):
                         raise ProtocolError(
-                            f"TileStream {name}: attribute {k!r} is reserved for its scheduler"
+                            f"WorkStream {name}: attribute {k!r} is reserved for its scheduler"
                         )
                     chans[k] = ch
         for name, obj in (*chans.items(), *turns.items()):
@@ -401,8 +399,8 @@ class WarpSpecialized:
                     )
                 if ann is Barriers and pname not in raw_bars:
                     raise ProtocolError(f"role {name}: no Barriers named {pname!r}")
-                if ann is Tiles and pname not in streams:
-                    raise ProtocolError(f"role {name}: no TileStream named {pname!r}")
+                if ann is WorkCursor and pname not in streams:
+                    raise ProtocolError(f"role {name}: no WorkStream named {pname!r}")
                 if ctx_type is not None:
                     ctx_types.setdefault(ctx_type, f"{name}.{pname}")
                 params.append((pname, ann))
@@ -459,31 +457,31 @@ class WarpSpecialized:
         self._ws_log = ProtocolLog() if self.trace_protocol else None
 
     @staticmethod
-    def _bind_stream(name: str, st: TileStream, roles: list, chans: dict, cluster):
-        """Check stream users; for broadcast policies add the scheduler role and bind every
+    def _bind_stream(name: str, st: WorkStream, roles: list, chans: dict, cluster):
+        """Check stream users; for broadcast schedules add the scheduler role and bind every
         stream user (and the scheduler) as a consumer of the work ring."""
-        users = [r for r in roles if any(a is Tiles for _, a in r.params)]
+        users = [r for r in roles if any(a is WorkCursor for _, a in r.params)]
         st.roles = [r.name for r in sorted(users, key=lambda r: r.first_warp)]
         for r in users:
             for pname, ann in r.params:
-                if ann is Tiles and pname != name:
-                    raise ProtocolError(f"role {r.name}: no TileStream named {pname!r}")
-        if st.policy.persistent:
+                if ann is WorkCursor and pname != name:
+                    raise ProtocolError(f"role {r.name}: no WorkStream named {pname!r}")
+        if st.schedule.persistent:
             idle = sorted({r.role for r in roles if not r.raw} - {r.role for r in users})
             if idle:
                 raise ProtocolError(
-                    f"{st.policy.describe()} runs several work items per CTA, but roles {idle} "
-                    f"do not take `{name}: Tiles`; every role must loop over the stream (a role "
-                    f"with no per-item work drains it: `while {name}.valid: {name}.advance()`)"
+                    f"{st.schedule.describe()} runs several work items per CTA, but roles {idle} "
+                    f"do not take `{name}: WorkCursor`; every role must loop over the stream (a "
+                    f"role with no per-item work drains it: `while {name}.valid: {name}.advance()`)"
                 )
-        if not st.policy.broadcast:
+        if not st.schedule.broadcast:
             return
         owned = {w for r in roles for w in r.warps}
         warp = st.scheduler_warp
         if warp is None:
             warp = next(w for w in range(max(owned, default=-1) + 2) if w not in owned)
         elif warp in owned:
-            raise ValueError(f"TileStream {name}: scheduler_warp {warp} is claimed by a role")
+            raise ValueError(f"WorkStream {name}: scheduler_warp {warp} is claimed by a role")
         group = range(warp // WARPGROUP * WARPGROUP, (warp // WARPGROUP + 1) * WARPGROUP)
         # The scheduler shares its warpgroup's budget (setmaxnreg is per warpgroup), including a
         # deliberate None; only an otherwise idle warpgroup takes the smallest declared budget.
@@ -493,9 +491,9 @@ class WarpSpecialized:
             regs = budgets.pop() if len(budgets) == 1 else min(b for b in budgets if b is not None)
         else:
             regs = min(any_regs) if any_regs else None
-        work = f"{name}_work"
-        fetch = [f"{name}_{k}" for k in st.policy.fetch_channels()]
-        params = [(work, Producer), (name, _SchedulerTiles), (name, _SchedulerFetch)]
+        ring = f"{name}_ring"
+        fetch = [f"{name}_{k}" for k in st.schedule.fetch_channels()]
+        params = [(ring, Producer), (name, _SchedulerCursor), (name, _SchedulerFetch)]
         # In a CTA pair only the leader claims; it publishes each item into both CTAs.
         sched = RoleInstance(
             f"{name}.scheduler",
@@ -510,9 +508,9 @@ class WarpSpecialized:
         )
         roles.append(sched)
         st.roles.append(sched.name)
-        chans[work].producers.append((sched, None))
+        chans[ring].producers.append((sched, None))
         for r in [*users, sched]:
-            chans[work].consumers.append((r, None))
+            chans[ring].consumers.append((r, None))
         for f in fetch:
             chans[f].producers.append((sched, None))
             chans[f].consumers.append((sched, None))
@@ -774,7 +772,7 @@ class WarpSpecialized:
 
     def launch_config(self, work=None, grid=None) -> dict:
         """``grid``/``block``/``cluster`` for ``kernel(...).launch(**cfg, stream=stream)``.
-        Kernels with a ``TileStream`` pass its ``work`` problem: the grid depends on the policy
+        Kernels with a ``WorkStream`` pass its ``BoundWork``: the grid depends on the schedule
         (a ``OneShot`` over plain ``Raster()`` launches the tile space)."""
         if work is not None:
             grid = work.grid()
@@ -789,8 +787,8 @@ class WarpSpecialized:
     def begin_roles(self, **problems):
         """Allocate and initialize barriers and payload buffers; allocate TMEM.
 
-        ``problems``: the runtime ``TileProblem`` of each declared ``TileStream``, by name
-        (``self.begin_roles(tiles=work)``).
+        ``problems``: the ``BoundWork`` of each declared ``WorkStream``, by name
+        (``self.begin_roles(work=bound)``).
 
         Plain Python at trace time (the loops are over host-side declarations); only the
         barrier initialization is a device-side branch.
@@ -798,7 +796,7 @@ class WarpSpecialized:
         self._collect()
         if set(problems) != set(self._ws_streams):
             raise ProtocolError(
-                f"begin_roles needs a problem for each TileStream {sorted(self._ws_streams)}, "
+                f"begin_roles needs a problem for each WorkStream {sorted(self._ws_streams)}, "
                 f"got {sorted(problems)}"
             )
         self._ws_problems = problems
@@ -975,9 +973,9 @@ class WarpSpecialized:
             r.name, None if r.raw else self._ws_log, iket=self.iket, iket_waits=self.iket_waits
         )
         args = self._role_args(r, ctx, trace)
-        # A role looping over a TileStream gets one IKET range per work item (TileCursor);
+        # A role looping over a WorkStream gets one IKET range per work item (WorkCursor);
         # any other role gets one over its whole body.
-        whole_range = self.iket and not any(isinstance(arg, TileCursor) for arg in args)
+        whole_range = self.iket and not any(isinstance(arg, WorkCursor) for arg in args)
         if whole_range:
             push(r.name)
         positional, keywords = [], {}
@@ -996,7 +994,7 @@ class WarpSpecialized:
             final = _returned_state(r.name, result, state_args)
             if self.iket:
                 for _, arg in state_args:
-                    if isinstance(arg, TileCursor):
+                    if isinstance(arg, WorkCursor):
                         cur = final[_state_identity(arg)]
                         pop_if(cur.index < cur._problem.total)
             for _, arg in state_args:
@@ -1044,18 +1042,18 @@ class WarpSpecialized:
                 args.append(TmemView(base, self.tmem_plan, r.name, trace.log))
             elif ann is Barriers:
                 args.append(self._ws_bars[pname])
-            elif ann is Tiles or ann is _SchedulerTiles:
+            elif ann is WorkCursor or ann is _SchedulerCursor:
                 st = self._ws_streams[pname]
                 end = None
-                if st.policy.broadcast:
-                    end = self._make_end(f"{pname}_work", False, None, trace, r.cta)
+                if st.schedule.broadcast:
+                    end = self._make_end(f"{pname}_ring", False, None, trace, r.cta)
                 args.append(
-                    TileCursor.create(
+                    WorkCursor.create(
                         st,
                         self._ws_problems[pname],
                         end,
                         trace,
-                        scheduler=ann is _SchedulerTiles,
+                        scheduler=ann is _SchedulerCursor,
                         slot=(st.roles.index(r.name), r.first_warp),
                     )
                 )
@@ -1066,9 +1064,9 @@ class WarpSpecialized:
                         self._make_end(f"{pname}_{k}", True, None, trace, r.cta),
                         self._make_end(f"{pname}_{k}", False, None, trace, r.cta),
                     )
-                    for k in st.policy.fetch_channels()
+                    for k in st.schedule.fetch_channels()
                 }
-                args.append(_Fetch(st.policy, ends, self._ws_problems[pname]))
+                args.append(_Fetch(st.schedule, ends, self._ws_problems[pname]))
             elif ann is Instance:
                 args.append(r.index)
             elif ann is Turn:
@@ -1119,7 +1117,7 @@ class RoleContext(SimpleNamespace):
         return self
 
 
-_ROLE_STATE_TYPES = (ProducerEnd, ConsumerEnd, TileCursor, TurnEnd)
+_ROLE_STATE_TYPES = (ProducerEnd, ConsumerEnd, WorkCursor, TurnEnd)
 
 
 def _state_identity(state):

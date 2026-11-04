@@ -75,7 +75,7 @@ def runtime_campaign(args) -> int:
             label = f"known:{known}" if known else res.status
             counts[label] = counts.get(label, 0) + 1
             row = asdict(res)
-            row["pair"], row["policy"] = spec.pair, spec.stream.policy if spec.stream else None
+            row["pair"], row["schedule"] = spec.pair, spec.stream.schedule if spec.stream else None
             row["known"], row["features"] = known, sorted(gen.features(spec))
             log.write(json.dumps(row) + "\n")
             log.flush()
@@ -139,7 +139,7 @@ def main() -> int:
         help="cancel queued jobs after this long; collect running jobs (0: all)",
     )
     rt.add_argument("--pair", type=lambda s: s == "1", default=None, help="force CtaPair (1/0)")
-    rt.add_argument("--stream", type=lambda s: s == "1", default=None, help="force a TileStream")
+    rt.add_argument("--stream", type=lambda s: s == "1", default=None, help="force a WorkStream")
     rt.add_argument("--empty", action="store_true", help="zero-work boundary corpus (G6)")
     rt.add_argument(
         "--wrapper",

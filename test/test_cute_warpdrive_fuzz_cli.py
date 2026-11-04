@@ -105,7 +105,7 @@ def test_known_failure_is_not_a_success(monkeypatch, tmp_path):
             spec.seed,
             "known",
             runtime.REJECT,
-            detail="mixed register budgets {'a': None, 'tiles.scheduler': 160}",
+            detail="mixed register budgets {'a': None, 'work.scheduler': 160}",
         ),
     )
     assert fuzz_warpdrive.runtime_campaign(campaign_args(tmp_path, seeds="0")) == 1

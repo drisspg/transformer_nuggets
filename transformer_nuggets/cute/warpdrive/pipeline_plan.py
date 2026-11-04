@@ -32,7 +32,7 @@ def plan_from_warpdrive(kernel, *, cta: int = 0, name: str | None = None) -> Pip
       ``slots / uses per item`` when the trace saw a static number of acquires/waits per item,
       else 1 (a lower bound for channels used in an inner loop). ``slots`` is the stage count,
       or 1 for a role bound to one slot of ``Slots``.
-      A ``TileStream`` work ring gets one more: every role releases a work slot as it starts
+      A ``WorkStream`` work ring gets one more: every role releases a work slot as it starts
       the item (on receipt), one item before the end of the region that holds it.
 
     Reuse distances need a compiled kernel; before a compile every channel counts as used once
@@ -83,7 +83,7 @@ def plan_from_warpdrive(kernel, *, cta: int = 0, name: str | None = None) -> Pip
                     downstream[prod].add(cons)
                     plan.add_dependency(Dependency(prod, cons, cname, 0, "data", cname))
     uses = getattr(kernel, "_ws_uses", {})
-    work_rings = {f"{stream}_work" for stream in kernel._ws_streams}
+    work_rings = {f"{stream}_ring" for stream in kernel._ws_streams}
     for cname, (ch, producers, consumers) in channels.items():
         bound = {ri.name for ri, slot in [*ch.producers, *ch.consumers] if slot is not None}
         for prod in producers:

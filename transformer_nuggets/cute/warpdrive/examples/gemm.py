@@ -1,6 +1,6 @@
 """BF16 ``D = A @ B^T`` (``F.linear`` layout) on SM100, written with ``warpdrive``.
 
-One CTA per 128x256 output tile (a ``TileStream`` with the ``OneShot`` policy), K stage 64,
+One CTA per 128x256 output tile (a ``WorkStream`` with the ``OneShot`` schedule), K stage 64,
 tcgen05 MMA 128x256x16, three A/B SMEM stages; warps 0-3 epilogue, 4 TMA load, 5 MMA. TMA
 zero-fills out-of-bounds boxes, so ragged M, N, K need only the epilogue store predicate.
 """
@@ -22,8 +22,8 @@ from transformer_nuggets.cute.warpdrive import (
     Producer,
     Ring,
     Threads,
-    Tiles,
-    TileStream,
+    WorkCursor,
+    WorkStream,
     Tma,
     Tmem,
     TmemPlan,
@@ -66,7 +66,7 @@ class Gemm(WarpSpecialized):
         self.ab = Ring(ab_stages, Tma((TILE[0] + TILE[1]) * TILE[2] * 2), Umma)
         self.acc = Ring(acc_stages, Umma, Threads)
         self.tmem_plan = TmemPlan().region("acc", TILE[1], acc_stages)
-        self.tiles = TileStream(policy=OneShot())  # one tile per CTA, m fastest
+        self.work = WorkStream(schedule=OneShot())  # one tile per CTA, m fastest
         self.trace_protocol = trace
 
     def get_name(self) -> str:
@@ -81,9 +81,9 @@ class Gemm(WarpSpecialized):
 
     @role(warps=4, regs=40)
     @cute.jit
-    def load(self, params: GemmParams, *, ab: Producer, tiles: Tiles):
-        while tiles.valid:
-            m, n, _ = tiles.work
+    def load(self, params: GemmParams, *, ab: Producer, work: WorkCursor):
+        while work.valid:
+            m, n, _ = work.item
             for k in cutlass.range(params.num_k_tiles, unroll=1):
                 with ab.produce() as s:
                     cute.copy(
@@ -98,15 +98,17 @@ class Gemm(WarpSpecialized):
                         params.tBsB[None, s.index],
                         tma_bar_ptr=s.barrier,
                     )
-            tiles.advance()
-        return ab, tiles
+            work.advance()
+        return ab, work
 
     @role(warps=5, regs=40)
     @cute.jit
-    def mma(self, params: GemmParams, *, ab: Consumer, acc: Producer, tiles: Tiles, tmem: Tmem):
+    def mma(
+        self, params: GemmParams, *, ab: Consumer, acc: Producer, work: WorkCursor, tmem: Tmem
+    ):
         tiled_mma = params.tiled_mma
         tCtAcc = cute.make_tensor(tmem.ptr("acc"), params.acc_layout)
-        while tiles.valid:
+        while work.valid:
             with acc.produce() as a:
                 tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
                 for k in cutlass.range(params.num_k_tiles, unroll=1):
@@ -120,12 +122,12 @@ class Gemm(WarpSpecialized):
                                 tCtAcc[None, None, None, a.index],
                             )
                             tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-            tiles.advance()
-        return ab, acc, tiles
+            work.advance()
+        return ab, acc, work
 
     @role(warps=range(4), regs=160)
     @cute.jit
-    def epilogue(self, params: GemmParams, *, acc: Consumer, tiles: Tiles, tmem: Tmem):
+    def epilogue(self, params: GemmParams, *, acc: Consumer, work: WorkCursor, tmem: Tmem):
         tidx, _, _ = cute.arch.thread_idx()
         t2r = tcgen05.make_tmem_copy(
             cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition.x32), cutlass.Float32),
@@ -133,8 +135,8 @@ class Gemm(WarpSpecialized):
         ).get_slice(tidx)
         tAcc = cute.make_tensor(tmem.ptr("acc"), params.acc_layout)
         rows, cols = params.mC.shape
-        while tiles.valid:
-            m, n, _ = tiles.work
+        while work.valid:
+            m, n, _ = work.item
             tCgC = params.tCgC[None, None, None, m, n]
             tDgC = t2r.partition_D(cute.zipped_divide(tCgC, params.epi_tiler))
             tDcC = t2r.partition_D(
@@ -157,14 +159,14 @@ class Gemm(WarpSpecialized):
                         for j in cutlass.range_constexpr(cute.size(rC)):
                             if cute.elem_less(crd[j], params.mC.shape):
                                 g[j] = rC[j]
-            tiles.advance()
-        return acc, tiles
+            work.advance()
+        return acc, work
 
     # ----------------------------------------------------------------- kernel
 
     @cute.kernel
-    def kernel(self, tiled_mma, tma_a, mA, tma_b, mB, mC, a_layout, b_layout, work):
-        smem = self.begin_roles(tiles=work)
+    def kernel(self, tiled_mma, tma_a, mA, tma_b, mB, mC, a_layout, b_layout, bound):
+        smem = self.begin_roles(work=bound)
         sA = smem.allocate_tensor(self.dtype, a_layout.outer, 1024, a_layout.inner)
         sB = smem.allocate_tensor(self.dtype, b_layout.outer, 1024, b_layout.inner)
         thr_mma = tiled_mma.get_slice(0)
@@ -242,10 +244,10 @@ class Gemm(WarpSpecialized):
             tma_op, b, cute.select(b_layout, mode=[0, 1, 2]), TILE, tiled_mma
         )
         m_tiles, n_tiles = cute.ceil_div(c.layout.shape, TILE[:2])
-        work = self.tiles.problem((m_tiles, n_tiles, 1))
+        bound = self.work.bind((m_tiles, n_tiles, 1))
         self.kernel.set_name_prefix(self.get_name())
-        self.kernel(tiled_mma, tma_a, mA, tma_b, mB, c, a_layout, b_layout, work).launch(
-            **self.launch_config(work), stream=stream
+        self.kernel(tiled_mma, tma_a, mA, tma_b, mB, c, a_layout, b_layout, bound).launch(
+            **self.launch_config(bound), stream=stream
         )
 
 
