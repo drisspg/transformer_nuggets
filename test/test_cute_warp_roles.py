@@ -157,6 +157,59 @@ class BoundToy(WarpSpecialized):
         self.kernel(out, n).launch(grid=(1, 1, 1), block=(self.num_threads, 1, 1), stream=stream)
 
 
+class HoleToy(WarpSpecialized):
+    """Producer warp 0 -> consumer warps 4-7, plus an idle role on warps 8-11. Warps 1-3 belong
+    to no role but share warp 0's warpgroup, so they must take its register budget
+    (setmaxnreg is .aligned per warpgroup). 12 warps: default 168 registers, so the producer
+    and idle role decrease and the consumer increases."""
+
+    def __init__(self):
+        self.ch = Slots(1, Threads, Threads, payload=(cutlass.Int32, (32,)))
+
+    @role(warps=0, regs=56)
+    @cute.jit
+    def prod(self, ch: Producer, c):
+        lane = cute.arch.lane_idx()
+        for i in cutlass.range(c.n, unroll=1):
+            with ch.produce(0) as h:
+                h.data[lane] = i * 32 + lane
+
+    @role(warps=range(4, 8), regs=232)
+    @cute.jit
+    def cons(self, ch: Consumer, c):
+        lane = cute.arch.lane_idx()
+        acc = cutlass.Int32(0)
+        for _ in cutlass.range(c.n, unroll=1):
+            with ch.consume(0) as h:
+                acc = acc + h.data[lane]
+        if cute.arch.warp_idx() == 4:
+            c.out[lane] = acc
+
+    @role(warps=range(8, 12), regs=56)
+    @cute.jit
+    def idle(self, c):
+        pass
+
+    @cute.kernel
+    def kernel(self, out: cute.Tensor, n: cutlass.Int32):
+        self.begin_roles()
+        self.run_roles(SimpleNamespace(out=out, n=n))
+
+    @cute.jit
+    def __call__(self, out: cute.Tensor, n: cutlass.Int32, stream: cuda.CUstream):
+        self.kernel.set_name_prefix("warp_roles_hole_toy")
+        self.kernel(out, n).launch(grid=(1, 1, 1), block=(self.num_threads, 1, 1), stream=stream)
+
+
+class OverBudgetHoleToy(HoleToy):
+    """Warp 0's 232 registers also bind holes 1-3: 4 warpgroups' worth over 65536."""
+
+    @role(warps=0, regs=232)
+    @cute.jit
+    def prod(self, ch: Producer, c):
+        pass
+
+
 def compile_toy(op):
     out = make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),), assumed_align=4)
     return compile_tvm_ffi(op, out, cutlass.Int32(1), name="warp_roles_toy")
@@ -185,6 +238,22 @@ def test_bound_producers_fan_in(requires_blackwell, n):
     compile_toy(BoundToy())(out, n)
     tri = n * (n + 1) // 2
     assert out[:32].tolist() == [tri] * 32 and out[32:].tolist() == [2 * tri] * 32
+
+
+@pytest.mark.parametrize("n", [1, 9])
+def test_register_holes_run(requires_blackwell, n):
+    out = torch.full((32,), -1, device="cuda", dtype=torch.int32)
+    compile_toy(HoleToy())(out, n)
+    torch.cuda.synchronize()
+    lane = torch.arange(32, dtype=torch.int32)
+    assert torch.equal(out.cpu(), 32 * n * (n - 1) // 2 + n * lane)
+
+
+def test_register_holes_take_their_warpgroup_budget():
+    # 232 x 32 x (4 + 4) + 56 x 32 x 4 = 66560: counting warp 0 alone would accept it.
+    with pytest.raises(ValueError, match="register budgets need 66560 > 65536"):
+        OverBudgetHoleToy().describe()
+    assert "padding          warps  1-3  regs=56" in HoleToy().describe()
 
 
 def test_trace_time_wrong_slot(requires_blackwell):

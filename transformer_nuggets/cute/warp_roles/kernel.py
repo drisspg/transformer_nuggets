@@ -41,6 +41,7 @@ from transformer_nuggets.cute.warp_roles.tmem import TmemPlan, TmemView
 WARP_SIZE = 32
 WARPGROUP = 4
 REGS_PER_SM = 65536
+MIN_REGS = 24  # setmaxnreg floor: the budget of a warpgroup no role owns
 # Named barrier ids owned by the layer; user code must not reuse them.
 TMEM_PTR_BARRIER_ID = 1
 TMEM_TEARDOWN_BARRIER_ID = 2
@@ -390,28 +391,29 @@ class WarpSpecialized:
         elif any(r.uses_tmem for r in roles):
             raise ProtocolError("roles take Tmem but the kernel has no tmem_plan")
         num_warps = max(owner) + 1
-        self.num_warps_used = num_warps
         uses_regs = any(r.regs is not None for r in roles)
         # setmaxnreg is .aligned per warpgroup: pad to whole warpgroups and require every warp
         # of a warpgroup to request the same budget.
         self.num_warps = -(-num_warps // WARPGROUP) * WARPGROUP if uses_regs else num_warps
         self.default_regs = min(REGS_PER_SM // (self.num_warps * WARP_SIZE) // 8 * 8, 256)
-        self.pad_regs = None
+        # (warps, regs) for each run of warps no role owns, holes included: they take their
+        # warpgroup's budget (MIN_REGS for an all-idle warpgroup).
+        self._ws_padding = []
         if uses_regs:
+            regs_of = {w: r.regs for r in roles for w in r.warps}
             for g in range(self.num_warps // WARPGROUP):
-                budgets = {
-                    owner.get(w, f"pad{w}"): next((r.regs for r in roles if w in r.warps), "pad")
-                    for w in range(g * WARPGROUP, (g + 1) * WARPGROUP)
-                }
-                vals = {v for v in budgets.values() if v != "pad"}
+                group = range(g * WARPGROUP, (g + 1) * WARPGROUP)
+                budgets = {owner[w]: regs_of[w] for w in group if w in owner}
+                vals = set(budgets.values())
                 if len(vals) > 1:
                     raise ValueError(f"warpgroup {g} has mixed register budgets {budgets}")
-                if "pad" in budgets.values():
-                    self.pad_regs = min(vals) if vals else 24
+                regs = vals.pop() if vals else MIN_REGS
+                idle = [w for w in group if w not in owner]
+                self._ws_padding += [(run, regs) for run in _runs(idle)]
             total = sum(
-                (r.regs if r.regs is not None else self.default_regs) * r.num_threads
-                for r in roles
-            ) + (self.num_warps - num_warps) * WARP_SIZE * (self.pad_regs or 0)
+                (regs if regs is not None else self.default_regs) * len(warps) * WARP_SIZE
+                for warps, regs in [*((r.warps, r.regs) for r in roles), *self._ws_padding]
+            )
             if total > REGS_PER_SM:
                 raise ValueError(f"register budgets need {total} > {REGS_PER_SM}")
 
@@ -436,6 +438,10 @@ class WarpSpecialized:
             lines.append(
                 f"  role {r.name:<11} warps {r.warps.start:>2}-{r.warps.stop - 1:<2} "
                 f"regs={r.regs}{where}"
+            )
+        for warps, regs in self._ws_padding:
+            lines.append(
+                f"  {'padding':<16} warps {warps.start:>2}-{warps.stop - 1:<2} regs={regs}"
             )
         for name, ch in self._ws_chans.items():
             kind = f"Slots({ch.n})" if ch.fixed else f"Ring({ch.n})"
@@ -626,9 +632,11 @@ class WarpSpecialized:
             else:
                 if _in_warps(warp_idx, r.first_warp, r.num_warps):
                     self._dispatch(r, ctx, tmem_threads)
-        if cutlass.const_expr(self.pad_regs is not None):  # noqa: SIM102 (runtime inside const)
-            if warp_idx >= self.num_warps_used:
-                cute.arch.setmaxregister_decrease(self.pad_regs)
+        padding = [(w, regs) for w, regs in self._ws_padding if regs is not None]
+        for i in cutlass.range_constexpr(len(padding)):
+            warps, regs = padding[i]
+            if _in_warps(warp_idx, warps.start, len(warps)):
+                self._set_regs(regs)
         if cutlass.const_expr(pair):
             # Remote arrivals into a CTA must land before it exits: every thread-issued remote
             # arrive precedes its thread's cluster arrive (release), and producers whose stages
@@ -790,6 +798,17 @@ def _barrier_unaligned(barrier_id: int, num_threads):
     nvvm.barrier_cta_sync(
         Int32(barrier_id).ir_value(), thread_count=Int32(num_threads).ir_value(), aligned=False
     )
+
+
+def _runs(warps: list[int]) -> list[range]:
+    """Each run of consecutive warps in a sorted list."""
+    runs = []
+    for w in warps:
+        if runs and runs[-1].stop == w:
+            runs[-1] = range(runs[-1].start, w + 1)
+        else:
+            runs.append(range(w, w + 1))
+    return runs
 
 
 def _in_warps(warp_idx, first: int, count: int):
