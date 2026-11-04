@@ -18,6 +18,7 @@ from pathlib import Path
 import cutlass
 from cutlass import cute
 
+from test.warpdrive_fuzz.mutate_tma import TmaMutation, compile_tma_mutation
 from test.warpdrive_fuzz.static import Finding, FuzzReport
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import ProtocolError
@@ -32,6 +33,7 @@ class Mutation:
     error: type[Exception] | None = ProtocolError
     message: str = ""
     obligation: bool = False
+    tma: TmaMutation | None = None
 
 
 CHANNEL_TEMPLATE = """\
@@ -79,12 +81,12 @@ import cutlass
 from cutlass import cute
 from types import SimpleNamespace
 from transformer_nuggets.cute.warpdrive import (
-    WarpSpecialized, TileStream, StaticPersistent, Tiles, role,
+    WarpSpecialized, TileStream, OneShot, StaticPersistent, DynamicPersistent, Clc, Tiles, role,
 )
 
 class Probe(WarpSpecialized):
     def __init__(self):
-        self.tiles = TileStream(policy=StaticPersistent())
+        self.tiles = TileStream(policy=POLICY)
 
     @role(warps=0)
     @cute.jit
@@ -97,8 +99,8 @@ BODY
         self.run_roles(SimpleNamespace(out=out, n=work.total))
 
     @cute.jit
-    def __call__(self, out: cute.Tensor, n: cutlass.Int32, stream):
-        work = self.tiles.problem((n, 1, 1), max_ctas=cutlass.Int32(1))
+    def __call__(self, out: cute.Tensor, n: cutlass.Int32, workspace: cute.Tensor, stream):
+        work = self.tiles.problem((n, 1, 1), workspace, max_ctas=cutlass.Int32(1))
         self.kernel.set_name_prefix("NAME")
         self.kernel(out, work).launch(**self.launch_config(work), stream=stream)
 """
@@ -107,7 +109,14 @@ BODY
 def mutations() -> list[Mutation]:
     loop = "for i in cutlass.range(ctx.n, unroll=1):\n"
     valid = loop + "    h = ch.acquire(SLOT)\n    h.commit()"
-    return [
+    corpus = [
+        Mutation("typo_annotation", "E07", valid, kind="typo", message="does not resolve"),
+        Mutation("wrong_role", "E21", valid, kind="wrong_role", message="producer is declared"),
+        Mutation(
+            "two_contexts", "E12", valid, kind="two_contexts", message="all receive the context"
+        ),
+        Mutation("wrong_context_type", "E15", valid, kind="wrong_context_type", message="context"),
+        Mutation("tuple_context", "E16", valid, kind="tuple_context", message="no attributes"),
         Mutation("valid", "R2", valid, error=None),
         Mutation(
             "drop_commit", "E58", loop + "    h = ch.acquire(SLOT)", message="handles never closed"
@@ -231,13 +240,77 @@ def mutations() -> list[Mutation]:
             error=None,
         ),
     ]
+    for mutation in corpus[6:12]:
+        if mutation.error is not None:
+            consumer_body = (
+                mutation.body.replace("acquire", "wait")
+                .replace("commit", "release")
+                .replace("produce", "consume")
+            )
+            if mutation.name == "wrong_close":
+                consumer_body = consumer_body.replace("h.release()", "h.commit()")
+            corpus.append(
+                Mutation(
+                    "consumer_" + mutation.name,
+                    mutation.contract,
+                    consumer_body,
+                    kind="consumer",
+                    message=mutation.message.replace("release()", "commit()"),
+                )
+            )
+    for pair, leader, group in ((False, False, "ONE"), (True, True, "TWO"), (True, False, "ONE")):
+        for copies in (1, 2):
+            for scale in (0.5, 1, 2):
+                config = TmaMutation(pair, leader, group, int(8192 * copies * scale), copies)
+                corpus.append(
+                    Mutation(
+                        f"tma_{pair}_{leader}_{copies}_{scale}",
+                        "E81/R11",
+                        "",
+                        kind="tma",
+                        error=None if scale == 1 else ProtocolError,
+                        message="bytes",
+                        tma=config,
+                    )
+                )
+        corpus.append(
+            Mutation(
+                f"tma_opaque_{pair}_{leader}",
+                "U6",
+                "",
+                kind="tma",
+                error=None,
+                obligation=True,
+                tma=TmaMutation(pair, leader, group, opaque=True),
+            )
+        )
+    for leader, group in ((True, "ONE"), (False, "TWO")):
+        corpus.append(
+            Mutation(
+                f"tma_bad_group_{leader}",
+                "E80",
+                "",
+                kind="tma",
+                message="CtaGroup",
+                tma=TmaMutation(True, leader, group),
+            )
+        )
+    return corpus
 
 
 def source_for(mutation: Mutation, seed: int, depth: int = 2) -> str:
     name = f"warpdrive_mutation_{seed}_{mutation.name}"
     if mutation.kind == "tiles":
-        return TILES_TEMPLATE.replace("BODY", textwrap.indent(mutation.body, "        ")).replace(
-            "NAME", name
+        policy = (
+            "OneShot()",
+            "StaticPersistent()",
+            "DynamicPersistent(stages=1)",
+            "Clc(stages=2)",
+        )[seed % 4]
+        return (
+            TILES_TEMPLATE.replace("BODY", textwrap.indent(mutation.body, "        "))
+            .replace("NAME", name)
+            .replace("POLICY", policy)
         )
     fixed = mutation.kind in ("slots", "bound")
     if mutation.kind == "bound":
@@ -246,10 +319,32 @@ def source_for(mutation: Mutation, seed: int, depth: int = 2) -> str:
         f"Slots({depth}, Threads, Threads)" if fixed else f"Ring({depth}, Threads, Threads)"
     )
     body = mutation.body.replace("SLOT", "0" if fixed else "")
-    source = CHANNEL_TEMPLATE.replace("PRODUCER_BODY", textwrap.indent(body, "        "))
+    source = CHANNEL_TEMPLATE
+    if mutation.kind == "consumer":
+        old = "        for i in cutlass.range(ctx.n, unroll=1):\n            h = ch.wait(SLOT)\n            h.release()"
+        assert source.count(old) == 1
+        source = source.replace(old, textwrap.indent(body, "        "))
+        body = "for i in cutlass.range(ctx.n, unroll=1):\n    h = ch.acquire()\n    h.commit()"
+    source = source.replace("PRODUCER_BODY", textwrap.indent(body, "        "))
     if mutation.kind == "bound":
         source = source.replace("@role(warps=0)", "@role(warps=[range(1), range(1, 2)])")
         source = source.replace("@role(warps=1)", "@role(warps=2)")
+    if mutation.kind == "typo":
+        source = source.replace("PRODUCER_ANNOTATION", '"Consumr"')
+    elif mutation.kind == "wrong_role":
+        declaration = declaration[:-1] + ', producer_role="other")'
+    elif mutation.kind == "two_contexts":
+        source = source.replace("PRODUCER_ANNOTATION, ctx):", "PRODUCER_ANNOTATION, ctx, other):")
+    elif mutation.kind == "wrong_context_type":
+        source = source.replace(
+            "class Probe",
+            "from dataclasses import dataclass\n@dataclass(frozen=True)\nclass ExpectedCtx:\n    n: cutlass.Int32\n\nclass Probe",
+        )
+        source = source.replace(
+            "PRODUCER_ANNOTATION, ctx):", "PRODUCER_ANNOTATION, ctx: ExpectedCtx):"
+        )
+    elif mutation.kind == "tuple_context":
+        source = source.replace("SimpleNamespace(out=out, n=n)", "(out, n)")
     return (
         source.replace("DECLARATION", declaration)
         .replace(
@@ -263,6 +358,8 @@ def source_for(mutation: Mutation, seed: int, depth: int = 2) -> str:
 def compile_mutation(mutation: Mutation, seed: int, depth: int = 2):
     """Compile fresh source without a runtime tensor, device query, or launch invocation."""
     os.environ.setdefault("CUTE_DSL_ARCH", "sm_100a")
+    if mutation.tma is not None:
+        return compile_tma_mutation(mutation.tma)
     source = source_for(mutation, seed, depth)
     digest = hashlib.sha256(source.encode()).hexdigest()[:16]
     root = Path(__file__).resolve().parents[2] / "agent_space" / "warpdrive" / "fuzz" / "mutations"
@@ -277,7 +374,10 @@ def compile_mutation(mutation: Mutation, seed: int, depth: int = 2):
     try:
         spec.loader.exec_module(module)
         out = make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),), assumed_align=4)
-        return compile_tvm_ffi(module.Probe(), out, cutlass.Int32(1), name=module_name)
+        args = [out, cutlass.Int32(1)]
+        if mutation.kind == "tiles":
+            args.append(make_fake_compact_tensor(cutlass.Int32, (2,), assumed_align=4))
+        return compile_tvm_ffi(module.Probe(), *args, name=module_name)
     finally:
         del sys.modules[module_name]
 
@@ -308,7 +408,11 @@ def run_mutation_fuzz(seed: int, budget: int) -> FuzzReport:
         depth = rng.choice((2, 3, 4))
         report.cases += 1
         try:
-            compile_mutation(mutation, seed + i, depth)
+            result = compile_mutation(mutation, seed + i, depth)
+            if mutation.tma is not None and mutation.error is None:
+                wanted = "unverified" if mutation.tma.opaque else "verified CtaGroup"
+                if wanted not in result.describe():
+                    raise AssertionError(f"TMA status must report {wanted}")
         except Exception as exc:  # noqa: BLE001 — compiler diagnostics are fuzz outcomes.
             if mutation.error is not None and is_expected_error(
                 exc, mutation.error, mutation.message
