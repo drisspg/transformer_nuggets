@@ -18,3 +18,17 @@
   `assumed_align` promise.
 - Use `set_name_prefix(...)` on `@cute.kernel` wrappers before launch; do not pass the
   removed `_name_prefix=` keyword.
+
+# warpdrive Testing Tiers
+
+Pick the smallest tier that covers the change; run bigger tiers only when asked or before
+landing core synchronization/scheduling changes.
+
+- Every change (~30 s on a GB300): `pytest -n 12 test/test_cute_warpdrive*.py`. Fuzz tests are
+  skipped by default (`addopts` excludes the `fuzz` marker).
+- Quick fuzz (~2-3 min, on request or before landing layer changes):
+  `pytest -n 12 -m fuzz test/test_cute_warpdrive*.py`.
+- Long campaigns, sanitizer and CUTracer runs, SASS/perf A/Bs: only when the user asks.
+  Use `scripts/fuzz_warpdrive.py {runtime,static,mutate}` under `gpu-run`.
+- CI's pre-commit pins ruff 0.14.9, which flags rules the dev ruff does not (e.g. E741);
+  check with `uvx ruff@0.14.9 check transformer_nuggets test scripts` before pushing.

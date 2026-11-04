@@ -654,8 +654,12 @@ with head dim 128.
 
 ```bash
 pip install -e ".[cute,dev]" pytest-xdist
-pytest -n 6 test/test_cute_warpdrive*.py
+pytest -n 12 test/test_cute_warpdrive*.py           # every change: ~30 s on a GB300
+pytest -n 12 -m fuzz test/test_cute_warpdrive*.py   # quick fuzz, when you want it: ~2-3 min
 ```
+
+Fuzz tests are skipped by default. Long campaigns (runtime, static, mutate; sanitizer and
+CUTracer wrappers) run from `scripts/fuzz_warpdrive.py`; see `GUARANTEES.md`.
 
 FA4 tests skip without `flash_attn.cute`. Coverage includes numerical correctness, determinism,
 shape reuse, all scheduler/CTA-pair configurations, protocol errors, raw/managed synchronization,
