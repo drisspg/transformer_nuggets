@@ -746,7 +746,10 @@ def test_describe_lists_the_traced_protocol(requires_blackwell):
     source lines, indented by dynamic region, and the TMEM regions each role touched."""
     from transformer_nuggets.cute.warpdrive.examples.gemm import Gemm, compile_gemm
 
-    op = Gemm(trace=True)
+    class TracedGemm(Gemm):  # its own compile-cache entry: a cache hit would skip the trace
+        pass
+
+    op = TracedGemm(trace=True)
     assert "Traced protocol" not in op.describe()  # nothing traced before the compile
     compile_gemm(op)
     text = op.describe()
