@@ -4,7 +4,10 @@ A kernel declares channels (``Ring`` for rotating stages, ``Slots`` for caller-c
 turnstiles, and a ``TmemPlan`` as attributes, and writes roles as methods decorated
 ``@role(warps, regs)`` directly above ``@cute.jit``. Role parameters receive channel ends
 by name and annotation (``Producer``, ``Consumer``, ``Consumer[Instance]``), the TMEM view
-(``Tmem``), the instance index (``Instance``), or a turnstile seat (``Turn``).
+(``Tmem``), the instance index (``Instance``), or a turnstile seat (``Turn``). The context
+passed to ``run_roles`` (a frozen dataclass of prologue values in the examples) goes to the
+parameter annotated with its type, or to the role's single unannotated parameter; any other
+annotation is a ``ProtocolError``.
 
 Ends are DSL values: dynamic loops carry their phases when the end is a local name that the
 loop body uses through a method call or reassignment. Helpers that take ends must return them

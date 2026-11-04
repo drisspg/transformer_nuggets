@@ -77,41 +77,41 @@ class PairToy(WarpSpecialized):
 
     @role(warps=[range(1), range(1, 2)])
     @cute.jit
-    def prod(self, stage: Instance, ch: Producer[Instance], c):
+    def prod(self, stage: Instance, ch: Producer[Instance], ctx):
         snapshot = ch  # "snapshot": a stale copy used later must not become the tail's state
         # Uneven commit counts per slot: slot 1 gets one more, so the slots' parities differ.
-        for _ in cutlass.range(c.n + stage, unroll=1):
+        for _ in cutlass.range(ctx.n + stage, unroll=1):
             h = ch.acquire(stage)
             if cutlass.const_expr(self.mode == "retire"):
                 h.retire()
             else:
                 h.commit()
         if cutlass.const_expr(self.mode == "snapshot"):  # noqa: SIM102 (runtime inside const)
-            if c.n > 0:  # a dynamic region that carries (rebuilds) the stale copy
-                c.out[3 + stage] = snapshot.full_barrier(stage).toint()
+            if ctx.n > 0:  # a dynamic region that carries (rebuilds) the stale copy
+                ctx.out[3 + stage] = snapshot.full_barrier(stage).toint()
 
     @role(warps=2, cta="leader")
     @cute.jit
-    def mma(self, ch: Consumer, back: Producer, c):
-        for _ in cutlass.range(c.n, unroll=1):
+    def mma(self, ch: Consumer, back: Producer, ctx):
+        for _ in cutlass.range(ctx.n, unroll=1):
             for j in cutlass.range_constexpr(2):
                 with ch.consume(j), back.produce():
                     pass
         with ch.consume(1), back.produce():
             pass
         if cute.arch.lane_idx() == 0:
-            c.out[2] = 2 * c.n + 1
+            ctx.out[2] = 2 * ctx.n + 1
 
     @role(warps=3)
     @cute.jit
-    def sink(self, back: Consumer, c):
+    def sink(self, back: Consumer, ctx):
         count = cutlass.Int32(0)
-        for _ in cutlass.range(2 * c.n + 1, unroll=1):
+        for _ in cutlass.range(2 * ctx.n + 1, unroll=1):
             with back.consume():
                 count = count + 1
         rank = self.cluster.rank()  # warp-uniform: not inside the lane-0 branch
         if cute.arch.lane_idx() == 0:
-            c.out[rank] = count
+            ctx.out[rank] = count
 
     @cute.kernel
     def kernel(self, out: cute.Tensor, n: cutlass.Int32):
@@ -177,12 +177,12 @@ class _Unpinned(WarpSpecialized):
 
     @role(warps=0)
     @cute.jit
-    def prod(self, ch: Producer, c):
+    def prod(self, ch: Producer, ctx):
         pass
 
     @role(warps=1)  # issues tcgen05 commits but runs in both CTAs
     @cute.jit
-    def mma(self, ch: Consumer, c):
+    def mma(self, ch: Consumer, ctx):
         pass
 
 
@@ -193,12 +193,12 @@ class _LeaderTmaToBoth(WarpSpecialized):
 
     @role(warps=0, cta="leader")
     @cute.jit
-    def load(self, ch: Producer, c):
+    def load(self, ch: Producer, ctx):
         pass
 
     @role(warps=1)
     @cute.jit
-    def use(self, ch: Consumer, c):
+    def use(self, ch: Consumer, ctx):
         pass
 
 
@@ -209,17 +209,17 @@ class _BothTmaToMixed(WarpSpecialized):
 
     @role(warps=0)
     @cute.jit
-    def load(self, ch: Producer, c):
+    def load(self, ch: Producer, ctx):
         pass
 
     @role(warps=[range(1, 2), range(2, 3)])
     @cute.jit
-    def use(self, ch: Consumer, c):
+    def use(self, ch: Consumer, ctx):
         pass
 
     @role(warps=3, cta="leader")
     @cute.jit
-    def lead(self, ch: Consumer, c):
+    def lead(self, ch: Consumer, ctx):
         pass
 
 
@@ -230,7 +230,7 @@ class _LeaderOnlyTmem(WarpSpecialized):
 
     @role(warps=0, cta="leader")
     @cute.jit
-    def mma(self, tmem: Tmem, c):
+    def mma(self, tmem: Tmem, ctx):
         pass
 
 
@@ -241,12 +241,12 @@ class _PairPayload(WarpSpecialized):
 
     @role(warps=0, cta="leader")
     @cute.jit
-    def prod(self, ch: Producer, c):
+    def prod(self, ch: Producer, ctx):
         pass
 
     @role(warps=1)
     @cute.jit
-    def use(self, ch: Consumer, c):
+    def use(self, ch: Consumer, ctx):
         pass
 
 
@@ -346,16 +346,16 @@ class PairStream(WarpSpecialized):
 
     @role(warps=0, cta="leader")
     @cute.jit
-    def lead(self, tiles: Tiles, c):
+    def lead(self, tiles: Tiles, ctx):
         while tiles.valid:
             m, n, _ = tiles.work
             if cute.arch.lane_idx() == 0:
-                cute.arch.atomic_add(c.out.iterator + m * c.n_tiles + n, cutlass.Int32(1))
+                cute.arch.atomic_add(ctx.out.iterator + m * ctx.n_tiles + n, cutlass.Int32(1))
             tiles.advance()
 
     @role(warps=1, cta="leader")
     @cute.jit
-    def other(self, tiles: Tiles, c):
+    def other(self, tiles: Tiles, ctx):
         while tiles.valid:
             tiles.advance()
 

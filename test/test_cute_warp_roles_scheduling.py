@@ -161,21 +161,21 @@ class ScheduleToy(WarpSpecialized):
         return f"warp_roles_sched_toy_{self.tiles.get_key()}_{self.mode}"
 
     @cute.jit
-    def _visit(self, r: int, tiles, count, c):
+    def _visit(self, r: int, tiles, count, ctx):
         m, n, l = tiles.work
-        tile = (l * c.en + n) * c.em + m
+        tile = (l * ctx.en + n) * ctx.em + m
         if cute.arch.lane_idx() == 0 and cute.arch.warp_idx() == r:
             bidx, _, _ = cute.arch.block_idx()
             if count < self.MAX_ITEMS:
-                c.log[r, bidx, count] = tile
-            cute.arch.atomic_add(c.hits.iterator + (r * c.hits.shape[1] + tile), Int32(1))
+                ctx.log[r, bidx, count] = tile
+            cute.arch.atomic_add(ctx.hits.iterator + (r * ctx.hits.shape[1] + tile), Int32(1))
 
     @role(warps=0)
     @cute.jit
-    def a(self, tiles: Tiles, c):
+    def a(self, tiles: Tiles, ctx):
         count = Int32(0)
         while tiles.valid:
-            self._visit(0, tiles, count, c)
+            self._visit(0, tiles, count, ctx)
             count += 1
             if cutlass.const_expr(self.mode == "conditional_advance"):
                 if count < self.MAX_ITEMS:  # a runtime predicate: some iterations skip it
@@ -187,13 +187,13 @@ class ScheduleToy(WarpSpecialized):
 
     @role(warps=range(1, 3))
     @cute.jit
-    def b(self, tiles: Tiles, c):
+    def b(self, tiles: Tiles, ctx):
         count = Int32(0)
         if cutlass.const_expr(self.mode == "no_advance"):
-            self._visit(1, tiles, count, c)
+            self._visit(1, tiles, count, ctx)
         else:
             while tiles.valid:
-                self._visit(1, tiles, count, c)
+                self._visit(1, tiles, count, ctx)
                 count += 1
                 tiles.advance()
 
@@ -372,12 +372,12 @@ class _IdleRole(WarpSpecialized):
 
     @role(warps=0)
     @cute.jit
-    def a(self, tiles: Tiles, c):
+    def a(self, tiles: Tiles, ctx):
         pass
 
     @role(warps=1)
     @cute.jit
-    def b(self, c):
+    def b(self, ctx):
         pass
 
 

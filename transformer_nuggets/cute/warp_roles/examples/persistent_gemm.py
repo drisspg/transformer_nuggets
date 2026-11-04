@@ -19,7 +19,7 @@ One compile serves every M, N, K: tile counts, the persistent grid cap, and the 
 are runtime values; policy, order, cluster, and stage counts are compile-time.
 """
 
-from types import SimpleNamespace
+from dataclasses import dataclass
 
 import cutlass
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -59,6 +59,27 @@ CTA_TILE_M, TILE_K = 128, 64  # per-CTA output rows and K step; tile N is a cons
 EPI_TILE = (128, 32)  # one TMA store box; tile_n // 32 per CTA output tile
 C_STAGES = 2  # SMEM staging buffers for the TMA-store epilogue
 EPI_BARRIER_ID = 3  # named barrier for the 4 epilogue warps (layer owns 1 and 2)
+
+
+@dataclass(frozen=True)
+class PersistentGemmCtx:
+    """Kernel-prologue values the roles read; built once in ``PersistentGemm.kernel``."""
+
+    tiled_mma: cute.TiledMma
+    tma_a: cute.CopyAtom
+    tma_b: cute.CopyAtom
+    tAsA: cute.Tensor  # TMA-partitioned SMEM stages of A and B
+    tAgA: cute.Tensor  # whole-problem A tiles: (TMA, m_tiles, k_tiles)
+    tBsB: cute.Tensor
+    tBgB: cute.Tensor  # whole-problem B tiles: (TMA, n_tiles, k_tiles)
+    tCrA: cute.Tensor  # MMA fragments over the SMEM stages
+    tCrB: cute.Tensor
+    num_k_tiles: cutlass.Int32
+    acc_layout: cute.Layout  # all accumulator stages
+    epi_tile: cute.Tile
+    tma_c: cute.CopyAtom
+    mC_tma: cute.Tensor
+    sC: cute.Tensor  # epilogue staging buffers
 
 
 class PersistentGemm(WarpSpecialized):
@@ -114,33 +135,37 @@ class PersistentGemm(WarpSpecialized):
 
     @role(warps=4, regs=40)
     @cute.jit
-    def load(self, ab: Producer, tiles: Tiles, c):
+    def load(self, ab: Producer, tiles: Tiles, ctx: PersistentGemmCtx):
         while tiles.valid:
             m, n, _ = tiles.work
-            tAgA = c.tAgA[None, m, None]
-            tBgB = c.tBgB[None, n, None]
-            for k in cutlass.range(c.num_k_tiles, unroll=1):
+            tAgA = ctx.tAgA[None, m, None]
+            tBgB = ctx.tBgB[None, n, None]
+            for k in cutlass.range(ctx.num_k_tiles, unroll=1):
                 with ab.produce() as s:
-                    cute.copy(c.tma_a, tAgA[None, k], c.tAsA[None, s.index], tma_bar_ptr=s.barrier)
-                    cute.copy(c.tma_b, tBgB[None, k], c.tBsB[None, s.index], tma_bar_ptr=s.barrier)
+                    cute.copy(
+                        ctx.tma_a, tAgA[None, k], ctx.tAsA[None, s.index], tma_bar_ptr=s.barrier
+                    )
+                    cute.copy(
+                        ctx.tma_b, tBgB[None, k], ctx.tBsB[None, s.index], tma_bar_ptr=s.barrier
+                    )
             tiles.advance()
 
     @role(warps=5, regs=40, cta="leader")
     @cute.jit
-    def mma(self, ab: Consumer, acc: Producer, tiles: Tiles, tmem: Tmem, c):
-        tiled_mma = c.tiled_mma
-        tCtAcc = cute.make_tensor(tmem.ptr("acc"), c.acc_layout)
+    def mma(self, ab: Consumer, acc: Producer, tiles: Tiles, tmem: Tmem, ctx: PersistentGemmCtx):
+        tiled_mma = ctx.tiled_mma
+        tCtAcc = cute.make_tensor(tmem.ptr("acc"), ctx.acc_layout)
         while tiles.valid:
             with acc.produce() as a:
                 tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-                for k in cutlass.range(c.num_k_tiles, unroll=1):
+                for k in cutlass.range(ctx.num_k_tiles, unroll=1):
                     with ab.consume() as s:
-                        for kb in cutlass.range_constexpr(cute.size(c.tCrA, mode=[2])):
+                        for kb in cutlass.range_constexpr(cute.size(ctx.tCrA, mode=[2])):
                             cute.gemm(
                                 tiled_mma,
                                 tCtAcc[None, None, None, a.index],
-                                c.tCrA[None, None, kb, s.index],
-                                c.tCrB[None, None, kb, s.index],
+                                ctx.tCrA[None, None, kb, s.index],
+                                ctx.tCrB[None, None, kb, s.index],
                                 tCtAcc[None, None, None, a.index],
                             )
                             tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
@@ -148,31 +173,33 @@ class PersistentGemm(WarpSpecialized):
 
     @role(warps=range(4), regs=160)
     @cute.jit
-    def epilogue(self, acc: Consumer, tiles: Tiles, tmem: Tmem, c):
+    def epilogue(self, acc: Consumer, tiles: Tiles, tmem: Tmem, ctx: PersistentGemmCtx):
         """TMEM -> registers -> swizzled SMEM -> TMA store, one 128x32 subtile at a time through
         ``C_STAGES`` SMEM buffers. TMA clips the ragged edges, so partial tiles cost the same."""
         tidx, _, _ = cute.arch.thread_idx()
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        thr_mma = c.tiled_mma.get_slice(self.cluster.rank())  # this CTA's rows of the tile
-        tAcc = transform_partitioned_tensor_layout(cute.make_tensor(tmem.ptr("acc"), c.acc_layout))
+        thr_mma = ctx.tiled_mma.get_slice(self.cluster.rank())  # this CTA's rows of the tile
+        tAcc = transform_partitioned_tensor_layout(
+            cute.make_tensor(tmem.ptr("acc"), ctx.acc_layout)
+        )
         # (MMA, MMA_M, MMA_N, m_tiles, n_tiles) -> ((M), (N), m_tiles, n_tiles)
         gC = transform_partitioned_tensor_layout(
             thr_mma.partition_C(
-                cute.local_tile(c.mC_tma, self.mma_tile, (None, None, None), proj=(1, 1, None))
+                cute.local_tile(ctx.mC_tma, self.mma_tile, (None, None, None), proj=(1, 1, None))
             )
         )
         gC_l = cute.make_tensor(gC.iterator, cute.append(gC.layout, cute.make_layout(1)))
         t2r, tTR_tAcc, tTR_rAcc = epilogue_tmem_copy_and_partition(
-            self, tidx, tAcc, gC_l, c.epi_tile, self.cluster.size > 1
+            self, tidx, tAcc, gC_l, ctx.epi_tile, self.cluster.size > 1
         )
         tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.dtype)
-        r2s, tRS_rC, tRS_sC = epilogue_smem_copy_and_partition(self, t2r, tTR_rC, tidx, c.sC)
+        r2s, tRS_rC, tRS_sC = epilogue_smem_copy_and_partition(self, t2r, tTR_rC, tidx, ctx.sC)
         bSG_sC, bSG_gC = cpasync.tma_partition(
-            c.tma_c,
+            ctx.tma_c,
             0,
             cute.make_layout(1),
-            cute.group_modes(c.sC, 0, 2),
-            cute.group_modes(cute.flat_divide(gC, c.epi_tile), 0, 2),
+            cute.group_modes(ctx.sC, 0, 2),
+            cute.group_modes(cute.flat_divide(gC, ctx.epi_tile), 0, 2),
         )
         tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc) - 1)  # (..., SUB, STAGE)
         subtiles = cute.size(tTR_tAcc, mode=[3])
@@ -188,7 +215,7 @@ class PersistentGemm(WarpSpecialized):
                     cute.arch.fence_view_async_shared()  # st.shared -> TMA store
                     cute.arch.barrier(barrier_id=EPI_BARRIER_ID, number_of_threads=128)
                     if warp == 0:
-                        cute.copy(c.tma_c, bSG_sC[None, buf], dst[None, i])
+                        cute.copy(ctx.tma_c, bSG_sC[None, buf], dst[None, i])
                         cute.arch.cp_async_bulk_commit_group()
                         # Buffer `buf` is rewritten C_STAGES subtiles later; keep at most
                         # C_STAGES - 1 stores still reading SMEM.
@@ -229,7 +256,7 @@ class PersistentGemm(WarpSpecialized):
         )
         acc_shape = tiled_mma.partition_shape_C(self.mma_tile[:2])
         acc_staged = tiled_mma.make_fragment_C(cute.append(acc_shape, self.acc_stages))
-        ctx = SimpleNamespace(
+        ctx = PersistentGemmCtx(
             tiled_mma=tiled_mma,
             tma_a=tma_a,
             tma_b=tma_b,

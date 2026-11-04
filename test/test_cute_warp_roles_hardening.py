@@ -4,6 +4,7 @@ mixes managed and raw synchronization."""
 
 import re
 import warnings
+from dataclasses import dataclass, fields
 from types import SimpleNamespace
 
 import pytest
@@ -37,7 +38,7 @@ from transformer_nuggets.cute.warp_roles import (
     role,
     unchecked,
 )
-from transformer_nuggets.cute.warp_roles.examples.gemm import TILE, Gemm
+from transformer_nuggets.cute.warp_roles.examples.gemm import TILE, Gemm, GemmCtx
 
 TILE_ROWS = 64  # one 64x64 bf16 TMA tile per stage
 TILE_BYTES = TILE_ROWS * 64 * 2
@@ -75,53 +76,65 @@ class _TmaToy(WarpSpecialized):
 
     @role(warps=0)
     @cute.jit
-    def load(self, ld: Producer, c):
-        for i in cutlass.range(c.n, unroll=1):
+    def load(self, ld: Producer, ctx):
+        for i in cutlass.range(ctx.n, unroll=1):
             h = ld.acquire()
             if cutlass.const_expr(self.mode == "opaque"):
                 # The barrier reaches the copy through a pointer the layer did not hand out.
                 bar = cute.make_ptr(
                     cutlass.Int64, h.barrier.toint(), cute.AddressSpace.smem, assumed_align=8
                 )
-                cute.copy(c.tma, c.tg[None, i % c.tiles], c.ts[None, h.index], tma_bar_ptr=bar)
+                cute.copy(
+                    ctx.tma, ctx.tg[None, i % ctx.tiles], ctx.ts[None, h.index], tma_bar_ptr=bar
+                )
             elif cutlass.const_expr(self.mode in ("half_opaque", "mixed_end")):
                 # Two copies of the tile per stage (Tma(2 x tile)); only one through h.barrier.
-                src, dst = c.tg[None, i % c.tiles], c.ts[None, h.index]
-                cute.copy(c.tma, src, dst, tma_bar_ptr=h.barrier)
+                src, dst = ctx.tg[None, i % ctx.tiles], ctx.ts[None, h.index]
+                cute.copy(ctx.tma, src, dst, tma_bar_ptr=h.barrier)
                 if cutlass.const_expr(self.mode == "half_opaque"):
                     other = cute.make_ptr(
                         cutlass.Int64, h.barrier.toint(), cute.AddressSpace.smem, assumed_align=8
                     )
                 else:
                     other = ld.full_barrier(h.index)
-                cute.copy(c.tma, src, dst, tma_bar_ptr=other)
+                cute.copy(ctx.tma, src, dst, tma_bar_ptr=other)
             elif cutlass.const_expr(self.mode == "nested"):
-                if c.n > 0:  # a dynamic branch: the copy's execution count is not static
+                if ctx.n > 0:  # a dynamic branch: the copy's execution count is not static
                     cute.copy(
-                        c.tma, c.tg[None, i % c.tiles], c.ts[None, h.index], tma_bar_ptr=h.barrier
+                        ctx.tma,
+                        ctx.tg[None, i % ctx.tiles],
+                        ctx.ts[None, h.index],
+                        tma_bar_ptr=h.barrier,
                     )
             elif cutlass.const_expr(self.mode == "rawptr"):
                 bar = self.barrier_ptr("ld") + h.index  # the full barrier, not handed out
-                cute.copy(c.tma, c.tg[None, i % c.tiles], c.ts[None, h.index], tma_bar_ptr=bar)
+                cute.copy(
+                    ctx.tma, ctx.tg[None, i % ctx.tiles], ctx.ts[None, h.index], tma_bar_ptr=bar
+                )
             elif cutlass.const_expr(self.mode == "optout"):
                 with unchecked("tma", reason="toy: atom verified by hand"):
                     bar = h.barrier
-                cute.copy(c.tma, c.tg[None, i % c.tiles], c.ts[None, h.index], tma_bar_ptr=bar)
+                cute.copy(
+                    ctx.tma, ctx.tg[None, i % ctx.tiles], ctx.ts[None, h.index], tma_bar_ptr=bar
+                )
             else:
                 cute.copy(
-                    c.tma, c.tg[None, i % c.tiles], c.ts[None, h.index], tma_bar_ptr=h.barrier
+                    ctx.tma,
+                    ctx.tg[None, i % ctx.tiles],
+                    ctx.ts[None, h.index],
+                    tma_bar_ptr=h.barrier,
                 )
             h.commit()
 
     @cute.jit
-    def consume(self, ld, c):
+    def consume(self, ld, ctx):
         rank = self.cluster.rank()  # warp-uniform: not inside the lane-0 branch
-        for i in cutlass.range(c.n, unroll=1):
+        for i in cutlass.range(ctx.n, unroll=1):
             with ld.consume() as h:
                 if cute.arch.lane_idx() == 0:
-                    first = c.s[0, 0, h.index].to(cutlass.Float32)
-                    last = c.s[TILE_ROWS - 1, 63, h.index].to(cutlass.Float32)
-                    c.out[rank * c.n + i] = first + 1000.0 * (last - first)
+                    first = ctx.s[0, 0, h.index].to(cutlass.Float32)
+                    last = ctx.s[TILE_ROWS - 1, 63, h.index].to(cutlass.Float32)
+                    ctx.out[rank * ctx.n + i] = first + 1000.0 * (last - first)
         return ld
 
     @cute.kernel
@@ -154,8 +167,8 @@ class _TmaToyAll(_TmaToy):
 
     @role(warps=1)
     @cute.jit
-    def use(self, ld: Consumer, c):
-        ld = self.consume(ld, c)
+    def use(self, ld: Consumer, ctx):
+        ld = self.consume(ld, ctx)
 
 
 class _TmaToyLeader(_TmaToy):
@@ -163,8 +176,8 @@ class _TmaToyLeader(_TmaToy):
 
     @role(warps=1, cta="leader")
     @cute.jit
-    def use(self, ld: Consumer, c):
-        ld = self.consume(ld, c)
+    def use(self, ld: Consumer, ctx):
+        ld = self.consume(ld, ctx)
 
 
 def make_tma_toy(cluster, consumer_cta="all", group="ONE", tx=TILE_BYTES, mode="plain"):
@@ -294,23 +307,23 @@ class RawStateToy(WarpSpecialized):
 
     @role(warps=0)
     @cute.jit
-    def prod(self, ch: Producer, c):
-        for _ in cutlass.range(c.n, unroll=1):
+    def prod(self, ch: Producer, ctx):
+        for _ in cutlass.range(ctx.n, unroll=1):
             h = ch.acquire()
             cute.arch.mbarrier_arrive(h.full_barrier)  # count: 32 threads, as derived
             h.commit(signal=False)
 
     @role(warps=1)
     @cute.jit
-    def cons(self, ch: Consumer, c):
-        for i in cutlass.range(c.n, unroll=1):
+    def cons(self, ch: Consumer, ctx):
+        for i in cutlass.range(ctx.n, unroll=1):
             nxt_index, nxt_phase = ch.index, ch.phase()
             h = ch.wait()
             if cute.arch.lane_idx() == 0:
-                c.out[4 * i + 0] = nxt_index
-                c.out[4 * i + 1] = nxt_phase
-                c.out[4 * i + 2] = h.index
-                c.out[4 * i + 3] = h.phase
+                ctx.out[4 * i + 0] = nxt_index
+                ctx.out[4 * i + 1] = nxt_phase
+                ctx.out[4 * i + 2] = h.index
+                ctx.out[4 * i + 3] = h.phase
             h.release()
 
     @cute.kernel
@@ -347,7 +360,7 @@ class OptOutToy(WarpSpecialized):
 
     @role(warps=0)
     @cute.jit
-    def prod(self, ch: Producer, c):
+    def prod(self, ch: Producer, ctx):
         check = "unclosed" if self.mode == "leak" else "cross_region"
         if cutlass.const_expr(self.mode == "leak"):
             if cutlass.const_expr(self.opt_out):
@@ -357,7 +370,7 @@ class OptOutToy(WarpSpecialized):
                 ch.acquire(0)
         else:
             h = ch.acquire(0)
-            for _ in cutlass.range(c.n, unroll=1):
+            for _ in cutlass.range(ctx.n, unroll=1):
                 if cutlass.const_expr(self.opt_out):
                     with unchecked(check, reason="toy: closed in the loop on purpose"):
                         h.commit()
@@ -366,7 +379,7 @@ class OptOutToy(WarpSpecialized):
 
     @role(warps=1)
     @cute.jit
-    def cons(self, ch: Consumer, c):
+    def cons(self, ch: Consumer, ctx):
         pass
 
     @cute.kernel
@@ -419,7 +432,7 @@ class _RawWithEnd(WarpSpecialized):
 
     @role(warps=0, raw=True)
     @cute.jit
-    def prod(self, ch: Producer, c):
+    def prod(self, ch: Producer, ctx):
         pass
 
 
@@ -430,12 +443,12 @@ class _RawInPersistent(WarpSpecialized):
 
     @role(warps=0)
     @cute.jit
-    def work(self, tiles: Tiles, c):
+    def work(self, tiles: Tiles, ctx):
         pass
 
     @role(warps=range(4, 8), regs=200, raw=True)
     @cute.jit
-    def side(self, bars: Barriers, c):
+    def side(self, bars: Barriers, ctx):
         pass
 
 
@@ -457,17 +470,17 @@ class _Overrides(WarpSpecialized):
 
     @role(warps=0)
     @cute.jit
-    def load(self, ab: Producer, c):
+    def load(self, ab: Producer, ctx):
         pass
 
     @role(warps=1)
     @cute.jit
-    def mma(self, ab: Consumer, acc: Producer, c):
+    def mma(self, ab: Consumer, acc: Producer, ctx):
         pass
 
     @role(warps=range(4, 8))
     @cute.jit
-    def epi(self, acc: Consumer, c):
+    def epi(self, acc: Consumer, ctx):
         pass
 
 
@@ -494,12 +507,12 @@ class _PairMasks(WarpSpecialized):
 
     @role(warps=0, cta="leader")
     @cute.jit
-    def mma(self, back: Producer, c):
+    def mma(self, back: Producer, ctx):
         pass
 
     @role(warps=1)
     @cute.jit
-    def sink(self, back: Consumer, c):
+    def sink(self, back: Consumer, ctx):
         pass
 
 
@@ -518,6 +531,14 @@ def test_pair_mask_override_wins():
 # --------------------------------------------------------------------------- #
 
 
+@dataclass(frozen=True)
+class MixedGemmCtx(GemmCtx):
+    """Gemm's context plus the user-built accumulator pipeline; Gemm's load role still takes
+    ``ctx: GemmCtx``, a base of this type."""
+
+    acc_pipe: pipeline.PipelineUmmaAsync
+
+
 class MixedGemm(Gemm):
     def __init__(self):
         super().__init__(ab_stages=3, acc_stages=1)
@@ -532,20 +553,20 @@ class MixedGemm(Gemm):
 
     @role(warps=5, regs=40)
     @cute.jit
-    def mma(self, ab: Consumer, tmem: Tmem, c):
-        tiled_mma = c.tiled_mma
-        tCtAcc = cute.make_tensor(tmem.ptr("acc"), c.acc_layout)
-        acc_producer, _ = c.acc_pipe.make_participants()
+    def mma(self, ab: Consumer, tmem: Tmem, ctx: MixedGemmCtx):
+        tiled_mma = ctx.tiled_mma
+        tCtAcc = cute.make_tensor(tmem.ptr("acc"), ctx.acc_layout)
+        acc_producer, _ = ctx.acc_pipe.make_participants()
         a = acc_producer.acquire_and_advance()
         tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-        for k in cutlass.range(c.num_k_tiles, unroll=1):
+        for k in cutlass.range(ctx.num_k_tiles, unroll=1):
             s = ab.wait()
-            for kb in cutlass.range_constexpr(cute.size(c.tCrA, mode=[2])):
+            for kb in cutlass.range_constexpr(cute.size(ctx.tCrA, mode=[2])):
                 cute.gemm(
                     tiled_mma,
                     tCtAcc[None, None, None, a.index],
-                    c.tCrA[None, None, kb, s.index],
-                    c.tCrB[None, None, kb, s.index],
+                    ctx.tCrA[None, None, kb, s.index],
+                    ctx.tCrB[None, None, kb, s.index],
                     tCtAcc[None, None, None, a.index],
                 )
                 tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
@@ -556,40 +577,41 @@ class MixedGemm(Gemm):
 
     @role(warps=range(4), regs=160, raw=True)
     @cute.jit
-    def epilogue(self, tmem: Tmem, c):
+    def epilogue(self, tmem: Tmem, ctx: MixedGemmCtx):
         tidx, _, _ = cute.arch.thread_idx()
         t2r = tcgen05.make_tmem_copy(
             cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition.x32), cutlass.Float32),
-            cute.zipped_divide(c.acc_fake, c.epi_tiler)[None, 0],
+            cute.zipped_divide(ctx.acc_fake, ctx.epi_tiler)[None, 0],
         ).get_slice(tidx)
-        tDgC = t2r.partition_D(cute.zipped_divide(c.tCgC, c.epi_tiler))
-        tDcC = t2r.partition_D(cute.zipped_divide(c.tCcC, c.epi_tiler))
+        tDgC = t2r.partition_D(cute.zipped_divide(ctx.tCgC, ctx.epi_tiler))
+        tDcC = t2r.partition_D(cute.zipped_divide(ctx.tCcC, ctx.epi_tiler))
         rAcc = cute.make_rmem_tensor(tDgC[None, None, 0].shape, cutlass.Float32)
         rC = cute.make_rmem_tensor(tDgC[None, None, 0].shape, self.dtype)
-        tAcc = cute.make_tensor(tmem.ptr("acc"), c.acc_layout)
-        _, acc_consumer = c.acc_pipe.make_participants()
+        tAcc = cute.make_tensor(tmem.ptr("acc"), ctx.acc_layout)
+        _, acc_consumer = ctx.acc_pipe.make_participants()
         a = acc_consumer.wait_and_advance()
-        tDtC = t2r.partition_S(cute.zipped_divide(tAcc[None, None, None, a.index], c.epi_tiler))
+        tDtC = t2r.partition_S(cute.zipped_divide(tAcc[None, None, None, a.index], ctx.epi_tiler))
         for i in cutlass.range_constexpr(cute.size(tDtC, mode=[2])):
             cute.copy(t2r, tDtC[None, None, i], rAcc)
             rC.store(rAcc.load().to(self.dtype))
             g, crd = tDgC[None, None, i], tDcC[None, None, i]
             for j in cutlass.range_constexpr(cute.size(rC)):
-                if cute.elem_less(crd[j], c.mC.shape):
+                if cute.elem_less(crd[j], ctx.mC.shape):
                     g[j] = rC[j]
         a.release()
 
     def run_roles(self, ctx):
         # User code between begin_roles() and run_roles(): build the raw pipeline on the
         # reserved barriers; the layer's init fence and CTA sync cover its initialization.
-        ctx.acc_pipe = pipeline.PipelineUmmaAsync.create(
+        acc_pipe = pipeline.PipelineUmmaAsync.create(
             num_stages=1,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 128),
             barrier_storage=self.barrier_ptr("acc_bars"),
             defer_sync=True,
         )
-        super().run_roles(ctx)
+        values = {f.name: getattr(ctx, f.name) for f in fields(ctx)}
+        super().run_roles(MixedGemmCtx(**values, acc_pipe=acc_pipe))
 
 
 _MIXED = MixedGemm()

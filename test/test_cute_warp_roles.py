@@ -1,4 +1,5 @@
 import math
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +20,7 @@ from transformer_nuggets.cute.warp_roles import (
     Ring,
     Slots,
     Threads,
+    TileStream,
     Tma,
     TmemPlan,
     Turn,
@@ -55,13 +57,13 @@ class SlotsToy(WarpSpecialized):
 
     @role(warps=0)
     @cute.jit
-    def prod(self, ch: Producer, c):
+    def prod(self, ch: Producer, ctx):
         lane = cute.arch.lane_idx()
         if cutlass.const_expr(self.mode == "leak"):
             ch.acquire(0)
         if cutlass.const_expr(self.mode == "cross_region"):
             early = ch.acquire(0)
-        for i in cutlass.range(c.n, unroll=1):
+        for i in cutlass.range(ctx.n, unroll=1):
             for j in cutlass.range_constexpr(2):
                 if cutlass.const_expr(self.mode == "cross_region" and j == 0):
                     early.commit()
@@ -76,14 +78,14 @@ class SlotsToy(WarpSpecialized):
 
     @role(warps=1)
     @cute.jit
-    def cons(self, ch: Consumer, c):
+    def cons(self, ch: Consumer, ctx):
         lane = cute.arch.lane_idx()
         acc = cutlass.Int32(0)
-        for _ in cutlass.range(c.n, unroll=1):
+        for _ in cutlass.range(ctx.n, unroll=1):
             for j in cutlass.range_constexpr(2):
                 with ch.consume(j) as h:
                     acc = acc + h.data[lane]
-        c.out[lane] = acc
+        ctx.out[lane] = acc
 
     @cute.kernel
     def kernel(self, out: cute.Tensor, n: cutlass.Int32):
@@ -104,13 +106,13 @@ class TurnToy(WarpSpecialized):
 
     @role(warps=[range(1), range(1, 2)])
     @cute.jit
-    def worker(self, seat: Instance, ts: Turn, c):
-        for _ in cutlass.range(c.n, unroll=1):
+    def worker(self, seat: Instance, ts: Turn, ctx):
+        for _ in cutlass.range(ctx.n, unroll=1):
             with ts.turn():
                 if cute.arch.lane_idx() == 0:
-                    pos = c.log[0]
-                    c.log[pos + 1] = seat
-                    c.log[0] = pos + 1
+                    pos = ctx.log[0]
+                    ctx.log[pos + 1] = seat
+                    ctx.log[0] = pos + 1
                     cute.arch.fence_acq_rel_cta()
 
     @cute.kernel
@@ -133,20 +135,20 @@ class BoundToy(WarpSpecialized):
 
     @role(warps=[range(1), range(1, 2)])
     @cute.jit
-    def prod(self, stage: Instance, ch: Producer[Instance], c):
+    def prod(self, stage: Instance, ch: Producer[Instance], ctx):
         slot = 1 - stage if cutlass.const_expr(self.mode == "wrong_slot") else stage
-        for i in cutlass.range(c.n, unroll=1):
+        for i in cutlass.range(ctx.n, unroll=1):
             with ch.produce(slot) as h:
                 h.data[cute.arch.lane_idx()] = (stage + 1) * (i + 1)
 
     @role(warps=2)
     @cute.jit
-    def cons(self, ch: Consumer, c):
+    def cons(self, ch: Consumer, ctx):
         lane = cute.arch.lane_idx()
-        for _ in cutlass.range(c.n, unroll=1):
+        for _ in cutlass.range(ctx.n, unroll=1):
             for j in cutlass.range_constexpr(2):
                 with ch.consume(j) as h:
-                    c.out[lane + 32 * j] = c.out[lane + 32 * j] + h.data[lane]
+                    ctx.out[lane + 32 * j] = ctx.out[lane + 32 * j] + h.data[lane]
 
     @cute.kernel
     def kernel(self, out: cute.Tensor, n: cutlass.Int32):
@@ -170,26 +172,26 @@ class HoleToy(WarpSpecialized):
 
     @role(warps=0, regs=56)
     @cute.jit
-    def prod(self, ch: Producer, c):
+    def prod(self, ch: Producer, ctx):
         lane = cute.arch.lane_idx()
-        for i in cutlass.range(c.n, unroll=1):
+        for i in cutlass.range(ctx.n, unroll=1):
             with ch.produce(0) as h:
                 h.data[lane] = i * 32 + lane
 
     @role(warps=range(4, 8), regs=232)
     @cute.jit
-    def cons(self, ch: Consumer, c):
+    def cons(self, ch: Consumer, ctx):
         lane = cute.arch.lane_idx()
         acc = cutlass.Int32(0)
-        for _ in cutlass.range(c.n, unroll=1):
+        for _ in cutlass.range(ctx.n, unroll=1):
             with ch.consume(0) as h:
                 acc = acc + h.data[lane]
         if cute.arch.warp_idx() == 4:
-            c.out[lane] = acc
+            ctx.out[lane] = acc
 
     @role(warps=range(8, 12), regs=56)
     @cute.jit
-    def idle(self, c):
+    def idle(self, ctx):
         pass
 
     @cute.kernel
@@ -208,7 +210,7 @@ class OverBudgetHoleToy(HoleToy):
 
     @role(warps=0, regs=232)
     @cute.jit
-    def prod(self, ch: Producer, c):
+    def prod(self, ch: Producer, ctx):
         pass
 
 
@@ -294,6 +296,190 @@ def test_trace_time_handle_errors(requires_blackwell, mode, message):
 
 
 # --------------------------------------------------------------------------- #
+# Role context: a typed frozen dataclass, or a namespace
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class ToyCtx:
+    out: cute.Tensor
+    n: cutlass.Int32
+
+
+@dataclass
+class MutableToyCtx:
+    out: cute.Tensor
+    n: cutlass.Int32
+
+
+class TypedCtxToy(WarpSpecialized):
+    """Producer warp 0 -> consumer warp 1 over one slot; both roles take ``ctx: ToyCtx``, and the
+    consumer writes through it inside a dynamic branch. ``ctx`` picks what the kernel passes to
+    run_roles; ``seen`` records the context type each role receives at trace time."""
+
+    def __init__(self, ctx: str = "typed"):
+        self.ctx = ctx
+        self.seen = []
+        self.ch = Slots(1, Threads, Threads, payload=(cutlass.Int32, (32,)))
+
+    @role(warps=0)
+    @cute.jit
+    def prod(self, ch: Producer, ctx: ToyCtx):
+        self.seen.append(type(ctx))
+        lane = cute.arch.lane_idx()
+        for i in cutlass.range(ctx.n, unroll=1):
+            with ch.produce(0) as h:
+                h.data[lane] = i * 32 + lane
+
+    @role(warps=1)
+    @cute.jit
+    def cons(self, ch: Consumer, ctx: ToyCtx):
+        self.seen.append(type(ctx))
+        lane = cute.arch.lane_idx()
+        acc = cutlass.Int32(0)
+        for _ in cutlass.range(ctx.n, unroll=1):
+            with ch.consume(0) as h:
+                acc = acc + h.data[lane]
+        if ctx.n > 0:
+            ctx.out[lane] = acc
+
+    @cute.kernel
+    def kernel(self, out: cute.Tensor, n: cutlass.Int32):
+        self.begin_roles()
+        if cutlass.const_expr(self.ctx == "typed"):
+            ctx = ToyCtx(out=out, n=n)
+        elif cutlass.const_expr(self.ctx == "mutable"):
+            ctx = MutableToyCtx(out=out, n=n)
+        else:
+            ctx = SimpleNamespace(out=out, n=n)
+        self.run_roles(ctx)
+
+    @cute.jit
+    def __call__(self, out: cute.Tensor, n: cutlass.Int32, stream: cuda.CUstream):
+        self.kernel.set_name_prefix(f"warp_roles_ctx_toy_{self.ctx}")
+        self.kernel(out, n).launch(grid=(1, 1, 1), block=(self.num_threads, 1, 1), stream=stream)
+
+
+class NamespaceCtxToy(TypedCtxToy):
+    """TypedCtxToy's roles with an unannotated context, as kernels built on SimpleNamespace
+    write them."""
+
+    @role(warps=0)
+    @cute.jit
+    def prod(self, ch: Producer, ctx):
+        self.seen.append(type(ctx))
+        lane = cute.arch.lane_idx()
+        for i in cutlass.range(ctx.n, unroll=1):
+            with ch.produce(0) as h:
+                h.data[lane] = i * 32 + lane
+
+    @role(warps=1)
+    @cute.jit
+    def cons(self, ch: Consumer, ctx):
+        self.seen.append(type(ctx))
+        lane = cute.arch.lane_idx()
+        acc = cutlass.Int32(0)
+        for _ in cutlass.range(ctx.n, unroll=1):
+            with ch.consume(0) as h:
+                acc = acc + h.data[lane]
+        if ctx.n > 0:
+            ctx.out[lane] = acc
+
+
+@pytest.mark.parametrize(
+    "toy, seen",
+    [(TypedCtxToy, ToyCtx), (NamespaceCtxToy, SimpleNamespace)],
+    ids=["typed", "namespace"],
+)
+def test_context_reaches_roles(requires_blackwell, toy, seen):
+    """A frozen dataclass reaches the roles as itself; a namespace still works, as a namespace."""
+    op = toy("typed" if toy is TypedCtxToy else "namespace")
+    out = torch.full((32,), -1, device="cuda", dtype=torch.int32)
+    compile_toy(op)(out, 5)
+    lane = torch.arange(32, device="cuda", dtype=torch.int32)
+    torch.testing.assert_close(out, 32 * 10 + 5 * lane)
+    assert len(op.seen) == 2 and all(isinstance(t, type) and issubclass(t, seen) for t in op.seen)
+    if toy is TypedCtxToy:
+        assert op.seen == [ToyCtx, ToyCtx]
+
+
+@pytest.mark.parametrize(
+    "ctx, message",
+    [
+        (
+            "namespace",
+            r"run_roles got a SimpleNamespace context, but \w+\.ctx is annotated ToyCtx",
+        ),
+        ("mutable", r"MutableToyCtx is a mutable dataclass; declare it @dataclass\(frozen=True\)"),
+    ],
+)
+def test_context_type_checked_at_run_roles(requires_blackwell, ctx, message):
+    toy = TypedCtxToy if ctx == "namespace" else NamespaceCtxToy  # unannotated: any type fits
+    with pytest.raises(Exception, match=message) as info:
+        compile_toy(toy(ctx))
+    assert "ProtocolError" in repr(info.value) or isinstance(info.value, ProtocolError)
+
+
+class TypoAnnotationToy(WarpSpecialized):
+    def __init__(self):
+        self.ab = Ring(2, Threads, Threads)
+
+    @role(warps=0)
+    @cute.jit
+    def load(self, ab: Producer, ctx: ToyCtx):
+        pass
+
+    @role(warps=1)
+    @cute.jit
+    def mma(self, ab: "Consumr", ctx: ToyCtx):  # noqa: F821 (the typo under test)
+        pass
+
+
+class LookalikeToy(WarpSpecialized):
+    def __init__(self):
+        self.tiles = TileStream()
+
+    @role(warps=0)
+    @cute.jit
+    def work(self, tiles: TileStream, ctx):
+        pass
+
+
+class TwoContextTypesToy(TypedCtxToy):
+    @role(warps=1)
+    @cute.jit
+    def cons(self, ch: Consumer, ctx: MutableToyCtx):
+        pass
+
+
+class TwoUnannotatedToy(TypedCtxToy):
+    @role(warps=1)
+    @cute.jit
+    def cons(self, ch: Consumer, extra, ctx):
+        pass
+
+
+@pytest.mark.parametrize(
+    "toy, message",
+    [
+        (
+            TypoAnnotationToy,
+            r"role mma: parameter ab is annotated 'Consumr', which does not resolve",
+        ),
+        (LookalikeToy, r"parameter tiles is annotated TileStream.*did you mean `tiles: Tiles`"),
+        (TwoContextTypesToy, r"unrelated types \(cons\.ctx: MutableToyCtx, prod\.ctx: ToyCtx\)"),
+        (TwoUnannotatedToy, r"role cons: parameters \['extra', 'ctx'\] would all receive"),
+    ],
+    ids=["typo", "lookalike", "two_types", "two_unannotated"],
+)
+def test_unrecognized_role_parameters(toy, message):
+    """Only the context-typed or single unannotated parameter receives the context; anything
+    else is an error naming the parameter, not a silent context injection."""
+    with pytest.raises(ProtocolError, match=message):
+        toy().describe()
+
+
+# --------------------------------------------------------------------------- #
 # Host-side declaration checks (no compile)
 # --------------------------------------------------------------------------- #
 
@@ -312,12 +498,12 @@ class BoundSlotsToy(WarpSpecialized):
 
     @role(warps=[range(4), range(4, 8)])
     @cute.jit
-    def prod(self, stage: Instance, ch: Producer[Instance], c):
+    def prod(self, stage: Instance, ch: Producer[Instance], ctx):
         pass
 
     @role(warps=range(8, 12))
     @cute.jit
-    def cons(self, ch: Consumer, c):
+    def cons(self, ch: Consumer, ctx):
         pass
 
 
@@ -345,12 +531,12 @@ class WideRolesToy(WarpSpecialized):
 
     @role(warps=range(4))
     @cute.jit
-    def prod(self, ch: Producer, c):
+    def prod(self, ch: Producer, ctx):
         pass
 
     @role(warps=range(4, 8))
     @cute.jit
-    def cons(self, ch: Consumer, c):
+    def cons(self, ch: Consumer, ctx):
         pass
 
 

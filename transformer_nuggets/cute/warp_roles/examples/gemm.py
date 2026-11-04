@@ -5,7 +5,7 @@ warps 0-3 epilogue, 4 TMA load, 5 MMA. TMA zero-fills out-of-bounds boxes, so ra
 need only the epilogue store predicate.
 """
 
-from types import SimpleNamespace
+from dataclasses import dataclass
 
 import cutlass
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -34,6 +34,29 @@ MMA_INST = (128, 256, 16)
 EPI_SUBTILES = 8  # 32 fp32 columns per tcgen05.ld 32x32b.x32
 
 
+@dataclass(frozen=True)
+class GemmCtx:
+    """Kernel-prologue values the roles read; built once in ``Gemm.kernel``."""
+
+    tiled_mma: cute.TiledMma
+    tma_a: cute.CopyAtom
+    tma_b: cute.CopyAtom
+    tAsA: cute.Tensor  # TMA-partitioned SMEM stages of A and B, and their global tiles
+    tAgA: cute.Tensor
+    tBsB: cute.Tensor
+    tBgB: cute.Tensor
+    tCrA: cute.Tensor  # MMA fragments over the SMEM stages
+    tCrB: cute.Tensor
+    num_k_tiles: cutlass.Int32
+    acc_fake: cute.Tensor  # one accumulator stage, for building the TMEM load
+    acc_layout: cute.Layout  # all accumulator stages
+    epi_tiler: cute.Tile
+    tCgC: cute.Tensor  # this tile of the output, and its coordinates
+    tCcC: cute.Tensor
+    mC: cute.Tensor
+    full_tile: cutlass.Boolean
+
+
 class Gemm(WarpSpecialized):
     def __init__(self, ab_stages: int = 3, acc_stages: int = 1, trace: bool = False):
         self.dtype = cutlass.BFloat16
@@ -53,57 +76,61 @@ class Gemm(WarpSpecialized):
 
     @role(warps=4, regs=40)
     @cute.jit
-    def load(self, ab: Producer, c):
-        for k in cutlass.range(c.num_k_tiles, unroll=1):
+    def load(self, ab: Producer, ctx: GemmCtx):
+        for k in cutlass.range(ctx.num_k_tiles, unroll=1):
             with ab.produce() as s:
-                cute.copy(c.tma_a, c.tAgA[None, k], c.tAsA[None, s.index], tma_bar_ptr=s.barrier)
-                cute.copy(c.tma_b, c.tBgB[None, k], c.tBsB[None, s.index], tma_bar_ptr=s.barrier)
+                cute.copy(
+                    ctx.tma_a, ctx.tAgA[None, k], ctx.tAsA[None, s.index], tma_bar_ptr=s.barrier
+                )
+                cute.copy(
+                    ctx.tma_b, ctx.tBgB[None, k], ctx.tBsB[None, s.index], tma_bar_ptr=s.barrier
+                )
 
     @role(warps=5, regs=40)
     @cute.jit
-    def mma(self, ab: Consumer, acc: Producer, tmem: Tmem, c):
-        tiled_mma = c.tiled_mma
-        tCtAcc = cute.make_tensor(tmem.ptr("acc"), c.acc_layout)
+    def mma(self, ab: Consumer, acc: Producer, tmem: Tmem, ctx: GemmCtx):
+        tiled_mma = ctx.tiled_mma
+        tCtAcc = cute.make_tensor(tmem.ptr("acc"), ctx.acc_layout)
         with acc.produce() as a:
             tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-            for k in cutlass.range(c.num_k_tiles, unroll=1):
+            for k in cutlass.range(ctx.num_k_tiles, unroll=1):
                 with ab.consume() as s:
-                    for kb in cutlass.range_constexpr(cute.size(c.tCrA, mode=[2])):
+                    for kb in cutlass.range_constexpr(cute.size(ctx.tCrA, mode=[2])):
                         cute.gemm(
                             tiled_mma,
                             tCtAcc[None, None, None, a.index],
-                            c.tCrA[None, None, kb, s.index],
-                            c.tCrB[None, None, kb, s.index],
+                            ctx.tCrA[None, None, kb, s.index],
+                            ctx.tCrB[None, None, kb, s.index],
                             tCtAcc[None, None, None, a.index],
                         )
                         tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
     @role(warps=range(4), regs=160)
     @cute.jit
-    def epilogue(self, acc: Consumer, tmem: Tmem, c):
+    def epilogue(self, acc: Consumer, tmem: Tmem, ctx: GemmCtx):
         tidx, _, _ = cute.arch.thread_idx()
         t2r = tcgen05.make_tmem_copy(
             cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition.x32), cutlass.Float32),
-            cute.zipped_divide(c.acc_fake, c.epi_tiler)[None, 0],
+            cute.zipped_divide(ctx.acc_fake, ctx.epi_tiler)[None, 0],
         ).get_slice(tidx)
-        tDgC = t2r.partition_D(cute.zipped_divide(c.tCgC, c.epi_tiler))
-        tDcC = t2r.partition_D(cute.zipped_divide(c.tCcC, c.epi_tiler))
+        tDgC = t2r.partition_D(cute.zipped_divide(ctx.tCgC, ctx.epi_tiler))
+        tDcC = t2r.partition_D(cute.zipped_divide(ctx.tCcC, ctx.epi_tiler))
         rAcc = cute.make_rmem_tensor(tDgC[None, None, 0].shape, cutlass.Float32)
         rC = cute.make_rmem_tensor(tDgC[None, None, 0].shape, self.dtype)
-        tAcc = cute.make_tensor(tmem.ptr("acc"), c.acc_layout)
+        tAcc = cute.make_tensor(tmem.ptr("acc"), ctx.acc_layout)
         with acc.consume() as a:
             tDtC = t2r.partition_S(
-                cute.zipped_divide(tAcc[None, None, None, a.index], c.epi_tiler)
+                cute.zipped_divide(tAcc[None, None, None, a.index], ctx.epi_tiler)
             )
             for i in cutlass.range_constexpr(EPI_SUBTILES):
                 cute.copy(t2r, tDtC[None, None, i], rAcc)
                 rC.store(rAcc.load().to(self.dtype))
-                if c.full_tile:
+                if ctx.full_tile:
                     cute.autovec_copy(rC, tDgC[None, None, i])
                 else:
                     g, crd = tDgC[None, None, i], tDcC[None, None, i]
                     for j in cutlass.range_constexpr(cute.size(rC)):
-                        if cute.elem_less(crd[j], c.mC.shape):
+                        if cute.elem_less(crd[j], ctx.mC.shape):
                             g[j] = rC[j]
 
     # ----------------------------------------------------------------- kernel
@@ -137,7 +164,7 @@ class Gemm(WarpSpecialized):
         acc_staged = tiled_mma.make_fragment_C(cute.append(acc_shape, self.acc_stages))
         cC = cute.make_identity_tensor(mC.shape)
         m, n = mC.shape
-        ctx = SimpleNamespace(
+        ctx = GemmCtx(
             tiled_mma=tiled_mma,
             tma_a=tma_a,
             tma_b=tma_b,

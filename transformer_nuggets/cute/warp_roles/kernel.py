@@ -6,7 +6,7 @@ import inspect
 import sys
 import warnings
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from types import SimpleNamespace
 
 import cutlass
@@ -108,6 +108,10 @@ class _SchedulerFetch:
     """Internal annotation: the scheduler warp's private policy channels (both ends)."""
 
 
+class _Context:
+    """Internal annotation: the parameter receives the context passed to ``run_roles``."""
+
+
 _ANNOTATIONS = {
     "Producer": Producer,
     "Consumer": Consumer,
@@ -118,7 +122,52 @@ _ANNOTATIONS = {
     "Barriers": Barriers,
 }
 # Parameters a raw role may take: no channel ends, cursors, or seats (they carry protocol state).
-_RAW_ANNOTATIONS = (Instance, Tmem, Barriers)
+_RAW_ANNOTATIONS = (Instance, Tmem, Barriers, _Context)
+# Layer classes a role might write in place of an annotation, and the annotation meant.
+_LOOKALIKES = (
+    (ProducerEnd, "Producer"),
+    (ConsumerEnd, "Consumer"),
+    (Channel, "Producer or Consumer"),
+    (TileStream, "Tiles"),
+    (TileCursor, "Tiles"),
+    (TmemPlan, "Tmem"),
+    (TmemView, "Tmem"),
+    (Turnstile, "Turn"),
+    (TurnEnd, "Turn"),
+)
+_CTX_RULE = (
+    "a parameter receives the context when it is annotated with the kernel's context type (the "
+    "type of the object passed to run_roles, or a base of it) or is the role's single "
+    "unannotated parameter"
+)
+
+
+def _resolve_param(role_name: str, pname: str, ann, fn) -> tuple[object, type | None]:
+    """(annotation, context type) of one role parameter; context parameters get ``_Context``
+    and their annotated type (``None`` when unannotated)."""
+    if ann is inspect.Parameter.empty:
+        return _Context, None
+    if isinstance(ann, str):
+        try:
+            ann = eval(ann, {**fn.__globals__, **_ANNOTATIONS})
+        except Exception as exc:
+            raise ProtocolError(
+                f"role {role_name}: parameter {pname} is annotated {ann!r}, which does not "
+                f"resolve ({type(exc).__name__}: {exc})"
+            ) from exc
+    if isinstance(ann, _Bound) or ann in _ANNOTATIONS.values():
+        return ann, None
+    if isinstance(ann, type):
+        for cls, meant in _LOOKALIKES:
+            if issubclass(ann, cls):
+                raise ProtocolError(
+                    f"role {role_name}: parameter {pname} is annotated {ann.__name__}, a layer "
+                    f"class rather than a role annotation; did you mean `{pname}: {meant}`?"
+                )
+        return _Context, ann
+    raise ProtocolError(
+        f"role {role_name}: parameter {pname} has unrecognized annotation {ann!r}; {_CTX_RULE}"
+    )
 
 
 @dataclass
@@ -240,6 +289,7 @@ class WarpSpecialized:
             else:
                 obj.parties.clear()
         roles = []
+        ctx_types = {}  # annotated context type -> first "role.param" using it
         for name in dir(type(self)):
             fn = getattr(type(self), name)
             meta = getattr(fn, "_warp_roles", None)
@@ -250,10 +300,8 @@ class WarpSpecialized:
                 raise TypeError(f"role {name}: put @role(...) directly above @cute.jit")
             params = []
             for pname, p in list(inspect.signature(fn).parameters.items())[1:]:
-                ann = p.annotation
-                if isinstance(ann, str):
-                    ann = eval(ann, {**fn.__globals__, **_ANNOTATIONS})
-                if raw and ann is not inspect.Parameter.empty and ann not in _RAW_ANNOTATIONS:
+                ann, ctx_type = _resolve_param(name, pname, p.annotation, fn)
+                if raw and ann not in _RAW_ANNOTATIONS:
                     raise ProtocolError(
                         f"raw role {name}: parameter {pname} is {getattr(ann, '__name__', ann)}; "
                         "raw roles take Instance, Tmem, Barriers, and the context only (drive "
@@ -261,7 +309,15 @@ class WarpSpecialized:
                     )
                 if ann is Barriers and pname not in raw_bars:
                     raise ProtocolError(f"role {name}: no Barriers named {pname!r}")
+                if ctx_type is not None:
+                    ctx_types.setdefault(ctx_type, f"{name}.{pname}")
                 params.append((pname, ann))
+            ctx_params = [p for p, a in params if a is _Context]
+            if len(ctx_params) > 1:
+                raise ProtocolError(
+                    f"role {name}: parameters {ctx_params} would all receive the context; "
+                    f"{_CTX_RULE}"
+                )
             for idx, wr in enumerate(ranges):
                 inst = f"{name}[{idx}]" if len(ranges) > 1 else name
                 ri = RoleInstance(
@@ -270,6 +326,15 @@ class WarpSpecialized:
                 ri.uses_tmem = any(a is Tmem for _, a in params)
                 roles.append(ri)
                 self._bind(ri, chans, turns)
+        # The context type is the most derived annotation; the others must be its bases.
+        derived = [t for t in ctx_types if all(issubclass(t, u) for u in ctx_types)]
+        if ctx_types and not derived:
+            sites = ", ".join(f"{site}: {t.__name__}" for t, site in ctx_types.items())
+            raise ProtocolError(
+                f"roles annotate the context with unrelated types ({sites}); {_CTX_RULE}"
+            )
+        self._ws_ctx_type = derived[0] if derived else None
+        self._ws_ctx_site = ctx_types.get(self._ws_ctx_type)
         for name, st in streams.items():
             self._bind_stream(name, st, roles, chans, cluster)
         roles.sort(key=lambda r: r.first_warp)
@@ -722,8 +787,7 @@ class WarpSpecialized:
     @cute.jit
     def run_roles(self, ctx):
         """CTA sync (barrier init + TMEM address), role dispatch, TMEM teardown."""
-        ctx = ctx if isinstance(ctx, RoleContext) else RoleContext(**vars(ctx))
-        check_atoms(vars(ctx), self.cluster)
+        ctx = self._role_context(ctx)
         pair = self.cluster.size > 1
         if cutlass.const_expr(not pair):
             # Fences mbarrier.init and syncs the CTA; the same bar.sync publishes the TMEM base
@@ -760,6 +824,30 @@ class WarpSpecialized:
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
         self._finish_trace()
+
+    def _role_context(self, ctx):
+        """The context the roles receive: a frozen dataclass as is, any other object (such as a
+        ``SimpleNamespace``) as a ``RoleContext`` copy of its attributes.
+
+        Checked against the roles' annotated context type and the cluster's MMA/TMA atoms."""
+        want = self._ws_ctx_type
+        if want is not None and not isinstance(ctx, want):
+            raise ProtocolError(
+                f"run_roles got a {type(ctx).__name__} context, but {self._ws_ctx_site} is "
+                f"annotated {want.__name__}; {_CTX_RULE}"
+            )
+        if is_dataclass(ctx):
+            if not type(ctx).__dataclass_params__.frozen:
+                raise ProtocolError(
+                    f"context {type(ctx).__name__} is a mutable dataclass; declare it "
+                    "@dataclass(frozen=True): every role shares it, and a field rebound inside "
+                    "one role's dynamic branch would leak that region's values into other roles"
+                )
+            check_atoms({f.name: getattr(ctx, f.name) for f in fields(ctx)}, self.cluster)
+            return ctx
+        ctx = ctx if isinstance(ctx, RoleContext) else RoleContext(**vars(ctx))
+        check_atoms(vars(ctx), self.cluster)
+        return ctx
 
     def _finish_trace(self):
         """Collect check opt-outs; warn once about TMA channels the check could not verify."""
@@ -912,7 +1000,7 @@ class WarpSpecialized:
                 args.append(
                     TurnEnd(ts, self._ws_bars.get(pname), seat, trace, Int32(int(seat == 0)))
                 )
-            else:
+            else:  # _Context
                 args.append(ctx)
         return args
 
@@ -938,13 +1026,14 @@ class WarpSpecialized:
 
 
 class RoleContext(SimpleNamespace):
-    """Kernel-prologue values shared by all roles; opaque to CuTeDSL control flow.
+    """A namespace context as the roles see it; opaque to CuTeDSL control flow.
 
-    The preprocessor treats ``c.x[i] = v`` inside a dynamic ``if``/``for`` as a write of
+    The preprocessor treats ``ctx.x[i] = v`` inside a dynamic ``if``/``for`` as a write of
     ``c`` and would carry a plain namespace through the region, rebinding its attributes to
     region results that do not dominate other roles. Context values are defined before role
     dispatch and never rebound, so carrying them is unnecessary: this class carries nothing
-    and reconstructs as itself.
+    and reconstructs as itself. A frozen dataclass needs no wrapper: its fields cannot be
+    rebound, and the preprocessor does not carry it (the examples' IR and SASS are unchanged).
     """
 
     def __extract_mlir_values__(self):
