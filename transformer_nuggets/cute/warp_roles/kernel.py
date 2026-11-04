@@ -326,6 +326,13 @@ class WarpSpecialized:
                 ri.uses_tmem = any(a is Tmem for _, a in params)
                 roles.append(ri)
                 self._bind(ri, chans, turns)
+        for t, site in ctx_types.items():
+            if not (is_dataclass(t) and t.__dataclass_params__.frozen):
+                raise ProtocolError(
+                    f"{site} is annotated {t.__name__}, which is not a frozen dataclass; an "
+                    "annotated context reaches the roles as itself, which the layer supports "
+                    "for frozen dataclasses (leave a SimpleNamespace context unannotated)"
+                )
         # The context type is the most derived annotation; the others must be its bases.
         derived = [t for t in ctx_types if all(issubclass(t, u) for u in ctx_types)]
         if ctx_types and not derived:
@@ -627,9 +634,17 @@ class WarpSpecialized:
         return self._ws_bars[name]
 
     def launch_config(self, work=None, grid=None) -> dict:
-        """``grid``/``block``/``cluster`` for ``kernel(...).launch(**cfg, stream=stream)``."""
+        """``grid``/``block``/``cluster`` for ``kernel(...).launch(**cfg, stream=stream)``.
+        Kernels with a ``TileStream`` pass its ``work`` problem: the grid depends on the policy
+        (a ``OneShot`` over plain ``Raster()`` launches the tile space)."""
+        self._collect()
         if work is not None:
             grid = work.grid()
+        elif self._ws_streams:
+            raise ProtocolError(
+                f"launch_config: kernel has TileStream(s) {sorted(self._ws_streams)}; pass "
+                "work=self.<stream>.problem(...) so the grid matches how roles read their item"
+            )
         return {
             "grid": grid,
             "block": (self.num_threads, 1, 1),
@@ -767,6 +782,11 @@ class WarpSpecialized:
             raise ProtocolError(
                 f"run_roles got a {type(ctx).__name__} context, but {self._ws_ctx_site} is "
                 f"annotated {want.__name__}; {_CTX_RULE}"
+            )
+        if not hasattr(ctx, "__dict__") and not is_dataclass(ctx):
+            raise ProtocolError(
+                f"context {type(ctx).__name__} has no attributes to share; pass a frozen "
+                "dataclass (or a SimpleNamespace)"
             )
         if is_dataclass(ctx):
             if not type(ctx).__dataclass_params__.frozen:
@@ -965,7 +985,8 @@ class RoleContext(SimpleNamespace):
     region results that do not dominate other roles. Context values are defined before role
     dispatch and never rebound, so carrying them is unnecessary: this class carries nothing
     and reconstructs as itself. A frozen dataclass needs no wrapper: its fields cannot be
-    rebound, and the preprocessor does not carry it (the examples' IR and SASS are unchanged).
+    rebound, and the preprocessor does not carry it (CuTeDSL 4.8.0: the FA4 2-CTA kernel's IR
+    and the examples' SASS matched the wrapped form).
     """
 
     def __extract_mlir_values__(self):

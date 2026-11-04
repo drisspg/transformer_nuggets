@@ -594,7 +594,7 @@ class MixedGemm(Gemm):
             cute.zipped_divide(ctx.acc_fake, ctx.epi_tiler)[None, 0],
         ).get_slice(tidx)
         # A raw role takes no tile cursor: OneShot over Raster() launches the tile grid, so the
-        # tile is blockIdx.
+        # tile is blockIdx (true while n_tiles <= 65535; past that the launch is 1-D).
         m, n, _ = cute.arch.block_idx()
         tDgC = t2r.partition_D(cute.zipped_divide(ctx.tCgC[None, None, None, m, n], ctx.epi_tiler))
         tDcC = t2r.partition_D(cute.zipped_divide(ctx.tCcC[None, None, None, m, n], ctx.epi_tiler))

@@ -2,6 +2,7 @@ import math
 import re
 from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import NamedTuple
 
 import pytest
 import torch
@@ -315,6 +316,16 @@ class MutableToyCtx:
     n: cutlass.Int32
 
 
+class TupleCtx(NamedTuple):
+    out: cute.Tensor
+    n: cutlass.Int32
+
+
+@dataclass(frozen=True)
+class OtherCtx:
+    out: cute.Tensor
+
+
 class TypedCtxToy(WarpSpecialized):
     """Producer warp 0 -> consumer warp 1 over one slot; both roles take ``ctx: ToyCtx``, and the
     consumer writes through it inside a dynamic branch. ``ctx`` picks what the kernel passes to
@@ -353,6 +364,8 @@ class TypedCtxToy(WarpSpecialized):
             ctx = ToyCtx(out=out, n=n)
         elif cutlass.const_expr(self.ctx == "mutable"):
             ctx = MutableToyCtx(out=out, n=n)
+        elif cutlass.const_expr(self.ctx == "tuple"):
+            ctx = TupleCtx(out=out, n=n)
         else:
             ctx = SimpleNamespace(out=out, n=n)
         self.run_roles(ctx)
@@ -414,6 +427,7 @@ def test_context_reaches_roles(requires_blackwell, toy, seen):
             r"run_roles got a SimpleNamespace context, but \w+\.ctx is annotated ToyCtx",
         ),
         ("mutable", r"MutableToyCtx is a mutable dataclass; declare it @dataclass\(frozen=True\)"),
+        ("tuple", r"context TupleCtx has no attributes to share; pass a frozen dataclass"),
     ],
 )
 def test_context_type_checked_at_run_roles(requires_blackwell, ctx, message):
@@ -451,6 +465,13 @@ class LookalikeToy(WarpSpecialized):
 class TwoContextTypesToy(TypedCtxToy):
     @role(warps=1)
     @cute.jit
+    def cons(self, ch: Consumer, ctx: OtherCtx):
+        pass
+
+
+class MutableAnnotationToy(TypedCtxToy):
+    @role(warps=1)
+    @cute.jit
     def cons(self, ch: Consumer, ctx: MutableToyCtx):
         pass
 
@@ -470,10 +491,11 @@ class TwoUnannotatedToy(TypedCtxToy):
             r"role mma: parameter ab is annotated 'Consumr', which does not resolve",
         ),
         (LookalikeToy, r"parameter tiles is annotated TileStream.*did you mean `tiles: Tiles`"),
-        (TwoContextTypesToy, r"unrelated types \(cons\.ctx: MutableToyCtx, prod\.ctx: ToyCtx\)"),
+        (TwoContextTypesToy, r"unrelated types \(cons\.ctx: OtherCtx, prod\.ctx: ToyCtx\)"),
         (TwoUnannotatedToy, r"role cons: parameters \['extra', 'ctx'\] would all receive"),
+        (MutableAnnotationToy, r"cons\.ctx is annotated MutableToyCtx, which is not a frozen"),
     ],
-    ids=["typo", "lookalike", "two_types", "two_unannotated"],
+    ids=["typo", "lookalike", "two_types", "two_unannotated", "mutable_annotation"],
 )
 def test_unrecognized_role_parameters(toy, message):
     """Only the context-typed or single unannotated parameter receives the context; anything
@@ -732,3 +754,12 @@ def test_describe_lists_the_traced_protocol(requires_blackwell):
     assert re.search(r"\n  role load:\n +ab\[i\] +acquire +@ gemm\.py:\d+\n", protocol), protocol
     assert re.search(r"\n    epilogue: acc\[0\]", protocol), protocol
     assert all(len(line) <= 100 for line in text.splitlines())
+
+
+def test_streams_launch_through_their_work_problem():
+    """A kernel with a TileStream must take its grid from the problem: a OneShot over plain
+    Raster() reads its item from blockIdx.y/z, which a hand-built 1-D grid would not set."""
+    from transformer_nuggets.cute.warp_roles.examples.gemm import Gemm
+
+    with pytest.raises(ProtocolError, match=r"TileStream\(s\) \['tiles'\]; pass work="):
+        Gemm().launch_config(grid=(4, 1, 1))

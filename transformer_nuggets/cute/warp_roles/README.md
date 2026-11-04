@@ -57,7 +57,7 @@ class PersistentGemm(WarpSpecialized):
                               tma_bar_ptr=s.barrier)
             tiles.advance()
 
-    @role(warps=5, regs=40)
+    @role(warps=5, regs=40, cta="leader")  # leader-only in a CTA pair
     @cute.jit
     def mma(self, ab: Consumer, acc: Producer, tiles: Tiles, tmem: Tmem, ctx: PersistentGemmCtx):
         tAcc = cute.make_tensor(tmem.ptr("acc"), ctx.acc_layout)
@@ -224,7 +224,8 @@ def load(self, ab: Producer, tiles: Tiles, ctx: PersistentGemmCtx):
 - `OneShot()`: one work item per CTA. With the default `Raster()` the launch grid is the tile
   space, `(m_tiles, n_tiles, l)`, and the item is read from `blockIdx`. When `n_tiles` or `l`
   exceeds the 65535 limit of `gridDim.y`/`z`, the launch falls back to a 1-D grid and the
-  kernel decodes the index. The check costs about 25-45 ns on 512^3 to 2048^2 GEMMs.
+  kernel decodes the index. The check costs about 25-45 ns on 512^3 to 2048^2 GEMMs (GB300).
+  Launch with `self.launch_config(work)` or `work.grid()`: the grid depends on the policy.
 - `StaticPersistent()`: each CTA strides by the persistent grid size.
 - `DynamicPersistent()`: claims work through a global atomic counter.
 - `Clc(stages=2)`: Blackwell cluster launch control.

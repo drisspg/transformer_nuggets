@@ -25,7 +25,9 @@ Three independent, compile-time choices:
   exceeds the 65535 limit of ``gridDim.y``/``z`` falls back to the 1-D grid; host and kernel
   make the same runtime choice from the extents, and the kernel decodes the index in a skipped
   branch of the prologue (about 25-45 ns on 512^3 to 2048^2 GEMMs, measured against reading
-  ``blockIdx`` unconditionally; the 1-D decode on every launch cost about 200 ns). Every other
+  ``blockIdx`` unconditionally; the 1-D decode on every launch cost about 200 ns; GB300,
+  CuTeDSL 4.8.0, CUDA-graph replay of examples/gemm.py). Launch with ``work.grid()`` or
+  ``launch_config(work)``. Every other
   combination launches a 1-D grid and decodes the index.
 * **distribution**, derived by the layer from the policy. Index sequences every role can compute
   (``OneShot``, ``StaticPersistent``) are decoded locally in each role with no synchronization.
@@ -210,8 +212,9 @@ class Raster(WorkMapping):
 
 @dataclass(frozen=True)
 class PdlWait:
-    """Readiness hook: ``griddepcontrol.wait`` before the first decode, for mappings that read
-    tables written by the preceding kernel under programmatic dependent launch."""
+    """Readiness hook: ``griddepcontrol.wait`` before the first mapping-dependent read, for
+    mappings that read tables written by the preceding kernel under programmatic dependent
+    launch."""
 
     def wait(self):
         cute.arch.griddepcontrol_wait()
@@ -529,7 +532,10 @@ class TileProblem:
         ws = None
         if self._uses_workspace():
             ws = cutlass.new_from_mlir_values(self.workspace, values[n:])
-        return TileProblem(self.stream, space, ws, None)
+        new = TileProblem(self.stream, space, ws, None)
+        # Prologue values (begin_roles) dominate every later region, so they carry as is.
+        new.first_words = getattr(self, "first_words", None)
+        return new
 
     def grid(self):
         """Launch grid for this policy: ``(ctas, 1, 1)``; ``max_ctas`` caps CTAs, so a pair
