@@ -36,7 +36,7 @@ the leader's barrier) and keeps stats/epi/turnstile CTA-local.
 """
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 
 import cutlass
@@ -58,6 +58,7 @@ from transformer_nuggets.cute.warpdrive import (
     Producer,
     Raster,
     Ring,
+    RoleConfig,
     SingleCta,
     Slots,
     Threads,
@@ -123,6 +124,24 @@ def umma(tiled_mma, acc, a, b, accumulate, ks=None):
 SPLIT_P = 3  # FA4 split_P_arrive: S/P/O is released after 3 of the 4 P stores (96 of 128 keys)
 
 
+@dataclass(frozen=True)
+class Fa4Roles:
+    """Role placement and register budgets for this example's two-Q-stage schedule.
+
+    Use dataclasses.replace to choose another register tuning bucket. Changing warp placement
+    also requires compatible tensor partitions; the kernel's math still assumes four-warps
+    for softmax/correction and one warp for load/MMA/epilogue.
+    """
+
+    softmax: RoleConfig = field(
+        default_factory=lambda: RoleConfig((range(4), range(4, 8)), regs=192)
+    )
+    correction: RoleConfig = field(default_factory=lambda: RoleConfig(range(8, 12), regs=80))
+    mma: RoleConfig = field(default_factory=lambda: RoleConfig(12, regs=48, cta="leader"))
+    epilogue: RoleConfig = field(default_factory=lambda: RoleConfig(13, regs=48))
+    load: RoleConfig = field(default_factory=lambda: RoleConfig(14, regs=48))
+
+
 class FlashAttentionForward(WarpSpecialized):
     def __init__(
         self,
@@ -132,7 +151,9 @@ class FlashAttentionForward(WarpSpecialized):
         policy=None,
         cluster=None,
         split_p: bool = False,
+        roles: Fa4Roles | None = None,
     ):
+        self.roles = roles if roles is not None else Fa4Roles()
         self.cluster = cluster or SingleCta()
         self.split_p = split_p
         cs = self.cluster.size
@@ -178,7 +199,7 @@ class FlashAttentionForward(WarpSpecialized):
 
     # ------------------------------------------------------------------ roles
 
-    @role(warps=14, regs=48)
+    @role(config=lambda kernel: kernel.roles.load)
     @cute.jit
     def load(self, q: Producer, kv: Producer, tiles: Tiles, ctx: Fa4Ctx):
         rank = self.cluster.rank()  # this CTA's rows of Q, keys of K, head dims of V
@@ -224,7 +245,7 @@ class FlashAttentionForward(WarpSpecialized):
                     cute.copy(ctx.tma_v, tVgV[None, i], tVsV[None, h.index], tma_bar_ptr=h.barrier)
             tiles.advance()
 
-    @role(warps=12, regs=48, cta="leader")
+    @role(config=lambda kernel: kernel.roles.mma)
     @cute.jit
     def mma(
         self,
@@ -326,7 +347,7 @@ class FlashAttentionForward(WarpSpecialized):
             umma(ctx.mma_pv, tO, tOrP, tOrV, True, range(first, n))
         return p_last
 
-    @role(warps=[range(4), range(4, 8)], regs=192)
+    @role(config=lambda kernel: kernel.roles.softmax)
     @cute.jit
     def softmax(
         self,
@@ -408,7 +429,7 @@ class FlashAttentionForward(WarpSpecialized):
         sm.update_row_sum(rS.load(), acc_scale, is_first)
         return s, p_last, stats, mufu
 
-    @role(warps=range(8, 12), regs=80)
+    @role(config=lambda kernel: kernel.roles.correction)
     @cute.jit
     def correction(
         self,
@@ -508,7 +529,7 @@ class FlashAttentionForward(WarpSpecialized):
                 r[e], r[e + 1] = cute.arch.mul_packed_f32x2((r[e], r[e + 1]), (scale, scale))
             copy_utils.cvt_copy(tiled_st, r, tOsO_r2s[None, 0, 0, i])
 
-    @role(warps=13, regs=48)
+    @role(config=lambda kernel: kernel.roles.epilogue)
     @cute.jit
     def epilogue(self, epi: Consumer, tiles: Tiles, ctx: Fa4Ctx):
         rank = self.cluster.rank()
@@ -713,6 +734,7 @@ def fa4_fwd(
     max_ctas: int | None = None,
     cluster=None,
     split_p: bool = False,
+    roles: Fa4Roles | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Attention forward for ``(batch, seqlen, heads, 128)`` bf16 tensors; returns (O, LSE).
 
@@ -735,11 +757,11 @@ def fa4_fwd(
     scale = softmax_scale if softmax_scale is not None else HEAD_DIM**-0.5
     out = torch.empty_like(q)
     lse = torch.empty(q.shape[0], q.shape[2], q.shape[1], device=q.device, dtype=torch.float32)
-    key = (kv_stages, turnstile, policy, cluster, split_p)
+    key = (kv_stages, turnstile, policy, cluster, split_p, roles)
     op = _OPS.get(key)
     if op is None:
         op = _OPS[key] = FlashAttentionForward(
-            kv_stages, turnstile, policy=policy, cluster=cluster, split_p=split_p
+            kv_stages, turnstile, policy=policy, cluster=cluster, split_p=split_p, roles=roles
         )
     fn = compile_fa4_fwd(op)
     workspace, sms = op.tiles.launch_args(q.device)

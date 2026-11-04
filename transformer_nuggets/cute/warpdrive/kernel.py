@@ -5,9 +5,11 @@ from __future__ import annotations
 import inspect
 import sys
 import warnings
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, is_dataclass
 from types import SimpleNamespace
+from typing import TypeVar
 
 import cutlass
 from cutlass import Int32, cute, memory, pipeline
@@ -194,50 +196,90 @@ class RoleInstance:
         return self.num_warps * WARP_SIZE
 
 
-def role(warps, regs: int | None = None, cta: str = ALL, raw: bool = False):
-    """Mark a method as a warp role. ``warps``: an int, a range, or a list of ranges.
+@dataclass(frozen=True)
+class RoleConfig:
+    """Host-side role placement, resolved before channels and launch resources are built.
 
-    A list instantiates the method once per range; an ``Instance`` parameter receives the
-    instance index. ``cta``: ``"all"`` (default) runs the role in every CTA of the kernel's
-    cluster; ``"leader"`` runs it in the leader CTA only (the MMA issuer of a ``CtaPair``; a
-    no-op placement for a single CTA). ``raw=True`` reserves the warps and register budget for
-    a user function the layer only dispatches: it takes ``Instance``, ``Tmem``, ``Barriers``,
-    and the context, but no channel ends, cursors, or seats, gets no protocol log or trace
-    checks, and is exempt from the "every role loops over the TileStream" rule. It still counts
-    in warpgroup padding, register budgets, and TMEM teardown. Put this decorator directly above
-    ``@cute.jit``: the preprocessor only rewrites functions whose innermost decorator is
-    ``<x>.jit``/``<x>.kernel`` and then re-applies the outer decorators to the rewritten
-    function.
+    An int names one warp; a range names a contiguous group; a sequence of ranges creates role
+    instances. Warps are normalized to an immutable tuple of ranges. ``regs=None`` requests no
+    register adjustment, not automatic tuning. All roles in a warpgroup must agree.
     """
-    if cta not in PLACEMENTS:
-        raise ValueError(f"role cta must be one of {PLACEMENTS}, got {cta!r}")
-    if regs is not None and (
-        type(regs) is not int or not MIN_REGS <= regs <= 256 or regs % 8 != 0
-    ):
-        raise ValueError(
-            f"role regs must be None or an int multiple of 8 in [24, 256], got {regs!r}"
-        )
-    if type(warps) is int:
-        ranges = [range(warps, warps + 1)]
-    elif isinstance(warps, range):
-        ranges = [warps]
-    else:
-        try:
-            ranges = list(warps)
-        except TypeError as exc:
+
+    warps: int | range | list[range] | tuple[range, ...]
+    regs: int | None = None
+    cta: str = ALL
+    raw: bool = False
+
+    def __post_init__(self):
+        if self.cta not in PLACEMENTS:
+            raise ValueError(f"role cta must be one of {PLACEMENTS}, got {self.cta!r}")
+        if self.regs is not None and (
+            type(self.regs) is not int or not MIN_REGS <= self.regs <= 256 or self.regs % 8 != 0
+        ):
             raise ValueError(
-                f"role warps must be an int, range, or list of ranges, got {warps!r}"
-            ) from exc
-    if not ranges:
-        raise ValueError(f"role warps must contain at least one range, got {warps!r}")
-    for r in ranges:
-        if not isinstance(r, range) or r.step != 1 or len(r) == 0:
-            raise ValueError(f"role warps must be non-empty unit-step ranges, got {warps!r}")
-        if r.start < 0 or r.stop > MAX_WARPS:
-            raise ValueError(f"role warps must lie in [0, {MAX_WARPS}), got {warps!r}")
+                f"role regs must be None or an int multiple of 8 in [24, 256], got {self.regs!r}"
+            )
+        if type(self.raw) is not bool:
+            raise ValueError(f"role raw must be a bool, got {self.raw!r}")
+        if type(self.warps) is int:
+            ranges = (range(self.warps, self.warps + 1),)
+        elif isinstance(self.warps, range):
+            ranges = (self.warps,)
+        else:
+            try:
+                ranges = tuple(self.warps)
+            except TypeError as exc:
+                raise ValueError(
+                    f"role warps must be an int, range, or list of ranges, got {self.warps!r}"
+                ) from exc
+        if not ranges:
+            raise ValueError(f"role warps must contain at least one range, got {self.warps!r}")
+        for r in ranges:
+            if not isinstance(r, range) or r.step != 1 or len(r) == 0:
+                raise ValueError(
+                    f"role warps must be non-empty unit-step ranges, got {self.warps!r}"
+                )
+            if r.start < 0 or r.stop > MAX_WARPS:
+                raise ValueError(f"role warps must lie in [0, {MAX_WARPS}), got {self.warps!r}")
+        object.__setattr__(self, "warps", ranges)
+
+
+KernelT = TypeVar("KernelT", bound="WarpSpecialized")
+
+
+def role(
+    warps: int | range | list[range] | tuple[range, ...] | None = None,
+    regs: int | None = None,
+    cta: str = ALL,
+    raw: bool = False,
+    *,
+    config: Callable[[KernelT], RoleConfig] | None = None,
+):
+    """Mark a method as a warp role, using fixed placement or a per-instance config selector.
+
+    ``@role(warps=4, regs=40)`` supplies a fixed RoleConfig. Alternatively,
+    ``@role(config=lambda kernel: kernel.roles.load)`` selects one after construction, on first
+    collection (describe, compile-cache lookup, or tracing). A named function or callable object
+    works too. The selector is host code, never a device call; its result is snapshotted for
+    that kernel instance. Construct a new instance to change a collected configuration.
+
+    A list of warp ranges instantiates the method once per range; an Instance parameter receives
+    its index. ``cta="leader"`` restricts execution to the leader of a pair; "all" is the default.
+    ``raw=True`` accepts Instance, Tmem, Barriers and a context, but no managed channel ends or
+    tile cursors. Raw roles still take part in register allocation and TMEM teardown. Put this
+    decorator directly above ``@cute.jit``; CuTeDSL re-applies it when preprocessing the source.
+    """
+    if config is not None:
+        if not callable(config):
+            raise TypeError("role config must be a callable returning RoleConfig")
+        if warps is not None or regs is not None or cta != ALL or raw is not False:
+            raise ValueError("role config cannot be combined with warps, regs, cta, or raw")
+        declaration = config
+    else:
+        declaration = RoleConfig(warps, regs, cta, raw)
 
     def deco(fn):
-        fn._warpdrive = (ranges, regs, cta, raw)
+        fn._warpdrive = declaration
         return fn
 
     return deco
@@ -327,7 +369,13 @@ class WarpSpecialized:
             meta = getattr(fn, "_warpdrive", None)
             if meta is None:
                 continue
-            ranges, regs, cta, raw = meta
+            resolved = meta if isinstance(meta, RoleConfig) else meta(self)
+            if not isinstance(resolved, RoleConfig):
+                raise ProtocolError(
+                    f"role {name}: config selector must return RoleConfig, "
+                    f"got {type(resolved).__name__}"
+                )
+            ranges, regs, cta, raw = resolved.warps, resolved.regs, resolved.cta, resolved.raw
             if not hasattr(fn, "__wrapped__"):
                 raise TypeError(f"role {name}: put @role(...) directly above @cute.jit")
             params = []
@@ -608,6 +656,27 @@ class WarpSpecialized:
             self._ws_budget_groups = [
                 (None, tuple(range(-(-self.num_warps // WARPGROUP))), tuple(range(len(roles))))
             ]
+
+    def role_config_key(self) -> tuple:
+        """Resolved placement/budgets, independent of selector identity. First use collects and
+        freezes the role configuration. Include this value in custom compilation caches."""
+        self._collect()
+        return tuple(
+            (r.role, r.index, r.first_warp, r.num_warps, r.regs, r.cta, r.raw)
+            for r in self._ws_roles
+        )
+
+    def __cute_compile_key__(self) -> tuple:
+        """Extra key consumed automatically by transformer_nuggets.cute.cache. This supplements
+        the author's algorithm key; it does not replace keys for tiles, dtypes or other flags."""
+        return (
+            type(self).__module__,
+            type(self).__qualname__,
+            self.role_config_key(),
+            self.cluster.get_key(),
+            self.iket_key(),
+            self.trace_key(),
+        )
 
     def enable_iket(self, enabled: bool = True, *, waits: bool = True):
         """Emit IKET ranges in the next compile (``tracing.py`` lists the names). Off: no IR.

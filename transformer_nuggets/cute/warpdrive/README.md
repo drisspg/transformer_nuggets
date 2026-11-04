@@ -134,6 +134,82 @@ class used as an annotation (`tiles: TileStream`, which suggests `Tiles`), two c
 parameters, or roles annotating unrelated context types. `run_roles` checks the object it gets
 against the annotated type and rejects mutable dataclasses.
 
+### Constructor-selected roles
+
+Keep fixed placement in the decorator, or select a `RoleConfig` from the kernel instance:
+
+```python
+from dataclasses import dataclass
+from transformer_nuggets.cute.warpdrive import RoleConfig
+
+
+@dataclass(frozen=True)
+class AttentionRoles:
+    softmax: RoleConfig
+    mma: RoleConfig
+
+
+class Attention(WarpSpecialized):
+    def __init__(self, registers):
+        self.roles = AttentionRoles(
+            softmax=RoleConfig([range(4), range(4, 8)], regs=registers.softmax),
+            mma=RoleConfig(12, regs=registers.other, cta="leader"),
+        )
+        # Declare channels and storage as usual.
+
+    @role(config=lambda kernel: kernel.roles.softmax)
+    @cute.jit
+    def softmax(self, stage: Instance, ctx):
+        ...
+```
+
+The selector is an ordinary host callable receiving the kernel and returning a `RoleConfig`.
+It doesn't have to be a lambda. This is equivalent:
+
+```python
+def select_softmax(kernel: Attention) -> RoleConfig:
+    return kernel.roles.softmax
+
+
+# On the role method:
+# @role(config=select_softmax)
+```
+
+Selectors run on first collection, after construction: `describe()`, a compile-cache lookup,
+or kernel tracing can trigger it. The resolved placement is snapshotted for that instance;
+construct a new kernel to change it. `RoleConfig` is frozen and copies lists of ranges into
+immutable tuples. Neither the selector nor the configuration becomes device code.
+
+`RoleConfig` has the same `warps`, `regs`, `cta` and `raw` fields as the decorator
+shorthand. Don't mix `config=` with placement arguments. Omitting `regs` requests no register
+adjustment, not auto-tuning. Conflicting choices in one warpgroup (including `None` versus a
+numeric budget) are errors. Channel counts, scheduler placement and padding are derived from
+the resolved configuration, and `describe()` shows it.
+
+The `transformer_nuggets.cute.cache` compile helpers automatically include resolved role
+placement and budgets via the kernel's `__cute_compile_key__()` hook, in addition to your
+algorithm key. Equivalent configurations share an entry; different budgets or placements do
+not. If you build your own cache, include `op.__cute_compile_key__()` too. Tiles, dtypes and
+other algorithm choices still belong in your key.
+
+The FA4 example exposes `Fa4Roles` and `fa4_fwd(..., roles=...)`. For another register bucket:
+
+```python
+from dataclasses import replace
+from transformer_nuggets.cute.warpdrive.examples.fa4_fwd import Fa4Roles, fa4_fwd
+
+roles = Fa4Roles()
+roles = replace(
+    roles,
+    softmax=replace(roles.softmax, regs=184),
+    correction=replace(roles.correction, regs=96),
+)
+out, lse = fa4_fwd(q, k, v, roles=roles)
+```
+
+Changing the warp layout can also require changes to your tensor partitions; deriving barrier
+counts does not rewrite the math's thread-to-data mapping.
+
 ## Channels
 
 `Ring(n, producer, consumer)` cycles through stages 0..n-1. `Slots(n, producer, consumer)` lets
@@ -149,6 +225,42 @@ The mechanisms say who signals:
 - `Threads`: every thread of every bound role arrives. Multiple consumers form a join.
 
 A `Tma` or `Umma` side must belong to exactly one single-warp role.
+
+### Who participates in a barrier?
+
+Participation comes from role signatures and warp placement, not analysis of which threads
+reach a call. For `Ring(2, Umma, Threads)`, a single-warp MMA producer contributes one UMMA
+completion to each full barrier. An epilogue consumer on warps 0-3 contributes 128 arrivals
+to each empty barrier. The producer cannot reuse a stage until those arrivals complete.
+
+`Slots` uses the same rule per slot: instance-bound ends contribute only to their own slot.
+CTA-pair placement also determines which CTAs contribute and where arrivals go; inspect the
+per-CTA counts with `print(op.describe())`.
+
+With `Threads`, every thread of the bound role must participate in each managed signal.
+Predicate the work, not the handoff:
+
+```python
+# All role threads wait/release; only valid lanes write output.
+with acc.consume() as h:
+    if output_in_bounds:
+        ...  # predicated output store
+
+# Not the Threads contract: only some role threads wait/release.
+if output_in_bounds:
+    with acc.consume() as h:
+        ...
+```
+
+Existing kernels also use one elected arrival per warp, relay warps for async-copy completion,
+and sparse work that skips stages. Those are valid patterns, but their participation need not
+match the default whole-role count. Local handle checks do not prove convergence, matching
+producer/consumer iteration counts, or that an elected signal follows every reader.
+
+For nonstandard signals, use count overrides and `commit(signal=False)` or
+`release(signal=False)`, or reserve raw barriers; see [Dropping down](#dropping-down). An override
+only changes the expected count. It does not select participating lanes or insert the join that
+makes their signal safe. An mbarrier counts arrivals, not thread identities.
 
 ```python
 with ab.produce() as h:  # acquire empty stage; commit on exit

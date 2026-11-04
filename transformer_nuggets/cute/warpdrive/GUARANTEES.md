@@ -63,6 +63,29 @@ These are conditional guarantees relative to that program, not a theorem about a
 | R17 | A space with any Raster extent <= 0 is empty: `bind` stores `(1,1,0)` (what the kernel's `work.space` reads), `work.grid()` launches one work unit under every policy, single CTA or pair, every role's first `valid` is false, no decode divides by zero (host or device), and the dynamic workspace is left zeroed for the next launch. The check is host code in the jit entry point; kernels pay nothing. |
 | R18 | `work.grid()` admits a space only when `policy.reach` of Raster's saturating Int64 count fits Int32: `total*cs` for OneShot/Clc (the 1-D grid; terminal index `total`), `total + units - 1` for Static/Dynamic (the last unit's terminal index). Within it, no grid extent, index, claim or CLC result wraps. |
 
+### Constructor-selected role configurations
+
+`@role(config=selector)` evaluates the host callable with the kernel instance on first
+collection. It must return a frozen `RoleConfig`; the same placement, participation and budget
+checks apply as for decorator shorthand. The configuration is snapshotted for that instance,
+not polled on subsequent calls. Construct a new instance for another configuration (U12).
+Selectors are never GPU operations. They must not depend on runtime tensor contents.
+
+The standard `cute.cache` compile helpers add `op.__cute_compile_key__()` to the author's
+algorithm key. It includes resolved roles (including an inserted scheduler), CTA topology and
+tracing flags. Equivalent configurations reuse a cache entry; changed role budgets/placement
+cannot collide just because the author's key omitted them. Custom caches must include the hook
+explicitly, and other static algorithm choices remain the author's responsibility.
+
+- A non-callable `config` raises `TypeError` at decoration.
+- Mixing `config` with explicit non-default placement arguments raises `ValueError`.
+- A selector returning anything other than `RoleConfig` raises `ProtocolError` at collection.
+- `RoleConfig.raw` must be a bool; other values raise `ValueError`.
+
+Tests: `test/test_cute_warpdrive_role_config.py` covers named functions, lambdas and callable
+objects, per-instance snapshots, graph validation, raw roles, equivalent-key reuse and differing
+configurations executing correct handoffs through the same algorithm cache key.
+
 ### Pair placement rules (R11)
 
 Write `C(r)={0}` for a leader role, `{0,1}` for an all-CTA role.

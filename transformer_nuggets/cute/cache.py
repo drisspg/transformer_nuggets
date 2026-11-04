@@ -98,6 +98,16 @@ def _cache_name(func: Callable) -> str:
     return func.__class__.__name__ if hasattr(func, "get_key") else func.__name__
 
 
+def _compile_cache_key(func: Callable, cache_key: str) -> str:
+    """An optional __cute_compile_key__ hook supplements the caller's algorithm key with
+    instance specialization state (for example warpdrive's resolved role configuration)."""
+    key = f"{_cache_name(func)}_{cache_key}"
+    extra = getattr(func, "__cute_compile_key__", None)
+    if extra is None:
+        extra = getattr(getattr(func, "__self__", None), "__cute_compile_key__", None)
+    return key if extra is None else f"{key}_instance={extra()!r}"
+
+
 def compile_and_cache(func: Callable, cache_key: str, *args, **kwargs):
     """
     Compile a @cute.jit decorated function with an explicit cache key.
@@ -112,7 +122,7 @@ def compile_and_cache(func: Callable, cache_key: str, *args, **kwargs):
         Compiled kernel that can be executed with the same tensor arguments
     """
     func_name = _cache_name(func)
-    full_cache_key = f"{func_name}_{cache_key}"
+    full_cache_key = _compile_cache_key(func, cache_key)
 
     # Check cache
     compiled_kernel = _kernel_cache.get(full_cache_key)
@@ -132,9 +142,10 @@ def compile_tvm_ffi_and_cache(
     *args,
     name: str | None = None,
 ):
-    """Cache one canonical fake-tensor TVM-FFI compilation."""
+    """Cache one canonical fake-tensor TVM-FFI compilation, including an optional instance key
+    returned by func.__cute_compile_key__()."""
     func_name = _cache_name(func)
-    full_cache_key = f"{func_name}_{cache_key}"
+    full_cache_key = _compile_cache_key(func, cache_key)
 
     compiled_kernel = _kernel_cache.get(full_cache_key)
     if compiled_kernel is not None:

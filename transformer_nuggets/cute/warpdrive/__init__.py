@@ -2,7 +2,10 @@
 
 A kernel declares channels (``Ring`` for rotating stages, ``Slots`` for caller-chosen slots),
 turnstiles, and a ``TmemPlan`` as attributes, and writes roles as methods decorated
-``@role(warps, regs)`` directly above ``@cute.jit``. Role parameters receive channel ends
+``@role(warps, regs)`` directly above ``@cute.jit``, or with
+``@role(config=lambda kernel: kernel.roles.load)`` selecting a frozen ``RoleConfig`` on first
+collection. Selectors may be any host callable. The resolved configuration is per instance;
+compile-cache helpers include it through ``__cute_compile_key__``. Role parameters receive channel ends
 by name and annotation (``Producer``, ``Consumer``, ``Consumer[Instance]``), the TMEM view
 (``Tmem``), the instance index (``Instance``), or a turnstile seat (``Turn``). The context
 passed to ``run_roles`` (a frozen dataclass of prologue values in the examples) goes to the
@@ -83,6 +86,7 @@ from transformer_nuggets.cute.warpdrive.kernel import (
     Consumer,
     Instance,
     Producer,
+    RoleConfig,
     Tmem,
     Turn,
     WarpSpecialized,
@@ -121,6 +125,7 @@ __all__ = [
     "ProtocolLog",
     "Raster",
     "Ring",
+    "RoleConfig",
     "SingleCta",
     "Slots",
     "StaticPersistent",
