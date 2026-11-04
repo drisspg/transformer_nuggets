@@ -705,6 +705,36 @@ def test_space_overflowing_int32_is_rejected(requires_blackwell, case, cluster):
     _check_valid_launch(op, fn, ws)
 
 
+@pytest.mark.parametrize("cluster", CLUSTERS, ids=CLUSTER_IDS)
+def test_concurrent_launches_use_one_workspace_per_stream(requires_blackwell, cluster):
+    """``launch_args()`` caches one workspace per (device, stream): launches on one stream share
+    it (they run in order), launches on two streams get distinct workspaces, so concurrent
+    atomic launches each cover their own space and each leave their counter zeroed."""
+    op = CountToy(*COUNT_CASES["atomic"], cluster)
+    fn = compile_count_toy(op)
+    streams = [torch.cuda.Stream() for _ in range(2)]
+    workspaces = []
+    for strm in streams:
+        with torch.cuda.stream(strm):
+            ws, _ = op.work.launch_args("cuda")
+            again, _ = op.work.launch_args("cuda")
+            assert again.data_ptr() == ws.data_ptr()
+            workspaces.append(ws)
+    assert workspaces[0].data_ptr() != workspaces[1].data_ptr()
+    space = (9, 7, 3)
+    want = math.prod(space) * op.cluster.size
+    counts = [torch.zeros(2, dtype=torch.int32, device="cuda") for _ in streams]
+    torch.cuda.synchronize()
+    for _ in range(4):  # several rounds in flight on both streams at once
+        for strm, ws, count in zip(streams, workspaces, counts, strict=True):
+            with torch.cuda.stream(strm):
+                fn(count, ws, *space, 6)
+    torch.cuda.synchronize()
+    for ws, count in zip(workspaces, counts, strict=True):
+        assert count.tolist() == [4 * want, 4 * want]
+        assert ws[:2].tolist() == [0, 0]
+
+
 def test_record_needs_a_bound_stream(requires_blackwell):
     stream = WorkStream(schedule=StaticPersistent(), record=4)
     with pytest.raises(ValueError, match="before launch_args"):
