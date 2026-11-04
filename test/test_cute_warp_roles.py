@@ -1,4 +1,5 @@
 import math
+import re
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -257,7 +258,9 @@ def test_register_holes_take_their_warpgroup_budget():
     # 232 x 32 x (4 + 4) + 56 x 32 x 4 = 66560: counting warp 0 alone would accept it.
     with pytest.raises(ValueError, match="register budgets need 66560 > 65536"):
         OverBudgetHoleToy().describe()
-    assert "padding          warps  1-3  regs=56" in HoleToy().describe()
+    op = HoleToy()
+    assert "  1-3    (padding)    56\n" in op.describe()
+    assert op._ws_padding == [(range(1, 4), 56)]
 
 
 def test_register_budget_branches_are_warpgroup_uniform():
@@ -702,7 +705,8 @@ def test_fa4_declared_graph():
     assert op.s.slot_counts("producer") == [1, 1]
     assert op.stats.slot_counts("producer") == [128, 128]
     assert op.num_threads == 512
-    assert "softmax[1]  warps  4-7" in summary
+    assert {r.name: r.warps for r in op._ws_roles}["softmax[1]"] == range(4, 8)
+    assert re.search(r"\n  4-7 +softmax\[1\] +192  all\n", summary), summary
 
 
 def test_fa4_rejects_key_tail(requires_blackwell):
@@ -713,3 +717,18 @@ def test_fa4_rejects_key_tail(requires_blackwell):
     k = torch.randn(1, 200, 1, 128, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="multiple of 128"):
         fa4_fwd(q, k, k)
+
+
+def test_describe_lists_the_traced_protocol(requires_blackwell):
+    """With trace_protocol, describe() after a compile adds each role's channel operations with
+    source lines, indented by dynamic region, and the TMEM regions each role touched."""
+    from transformer_nuggets.cute.warp_roles.examples.gemm import Gemm, compile_gemm
+
+    op = Gemm(trace=True)
+    assert "Traced protocol" not in op.describe()  # nothing traced before the compile
+    compile_gemm(op)
+    text = op.describe()
+    protocol = text[text.index("Traced protocol\n") :]
+    assert re.search(r"\n  role load:\n +ab\[i\] +acquire +@ gemm\.py:\d+\n", protocol), protocol
+    assert re.search(r"\n    epilogue: acc\[0\]", protocol), protocol
+    assert all(len(line) <= 100 for line in text.splitlines())

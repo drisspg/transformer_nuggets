@@ -213,8 +213,11 @@ def test_tma_check_accepts_matching_atoms(requires_blackwell, cluster, consumer_
     with warnings.catch_warnings():
         warnings.simplefilter("error")  # a verified kernel emits no "unverified" warning
         run_tma_toy(op)
+    report = op._ws_tma["ld"]
+    assert report.groups == {group} and report.stage_bytes == {TILE_BYTES}
+    assert not report.unverified
     text = op.describe()
-    assert f"tma ld: verified CtaGroup.{group}, {TILE_BYTES} B/stage per CTA" in text
+    assert f"tma       verified CtaGroup.{group}, {TILE_BYTES} B/stage per CTA @ " in text
 
 
 @pytest.mark.parametrize(
@@ -256,7 +259,7 @@ def test_tma_check_fails_open_on_opaque_barrier(requires_blackwell):
     op = make_tma_toy(SingleCta(), mode="opaque")
     with pytest.warns(UserWarning, match=r"TMA check could not verify channel\(s\) \['ld'\]"):
         run_tma_toy(op)
-    assert "tma ld: unverified (barrier taken at test_cute_warp_roles_hardening.py:" in (
+    assert "tma       unverified (barrier taken at test_cute_warp_roles_hardening.py:" in (
         op.describe()
     )
 
@@ -276,7 +279,8 @@ def test_tma_check_fails_open_on_partial_accounting(mode, tx, reason):
     op = make_tma_toy(SingleCta(), tx=tx, mode=mode)
     with pytest.warns(UserWarning, match=r"could not verify channel\(s\) \['ld'\]"):
         compile_tma_toy(op)
-    assert re.search(r"tma ld: unverified \(.*" + reason, op.describe()), op.describe()
+    assert any(re.search(reason, why) for why in op._ws_tma["ld"].unverified)
+    assert "tma       unverified (" in op.describe()
 
 
 def test_tma_rawptr_kernel_runs(requires_blackwell):
@@ -288,9 +292,9 @@ def test_tma_opt_out_is_listed(requires_blackwell):
     op = make_tma_toy(SingleCta(), mode="optout")
     run_tma_toy(op)
     text = op.describe()
-    assert "unchecked tma @ test_cute_warp_roles_hardening.py:" in text
+    assert "Unchecked opt-outs\n  unchecked tma @ test_cute_warp_roles_hardening.py:" in text
     assert "load: 'toy: atom verified by hand' -> ld barrier at" in text
-    assert "tma ld: opted out (unchecked)" in text
+    assert "tma       opted out (unchecked)" in text
 
 
 # --------------------------------------------------------------------------- #
@@ -455,10 +459,13 @@ class _RawInPersistent(WarpSpecialized):
 def test_raw_role_declarations():
     with pytest.raises(ProtocolError, match="raw role prod: parameter ch is Producer"):
         _RawWithEnd()._collect()
-    text = _RawInPersistent().describe()  # raw roles need not loop over the stream
-    assert "role side        warps  4-7  regs=200 raw (no ends, unchecked)" in text
-    assert "8 warps" in text  # padded to whole warpgroups
-    assert "barriers bars: 2 mbarriers, layer-initialized [32, 1], user-driven" in text
+    op = _RawInPersistent()
+    text = op.describe()  # raw roles need not loop over the stream
+    side = next(r for r in op._ws_roles if r.name == "side")
+    assert side.raw and side.warps == range(4, 8) and side.regs == 200
+    assert op.num_warps == 8  # padded to whole warpgroups
+    assert "  4-7    side        200  all  raw\n" in text
+    assert "  bars  2 mbarriers  layer-initialized [32, 1]  user-driven (unchecked)" in text
     with pytest.raises(ValueError, match="Barriers counts must be 2 positive ints"):
         Barriers(2, counts=[1])
 
@@ -487,9 +494,11 @@ class _Overrides(WarpSpecialized):
 def test_overrides_are_shown_against_derived_values():
     op = _Overrides(tx=4096, empty_counts=[1, 4])
     text = op.describe()
-    assert "chan ab     Ring(2)  load -> mma; full arrivals [1, 1], empty arrivals [1, 4]" in text
-    assert "override tx=4096 (derived 4096), empty_counts=[1, 4] (derived [1, 1]) WARNING" in text
-    assert "remote_scope=cluster (derived cta) WARNING: differs from derived" in text
+    # Effective counts, then each override as derived -> effective.
+    assert "empty     [1, 4]\n" in text
+    assert "override  tx 4096 -> 4096\n" in text
+    assert "override  empty_counts 1 x2 -> [1, 4]  (differs from derived)\n" in text
+    assert "override  remote_scope cta -> cluster  (differs from derived)" in text
     assert op.ab.scope.empty_counts == {0: [1, 4]} and op.ab.derived_scope.empty_counts == {
         0: [1, 1]
     }
@@ -521,7 +530,8 @@ def test_pair_mask_override_wins():
     text = op.describe()
     assert op.back.derived_scope.full_mask == 0b11 and op.back.scope.full_mask == 0b01
     assert op.back.scope.empty_mask == 0b01  # derived: the leader-only producer's CTA
-    assert "commit_mask=0b01" in text and "override full_mask=1 (derived 3) WARNING" in text
+    assert "scope     pair-scoped, commit_mask 0b01, remote_scope cta\n" in text
+    assert "override  full_mask 0b11 -> 0b01  (differs from derived)" in text
 
 
 # --------------------------------------------------------------------------- #
@@ -634,11 +644,12 @@ def test_mixed_managed_and_raw_gemm(requires_blackwell, m, n, k):
     compile_gemm(op)(a, b, out)
     assert (out.float() - ref).abs().max().item() <= 2 * torch_err + 1e-3
     text = op.describe()
-    assert "role epilogue    warps  0-3  regs=160 raw (no ends, unchecked)" in text
-    assert "barriers acc_bars: 2 mbarriers, user-initialized, user-driven" in text
-    assert "override empty_counts=[1, 1, 1] (derived [1, 1, 1])" in text
-    assert "WARNING" not in text
-    assert "tma ab: verified CtaGroup.ONE, 49152 B/stage per CTA" in text
+    assert "  0-3    epilogue    160  all  raw\n" in text
+    assert "  acc_bars  2 mbarriers  user-initialized  user-driven (unchecked)" in text
+    assert "override  empty_counts 1 x3 -> 1 x3\n" in text
+    assert "differs from derived" not in text
+    report = op._ws_tma["ab"]
+    assert report.groups == {"ONE"} and report.stage_bytes == {49152}
 
 
 def test_raw_role_runs_under_its_budget_branch(monkeypatch):

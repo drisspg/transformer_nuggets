@@ -251,27 +251,6 @@ def _per_rank_counts(chan, key: str, value, cluster) -> dict:
     return out
 
 
-def describe_overrides(chan) -> str:
-    """`` override ...`` text: each overridden value next to the derived one."""
-    parts = []
-    derived = chan.derived_scope
-    for key in chan.override or {}:
-        ours, theirs = getattr(derived, key), getattr(chan.scope, key)
-        note = " WARNING: differs from derived" if ours != theirs else ""
-        parts.append(f"{key}={_fmt(theirs)} (derived {_fmt(ours)}){note}")
-    if chan.remote_scope_overridden:
-        ours, theirs = chan.derived_remote_scope, chan.remote_scope
-        note = " WARNING: differs from derived" if ours != theirs else ""
-        parts.append(f"remote_scope={theirs} (derived {ours}){note}")
-    return "; override " + ", ".join(parts) if parts else ""
-
-
-def _fmt(value) -> str:
-    if isinstance(value, dict) and len({tuple(v) for v in value.values()}) == 1:
-        return str(next(iter(value.values())))
-    return str(value)
-
-
 def check_atoms(ctx_values, cluster):
     """Trace-time check that MMA atoms in the role context match the cluster, and that a
     single-CTA kernel has no 2-CTA TMA loads. A pair kernel may hold both kinds of TMA load:

@@ -130,21 +130,23 @@ def compile_toy(op):
 
 
 def test_pair_toy_derived_scopes():
-    text = PairToy().describe()
-    assert (
-        "cluster (2, 1, 1)" in text and "role mma         warps  2-2  regs=None cta=leader" in text
-    )
+    op = PairToy()
+    text = op.describe()
+    assert "  cluster  CTA pair (2, 1, 1), tcgen05 CtaGroup.TWO, leader = rank 0" in text
+    assert [(r.name, r.cta) for r in op._ws_roles if r.name == "mma"] == [("mma", "leader")]
     # Threads from both CTAs join on the leader (32 + 32 per slot); the multicast commit lands
     # once on each CTA's empty barrier; producers drain because the release is asynchronous.
-    assert (
-        "chan ch     Slots(2) prod[0]@0, prod[1]@1 -> mma; pair-scoped: full leader [64, 64]"
-        in text
-    )
-    assert "empty leader [1, 1], peer [1, 1] release_mask=0b11 remote_scope=cta tail" in text
-    assert (
-        "chan back   Ring(2)  mma -> sink; pair-scoped: full leader [1, 1], peer [1, 1]; " in text
-    )
-    assert "empty leader [64, 64]" in text
+    ch = op.ch.scope
+    assert ch.pair and ch.full_ctas == (0,) and ch.full_counts[0] == [64, 64]
+    assert ch.empty_ctas == (0, 1) and ch.empty_counts == {0: [1, 1], 1: [1, 1]}
+    assert ch.empty_mask == 0b11 and ch.tail and op.ch.remote_scope == "cta"
+    back = op.back.scope
+    assert back.full_ctas == (0, 1) and back.full_counts == {0: [1, 1], 1: [1, 1]}
+    assert back.empty_ctas == (0,) and back.empty_counts[0] == [64, 64]
+    # Key lines of the channel block: per-CTA counts with uniform slots collapsed.
+    assert "  ch    Slots(2) prod[0]@0, prod[1]@1 -> mma" in text
+    assert "full      leader 64 x2\n" in text
+    assert "scope     pair-scoped, release_mask 0b11, remote_scope cta, tail" in text
 
 
 @pytest.mark.parametrize("mode", ["ok", "snapshot"])
@@ -269,46 +271,56 @@ def test_leader_placement_is_a_noop_for_one_cta():
     """The same role source runs on one CTA: `cta="leader"` places it in the only CTA."""
     from transformer_nuggets.cute.warp_roles.examples.persistent_gemm import PersistentGemm
 
-    text = PersistentGemm().describe()
-    assert "cta=leader" not in text and "pair-scoped" not in text
-    assert "chan ab     Ring(4)  load -> mma; full arrivals [1, 1, 1, 1]" in text
+    op = PersistentGemm()
+    text = op.describe()
+    assert "leader" not in text and "pair-scoped" not in text and "scope" not in text
+    assert op.ab.scope.full_counts == {0: [1] * 4} and not op.ab.scope.pair
+    assert "full      1 x4, tx 49152 B\n" in text
 
 
 def test_pair_gemm_declared_graph():
     from transformer_nuggets.cute.warp_roles.examples.persistent_gemm import PersistentGemm
 
-    text = PersistentGemm(policy=Clc(), cluster=PAIR).describe()
+    op = PersistentGemm(policy=Clc(), cluster=PAIR)
+    text = op.describe()
+    chans = op._ws_chans
     # Both CTAs' TMA bytes (2 x 32 KB) complete on the leader, armed once by its producer.
-    assert (
-        "chan ab     Ring(6)  load -> mma; pair-scoped: full leader [1, 1, 1, 1, 1, 1]; " in text
-    )
-    assert "tx=65536 release_mask=0b11 tail" in text
-    assert (
-        "chan acc    Ring(2)  mma -> epilogue; pair-scoped: full leader [1, 1], peer [1, 1]; "
-        in text
-    )
-    assert "empty leader [256, 256] commit_mask=0b11" in text
+    ab = chans["ab"].scope
+    assert ab.pair and ab.full_ctas == (0,) and ab.full_counts[0] == [1] * 6
+    assert ab.tx == 65536 and ab.empty_mask == 0b11 and ab.tail
+    acc = chans["acc"].scope
+    assert acc.full_counts == {0: [1, 1], 1: [1, 1]} and acc.full_mask == 0b11
+    assert acc.empty_ctas == (0,) and acc.empty_counts[0] == [256, 256]
     # The leader's scheduler publishes into both CTAs (st.async bytes), and every consumer
     # releases the leader's slot: epilogue and load in both CTAs, the leader-only MMA and
     # scheduler once: 2 x (128 + 32) + 32 + 32.
-    assert "tiles.scheduler warps  6-6  regs=40 cta=leader" in text
-    assert "chan tiles_work Ring(2)  tiles.scheduler -> " in text
-    assert "full leader [1, 1], peer [1, 1]; empty leader [384, 384] tx=16" in text
-    assert "chan tiles_clc Slots(1) tiles.scheduler -> tiles.scheduler; full arrivals [1]" in text
+    sched = next(r for r in op._ws_roles if r.name == "tiles.scheduler")
+    assert (sched.first_warp, sched.regs, sched.cta) == (6, 40, "leader")
+    work = chans["tiles_work"].scope
+    assert work.full_counts == {0: [1, 1], 1: [1, 1]} and work.tx == 16
+    assert work.empty_ctas == (0,) and work.empty_counts[0] == [384, 384]
+    clc = chans["tiles_clc"].scope
+    assert not clc.pair and clc.full_counts[0] == [1]
+    # Golden lines.
+    assert "  6      tiles.scheduler    40  leader\n" in text
+    assert "full      leader 1 x6, tx 65536 B (leader-armed)\n" in text
+    assert "scope     pair-scoped, release_mask 0b11, tail\n" in text
+    assert (
+        "  tiles_work  Ring(2)  tiles.scheduler -> epilogue, load, mma, tiles.scheduler\n" in text
+    )
 
 
 def test_fa4_pair_declared_graph():
     pytest.importorskip("flash_attn.cute")
     from transformer_nuggets.cute.warp_roles.examples.fa4_fwd import FlashAttentionForward
 
-    text = FlashAttentionForward(cluster=PAIR).describe()
-    assert (
-        "chan kv     Ring(6)  load -> mma; pair-scoped: full leader" in text and "tx=32768" in text
-    )
-    assert "tx=65536" in text  # Q: two 32 KB halves
+    op = FlashAttentionForward(cluster=PAIR)
+    op.describe()
+    assert op.kv.scope.pair and op.kv.scope.full_ctas == (0,) and op.kv.scope.tx == 32768
+    assert op.q.scope.tx == 65536  # Q: two 32 KB halves
     # S joins softmax[j] and correction of both CTAs on the leader: 2 x (128 + 128).
-    assert "empty leader [512, 512]" in text
-    assert "chan stats  Slots(2) softmax[0]@0, softmax[1]@1 -> correction; full arrivals" in text
+    assert op.s.scope.empty_ctas == (0,) and op.s.scope.empty_counts[0] == [512, 512]
+    assert not op.stats.scope.pair and op.stats.scope.full_counts == {0: [128] * 2, 1: [128] * 2}
 
 
 @cute.jit

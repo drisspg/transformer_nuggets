@@ -32,8 +32,8 @@ from transformer_nuggets.cute.warp_roles.cluster import (
     apply_overrides,
     check_atoms,
     derive_scope,
-    describe_overrides,
 )
+from transformer_nuggets.cute.warp_roles.describe import describe_kernel
 from transformer_nuggets.cute.warp_roles.protocol import (
     ProtocolError,
     ProtocolLog,
@@ -589,81 +589,11 @@ class WarpSpecialized:
         return self.num_warps * WARP_SIZE
 
     def describe(self) -> str:
-        """Static role/channel summary, plus the recorded protocol when traced."""
+        """Plain-text summary of what the layer derived: roles and register budgets, channels
+        (arrival counts per CTA, TMA bytes, masks, overrides, TMA check status), streams, TMEM,
+        and, after a compile, check opt-outs and the traced protocol (``describe.py``)."""
         self._collect()
-        pair = self.cluster.size > 1
-        lines = [f"{self.num_warps} warps ({self.num_threads} threads)"]
-        if pair:
-            m, n, k = self.cluster.shape
-            v = self.cluster.size
-            lines[0] += (
-                f"; {self.cluster.describe()}; cta_layout_vmnk shape (({v}),{m // v},{n},{k})"
-            )
-        for r in self._ws_roles:
-            where = " cta=leader" if pair and r.cta == LEADER else ""
-            where += " raw (no ends, unchecked)" if r.raw else ""
-            lines.append(
-                f"  role {r.name:<11} warps {r.warps.start:>2}-{r.warps.stop - 1:<2} "
-                f"regs={r.regs}{where}"
-            )
-        for warps, regs in self._ws_padding:
-            lines.append(
-                f"  {'padding':<16} warps {warps.start:>2}-{warps.stop - 1:<2} regs={regs}"
-            )
-        for name, ch in self._ws_chans.items():
-            kind = f"Slots({ch.n})" if ch.fixed else f"Ring({ch.n})"
-            prods = ", ".join(r.name + ("" if s is None else f"@{s}") for r, s in ch.producers)
-            cons = ", ".join(r.name + ("" if s is None else f"@{s}") for r, s in ch.consumers)
-            sc = ch.scope
-            if sc.pair:
-                full = ", ".join(
-                    f"{'leader' if c == 0 else 'peer'} {sc.full_counts[c]}" for c in sc.full_ctas
-                )
-                empty = ", ".join(
-                    f"{'leader' if c == 0 else 'peer'} {sc.empty_counts[c]}" for c in sc.empty_ctas
-                )
-                extra = f" tx={sc.tx}" if sc.tx is not None else ""
-                if ch.producer is Umma:
-                    extra += f" commit_mask={sc.full_mask:#04b}"
-                if ch.consumer is Umma:
-                    extra += f" release_mask={sc.empty_mask:#04b}"
-                if Threads in (ch.producer, ch.consumer):
-                    extra += f" remote_scope={ch.remote_scope}"
-                extra += " tail" if sc.tail else ""
-                lines.append(
-                    f"  chan {name:<6} {kind:<8} {prods} -> {cons}; pair-scoped: full {full}; "
-                    f"empty {empty}{extra}{describe_overrides(ch)}"
-                )
-                continue
-            lines.append(
-                f"  chan {name:<6} {kind:<8} {prods} -> {cons}; full arrivals "
-                f"{sc.full_counts[0]}, empty arrivals {sc.empty_counts[0]}"
-                f"{describe_overrides(ch)}"
-            )
-        for name, ts in self._ws_turns.items():
-            seats = " -> ".join(r.name for r in ts.parties)
-            lines.append(f"  turnstile {name}: {seats} (enabled={ts.enabled})")
-        for name, b in self._ws_raw_bars.items():
-            init = "user-initialized" if b.counts is None else f"layer-initialized {b.counts}"
-            lines.append(f"  barriers {name}: {b.n} mbarriers, {init}, user-driven (unchecked)")
-        for name, st in self._ws_streams.items():
-            sched = next((r for r in self._ws_roles if r.fn is scheduler_role), None)
-            dist = (
-                f"scheduler warp {sched.first_warp} broadcasts over {name}_work"
-                if sched
-                else "decoded locally in every role"
-            )
-            lines.append(f"  stream {name}: {st.describe()}; {dist}")
-        if self.tmem_plan is not None:
-            plan = self.tmem_plan
-            lines.append(f"  tmem: {plan.used_cols} columns used, {plan.alloc_cols} allocated")
-            lines.append(plan.describe())
-        # Filled by the last trace (compile): TMA verification status and check opt-outs.
-        lines.extend(report.describe(name) for name, report in self._ws_tma.items())
-        lines.extend(f"  {opt.describe()}" for opt in self._ws_opt_outs)
-        if self._ws_log is not None and self._ws_log.ops:
-            lines.append(self._ws_log.describe())
-        return "\n".join(lines)
+        return describe_kernel(self)
 
     def _barrier_plan(self):
         """(owner, offset, {cta rank: arrival counts}) for every mbarrier, in allocation order.
@@ -863,7 +793,7 @@ class WarpSpecialized:
                     )
         unverified = [n for n, rep in self._ws_tma.items() if rep.unverified]
         if unverified:
-            details = "; ".join(self._ws_tma[n].describe(n).strip() for n in unverified)
+            details = "; ".join(f"{n}: {self._ws_tma[n].status()}" for n in unverified)
             warnings.warn(
                 f"warp_roles: TMA check could not verify channel(s) {unverified} (no error "
                 f"raised; see describe()): {details}",

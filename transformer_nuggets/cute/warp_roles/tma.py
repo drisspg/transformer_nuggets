@@ -60,20 +60,18 @@ class TmaReport:
     unverified: list = field(default_factory=list)
     opted_out: bool = False
 
-    def describe(self, name: str) -> str:
+    def status(self, fmt_sites=None) -> str:
+        """``verified ...``, ``unverified (reasons)``, or ``opted out``; ``fmt_sites`` joins the
+        copy sites (default: comma-separated)."""
         if self.unverified:
-            reasons = "; ".join(dict.fromkeys(self.unverified))
-            return f"  tma {name}: unverified ({reasons})"
+            return f"unverified ({'; '.join(dict.fromkeys(self.unverified))})"
         if not self.copies:
-            what = "opted out (unchecked)" if self.opted_out else "no TMA copies traced"
-            return f"  tma {name}: {what}"
+            return "opted out (unchecked)" if self.opted_out else "no TMA copies traced"
         groups = "/".join(f"CtaGroup.{g}" for g in sorted(self.groups))
         nbytes = ", ".join(str(b) for b in sorted(self.stage_bytes)) or "not counted"
-        sites = ", ".join(sorted(self.copies))
+        sites = (fmt_sites or (lambda s: ", ".join(sorted(s))))(self.copies)
         partial = "; some barriers opted out" if self.opted_out else ""
-        return (
-            f"  tma {name}: verified {groups}, {nbytes} B/stage per CTA; copies @ {sites}{partial}"
-        )
+        return f"verified {groups}, {nbytes} B/stage per CTA @ {sites}{partial}"
 
 
 @dataclass
