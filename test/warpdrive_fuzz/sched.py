@@ -280,6 +280,11 @@ def expected_scopes(spec: gen.KernelSpec) -> dict[str, WantScope]:
     cs = geom.size
     out = {}
     for ch in spec.channels:
+        if ch.kind == "raw":  # Barriers: no derived scope (checked with the barrier plan)
+            continue
+        tma_bytes = ch.tma_bytes
+        if ch.mma == "ab":
+            tma_bytes = (gen.MMA_M + spec.mma.n) * spec.mma.k * 2
         out[ch.name] = want_scope(
             ch.n,
             ch.producer,
@@ -287,11 +292,11 @@ def expected_scopes(spec: gen.KernelSpec) -> dict[str, WantScope]:
             _insts(spec, list(ch.producers)),
             _insts(spec, list(ch.consumers)),
             geom,
-            ch.tma_bytes if ch.producer == "tma" else None,
+            tma_bytes if ch.producer == "tma" else None,
             multicast=tuple(ch.multicast),
         )
     s = spec.stream
-    if s is not None and s.schedule in ("atomic", "clc"):
+    if s is not None and s.broadcast:
         # One scheduler per cluster: rank 0 (the leader in a CTA pair) publishes to every CTA.
         place = "all" if cs == 1 else "leader" if geom.ctas("leader") == (0,) else "rank0"
         sched = Inst("work.scheduler", 32, place, None)
@@ -299,6 +304,7 @@ def expected_scopes(spec: gen.KernelSpec) -> dict[str, WantScope]:
             Inst(f"{r.name}[{i}]", r.threads, r.cta, None)
             for r in spec.roles
             for i in range(r.instances)
+            if not r.raw
         ]
         out["work_ring"] = want_scope(
             s.stages,
@@ -328,7 +334,7 @@ def expected_regs(spec: gen.KernelSpec) -> tuple[int, list, dict] | None:
     s = spec.stream
     if not any(r.regs is not None for r in spec.roles):
         return None
-    if s is not None and s.schedule in ("atomic", "clc"):
+    if s is not None and s.broadcast:
         w = scheduler_warp(spec)
         group = {budget[x] for x in range(w // 4 * 4, w // 4 * 4 + 4) if x in budget}
         numeric = [r.regs for r in spec.roles if r.regs is not None]
@@ -384,7 +390,25 @@ def check_declared(spec: gen.KernelSpec, workdir: Path) -> ScopeReport:
     chans = op._ws_chans
     for name, want in expected_scopes(spec).items():
         rep.channels += 1
-        got = chans[name].scope
+        got = chans[name].derived_scope
+        # Overrides replace exactly the overridden fields of the effective scope (U7).
+        spec_ch = next((c for c in spec.channels if c.name == name), None)
+        if spec_ch is not None and spec_ch.manual:
+            effective = chans[name].scope
+            for key, value in gen.override_of(spec, spec_ch).items():
+                field_counts = getattr(effective, key)
+                want_counts = (
+                    value
+                    if isinstance(value, dict)
+                    else {
+                        c: [value] * spec_ch.n if isinstance(value, int) else value
+                        for c in range(spec.cs)
+                    }
+                )
+                if {c: list(v) for c, v in field_counts.items()} != want_counts:
+                    rep.failures.append(
+                        f"{name}.{key}: effective {field_counts}, override {value}"
+                    )
         for f in (
             "pair",
             "full_ctas",
@@ -401,7 +425,7 @@ def check_declared(spec: gen.KernelSpec, workdir: Path) -> ScopeReport:
                     f"{name}.{f}: layer {getattr(got, f)!r}, model {getattr(want, f)!r}"
                 )
     s = spec.stream
-    if s is not None and s.schedule in ("atomic", "clc"):
+    if s is not None and s.broadcast:
         warp = scheduler_warp(spec)
         if f"scheduler warp {warp} broadcasts" not in text:
             rep.failures.append(f"scheduler not at warp {warp}:\n{text}")
@@ -421,10 +445,21 @@ def check_declared(spec: gen.KernelSpec, workdir: Path) -> ScopeReport:
                 rep.failures.append(f"{name} budget {got_regs.get(name)}, model {b}")
     # R1: barriers are initialized with the effective counts (full then empty, per stage).
     plan, _ = op._barrier_plan()
+    raw = {c.name: c for c in spec.channels if c.kind == "raw"}
     for name, _, counts in plan:
         if name in chans:
             sc = chans[name].scope
             for c in range(spec.cs):
                 if counts[c] != sc.full_counts[c] + sc.empty_counts[c]:
                     rep.failures.append(f"{name} rank {c} init counts {counts[c]}")
+        elif name in raw:  # Barriers(counts=...) initialized as declared; None: by the kernel
+            ch = raw[name]
+            p_threads = spec.role(ch.producers[0][0]).threads
+            c_threads = spec.role(ch.consumers[0][0]).threads
+            want = [p_threads] * ch.n + [c_threads] * ch.n if ch.raw_init == "auto" else None
+            for c in range(spec.cs):
+                if want is None and any(x is not None for x in counts[c]):
+                    rep.failures.append(f"{name} rank {c}: counts=None initialized {counts[c]}")
+                elif want is not None and list(counts[c]) != want:
+                    rep.failures.append(f"{name} rank {c} init counts {counts[c]}, want {want}")
     return rep

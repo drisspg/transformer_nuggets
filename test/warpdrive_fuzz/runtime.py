@@ -82,6 +82,9 @@ def load_kernel(spec, workdir: Path):
         mod_spec.loader.exec_module(module)
     op = getattr(module, gen.class_name(spec))()
     op.trace_protocol = spec.trace  # before the first collection (R16)
+    op.alias_check = spec.alias_check
+    if spec.iket:
+        op.enable_iket(waits=spec.iket == 2)
     return op
 
 
@@ -93,11 +96,22 @@ def compile_kernel(spec, op):
     from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 
     i32 = cutlass.Int32
-    srcs = [
-        make_fake_compact_tensor(i32, (ch.tma_tiles * ch.tma_rows, gen.TMA_COLS))
-        for ch in spec.channels
-        if ch.producer == "tma"
-    ]
+    chans = {f"src_{ch.name}": ch for ch in spec.channels}
+    srcs = []
+    for name, kind in gen.call_args(spec):
+        if kind == "tma_src":
+            ch = chans[name]
+            srcs.append(make_fake_compact_tensor(i32, (ch.tma_tiles * ch.tma_rows, gen.TMA_COLS)))
+        elif kind in ("mma_a", "mma_b"):
+            rows = gen.MMA_M if kind == "mma_a" else spec.mma.n
+            tiles = gen.mma_channels(spec)[0].tma_tiles
+            srcs.append(make_fake_compact_tensor(cutlass.BFloat16, (tiles * rows, spec.mma.k)))
+        elif kind == "rows":
+            srcs.append(make_fake_compact_tensor(i32, (cute.sym_int(), 3)))
+        elif kind == "vec":
+            srcs.append(make_fake_compact_tensor(i32, (cute.sym_int(),), assumed_align=4))
+        else:
+            srcs.append(Int32(1))
     return compile_tvm_ffi(
         op,
         make_fake_compact_tensor(i32, (cute.sym_int(),), assumed_align=4),
@@ -122,6 +136,82 @@ def tma_source(ch, device):
     return vals.reshape(tiles * rows, cols).to(torch.int32).to(device).contiguous()
 
 
+def mma_operand(spec, kind: str, device):
+    """The bf16 A (``(tiles * 128, k)``) or B (``(tiles * n, k)``) source of the MMA subgraph:
+    small integers, so every accumulator is exact in fp32."""
+    import torch
+
+    from test.warpdrive_fuzz import gen, runtime_device
+
+    tiles = gen.mma_channels(spec)[0].tma_tiles
+    rows = gen.MMA_M if kind == "mma_a" else spec.mma.n
+    fn = runtime_device.mma_a if kind == "mma_a" else runtime_device.mma_b
+    t = torch.arange(tiles).view(-1, 1, 1)
+    r = torch.arange(rows).view(1, -1, 1)
+    k = torch.arange(spec.mma.k).view(1, 1, -1)
+    vals = fn(t, r, k, spec.mma.salt).reshape(tiles * rows, spec.mma.k)
+    return vals.to(torch.bfloat16).to(device).contiguous()
+
+
+def static_args(spec, device) -> dict:
+    """Entry-point tensors that do not depend on the runtime variant."""
+    from test.warpdrive_fuzz import gen
+
+    chans = {f"src_{ch.name}": ch for ch in spec.channels}
+    out = {}
+    for name, kind in gen.call_args(spec):
+        if kind == "tma_src":
+            out[name] = tma_source(chans[name], device)
+        elif kind in ("mma_a", "mma_b"):
+            out[name] = mma_operand(spec, kind, device)
+    return out
+
+
+class MappingArgs:
+    """The table/packed mapping's tensors for one launch of a variant. ``reset()`` restores
+    the pre-launch state (stream-ordered). With PDL the table and length start wrong (every
+    row an out-of-space item, the length the full capacity) and the producer kernel fixes them,
+    so a consumer that decoded before ``griddepcontrol.wait`` returned is caught."""
+
+    def __init__(self, s, device):
+        import torch
+
+        from test.warpdrive_fuzz import gen, oracle
+
+        self.s, self.tensors, self.initial = s, {}, {}
+        if s is None or s.mapping == "raster":
+            return
+        items, _ = oracle.space(s)  # the table mapping's empty space keeps one unread row
+        rows = torch.tensor(items or [oracle.garbage_row(s)], dtype=torch.int32).view(-1, 3)
+        if s.mapping == "table":
+            init = {"table": rows, "bad": torch.zeros(1, dtype=torch.int32)}
+        elif not s.pdl:
+            init = {"table": rows, "length": torch.tensor([len(gen.packed_rows(s))])}
+        else:
+            init = {
+                "table": torch.full_like(rows, 99),
+                "length": torch.tensor([rows.shape[0]]),
+                "stage": rows,
+            }
+        self.tensors = {k: v.to(device, torch.int32) for k, v in init.items()}
+        self.initial = {k: v.clone() for k, v in self.tensors.items()}
+
+    def reset(self):
+        for k, v in self.tensors.items():
+            v.copy_(self.initial[k])
+
+    def args(self) -> dict:
+        from test.warpdrive_fuzz import gen
+
+        out = dict(self.tensors)
+        if self.s is not None and self.s.pdl:
+            out["plen"] = len(gen.packed_rows(self.s))
+        return out
+
+    def bad(self) -> int:
+        return int(self.tensors["bad"][0]) if "bad" in self.tensors else 0
+
+
 def run_case(spec, workdir: Path) -> CaseResult:
     """Compile once, then launch the spec and each runtime-shape variant with the same binary,
     checking every launch (a hang hangs the caller)."""
@@ -143,7 +233,7 @@ def run_case(spec, workdir: Path) -> CaseResult:
         return result
     result.compile_s = time.perf_counter() - t0
     _phase("compiled")
-    srcs = [tma_source(ch, device) for ch in spec.channels if ch.producer == "tma"]
+    srcs = static_args(spec, device)
     failures, checked = [], 0
     t1 = time.perf_counter()
     for v, view in enumerate(gen.variant_specs(spec)):
@@ -151,8 +241,7 @@ def run_case(spec, workdir: Path) -> CaseResult:
         failures += rep.failures
         checked += rep.checked
     result.run_s = time.perf_counter() - t1
-    if spec.trace and "Traced protocol" not in op.describe():
-        failures.append("trace_protocol=True compiled, but describe() lists no traced protocol")
+    failures += describe_checks(spec, op.describe())
     if failures:
         result.status = FAIL
         result.failures = failures[:50]
@@ -160,9 +249,56 @@ def run_case(spec, workdir: Path) -> CaseResult:
     return result
 
 
+def describe_checks(spec, text: str) -> list[str]:
+    """What ``describe()`` must report after the compile (R16, U8, the alias diagnostic)."""
+    out = []
+    if spec.trace and "Traced protocol" not in text:
+        out.append("trace_protocol=True compiled, but describe() lists no traced protocol")
+    kinds = {c.unchecked for c in spec.channels if c.unchecked}
+    kinds |= {"alias"} if any(c.alias_opt_out for c in spec.channels) else set()
+    for kind in sorted(kinds):
+        lines = [ln for ln in text.splitlines() if ln.strip().startswith(f"unchecked {kind} @")]
+        if not lines:
+            out.append(f"describe() does not list the unchecked({kind!r}) opt-out")
+        elif (kind != "alias" or spec.alias_check != "off") and all(
+            "stale opt-out" in ln for ln in lines
+        ):
+            out.append(f"unchecked({kind!r}) let nothing through: {lines[0].strip()}")
+    overlaps = [c for c in spec.channels if c.storage == "overlap"]
+    if overlaps and spec.alias_check != "off":
+        if "Alias diagnostic" not in text:
+            out.append("alias_check on with declared overlaps, but no alias diagnostic report")
+        else:
+            report = text.split("Alias diagnostic", 1)[1].split("\n\n", 1)[0].splitlines()[1:]
+            hazards = [ln.strip() for ln in report if "potential hazard" in ln]
+            if hazards:
+                out.append(f"alias diagnostic: potential hazard on an ordered overlap: {hazards}")
+    return out
+
+
+class _LaunchState:
+    """One stream's buffers for repeated launches of the compiled kernel."""
+
+    def __init__(self, spec, op, device, rows: int, hits_len: int):
+        import torch
+
+        from test.warpdrive_fuzz import oracle
+
+        s = spec.stream
+        self.hits = torch.zeros(hits_len + 64, dtype=torch.int32, device=device)
+        if s is not None:
+            self.ws, _ = op.work.launch_args(device)
+        else:
+            self.ws = torch.zeros(4, dtype=torch.int32, device=device)
+        self.init = torch.from_numpy(oracle.initial_clog(spec, rows).reshape(-1)).to(device)
+        self.clog = torch.empty_like(self.init)
+        self.mapping = MappingArgs(s, device)
+
+
 def _launch_and_check(spec, op, fn, device, srcs, tag: str):
     """Launch ``spec`` (its runtime extents, cap and iterations) ``spec.launches`` times, plus
-    two CUDA-graph replays when ``spec.graph``; check each against the model."""
+    two CUDA-graph replays when ``spec.graph`` and two concurrent launches on two streams when
+    ``spec.concurrent``; check each against the model."""
     import numpy as np
     import torch
 
@@ -175,55 +311,74 @@ def _launch_and_check(spec, op, fn, device, srcs, tag: str):
     total = s.total if s is not None else 0
     n_inst = sum(r.instances for r in spec.roles)
     hits_len = max(n_inst * spec.cs * total, 1)
-    hits = torch.zeros(hits_len + 64, dtype=torch.int32, device=device)
-    if s is not None:
-        ws, _ = op.work.launch_args(device)
-        extents, max_ctas = s.extents, s.max_ctas
-    else:
-        ws = torch.zeros(4, dtype=torch.int32, device=device)
-        extents, max_ctas = (1, 1, 1), 1
-    init = torch.from_numpy(oracle.initial_clog(spec, rows).reshape(-1)).to(device)
-    clog = torch.empty_like(init)
+    extents, max_ctas = (s.extents, s.max_ctas) if s is not None else ((1, 1, 1), 1)
     gx = oracle.expected_grid(spec)[0]
     prefix = f"{tag} " if tag else ""
+    st = _LaunchState(spec, op, device, rows, hits_len)
 
-    def collect():
+    def collect(st):
         return oracle.Launch(
-            clog.cpu().numpy().reshape(rows, lay.per_cta).copy(),
-            hits.cpu().numpy().copy(),
-            ws.cpu().numpy().copy(),
-            op.work.timeline(ws, gx) if s is not None and s.record else None,
+            st.clog.cpu().numpy().reshape(rows, lay.per_cta).copy(),
+            st.hits.cpu().numpy().copy(),
+            st.ws.cpu().numpy().copy(),
+            op.work.timeline(st.ws, gx) if s is not None and s.record else None,
+            st.mapping.bad(),
         )
 
-    def launch():
-        clog.copy_(init)
-        hits.zero_()
-        fn(clog, hits, ws, spec.iters, *extents, max_ctas, *srcs)
+    def launch(st):
+        st.clog.copy_(st.init)
+        st.hits.zero_()
+        st.mapping.reset()
+        extra = {**srcs, **st.mapping.args()}
+        args = [extra[name] for name, _ in gen.call_args(spec)]
+        fn(st.clog, st.hits, st.ws, spec.iters, *extents, max_ctas, *args)
 
-    runs = []
+    runs, states = [], [st]
     for k in range(spec.launches):
         if s is not None and s.record:  # refills the log with -1; [claims, finished] stay
-            ws, _ = op.work.launch_args(device, max_ctas=gx)
+            st.ws, _ = op.work.launch_args(device, max_ctas=gx)
         torch.cuda.synchronize()
         _phase(f"launch {prefix}{k}")
-        launch()
+        launch(st)
         torch.cuda.synchronize()
         _phase(f"launched {prefix}{k}")
-        runs.append(collect())
+        runs.append(collect(st))
     if spec.graph:  # R14: ordered graph replays reuse the self-resetting workspace
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            launch()
+            launch(st)
         for k in range(2):
             _phase(f"launch {prefix}graph {k}")
             graph.replay()
             torch.cuda.synchronize()
             _phase(f"launched {prefix}graph {k}")
-            runs.append(collect())
+            runs.append(collect(st))
+    if spec.concurrent:
+        # Two launches in flight at once on two streams. launch_args() caches one workspace
+        # per (device, stream), so each gets its own: the documented way to run concurrently.
+        streams = [torch.cuda.Stream(device) for _ in range(2)]
+        pair = []
+        for strm in streams:
+            with torch.cuda.stream(strm):
+                pair.append(_LaunchState(spec, op, device, rows, hits_len))
+                if s is not None and s.record:
+                    pair[-1].ws, _ = op.work.launch_args(device, max_ctas=gx)
+        if s is not None and pair[0].ws.data_ptr() == pair[1].ws.data_ptr():
+            raise AssertionError("launch_args() returned one workspace for two streams")
+        torch.cuda.synchronize()
+        _phase(f"launch {prefix}concurrent")
+        for strm, cst in zip(streams, pair, strict=True):
+            with torch.cuda.stream(strm):
+                launch(cst)
+        torch.cuda.synchronize()
+        _phase(f"launched {prefix}concurrent")
+        runs += [collect(cst) for cst in pair]
+        states += pair
     _phase(f"checking {prefix}")
     rep = oracle.check(spec, runs)
-    if np.any(hits.cpu().numpy()[hits_len:] != 0):
-        rep.fail("hits written past the item range")
+    for state in states:
+        if np.any(state.hits.cpu().numpy()[hits_len:] != 0):
+            rep.fail("hits written past the item range")
     if tag:
         rep.failures = [f"{tag} {extents}/{max_ctas}/{spec.iters}: {f}" for f in rep.failures]
     return rep

@@ -119,6 +119,13 @@ class RoleSpec:
     # Per-iteration handle program: ("o" | "c", channel, side, key) in execution order.
     events: tuple[tuple[str, str, str, int], ...] = ()
     with_handles: tuple[Key, ...] = ()  # handles emitted as nested ``with`` blocks
+    # "": a generated managed role; "raw": role(raw=True) driving a Barriers ring;
+    # "mma_load" / "mma" / "mma_epi": the TMA -> tcgen05 MMA -> TMEM epilogue subgraph.
+    kind: str = ""
+
+    @property
+    def raw(self) -> bool:
+        return self.kind == "raw"
 
     @property
     def instances(self) -> int:
@@ -153,6 +160,24 @@ class ChannelSpec:
     release_fence: str | None = None
     remote_scope: str | None = None
     salt: int = 0
+    # "raw" kind: a Barriers ring between raw roles; "auto" (Barriers(counts=...)) or "manual"
+    # (counts=None, initialized in the kernel prologue).
+    raw_init: str = ""
+    mma: str = ""  # "ab" (Tma -> Umma A/B stages) | "acc" (Umma -> Threads accumulator)
+    # Sides ("p", "c", "pc") that close with signal=False and arrive once per warp themselves,
+    # under an override of that side's counts given as an int, a per-slot list or {rank: list}.
+    manual: str = ""
+    override_form: str = ""
+    generic: bool = False  # declared as Channel(...) rather than Ring(...)
+    # unchecked(...) site: "cross_region" (close inside a dynamic branch), "unclosed" (open
+    # with the opt-out, signal through the raw barrier, never close) or "tma" (TMA barrier).
+    unchecked: str = ""
+    unchecked_side: str = ""
+    # Payload channels: "buffer" (an SmemPlan buffer instead of payload=) or "overlap" (the
+    # producer writes buffer Q, declared overlaps=P, the consumer reads P); TMA channels:
+    # "buffer" (an SmemPlan buffer with a StageView of the TMA partition).
+    storage: str = ""
+    alias_opt_out: bool = False  # the consumer's read annotation sits in unchecked("alias")
 
     @property
     def tma_tiles(self) -> int:
@@ -188,15 +213,44 @@ class StreamSpec:
     rounds: tuple[int, int, int, int, int]  # (base, spread, a, b, c)
     launch_1d: bool = False  # OneShot: a hand-built (total * cs, 1, 1) grid (R13)
     record: int = 0  # WorkStream(record=k): the timeline must match the item logs (R16)
+    # "raster" (Raster / SkipMod); "table": a WorkMap without decodes_any_index reading a
+    # permuted item table and counting decodes outside [0, total); "packed": PackedWork over a
+    # table of the items ``skip`` keeps, ``pad`` spare rows, under PdlWait.
+    mapping: str = "raster"
+    pad: int = 0
+    pdl: bool = False  # packed: a producer kernel writes the table, consumer launched with PDL
+    order_seed: int = 0  # table/packed row order
 
     @property
-    def total(self) -> int:
+    def raster_total(self) -> int:
         em, en, el = self.extents
         return em * en * el if min(self.extents) > 0 else 0  # R17: any extent <= 0 is empty
 
     @property
+    def total(self) -> int:
+        """Item indices ``[0, total)`` the stream visits (packed: the table capacity)."""
+        if self.mapping == "packed":
+            return len(packed_rows(self)) + self.pad
+        return self.raster_total
+
+    @property
     def plain_raster(self) -> bool:
-        return self.along == "m" and self.swizzle == 1 and not self.reverse and self.skip is None
+        return (
+            self.mapping == "raster"
+            and self.along == "m"
+            and self.swizzle == 1
+            and not self.reverse
+            and self.skip is None
+        )
+
+    @property
+    def broadcast(self) -> bool:
+        return self.schedule in BROADCAST
+
+    @property
+    def capped(self) -> bool:
+        """Launch units capped by max_ctas (``uses_max_ctas``)."""
+        return self.schedule in ("static", "atomic", "reverse", "rbroadcast")
 
     @property
     def tile_grid(self) -> bool:
@@ -206,6 +260,63 @@ class StreamSpec:
     def item_rounds(self, m: int, n: int, li: int) -> int:
         base, spread, a, b, c = self.rounds
         return (m * a + n * b + li * c) % spread + base
+
+
+BROADCAST = ("atomic", "clc", "rbroadcast")
+
+
+@functools.cache
+def item_order(s: StreamSpec) -> tuple[tuple[int, int, int], ...]:
+    """Raster visiting order: ``l`` slowest; bands of ``swizzle`` tiles across the non-``along``
+    axis, the banded axis fastest inside a band; reversed axes count down."""
+    em, en, el = s.extents
+    if min(s.extents) <= 0:
+        return ()
+    e_along, e_band = (em, en) if s.along == "m" else (en, em)
+    out = []
+    for li in range(el):
+        for start in range(0, e_band, s.swizzle):
+            band = range(start, min(start + s.swizzle, e_band))
+            for a in range(e_along):
+                for b in band:
+                    m, n = (a, b) if s.along == "m" else (b, a)
+                    if "m" in s.reverse:
+                        m = em - 1 - m
+                    if "n" in s.reverse:
+                        n = en - 1 - n
+                    out.append((m, n, el - 1 - li if "l" in s.reverse else li))
+    return tuple(out)
+
+
+def skipped(s: StreamSpec, item) -> bool:
+    if s.skip is None:
+        return False
+    a, b, c, k = s.skip
+    m, n, li = item
+    return (m * a + n * b + li * c) % k == 0
+
+
+@functools.cache
+def table_rows(s: StreamSpec) -> tuple[tuple[int, int, int], ...]:
+    """The "table" mapping's rows: the raster items in a seeded permutation."""
+    rows = list(item_order(s))
+    random.Random(s.order_seed).shuffle(rows)
+    return tuple(rows)
+
+
+@functools.cache
+def packed_rows(s: StreamSpec) -> tuple[tuple[int, int, int], ...]:
+    """The "packed" mapping's first ``length`` rows: the permuted items ``skip`` keeps."""
+    return tuple(it for it in table_rows(s) if not skipped(s, it))
+
+
+@dataclass(frozen=True)
+class MmaSpec:
+    """A 128 x n x k tcgen05 BF16 MMA tile per accumulator epoch (single CTA)."""
+
+    n: int  # accumulator columns
+    k: int  # K elements per A/B stage
+    salt: int
 
 
 @dataclass(frozen=True)
@@ -244,6 +355,13 @@ class KernelSpec:
     @property
     def geom(self) -> Geometry:
         return Geometry(*self.shape)
+
+    iket: int = 0  # 1: enable_iket(waits=False), 2: enable_iket() (compiled and run, no capture)
+    alias_check: str = "warn"
+    # Also launch the compiled kernel twice concurrently on two streams, each with its own
+    # launch_args() workspace and logs (the documented per-stream workspace contract).
+    concurrent: bool = False
+    mma: MmaSpec | None = None
 
     @property
     def cs(self) -> int:
@@ -284,8 +402,11 @@ def spec_from_dict(d: dict) -> KernelSpec:
     stream = d.get("stream")
     if stream is not None:
         stream = StreamSpec(**{k: _tuples(v) for k, v in stream.items()})
-    rest = {k: _tuples(v) for k, v in d.items() if k not in ("roles", "channels", "stream")}
-    return KernelSpec(roles=roles, channels=chans, stream=stream, **rest)
+    mma = d.get("mma")
+    if mma is not None:
+        mma = MmaSpec(**mma)
+    rest = {k: _tuples(v) for k, v in d.items() if k not in ("roles", "channels", "stream", "mma")}
+    return KernelSpec(roles=roles, channels=chans, stream=stream, mma=mma, **rest)
 
 
 # --------------------------------------------------------------------------- #
@@ -492,6 +613,257 @@ def _placement(rng: random.Random, pair: bool, cluster: tuple) -> str:
     return "leader" if x < 0.3 else "rank0" if x < 0.45 else "all"
 
 
+def _scheduler_regs(roles: list[dict], sched: int | None):
+    """R9: a warp the scheduler takes in an owned warpgroup has that group's budget (None
+    included); alone in a warpgroup it takes the smallest numeric budget."""
+    if sched is None:
+        return None
+    grp = {
+        r["regs"]
+        for r in roles
+        for f in r["warps"]
+        for w in range(f, f + r["width"])
+        if w // WARPGROUP == sched // WARPGROUP
+    }
+    nums = [r["regs"] for r in roles if r["regs"] is not None]
+    return grp.pop() if len(grp) == 1 else (min(nums) if nums else None)
+
+
+def _extend_stream(ext: random.Random, s: StreamSpec) -> StreamSpec:
+    """Custom schedules (a local and a broadcast ``IndexSchedule``) and mappings without
+    ``decodes_any_index`` (an item table, ``PackedWork`` under ``PdlWait``)."""
+    if s.schedule in ("static", "atomic") and ext.random() < 0.3:
+        s = dataclasses.replace(
+            s, schedule={"static": "reverse", "atomic": "rbroadcast"}[s.schedule]
+        )
+    if s.extents[1] >= 65535:
+        return s
+    r = ext.random()
+    if r < 0.15:
+        s = dataclasses.replace(s, mapping="table", skip=None, order_seed=ext.randrange(1 << 16))
+    elif r < 0.3:
+        skip = s.skip or tuple(ext.randint(0, 3) for _ in range(3)) + (ext.randint(2, 4),)
+        s = dataclasses.replace(
+            s,
+            mapping="packed",
+            skip=skip,
+            pad=ext.randint(1, 9),
+            ready=True,
+            pdl=ext.random() < 0.6,
+            order_seed=ext.randrange(1 << 16),
+        )
+    return s
+
+
+MMA_M = 128
+PRODUCER_THREADS = 128  # the packed table's PDL producer kernel
+MMA_TILES_MAX_COLS = 512
+
+
+def _owned(roles: list[dict]) -> set[int]:
+    return {w for r in roles for f in r["warps"] for w in range(f, f + r["width"])}
+
+
+def _extend_roles(ext, roles, channels, geom, sched, tmem_regions):
+    """Append the MMA subgraph (single CTA) and a raw Barriers ring to ``roles``/``channels``
+    in fresh warpgroups; give those groups budgets that fit. Returns ``(MmaSpec | None,
+    tmem_regions, SMEM bytes)``."""
+    top = max(_owned(roles) | ({sched} if sched is not None else set()))
+    w = (top // WARPGROUP + 1) * WARPGROUP
+    first_new = len(roles)
+    mma, smem = None, 0
+    used_cols = sum(c * k for _, c, k in tmem_regions)
+    if geom.size == 1 and ext.random() < 0.25 and w + 6 <= MAX_WARPS:
+        n, k = ext.choice([32, 64]), 64
+        ab_n, acc_n, kb = ext.randint(1, 3), ext.randint(1, 2), ext.randint(1, 3)
+        if used_cols + n * acc_n <= MMA_TILES_MAX_COLS:
+            mma = MmaSpec(n=n, k=k, salt=ext.randrange(64))
+            tmem_regions = (*tmem_regions, ("mma_acc", n, acc_n))
+            base = {"instances": 1, "cta": "all", "jitter": 0, "tmem": False, "regs": None}
+            roles += [
+                {
+                    **base,
+                    "name": "m_epi",
+                    "width": 4,
+                    "warps": (w,),
+                    "tmem": True,
+                    "kind": "mma_epi",
+                },
+                {**base, "name": "m_load", "width": 1, "warps": (w + 4,), "kind": "mma_load"},
+                {
+                    **base,
+                    "name": "m_mma",
+                    "width": 1,
+                    "warps": (w + 5,),
+                    "tmem": True,
+                    "kind": "mma",
+                },
+            ]
+            w += 6
+            chan = {
+                "kind": "ring",
+                "producers": (),
+                "consumers": (),
+                "extra_mult": 0,
+                "payload": False,
+                "salt": ext.randrange(4096),
+            }
+            channels += [
+                {
+                    **chan,
+                    "name": "mab",
+                    "n": ab_n,
+                    "producer": "tma",
+                    "consumer": "umma",
+                    "tma_rows": 0,
+                    "producers": (("m_load", False),),
+                    "consumers": (("m_mma", False),),
+                    "mult": kb,
+                    "mma": "ab",
+                },
+                {
+                    **chan,
+                    "name": "macc",
+                    "n": acc_n,
+                    "producer": "umma",
+                    "consumer": "threads",
+                    "producers": (("m_mma", False),),
+                    "consumers": (("m_epi", False),),
+                    "mult": 1,
+                    "mma": "acc",
+                },
+            ]
+            roles[-2]["events"] = tuple(
+                e for j in range(kb) for e in (("o", "mab", "p", j), ("c", "mab", "p", j))
+            )
+            roles[-1]["events"] = (
+                ("o", "macc", "p", 0),
+                *(e for j in range(kb) for e in (("o", "mab", "c", j), ("c", "mab", "c", j))),
+                ("c", "macc", "p", 0),
+            )
+            roles[-3]["events"] = (("o", "macc", "c", 0), ("c", "macc", "c", 0))
+            smem += ab_n * (MMA_M + n) * k * 2 + 2048
+    if ext.random() < 0.25:
+        wp, wc = ext.choice([1, 1, 2]), ext.choice([1, 1, 2])
+        if w + wp + wc <= MAX_WARPS:
+            cta = ext.choice(["all", "leader", "rank0"]) if geom.size > 1 else "all"
+            jitter = any(r["jitter"] for r in roles)
+            n = ext.randint(1, 4)
+            for name, width in (("x_rawp", wp), ("x_rawc", wc)):
+                side = "p" if name == "x_rawp" else "c"
+                roles.append(
+                    {
+                        "name": name,
+                        "width": width,
+                        "instances": 1,
+                        "cta": cta,
+                        "regs": None,
+                        "warps": (w,),
+                        "jitter": ext.choice([0, 40, 400]) if jitter else 0,
+                        "tmem": bool(tmem_regions) and side == "c" and ext.random() < 0.5,
+                        "kind": "raw",
+                        "events": (("o", "xraw", side, 0), ("c", "xraw", side, 0)),
+                    }
+                )
+                w += width
+            channels.append(
+                {
+                    "name": "xraw",
+                    "kind": "raw",
+                    "n": n,
+                    "producer": "threads",
+                    "consumer": "threads",
+                    "producers": (("x_rawp", False),),
+                    "consumers": (("x_rawc", False),),
+                    "mult": 1,
+                    "extra_mult": ext.randint(0, 1),
+                    "payload": False,
+                    "salt": ext.randrange(4096),
+                    "raw_init": ext.choice(["auto", "manual"]),
+                }
+            )
+            smem += 32 * wp * 4 * n + 16 * n + 16
+    for r in roles[first_new:]:
+        r.setdefault("with_handles", ())
+    if not _budget_new_groups(ext, roles, first_new, sched):
+        del roles[first_new:]
+        channels[:] = [c for c in channels if c["kind"] != "raw" and not c.get("mma")]
+        return None, tuple(t for t in tmem_regions if t[0] != "mma_acc"), 0
+    return mma, tmem_regions, smem
+
+
+def _budget_new_groups(ext, roles, first_new, sched) -> bool:
+    """Warpgroup-uniform budgets for the appended roles' groups that keep R9's total (False:
+    none fits next to the existing budgets)."""
+    groups = sorted({w // WARPGROUP for r in roles[first_new:] for w in _owned([r])})
+    for g in groups:
+        members = [r for r in roles[first_new:] if any(w // WARPGROUP == g for w in _owned([r]))]
+        heavy = any(r.get("kind") in ("mma", "mma_epi") for r in members)
+        options = [None, *range(64 if heavy else 24, 257, 8)]
+        ext.shuffle(options)
+        for regs in options:
+            for r in members:
+                r["regs"] = regs
+            total = register_total(roles, sched, _scheduler_regs(roles, sched))
+            if total is not None and total <= REGS_PER_SM:
+                break
+        else:
+            return False
+    return True
+
+
+def _extend_channels(ext, channels, roles, geom):
+    """Overrides with manual per-warp signals, unchecked(...) sites and SmemPlan storage on the
+    generated channels."""
+    by_name = {r["name"]: r for r in roles}
+    for ch in channels:
+        if ch["kind"] == "raw" or ch.get("mma"):
+            continue
+        parts = (*ch["producers"], *ch["consumers"])
+        # Manual signals reach this CTA only: a multicast stage is released in every CTA it
+        # was copied into (U7: raw signals must use the effective targets).
+        local = len({geom.ctas(by_name[r]["cta"]) for r, _ in parts}) == 1
+        local = local and not ch.get("multicast")
+        if local and ext.random() < 0.2:
+            sides = [
+                x
+                for x, mech in (("p", ch["producer"]), ("c", ch["consumer"]))
+                if mech == "threads"
+            ]
+            if sides:
+                ch["manual"] = "".join(x for x in sides if ext.random() < 0.7) or sides[0]
+                ch["override_form"] = ext.choice(["int", "list", "rank"])
+                ch["generic"] = ch["kind"] == "ring" and ext.random() < 0.5
+        if not ch.get("manual") and ext.random() < 0.15:
+            kinds = ["cross_region"]
+            if local and ch["producer"] in ("threads", "tma"):
+                kinds.append("unclosed")
+            if ch["producer"] == "tma":
+                kinds.append("tma")
+            kind = ext.choice(kinds)
+            side = ext.choice("pc") if kind == "cross_region" else "p"
+            if kind == "unclosed" and ch["consumer"] == "threads" and ext.random() < 0.5:
+                side = "c"
+            ch["unchecked"], ch["unchecked_side"] = kind, side
+        if ch["payload"] and ext.random() < 0.3:
+            fan_in = len(ch["producers"]) > 1
+            ch["storage"] = "buffer" if fan_in or ext.random() < 0.4 else "overlap"
+            ch["alias_opt_out"] = ch["storage"] == "overlap" and ext.random() < 0.3
+        elif ch["producer"] == "tma" and not ch.get("multicast") and ext.random() < 0.3:
+            ch["storage"] = "buffer"
+
+
+def _extend_kernel(ext, spec: KernelSpec) -> KernelSpec:
+    s = spec.stream
+    alias = ext.random()
+    return dataclasses.replace(
+        spec,
+        iket=ext.choice([1, 2]) if ext.random() < 0.15 else 0,
+        alias_check="strict" if alias < 0.25 else "off" if alias < 0.4 else "warn",
+        concurrent=ext.random() < 0.15 and not spec.graph and (s is None or s.total < 4096),
+    )
+
+
 def generate(
     seed: int,
     *,
@@ -509,6 +881,9 @@ def generate(
     if empty:
         stream = True
     rng = random.Random(seed)
+    # Knobs added after the first campaigns draw from their own stream, so a seed keeps the
+    # kernel it had before them apart from the extensions (findings cite seeds).
+    ext = random.Random(f"wdfuzz-ext-{seed}")
     cluster = tuple(cluster) if cluster is not None else ()
     if cluster:
         pair = cluster[2]
@@ -758,10 +1133,11 @@ def generate(
             launch_1d=schedule == "oneshot" and rng.random() < 0.3,
             record=rng.randint(1, 4) if extents[1] < 65535 and rng.random() < 0.15 else 0,
         )
+        stream_spec = _extend_stream(ext, stream_spec)
 
     # Registers: random warpgroup-uniform budgets that fit, including the scheduler warp.
     sched = None
-    if stream_spec is not None and stream_spec.schedule in ("atomic", "clc"):
+    if stream_spec is not None and stream_spec.broadcast:
         owned = sorted({w for r in roles for f in r["warps"] for w in range(f, f + r["width"])})
         holes = [w for w in range(max(owned) + 2) if w not in owned]
         explicit = rng.choice(holes) if rng.random() < 0.3 else None
@@ -770,21 +1146,7 @@ def generate(
     if rng.random() < 0.5:
         for _ in range(20):
             _assign_regs(rng, roles)
-            if sched is not None:
-                # R9: a warp the scheduler takes in an owned warpgroup has that group's budget
-                # (None included); alone in a warpgroup it takes the smallest numeric budget.
-                grp = {
-                    r["regs"]
-                    for r in roles
-                    for f in r["warps"]
-                    for w in range(f, f + r["width"])
-                    if w // 4 == sched // 4
-                }
-                nums = [r["regs"] for r in roles if r["regs"] is not None]
-                sched_regs = grp.pop() if len(grp) == 1 else (min(nums) if nums else None)
-            else:
-                sched_regs = None
-            total = register_total(roles, sched, sched_regs)
+            total = register_total(roles, sched, _scheduler_regs(roles, sched))
             if total is not None and total <= REGS_PER_SM:
                 break
         else:
@@ -809,6 +1171,14 @@ def generate(
         r["events"] = tuple(tuple(e) for e in events)
         r["with_handles"] = tuple(_laminar(rng, events))
 
+    # Raw roles over Barriers and the MMA subgraph sit in fresh warpgroups above every role and
+    # the scheduler, with fixed sequential handle programs.
+    mma, ext_smem = None, 0
+    if stream_spec is None or stream_spec.extents[1] < 65535:
+        mma, tmem_regions, ext_smem = _extend_roles(
+            ext, roles, channels, geom, sched, tmem_regions
+        )
+
     grid_rows = 1
     if stream_spec is None:
         units = rng.randint(1, 3)
@@ -816,7 +1186,7 @@ def generate(
     else:
         units = 1
         s = stream_spec
-        if s.schedule in ("static", "atomic"):
+        if s.capped:
             grid_rows = max(1, min(s.total, max(s.max_ctas // geom.size, 1)))
         else:
             grid_rows = max(s.total, 1)
@@ -824,7 +1194,7 @@ def generate(
     smem_pad = 0
     if stream_spec is not None and stream_spec.schedule == "clc" and rng.random() < 0.5:
         smem_pad = 40000  # ~160 KB: one CTA per SM, so try_cancel has CTAs to cancel
-    used = 0
+    used = ext_smem
     for ch in channels:  # barriers, layer payloads and TMA stages, 16-byte aligned
         used += 16 * ch["n"]
         if ch["payload"]:
@@ -842,7 +1212,8 @@ def generate(
             ch["payload"] = False
             used -= 4 * 512 * ch["n"]
     smem_pad = min(smem_pad, max(0, (200_000 - used) // 4))
-    return KernelSpec(
+    _extend_channels(ext, channels, roles, geom)
+    spec = KernelSpec(
         seed=seed,
         pair=pair,
         cluster=cluster,
@@ -857,6 +1228,7 @@ def generate(
                 tmem=bool(r["tmem"]),
                 events=r["events"],
                 with_handles=r["with_handles"],
+                kind=r.get("kind", ""),
             )
             for r in roles
         ),
@@ -874,7 +1246,9 @@ def generate(
         trace=rng.random() < 0.15,
         variants=_variants(rng, stream_spec, big_grid or any(r["jitter"] for r in roles)),
         graph=rng.random() < 0.2 and not (stream_spec is not None and stream_spec.record),
+        mma=mma,
     )
+    return _extend_kernel(ext, spec)
 
 
 def _variants(rng: random.Random, s: StreamSpec | None, small_only: bool) -> tuple:
@@ -932,7 +1306,14 @@ _SCHEDULE = {
     "static": "StaticPersistent()",
     "atomic": "AtomicPersistent(stages={})",
     "clc": "ClusterLaunchControl(stages={})",
+    "reverse": "ReverseStatic()",
+    "rbroadcast": "ReverseBroadcast(stages={})",
 }
+_FENCE = {
+    "smem_async": "cute.arch.fence_view_async_shared()",
+    "tmem_store": "cute.arch.fence_view_async_tmem_store()",
+}
+REASON = "fuzz: the generated program signals this edge itself"
 
 
 def class_name(spec: KernelSpec) -> str:
@@ -948,8 +1329,73 @@ def _hvar(key) -> str:
     return f"h_{ch}_{side}_{'b' if k == BOUND else k}"
 
 
+def warp_counts(spec: KernelSpec, ch: ChannelSpec, side: str) -> list[int]:
+    """Per-slot arrivals when every warp of a side arrives once (an elected lane per warp)."""
+    lst = ch.producers if side == "p" else ch.consumers
+    return [
+        sum(spec.role(r).width * (1 if b else spec.role(r).instances) for r, b in lst)
+        for _ in range(ch.n)
+    ]
+
+
+def override_of(spec: KernelSpec, ch: ChannelSpec) -> dict:
+    """The ``override=`` of a channel whose ``manual`` sides arrive once per warp."""
+    out = {}
+    for side in ch.manual:
+        counts = warp_counts(spec, ch, side)
+        key = "full_counts" if side == "p" else "empty_counts"
+        if ch.override_form == "int" and len(set(counts)) == 1:
+            out[key] = counts[0]
+        elif ch.override_form == "rank":
+            out[key] = {c: counts for c in range(spec.cs)}
+        else:
+            out[key] = counts
+    return out
+
+
+def uses_stream(spec: KernelSpec, r: RoleSpec) -> bool:
+    """The role follows the work stream: managed roles, and raw roles under OneShot (through
+    ``single_item()``). Other raw roles run ``iters`` iterations."""
+    s = spec.stream
+    return s is not None and (not r.raw or s.schedule == "oneshot")
+
+
+def smem_buffers(spec: KernelSpec) -> list[tuple[str, str]]:
+    """``(plan buffer, layout expression)`` of every SmemPlan buffer, in declaration order."""
+    out = []
+    for ch in spec.channels:
+        if ch.storage and ch.producer == "tma":
+            out.append(
+                (
+                    f"T_{ch.name}",
+                    f"cute.make_ordered_layout(({ch.tma_rows}, {TMA_COLS}, "
+                    f"{ch.n}), order=(1, 0, 2))",
+                )
+            )
+        elif ch.storage:
+            _, width = payload_offsets(spec, ch)
+            layout = f"cute.make_layout(({width}, {ch.n}))"
+            out.append((f"P_{ch.name}", layout))
+            if ch.storage == "overlap":
+                out.append((f"Q_{ch.name}", layout))
+    if spec.mma is not None:
+        out += [("MA", "m_a_layout"), ("MB", "m_b_layout")]
+    return out
+
+
+def mma_channels(spec: KernelSpec) -> tuple[ChannelSpec, ChannelSpec]:
+    chans = {c.mma: c for c in spec.channels if c.mma}
+    return chans["ab"], chans["acc"]
+
+
 def _role_params(spec: KernelSpec, r: RoleSpec) -> list[str]:
     params = ["self"]
+    if r.raw:
+        params.append("xraw: Barriers")
+        if r.tmem:
+            params.append("tmem: Tmem")
+        params.append("ctx")
+        return params
     if r.instances > 1 or any(
         b for ch in spec.channels for rn, b in (*ch.producers, *ch.consumers) if rn == r.name
     ):
@@ -981,6 +1427,7 @@ def _emit_body(src: _Src, spec: KernelSpec, r: RoleSpec, extra: bool):
     """One iteration of the role's handle program (``extra``: the final partial round)."""
     chans = {c.name: c for c in spec.channels}
     lay = Layout.of(spec)
+    mma = spec.mma
 
     def present(key) -> str | None:
         """Python condition for the handle being used this round (None: always)."""
@@ -988,7 +1435,7 @@ def _emit_body(src: _Src, spec: KernelSpec, r: RoleSpec, extra: bool):
         c = chans[ch]
         if not extra:
             return None
-        if c.kind == "ring":
+        if c.kind != "slots":
             return "True" if k < c.extra_mult else "False"
         if k == BOUND:
             return f"stage in {tuple(c.extra_slots)!r}"
@@ -996,13 +1443,41 @@ def _emit_body(src: _Src, spec: KernelSpec, r: RoleSpec, extra: bool):
 
     def epoch(key) -> str:
         c = chans[key[0]]
-        return f"(it * {c.mult} + {key[2]})" if c.kind == "ring" else "it"
+        return f"(it * {c.mult} + {key[2]})" if c.kind != "slots" else "it"
 
     def slot(key) -> str:
         c = chans[key[0]]
-        if c.kind == "ring":
+        if c.kind != "slots":
             return "0"
         return "stage" if key[2] == BOUND else str(key[2])
+
+    def unchecked_here(key, kind: str) -> bool:
+        c = chans[key[0]]
+        return c.unchecked == kind and c.unchecked_side == key[1]
+
+    def words(key, write: bool) -> str:
+        """The payload words of the handle's stage as a 1-D tensor."""
+        c, h = chans[key[0]], _hvar(key)
+        if c.kind == "raw":
+            return f"ctx.rb_{c.name}[None, s_{c.name}_{key[1]}]"
+        if c.storage == "overlap":
+            if write:
+                return f'{h}.view("Q", write=True)'
+            if c.alias_opt_out:
+                src('with unchecked("alias", reason="fuzz: ordered by the stage handoff"):')
+                src(f'    v_{h} = {h}.view("P", read=True)')
+                return f"v_{h}"
+            return f'{h}.view("P", read=True)'
+        if c.storage == "buffer":
+            return f'{h}.view("P", {"write" if write else "read"}=True)'
+        return f"{h}.data"
+
+    def tile(key) -> str:
+        """A TMA stage, ``(rows, cols)``, read by threads."""
+        c, h = chans[key[0]], _hvar(key)
+        if c.storage:
+            return f'{h}.view("T", read=True)'
+        return f"ctx.s_{c.name}[None, None, {h}.index]"
 
     def on_open(key):
         ch, side, _ = key
@@ -1010,69 +1485,157 @@ def _emit_body(src: _Src, spec: KernelSpec, r: RoleSpec, extra: bool):
         h = _hvar(key)
         e = epoch(key)
         counter = f"k_{ch}_{side}"
+        if c.kind == "raw":
+            sv = f"s_{ch}_{side}"
+            src(f"{sv} = {counter} % {c.n}")
+            if side == "p":
+                src(
+                    f"cute.arch.mbarrier_wait(xraw + ({c.n} + {sv}), (({counter} // {c.n}) & 1) ^ 1)"
+                )
+            else:
+                src(f"cute.arch.mbarrier_wait(xraw + {sv}, ({counter} // {c.n}) & 1)")
         if side == "p":
             src(f"D.jitter({e}, tid, {c.salt}, {r.jitter})")
-            if c.payload:
+            if c.mma == "acc":
+                src("mma_t.set(tcgen05.Field.ACCUMULATE, False)")
+            elif c.mma == "ab":
+                for op in ("a", "b"):
+                    src(
+                        f"cute.copy(ctx.m_tma_{op}, ctx.m_t{op.upper()}g{op.upper()}[None, {e} % "
+                        f'{c.tma_tiles}, 0], {h}.view("{op.upper()}", write=True, by="tma"), '
+                        f"tma_bar_ptr={h}.barrier)"
+                    )
+            elif c.payload or c.kind == "raw":
                 offs, _ = payload_offsets(spec, c)
                 src(
-                    f"D.write_words({h}.data, {e}, tid, {slot(key)}, {_by_stage(offs[r.name], r)}, "
-                    f"{c.salt})"
+                    f"D.write_words({words(key, True)}, {e}, tid, {slot(key)}, "
+                    f"{_by_stage(offs[r.name], r)}, {c.salt})"
                 )
             elif c.producer == "tma":
                 mcast = f", mcast_mask=ctx.mc_{ch}" if c.multicast else ""
+                bar = f"{h}.barrier"
+                if unchecked_here(key, "tma"):
+                    src('with unchecked("tma", reason="fuzz: opaque barrier access"):')
+                    src(f"    bar_{h} = {h}.barrier")
+                    bar = f"bar_{h}"
+                dst = f"ctx.ts_{ch}[None, {h}.index]"
+                if c.storage:
+                    dst = f'{h}.view("T", write=True, by="tma")'
                 src(
-                    f"cute.copy(ctx.tma_{ch}, ctx.tg_{ch}[None, {e} % {c.tma_tiles}], "
-                    f"ctx.ts_{ch}[None, {h}.index], tma_bar_ptr={h}.barrier{mcast})"
+                    f"cute.copy(ctx.tma_{ch}, ctx.tg_{ch}[None, {e} % {c.tma_tiles}], {dst}, "
+                    f"tma_bar_ptr={bar}{mcast})"
                 )
         else:
             offs = tuple(lay.cons[(ch, r.name, i)] for i in range(r.instances))
             log = f"base + {_by_stage(offs, r)} + 2"
-            if c.payload:
-                _, width = payload_offsets(spec, c)
+            if c.mma == "ab":
+                acc = _hvar(("macc", "p", 0))
+                src(f"for kb in cutlass.range_constexpr({mma.k // 16}):")
                 src(
-                    f"err_{ch} = err_{ch} + D.check_words({h}.data, {e}, tid, {slot(key)}, "
+                    f"    cute.gemm(mma_t, tAcc[None, None, None, {acc}.index], "
+                    f'{h}.view("A", None, None, kb, read=True, by="umma"), '
+                    f'{h}.view("B", None, None, kb, read=True, by="umma"), '
+                    f"tAcc[None, None, None, {acc}.index])"
+                )
+                src("    mma_t.set(tcgen05.Field.ACCUMULATE, True)")
+            elif c.mma == "acc":
+                ab = mma_channels(spec)[0]
+                src(
+                    "tDtC = t2r.partition_S(cute.zipped_divide(tAcc[None, None, None, "
+                    f"{h}.index], ctx.m_epi_tiler))"
+                )
+                src(f"for i in cutlass.range_constexpr({mma.n // 32}):")
+                src("    cute.copy(t2r, tDtC[None, None, i], rAcc)")
+                src(
+                    f"    err_{ch} = err_{ch} + D.mma_check(rAcc, tDcC[None, None, i], {e}, "
+                    f"{ab.mult}, {ab.tma_tiles}, {mma.k}, {mma.salt})"
+                )
+            elif c.payload or c.kind == "raw":
+                _, width = payload_offsets(spec, c)
+                data = words(key, False)
+                src(f"d_{h} = {data}")
+                src(
+                    f"err_{ch} = err_{ch} + D.check_words(d_{h}, {e}, tid, {slot(key)}, "
                     f"{width}, {r.threads}, {c.salt})"
                 )
                 src(
-                    f"D.put_capped(ctx.clog, {log}, {counter}, {spec.log_cap}, "
-                    f"{h}.data[0] >> 12, lead)"
+                    f"D.put_capped(ctx.clog, {log}, {counter}, {spec.log_cap}, d_{h}[0] >> 12, lead)"
                 )
             elif c.tiles_checked:
+                src(f"t_{h} = {tile(key)}")
                 src(
-                    f"err_{ch} = err_{ch} + D.check_tile(ctx.s_{ch}, {h}.index, {e} % "
-                    f"{c.tma_tiles}, tid, {c.tma_rows}, {TMA_COLS}, {r.threads}, {c.salt})"
+                    f"err_{ch} = err_{ch} + D.check_tile(t_{h}, {e} % {c.tma_tiles}, tid, "
+                    f"{c.tma_rows}, {TMA_COLS}, {r.threads}, {c.salt})"
                 )
                 src(
-                    f"D.put_capped(ctx.clog, {log}, {counter}, {spec.log_cap}, "
-                    f"ctx.s_{ch}[0, 0, {h}.index] >> 12, lead)"
+                    f"D.put_capped(ctx.clog, {log}, {counter}, {spec.log_cap}, t_{h}[0, 0] >> 12, "
+                    "lead)"
                 )
         src(f"{counter} = {counter} + 1")
 
     def on_close(key):
         ch, side, _ = key
         c = chans[ch]
-        h = _hvar(key)
         if side == "c":
             src(f"D.jitter({epoch(key)}, tid, {c.salt + 1}, {r.jitter})")
-            if c.payload:
+            if c.payload or c.kind == "raw":
                 _, width = payload_offsets(spec, c)
                 src(
-                    f"err_{ch} = err_{ch} + D.check_words({h}.data, {epoch(key)}, tid, "
+                    f"err_{ch} = err_{ch} + D.check_words({words(key, False)}, {epoch(key)}, tid, "
                     f"{slot(key)}, {width}, {r.threads}, {c.salt})"
                 )
             elif c.tiles_checked:
                 src(
-                    f"err_{ch} = err_{ch} + D.check_tile(ctx.s_{ch}, {h}.index, {epoch(key)} % "
+                    f"err_{ch} = err_{ch} + D.check_tile({tile(key)}, {epoch(key)} % "
                     f"{c.tma_tiles}, tid, {c.tma_rows}, {TMA_COLS}, {r.threads}, {c.salt})"
                 )
 
-    def open_expr(key) -> str:
+    def open_stmt(key):
         ch, side, k = key
+        c = chans[ch]
+        if c.kind == "raw":
+            return
         op = "acquire" if side == "p" else "wait"
-        arg = "" if chans[ch].kind == "ring" else ("stage" if k == BOUND else str(k))
-        return f"{ch}.{op}({arg})"
+        arg = "" if c.kind == "ring" else ("stage" if k == BOUND else str(k))
+        if unchecked_here(key, "unclosed"):
+            src('with unchecked("unclosed", reason="fuzz: signalled through the raw barrier"):')
+            src(f"    {_hvar(key)} = {ch}.{op}({arg})")
+        else:
+            src(f"{_hvar(key)} = {ch}.{op}({arg})")
 
-    withs = set(r.with_handles) if not extra else set()
+    def close_stmt(key):
+        ch, side, _ = key
+        c = chans[ch]
+        h = _hvar(key)
+        fence = c.commit_fence if side == "p" else c.release_fence
+        bar = f"{h}.full_barrier" if side == "p" else f"{h}.empty_barrier"
+        close = "commit" if side == "p" else "release"
+        if c.kind == "raw":
+            target = f"xraw + s_{ch}_p" if side == "p" else f"xraw + ({c.n} + s_{ch}_c)"
+            src(f"cute.arch.mbarrier_arrive({target})")
+        elif side in c.manual:
+            if fence:
+                src(_FENCE[fence])
+            src(f"D.warp_arrive({bar})")
+            src(f"{h}.{close}(signal=False)")
+        elif unchecked_here(key, "unclosed"):
+            if c.producer == "tma" and side == "p":
+                return  # the TMA transaction completes the stage; no close, no arrival
+            if fence:
+                src(_FENCE[fence])
+            src(f"cute.arch.mbarrier_arrive({bar})")
+        elif unchecked_here(key, "cross_region"):
+            src("if tid >= 0:")
+            src('    with unchecked("cross_region", reason="fuzz: closed in a uniform branch"):')
+            src(f"        {h}.{close}()")
+        else:
+            src(f"{h}.{close}()")
+
+    def with_ok(key) -> bool:
+        c = chans[key[0]]
+        return not c.manual and c.unchecked not in ("unclosed", "cross_region")
+
+    withs = {k for k in r.with_handles if with_ok(k)} if not extra else set()
     stack = []
     emitted = False
     for op, ch, side, k in r.events:
@@ -1085,14 +1648,13 @@ def _emit_body(src: _Src, spec: KernelSpec, r: RoleSpec, extra: bool):
             src.block(f"if cutlass.const_expr({cond}):")
         if op == "o":
             if key in withs:
-                src.block(
-                    f"with {open_expr(key).replace('acquire', 'produce').replace('wait', 'consume')}"
-                    f" as {_hvar(key)}:"
-                )
+                verb = "produce" if side == "p" else "consume"
+                arg = "" if chans[ch].kind == "ring" else ("stage" if k == BOUND else str(k))
+                src.block(f"with {ch}.{verb}({arg}) as {_hvar(key)}:")
                 stack.append(key)
                 on_open(key)
             else:
-                src(f"{_hvar(key)} = {open_expr(key)}")
+                open_stmt(key)
                 on_open(key)
         else:
             on_close(key)
@@ -1101,7 +1663,7 @@ def _emit_body(src: _Src, spec: KernelSpec, r: RoleSpec, extra: bool):
                 stack.pop()
                 src.end()
             else:
-                src(f"{_hvar(key)}.{'commit' if side == 'p' else 'release'}()")
+                close_stmt(key)
         if guarded:
             src.end()
         emitted = True
@@ -1109,12 +1671,35 @@ def _emit_body(src: _Src, spec: KernelSpec, r: RoleSpec, extra: bool):
         src("pass")
 
 
+def _emit_role_setup(src: _Src, spec: KernelSpec, r: RoleSpec):
+    """Per-role values the MMA subgraph and storage-bound channels need before the loop."""
+    if r.kind == "mma_load":
+        src("mab = mab.views(A=ctx.m_tAsA, B=ctx.m_tBsB)")
+    elif r.kind == "mma":
+        src("mab = mab.views(A=ctx.m_tCrA, B=ctx.m_tCrB)")
+        src("mma_t = ctx.m_tiled")
+        src('tAcc = cute.make_tensor(tmem.ptr("mma_acc"), ctx.m_acc_layout)')
+    elif r.kind == "mma_epi":
+        src(
+            "t2r = tcgen05.make_tmem_copy(cute.make_copy_atom(tcgen05.Ld32x32bOp("
+            "tcgen05.Repetition.x32), cutlass.Float32), cute.zipped_divide(ctx.m_acc_fake, "
+            "ctx.m_epi_tiler)[None, 0]).get_slice(tid)"
+        )
+        src('tAcc = cute.make_tensor(tmem.ptr("mma_acc"), ctx.m_acc_layout)')
+        src("tDcC = t2r.partition_D(cute.zipped_divide(ctx.m_tCcC, ctx.m_epi_tiler))")
+        src("rAcc = cute.make_rmem_tensor(tDcC[None, None, 0].shape, cutlass.Float32)")
+    for ch in spec.channels:
+        if ch.storage and ch.producer == "tma" and any(rn == r.name for rn, _ in ch.producers):
+            src(f"{ch.name} = {ch.name}.views(T=StageView(ctx.ts_{ch.name}, axis=1))")
+
+
 def _emit_role(src: _Src, spec: KernelSpec, r: RoleSpec):
     lay = Layout.of(spec)
     regs = "" if r.regs is None else f", regs={r.regs}"
     cta = "" if r.cta == "all" else f', cta="{r.cta}"'
+    raw = ", raw=True" if r.raw else ""
     warps = f"[{', '.join(f'range({w}, {w + r.width})' for w in r.warps)}]"
-    src(f"@role(warps={warps}{regs}{cta})")
+    src(f"@role(warps={warps}{regs}{cta}{raw})")
     src("@cute.jit")
     src.block(f"def {r.name}({', '.join(_role_params(spec, r))}):")
     first = _by_stage(r.warps, r)
@@ -1124,6 +1709,7 @@ def _emit_role(src: _Src, spec: KernelSpec, r: RoleSpec):
     src(f"base = D.cta_id() * {lay.per_cta}")
     codes = tuple(presence_code(spec, r.name, i) for i in range(r.instances))
     src(f"D.mark_warp(ctx.clog, base + {lay.presence}, {_by_stage(codes, r)})")
+    _emit_role_setup(src, spec, r)
     src("it = Int32(0)")
     counters = []
     for ch in spec.channels:
@@ -1146,12 +1732,24 @@ def _emit_role(src: _Src, spec: KernelSpec, r: RoleSpec):
             src.end()
         src("it = it + 1")
 
-    if spec.stream is None:
+    s = spec.stream
+    if not uses_stream(spec, r):
         src.block("for _ in cutlass.range(ctx.iters, unroll=1):")
         iteration()
         src.end()
+    elif r.raw:  # OneShot: this unit's one item, as a managed cursor would start
+        items = _by_stage(tuple(lay.role_items[(r.name, i)] for i in range(r.instances)), r)
+        base_r, spread, a, b, c = s.rounds
+        src("valid, (m, n, l) = self.work.single_item()")
+        src("rounds = Int32(0)")
+        src.block("if valid:")
+        src(f"rounds = (Int32(m) * {a} + Int32(n) * {b} + Int32(l) * {c}) % {spread} + {base_r}")
+        src.end()
+        src(f"D.log_raw_item(ctx.clog, base + {items}, {spec.item_cap}, valid, (m, n, l), lead)")
+        src.block("for _ in cutlass.range(rounds, unroll=1):")
+        iteration()
+        src.end()
     else:
-        s = spec.stream
         items = _by_stage(tuple(lay.role_items[(r.name, i)] for i in range(r.instances)), r)
         base_r, spread, a, b, c = s.rounds
         src("nitems = Int32(0)")
@@ -1179,15 +1777,95 @@ def _emit_role(src: _Src, spec: KernelSpec, r: RoleSpec):
         src(f"D.put(ctx.clog, base + {off}, k_{ch}_{side}, lead)")
         if side == "c":
             src(f"D.add(ctx.clog, base + {off} + 1, err_{ch})")
-    returned = [ch for ch, _ in counters]
+    returned = [] if r.raw else [ch for ch, _ in counters]
     if spec.turn_role == r.name:
         returned.append("ts")
-    if spec.stream is not None:
+    if s is not None and not r.raw:
         returned.append("work")
     if returned:
         src(f"return {', '.join(returned)}")
     src.end()
     src()
+
+
+def call_args(spec: KernelSpec) -> list[tuple[str, str]]:
+    """``(name, kind)`` of the entry point's tensor arguments after ``max_ctas`` (before the
+    stream). Kinds: ``tma_src``, ``mma_a``, ``mma_b``, ``rows`` (int32 (rows, 3)), ``vec``
+    (int32 vector), ``int`` (Int32)."""
+    out = [
+        (f"src_{ch.name}", "tma_src")
+        for ch in spec.channels
+        if ch.producer == "tma" and not ch.mma
+    ]
+    if spec.mma is not None:
+        out += [("mma_a", "mma_a"), ("mma_b", "mma_b")]
+    s = spec.stream
+    if s is not None and s.mapping == "table":
+        out += [("table", "rows"), ("bad", "vec")]
+    elif s is not None and s.mapping == "packed":
+        out += [("table", "rows"), ("length", "vec")]
+        if s.pdl:
+            out += [("stage", "rows"), ("plen", "int")]
+    return out
+
+
+_PREAMBLE_SCHEDULES = '''
+@cute.jit
+def _countdown(index, problem):
+    """``index`` while it is a valid index, else the terminal index ``total``."""
+    return cutlass.select_(index >= 0, index, problem.total)
+
+
+@dataclass(frozen=True)
+class ReverseStatic(IndexSchedule):
+    """Static persistent from the back: unit ``b`` runs ``total-1-b, total-1-b-U, ...``."""
+
+    def first_index(self, problem):
+        return _countdown(problem.total - 1 - problem.first_unit(), problem)
+
+    def next_index(self, index, problem):
+        return _countdown(index - problem.units(), problem)
+
+
+@dataclass(frozen=True)
+class ReverseBroadcast(IndexSchedule):
+    """The same sequence, claimed on the scheduler warp and broadcast."""
+
+    stages: int = 2
+    broadcast = True
+
+    def first_index(self, problem):
+        return _countdown(problem.total - 1 - problem.first_unit(), problem)
+
+    def claim_next(self, fetch, problem, index):
+        return _countdown(index - problem.units(), problem)
+
+'''
+
+_PREAMBLE_TABLE = '''
+@dataclass(frozen=True)
+class TableMap(WorkMap):
+    """Rows of an int32 ``(max(total, 1), 3)`` table; no ``decodes_any_index``, so a decode
+    outside ``[0, total)`` (R14) counts in ``bad[0]``."""
+
+    words = 3
+
+    def bind(self, space):
+        table, bad, em, en, el = space
+        nonempty = (em > 0) & (en > 0) & (el > 0)
+        return table, bad, cutlass.select_(nonempty, em * en * el, Int32(0))
+
+    def count64(self, space):
+        return Int64(space[2])
+
+    def decode(self, index, space):
+        table, bad, total = space
+        return True, D.table_row(table, bad, index, total)
+
+    def get_key(self):
+        return "fuzztable"
+
+'''
 
 
 def emit(spec: KernelSpec) -> str:
@@ -1199,18 +1877,22 @@ def emit(spec: KernelSpec) -> str:
     src("from types import SimpleNamespace")
     src()
     src("import cutlass")
+    src("import cutlass.utils.blackwell_helpers as sm100_utils")
     src("from cuda.bindings import driver as cuda")
-    src("from cutlass import Int32, cute")
+    src("from cutlass import Int32, Int64, cute")
     src("from cutlass.cute.nvgpu import cpasync, tcgen05")
     src()
     src("from test.warpdrive_fuzz import runtime_device as D")
     src("from transformer_nuggets.cute.warpdrive import (")
     for name in (
+        "AtomicPersistent",
+        "Barriers",
+        "Channel",
         "Cluster",
         "ClusterLaunchControl",
         "Consumer",
         "CtaPair",
-        "AtomicPersistent",
+        "IndexSchedule",
         "Instance",
         "OneShot",
         "PdlWait",
@@ -1218,10 +1900,10 @@ def emit(spec: KernelSpec) -> str:
         "Raster",
         "Ring",
         "Slots",
+        "SmemPlan",
+        "StageView",
         "StaticPersistent",
         "Threads",
-        "WorkCursor",
-        "WorkStream",
         "Tma",
         "Tmem",
         "TmemPlan",
@@ -1229,13 +1911,18 @@ def emit(spec: KernelSpec) -> str:
         "Turnstile",
         "Umma",
         "WarpSpecialized",
+        "WorkCursor",
+        "WorkMap",
+        "WorkStream",
         "role",
+        "unchecked",
     ):
         src(f"    {name},")
     src(")")
+    src("from transformer_nuggets.cute.warpdrive.examples.packed_work import PackedWork")
     src()
     s = spec.stream
-    if s is not None and s.skip is not None:
+    if s is not None and s.mapping == "raster" and s.skip is not None:
         a, b, c, k = s.skip
         src()
         src("@dataclass(frozen=True)")
@@ -1251,6 +1938,10 @@ def emit(spec: KernelSpec) -> str:
         src(f'return "skipmod{a}{b}{c}{k}_" + super().get_key()')
         src.end(2)
         src()
+    if s is not None and s.schedule in ("reverse", "rbroadcast"):
+        src.lines += _PREAMBLE_SCHEDULES.splitlines()
+    if s is not None and s.mapping == "table":
+        src.lines += _PREAMBLE_TABLE.splitlines()
     src()
     src.block(f"class {class_name(spec)}(WarpSpecialized):")
     src.block("def __init__(self):")
@@ -1259,12 +1950,52 @@ def emit(spec: KernelSpec) -> str:
             src(f"self.cluster = {spec.geom.emit()}")
     elif spec.pair:
         src("self.cluster = CtaPair()")
+    plan = smem_buffers(spec)
+    if plan:
+        src("self.smem_plan = SmemPlan()")
+        for name, _ in plan:
+            if name in ("MA", "MB"):
+                src(
+                    f'{name.lower()} = self.smem_plan.buffer("{name}", cutlass.BFloat16, align=1024)'
+                )
+            elif name.startswith("Q_"):
+                root = "P_" + name[2:]
+                src(
+                    f'{name.lower()} = self.smem_plan.buffer("{name}", Int32, '
+                    f"overlaps={root.lower()})"
+                )
+            elif name.startswith("T_"):
+                src(f'{name.lower()} = self.smem_plan.buffer("{name}", Int32, align=128)')
+            else:
+                src(f'{name.lower()} = self.smem_plan.buffer("{name}", Int32)')
     for ch in spec.channels:
-        cls = "Ring" if ch.kind == "ring" else "Slots"
-        mcast = f', multicast="{ch.multicast}"' if ch.multicast else ""
-        prod = f"Tma({ch.tma_bytes}{mcast})" if ch.producer == "tma" else _MECH[ch.producer]
+        if ch.kind == "raw":
+            p_threads = spec.role(ch.producers[0][0]).threads
+            c_threads = spec.role(ch.consumers[0][0]).threads
+            counts = (
+                f", counts={[p_threads] * ch.n + [c_threads] * ch.n}"
+                if ch.raw_init == "auto"
+                else ""
+            )
+            src(f"self.{ch.name} = Barriers({2 * ch.n}{counts})")
+            continue
+        cls = "Channel" if ch.generic else "Ring" if ch.kind == "ring" else "Slots"
+        if ch.mma == "ab":
+            nbytes = (MMA_M + spec.mma.n) * spec.mma.k * 2
+            prod = f"Tma({nbytes})"
+        else:
+            mcast = f', multicast="{ch.multicast}"' if ch.multicast else ""
+            prod = f"Tma({ch.tma_bytes}{mcast})" if ch.producer == "tma" else _MECH[ch.producer]
         args = [str(ch.n), prod, _MECH[ch.consumer]]
-        if ch.payload:
+        if ch.mma == "ab":
+            args.append('buffer={"A": ma, "B": mb}')
+        elif ch.storage and ch.producer == "tma":
+            args.append(f'buffer={{"T": t_{ch.name}}}')
+        elif ch.storage == "overlap":
+            args.append(f'buffer={{"P": p_{ch.name}, "Q": q_{ch.name}}}')
+        elif ch.storage:
+            args.append(f'buffer={{"P": p_{ch.name}}}')
+        elif ch.payload:
             _, width = payload_offsets(spec, ch)
             args.append(f"payload=(Int32, ({width},))")
         if ch.commit_fence:
@@ -1273,15 +2004,24 @@ def emit(spec: KernelSpec) -> str:
             args.append(f'release_fence="{ch.release_fence}"')
         if ch.remote_scope:
             args.append(f'remote_scope="{ch.remote_scope}"')
+        if ch.manual:
+            args.append(f"override={override_of(spec, ch)!r}")
         src(f"self.{ch.name} = {cls}({', '.join(args)})")
     if spec.turn_role is not None:
         src(f"self.ts = Turnstile(enabled={spec.turn_enabled})")
     if spec.tmem_regions:
-        plan = "TmemPlan()" + "".join(f'.region("{n}", {c}, {k})' for n, c, k in spec.tmem_regions)
-        src(f"self.tmem_plan = {plan}")
+        tplan = "TmemPlan()" + "".join(
+            f'.region("{n}", {c}, {k})' for n, c, k in spec.tmem_regions
+        )
+        src(f"self.tmem_plan = {tplan}")
     if s is not None:
-        mapping = "SkipMod" if s.skip is not None else "Raster"
-        mapping += f'(along="{s.along}", swizzle={s.swizzle}, reverse={tuple(s.reverse)!r})'
+        if s.mapping == "table":
+            mapping = "TableMap()"
+        elif s.mapping == "packed":
+            mapping = "PackedWork(words=3)"
+        else:
+            mapping = "SkipMod" if s.skip is not None else "Raster"
+            mapping += f'(along="{s.along}", swizzle={s.swizzle}, reverse={tuple(s.reverse)!r})'
         schedule = _SCHEDULE[s.schedule].format(s.stages)
         extra = f", scheduler_warp={s.scheduler_warp}" if s.scheduler_warp is not None else ""
         ready = ", ready=PdlWait()" if s.ready else ""
@@ -1298,23 +2038,48 @@ def emit(spec: KernelSpec) -> str:
     for r in spec.roles:
         _emit_role(src, spec, r)
 
-    tma = [ch for ch in spec.channels if ch.producer == "tma"]
+    tma = [ch for ch in spec.channels if ch.producer == "tma" and not ch.mma]
     kargs = ["self", "clog: cute.Tensor", "hits: cute.Tensor", "iters: Int32"]
     for ch in tma:
         kargs += [f"tma_{ch.name}", f"tg_{ch.name}"]
+    if spec.mma is not None:
+        kargs += ["m_tiled", "m_tma_a", "m_mA", "m_tma_b", "m_mB", "m_a_layout", "m_b_layout"]
     if s is not None:
         kargs.append("bound")
     src("@cute.kernel")
     src.block(f"def kernel({', '.join(kargs)}):")
-    src("smem = self.begin_roles(work=bound)" if s is not None else "smem = self.begin_roles()")
+    layouts = ", ".join(f'"{name}": {layout}' for name, layout in plan)
+    begin = ["work=bound"] if s is not None else []
+    if plan:
+        begin.append(f"layouts={{{layouts}}}")
+    src(f"smem = self.begin_roles({', '.join(begin)})")
     ctx = ["clog=clog", "hits=hits", "iters=iters"]
     ctx.append("total=bound.total" if s is not None else "total=Int32(0)")
+    for ch in spec.channels:
+        if ch.kind == "raw":
+            p_threads = spec.role(ch.producers[0][0]).threads
+            c_threads = spec.role(ch.consumers[0][0]).threads
+            src(
+                f"rb_{ch.name} = smem.allocate_tensor(Int32, cute.make_layout(({p_threads}, {ch.n})), 16)"
+            )
+            ctx.append(f"rb_{ch.name}=rb_{ch.name}")
+            if ch.raw_init == "manual":  # Barriers(counts=None): before run_roles
+                src(f'xbars = self.barrier_ptr("{ch.name}")')
+                src.block("if cute.arch.make_warp_uniform(cute.arch.warp_idx()) == 0:")
+                src.block("with cute.arch.elect_one():")
+                src.block(f"for i in cutlass.range_constexpr({ch.n}):")
+                src(f"cute.arch.mbarrier_init(xbars + i, {p_threads})")
+                src(f"cute.arch.mbarrier_init(xbars + ({ch.n} + i), {c_threads})")
+                src.end(3)
     for ch in tma:
         c = ch.name
-        src(
-            f"s_{c} = smem.allocate_tensor(Int32, cute.make_ordered_layout(({ch.tma_rows}, "
-            f"{TMA_COLS}, {ch.n}), order=(1, 0, 2)), 128)"
-        )
+        if ch.storage:
+            src(f's_{c} = self.buffer("T_{c}")')
+        else:
+            src(
+                f"s_{c} = smem.allocate_tensor(Int32, cute.make_ordered_layout(({ch.tma_rows}, "
+                f"{TMA_COLS}, {ch.n}), order=(1, 0, 2)), 128)"
+            )
         coord, layout = "0", "cute.make_layout(1)"
         if ch.multicast:
             src(f'mc_{c} = self.cluster.multicast("{ch.multicast}")')
@@ -1325,11 +2090,54 @@ def emit(spec: KernelSpec) -> str:
             f"cute.group_modes(s_{c}, 0, 2), cute.group_modes(tg_{c}, 0, 2))"
         )
         ctx += [f"tma_{c}=tma_{c}", f"tg_{c}=tgp_{c}", f"ts_{c}=ts_{c}", f"s_{c}=s_{c}"]
+    if spec.mma is not None:
+        m = spec.mma
+        tile = f"({MMA_M}, {m.n}, {m.k})"
+        acc_n = mma_channels(spec)[1].n
+        src('m_sA, m_sB = self.buffer("MA"), self.buffer("MB")')
+        src("m_thr = m_tiled.get_slice(0)")
+        src(f"m_gA = cute.local_tile(m_mA, {tile}, (None, None, None), proj=(1, None, 1))")
+        src(f"m_gB = cute.local_tile(m_mB, {tile}, (None, None, None), proj=(None, 1, 1))")
+        for op, part in (("A", "partition_A"), ("B", "partition_B")):
+            src(
+                f"m_t{op}s{op}, m_t{op}g{op} = cpasync.tma_partition(m_tma_{op.lower()}, 0, "
+                f"cute.make_layout(1), cute.group_modes(m_s{op}, 0, 3), "
+                f"cute.group_modes(m_thr.{part}(m_g{op}), 0, 3))"
+            )
+        src(f"m_acc_shape = m_tiled.partition_shape_C(({MMA_M}, {m.n}))")
+        src("m_acc_fake = m_tiled.make_fragment_C(m_acc_shape)")
+        src(f"m_acc_staged = m_tiled.make_fragment_C(cute.append(m_acc_shape, {acc_n}))")
+        src(f"m_tCcC = m_thr.partition_C(cute.make_identity_tensor(({MMA_M}, {m.n})))")
+        ctx += [
+            "m_tiled=m_tiled",
+            "m_tma_a=m_tma_a",
+            "m_tma_b=m_tma_b",
+            "m_tAgA=m_tAgA",
+            "m_tBgB=m_tBgB",
+            "m_tAsA=StageView(m_tAsA, axis=1)",
+            "m_tBsB=StageView(m_tBsB, axis=1)",
+            "m_tCrA=StageView(m_tiled.make_fragment_A(m_sA), axis=3)",
+            "m_tCrB=StageView(m_tiled.make_fragment_B(m_sB), axis=3)",
+            "m_acc_fake=m_acc_fake",
+            "m_acc_layout=m_acc_staged.layout",
+            f"m_epi_tiler=((cute.size(m_acc_fake, mode=[0, 0]), "
+            f"cute.size(m_acc_fake, mode=[0, 1]) // {m.n // 32}),)",
+            "m_tCcC=m_tCcC",
+        ]
     if spec.smem_pad:
         src(f"smem.allocate_array(Int32, {spec.smem_pad})")
     src(f"self.run_roles(SimpleNamespace({', '.join(ctx)}))")
     src.end()
     src()
+    if s is not None and s.pdl:
+        src("@cute.kernel")
+        src.block(
+            "def produce(self, table: cute.Tensor, length: cute.Tensor, stage: cute.Tensor, "
+            "plen: Int32):"
+        )
+        src("D.produce_rows(table, length, stage, plen)")
+        src.end()
+        src()
     cargs = [
         "self",
         "clog: cute.Tensor",
@@ -1341,7 +2149,9 @@ def emit(spec: KernelSpec) -> str:
         "el: Int32",
         "max_ctas: Int32",
     ]
-    cargs += [f"src_{ch.name}: cute.Tensor" for ch in tma]
+    cargs += [
+        f"{name}: {'Int32' if kind == 'int' else 'cute.Tensor'}" for name, kind in call_args(spec)
+    ]
     cargs.append("stream: cuda.CUstream")
     src("@cute.jit")
     src.block(f"def __call__({', '.join(cargs)}):")
@@ -1364,15 +2174,60 @@ def emit(spec: KernelSpec) -> str:
         )
         src(f"tiles_{c} = cute.local_tile(tgt_{c}, ({ch.tma_rows}, {TMA_COLS}), (None, 0))")
         launch_args += [f"tma_{c}", f"tiles_{c}"]
+    if spec.mma is not None:
+        m = spec.mma
+        tile = f"({MMA_M}, {m.n}, {m.k})"
+        ab_n = mma_channels(spec)[0].n
+        src(
+            "m_tiled = cute.make_tiled_mma(tcgen05.MmaF16BF16Op(cutlass.BFloat16, "
+            f"cutlass.Float32, ({MMA_M}, {m.n}, 16), tcgen05.CtaGroup.ONE, "
+            "tcgen05.OperandSource.SMEM, cute.nvgpu.OperandMajorMode.K, "
+            "cute.nvgpu.OperandMajorMode.K))"
+        )
+        src(
+            f"m_a_layout = sm100_utils.make_smem_layout_a(m_tiled, {tile}, cutlass.BFloat16, {ab_n})"
+        )
+        src(
+            f"m_b_layout = sm100_utils.make_smem_layout_b(m_tiled, {tile}, cutlass.BFloat16, {ab_n})"
+        )
+        src("m_tma_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)")
+        for op in ("a", "b"):
+            src(
+                f"m_tma_{op}, m_m{op.upper()} = cute.nvgpu.make_tiled_tma_atom_{op.upper()}("
+                f"m_tma_op, mma_{op}, cute.select(m_{op}_layout, mode=[0, 1, 2]), {tile}, m_tiled)"
+            )
+        launch_args += [
+            "m_tiled",
+            "m_tma_a",
+            "m_mA",
+            "m_tma_b",
+            "m_mB",
+            "m_a_layout",
+            "m_b_layout",
+        ]
+    pdl = ""
     if s is not None:
-        src("bound = self.work.bind((em, en, el), ws, max_ctas)")
+        if s.mapping == "table":
+            space = "(table, bad, em, en, el)"
+        elif s.mapping == "packed":
+            space = "(table, length)"
+        else:
+            space = "(em, en, el)"
+        if s.pdl:
+            src(f'self.produce.set_name_prefix("{kernel_name(spec)}_produce")')
+            src(
+                "self.produce(table, length, stage, plen).launch(grid=(1, 1, 1), "
+                f"block=({PRODUCER_THREADS}, 1, 1), stream=stream)"
+            )
+            pdl = ", use_pdl=True"
+        src(f"bound = self.work.bind({space}, ws, max_ctas)")
         launch_args.append("bound")
         cfg = "**self.launch_config(bound)"
         if s.launch_1d:
             cfg = f"**self.launch_config(grid=(cutlass.max(bound.total, 1) * {spec.cs}, 1, 1))"
     else:
         cfg = f"**self.launch_config(grid=({spec.units * spec.cs}, 1, 1))"
-    src(f"self.kernel({', '.join(launch_args)}).launch({cfg}, stream=stream)")
+    src(f"self.kernel({', '.join(launch_args)}).launch({cfg}, stream=stream{pdl})")
     src.end(2)
     return src.text()
 
@@ -1406,6 +2261,23 @@ def features(spec: KernelSpec) -> set[str]:
         out.add("oneshot_1d_launch")
     if s is not None and s.record:
         out.add("record")
+    if s is not None and s.mapping != "raster":
+        out.add(f"mapping_{s.mapping}")
+    if s is not None and s.pdl:
+        out.add("pdl_producer")
+    if spec.iket:
+        out.add("iket" if spec.iket == 2 else "iket_nowait")
+    if spec.alias_check != "warn":
+        out.add(f"alias_{spec.alias_check}")
+    if spec.concurrent:
+        out.add("concurrent_streams")
+    if spec.mma is not None:
+        out.add("tcgen05_mma")
+    for r in spec.roles:
+        if r.raw:
+            out.add("raw_role_tmem" if r.tmem else "raw_role")
+            if s is not None and s.schedule == "oneshot":
+                out.add("raw_single_item")
     if spec.turn_role:
         out.add("turnstile" if spec.turn_enabled else "turnstile_disabled")
     if spec.tmem_regions:
@@ -1444,4 +2316,17 @@ def features(spec: KernelSpec) -> set[str]:
             out.add("tma_multicast")
         if ch.kind == "slots" and ch.n > 4:
             out.add("slots_many")
+        if ch.kind == "raw":
+            out.add(f"barriers_{ch.raw_init}")
+        if ch.manual:
+            out.add("override_signal_false")
+            out.add(f"override_{ch.override_form}_{ch.manual}")
+        if ch.generic:
+            out.add("channel_class")
+        if ch.unchecked:
+            out.add(f"unchecked_{ch.unchecked}")
+        if ch.storage:
+            out.add(f"storage_{ch.storage}_{'tma' if ch.producer == 'tma' else 'threads'}")
+        if ch.alias_opt_out:
+            out.add("unchecked_alias")
     return out

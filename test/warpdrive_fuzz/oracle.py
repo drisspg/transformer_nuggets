@@ -13,38 +13,46 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from test.warpdrive_fuzz.gen import BOUND, MAX_WARPS, KernelSpec, Layout, StreamSpec, presence_code
+from test.warpdrive_fuzz.gen import (
+    BOUND,
+    MAX_WARPS,
+    KernelSpec,
+    Layout,
+    StreamSpec,
+    item_order,
+    packed_rows,
+    presence_code,
+    skipped,
+    table_rows,
+    uses_stream,
+)
 
 GRID_YZ_LIMIT = 65535
 
 
-@functools.cache
 def raster_order(s: StreamSpec) -> list[tuple[int, int, int]]:
-    """Every (m, n, l) in visiting order: ``l`` slowest; bands of ``swizzle`` tiles across the
-    non-``along`` axis, the banded axis fastest inside a band; reversed axes count down."""
-    em, en, el = s.extents
-    e_along, e_band = (em, en) if s.along == "m" else (en, em)
-    out = []
-    for li in range(el):
-        for start in range(0, e_band, s.swizzle):
-            band = range(start, min(start + s.swizzle, e_band))
-            for a in range(e_along):
-                for b in band:
-                    m, n = (a, b) if s.along == "m" else (b, a)
-                    if "m" in s.reverse:
-                        m = em - 1 - m
-                    if "n" in s.reverse:
-                        n = en - 1 - n
-                    out.append((m, n, el - 1 - li if "l" in s.reverse else li))
-    return out
+    """Every (m, n, l) in visiting order (``gen.item_order``: an explicit enumeration of the
+    documented order, independent of ``Raster.decode``)."""
+    return list(item_order(s))
 
 
-def skipped(s: StreamSpec, item) -> bool:
-    if s.skip is None:
-        return False
-    a, b, c, k = s.skip
-    m, n, li = item
-    return (m * a + n * b + li * c) % k == 0
+def garbage_row(s: StreamSpec) -> tuple[int, int, int]:
+    """Spare packed-table rows: outside the raster space, so a decoded one is visibly wrong."""
+    return (max(s.extents[0], 0) + 7, 0, 0)
+
+
+@functools.cache
+def space(s: StreamSpec) -> tuple[tuple, tuple]:
+    """``(item per index, kept per index)`` over ``[0, s.total)`` for the stream's mapping."""
+    if s.mapping == "table":
+        items = table_rows(s)
+        return items, (True,) * len(items)
+    if s.mapping == "packed":
+        rows = packed_rows(s)
+        items = rows + (garbage_row(s),) * s.pad
+        return items, tuple(i < len(rows) for i in range(len(items)))
+    items = item_order(s)
+    return items, tuple(not skipped(s, it) for it in items)
 
 
 def expected_grid(spec: KernelSpec) -> tuple[int, int, int]:
@@ -53,7 +61,7 @@ def expected_grid(spec: KernelSpec) -> tuple[int, int, int]:
     if s is None:
         return (spec.units * cs, 1, 1)
     em, en, el = s.extents
-    if min(s.extents) <= 0 and not s.launch_1d:  # R17: an empty space launches one work unit
+    if s.total == 0 and not s.launch_1d:  # R17: an empty space launches one work unit
         return (cs, 1, 1)
     if s.launch_1d:
         return (max(s.total, 1) * cs, 1, 1)
@@ -61,7 +69,7 @@ def expected_grid(spec: KernelSpec) -> tuple[int, int, int]:
         if en <= GRID_YZ_LIMIT and el <= GRID_YZ_LIMIT:
             return (max(em, 1) * cs, max(en, 1), max(el, 1))
         return (max(s.total, 1) * cs, 1, 1)
-    if s.schedule in ("static", "atomic"):
+    if s.capped:
         cap = max(s.max_ctas // cs, 1) if cs > 1 else s.max_ctas
         return (max(1, min(s.total, cap)) * cs, 1, 1)
     return (max(s.total, 1) * cs, 1, 1)
@@ -96,16 +104,19 @@ def ctas(spec: KernelSpec) -> list[Cta]:
 
 
 def static_items(spec: KernelSpec, unit: int, units: int) -> list[int] | None:
-    """The unit's kept indices for OneShot/StaticPersistent; None for claimed schedules."""
+    """The unit's kept indices for schedules with a fixed per-unit sequence (OneShot, static,
+    and the two reverse-static custom schedules); None for claimed schedules."""
     s = spec.stream
-    order = raster_order(s)
+    _, kept = space(s)
     if s.schedule == "oneshot":
         seq = [unit] if unit < s.total else []
     elif s.schedule == "static":
         seq = list(range(unit, s.total, units))
+    elif s.schedule in ("reverse", "rbroadcast"):
+        seq = list(range(s.total - 1 - unit, -1, -units))
     else:
         return None
-    return [i for i in seq if not skipped(s, order[i])]
+    return [i for i in seq if kept[i]]
 
 
 @dataclass
@@ -128,12 +139,12 @@ def handle_stream(spec: KernelSpec, rname: str, inst: int, its: int) -> tuple[di
                 continue
             c = chans[ch]
             if extra:
-                if c.kind == "ring" and k >= c.extra_mult:
+                if c.kind != "slots" and k >= c.extra_mult:
                     continue
                 slot = inst if k == BOUND else k
                 if c.kind == "slots" and slot not in c.extra_slots:
                     continue
-            e = i * c.mult + k if c.kind == "ring" else i
+            e = i * c.mult + k if c.kind != "slots" else i
             if side == "p":
                 prods[ch] = prods.get(ch, 0) + 1
             else:
@@ -147,7 +158,8 @@ def handle_stream(spec: KernelSpec, rname: str, inst: int, its: int) -> tuple[di
     for ch in {c.name for c in spec.channels if any(rn == rname for rn, _ in c.consumers)}:
         c = chans[ch]
         vals = cons.get(ch, [])
-        out[ch] = Expected(len(vals), vals if (c.payload or c.tiles_checked) else None)
+        tagged = c.payload or c.tiles_checked or c.kind == "raw"
+        out[ch] = Expected(len(vals), vals if tagged else None)
     for ch in {c.name for c in spec.channels if any(rn == rname for rn, _ in c.producers)}:
         prods.setdefault(ch, 0)
     return out, prods
@@ -159,6 +171,7 @@ class Launch:
     hits: np.ndarray  # flat int32
     ws: np.ndarray
     timeline: dict | None = None  # WorkStream.timeline(): {role: [[(index, t), ...] per CTA]}
+    bad: int = 0  # decodes outside [0, total) of a mapping without decodes_any_index (R14)
 
 
 @dataclass
@@ -213,7 +226,7 @@ def check_launch(spec: KernelSpec, run: Launch, tag: str) -> Report:
     )
     s = spec.stream
     units = max(c.unit for c in cta_list) + 1
-    order = raster_order(s) if s is not None else []
+    order, kept = space(s) if s is not None else ((), ())
     unit_items: dict[int, list[int] | None] = {}
     absent = {}
     active_ranks = {
@@ -245,9 +258,20 @@ def check_launch(spec: KernelSpec, run: Launch, tag: str) -> Report:
         # Work items (R12): the unit's sequence, the same in every role and CTA of the unit.
         its = spec.iters
         if s is not None:
-            seqs = []
+            seqs, raw_seqs = [], []
             for r in spec.roles:
-                if not placed(spec, r.name, cta.rank):
+                if not placed(spec, r.name, cta.rank) or not uses_stream(spec, r):
+                    continue
+                if r.raw:  # single_item(): a count and the item's hash, no index
+                    off = lay.role_items[(r.name, 0)]
+                    k = int(row[off])
+                    raw_seqs.append(
+                        (
+                            r.name,
+                            k,
+                            row[off + 1 + spec.item_cap : off + 2 + spec.item_cap][:k].tolist(),
+                        )
+                    )
                     continue
                 for i in range(r.instances):
                     off = lay.role_items[(r.name, i)]
@@ -267,11 +291,7 @@ def check_launch(spec: KernelSpec, run: Launch, tag: str) -> Report:
                     )
             if len({(k, tuple(v)) for _, k, v, _ in seqs}) > 1:
                 rep.fail(f"{tag}: cta {cta.b} roles saw different item sequences: {seqs[:4]}")
-            expect = (
-                static_items(spec, cta.unit, units)
-                if s.schedule in ("oneshot", "static")
-                else None
-            )
+            expect = static_items(spec, cta.unit, units)  # None for claimed schedules
             if cta.unit in unit_items and unit_items[cta.unit] is not None and seqs:
                 prev = unit_items[cta.unit]
                 rep.expect(
@@ -286,13 +306,21 @@ def check_launch(spec: KernelSpec, run: Launch, tag: str) -> Report:
                         f"{tag}: cta {cta.b} {name} items {k}:{idx[:8]} != {len(expect)}:"
                         f"{expect[:8]}",
                     )
+                for name, k, hashes in raw_seqs:  # R20: what a managed cursor starts with
+                    want_h = [item_hash(*order[i]) for i in expect]
+                    rep.expect(
+                        k == len(expect) and hashes == want_h[:1],
+                        f"{tag}: cta {cta.b} raw {name} single_item {k}:{hashes} != "
+                        f"{len(expect)}:{want_h[:1]}",
+                    )
             elif seqs:
                 name, k, idx, _ = seqs[0]
                 unit_items.setdefault(cta.unit, idx if k <= spec.item_cap else None)
                 expect = idx if k <= spec.item_cap else None
             for name, k, idx, hashes in seqs:
                 rep.expect(
-                    hashes == [item_hash(*order[i]) for i in idx if 0 <= i < len(order)],
+                    hashes == [item_hash(*order[i]) for i in idx if 0 <= i < len(order)]
+                    and all(0 <= i < len(order) for i in idx),
                     f"{tag}: cta {cta.b} {name} work words do not decode its indices {idx[:8]}",
                 )
             if run.timeline is not None and s.record:
@@ -324,11 +352,13 @@ def check_launch(spec: KernelSpec, run: Launch, tag: str) -> Report:
                 continue
             for i in range(r.instances):
                 got_it = int(row[lay.role_it[(r.name, i)]])
-                reported.add(got_it)
-                role_its = got_it if its is None else its
+                follows = uses_stream(spec, r)
+                if follows:
+                    reported.add(got_it)
+                role_its = spec.iters if not follows else got_it if its is None else its
                 rep.expect(
                     got_it == role_its,
-                    f"{tag}: cta {cta.b} {r.name}[{i}] ran {got_it} iterations, model {its}",
+                    f"{tag}: cta {cta.b} {r.name}[{i}] ran {got_it} iterations, model {role_its}",
                 )
                 cons, prods = handle_stream(spec, r.name, i, role_its)
                 for ch, exp in cons.items():
@@ -377,7 +407,7 @@ def check_launch(spec: KernelSpec, run: Launch, tag: str) -> Report:
         rep.expect(ranks >= active_ranks, f"{tag}: CLC unit {unit} ran in only some of its CTAs")
     # R12 coverage: each kept index once per participating (role instance, rank).
     if s is not None:
-        kept = np.array([0 if skipped(s, it) else 1 for it in order], dtype=np.int32)
+        kept = np.array(kept, dtype=np.int32)
         total = s.total
         for r in spec.roles:
             for i in range(r.instances):
@@ -386,7 +416,8 @@ def check_launch(spec: KernelSpec, run: Launch, tag: str) -> Report:
                     seg = run.hits[
                         (ordinal * cs + rank) * total : (ordinal * cs + rank + 1) * total
                     ]
-                    want = kept if placed(spec, r.name, rank) else np.zeros_like(kept)
+                    logs = placed(spec, r.name, rank) and not r.raw
+                    want = kept if logs else np.zeros_like(kept)
                     if not np.array_equal(seg, want):
                         bad = np.nonzero(seg != want)[0][:8].tolist()
                         rep.fail(
@@ -398,11 +429,21 @@ def check_launch(spec: KernelSpec, run: Launch, tag: str) -> Report:
                 run.ws[:2].tolist() == [0, 0],
                 f"{tag}: atomic workspace not reset: {run.ws[:2].tolist()}",
             )
+        rep.expect(
+            run.bad == 0,
+            f"{tag}: the table mapping (no decodes_any_index) was decoded {run.bad} times "
+            "outside [0, total)",
+        )
     return rep
 
 
 def deterministic(spec: KernelSpec) -> bool:
-    return spec.stream is None or spec.stream.schedule in ("oneshot", "static")
+    return spec.stream is None or spec.stream.schedule in (
+        "oneshot",
+        "static",
+        "reverse",
+        "rbroadcast",
+    )
 
 
 def check(spec: KernelSpec, runs: list[Launch]) -> Report:
