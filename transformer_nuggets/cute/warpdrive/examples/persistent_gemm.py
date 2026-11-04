@@ -7,7 +7,7 @@ tile i; the epilogue stores through SMEM with TMA, which also clips ragged edges
 policy and the cluster are constructor arguments::
 
     PersistentGemm(policy=StaticPersistent())      # or OneShot(), DynamicPersistent(), Clc()
-    PersistentGemm(order=Raster(along="n", swizzle=4))  # any WorkMapping
+    PersistentGemm(order=CutlassStaticPersistent(swizzle=8))  # any WorkMapping, or an adapter
     PersistentGemm(cluster=CtaPair())              # 2-CTA: 256x256 MMA tiles, CtaGroup.TWO
 
 With ``CtaPair`` the MMA tile is 256x256x64: each CTA of the pair loads its 128 rows of A and

@@ -23,8 +23,9 @@ views and raw barrier pointers are not returned.
 The layer uses the returned state directly; no execution state is recovered from Python frames.
 Work scheduling (``scheduling.py``): declare ``self.tiles = TileStream(order=..., policy=...)``
 and give roles ``tiles: Tiles``; the policy (``OneShot``, ``StaticPersistent``,
-``DynamicPersistent``, ``Clc``, or a ``Policy`` subclass) and the order (``Raster`` or a
-``WorkMapping`` subclass) are one-line switches. Clusters (``cluster.py``): declare
+``DynamicPersistent``, ``Clc``, or a ``Policy`` subclass) and the order (``Raster``, a
+``WorkMapping`` subclass, or an ``adapters.py`` wrapper around a CUTLASS/FA4 scheduler) are
+one-line switches. Clusters (``cluster.py``): declare
 ``self.cluster = CtaPair()`` and pin the MMA role with ``@role(..., cta="leader")``. See
 ``examples/`` for a GEMM, a persistent GEMM, and an FA4-style attention forward.
 
@@ -77,6 +78,7 @@ outside a layer payload must declare ``remote_scope="cluster"``. The layer canno
 case. The cluster scope costs about 30% on FA4's hot S channel.
 """
 
+from transformer_nuggets.cute.warpdrive.adapters import CutlassStaticPersistent, Fa4Scheduler
 from transformer_nuggets.cute.warpdrive.channels import (
     Barriers,
     Channel,
@@ -124,7 +126,9 @@ __all__ = [
     "Clc",
     "Consumer",
     "CtaPair",
+    "CutlassStaticPersistent",
     "DynamicPersistent",
+    "Fa4Scheduler",
     "Handle",
     "Instance",
     "OneShot",

@@ -1,6 +1,9 @@
-"""The public scheduler interface: custom policies and the raw-role work-item accessor, swapped
-into the same kernels with one argument."""
+"""The public scheduler interface: custom policies, external scheduler adapters, and the raw-role
+work-item accessor, swapped into the same kernels with one argument."""
 
+import importlib
+import sys
+import warnings
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -12,6 +15,10 @@ pytest.importorskip("cutlass.cute")
 import cutlass
 from cuda.bindings import driver as cuda
 from cutlass import Int32, cute
+from cutlass_static_persistent_tile_scheduler import (
+    PersistentTileSchedulerParams,
+    StaticPersistentTileScheduler,
+)
 from test_cute_warpdrive_scheduling import (
     EMPTY_SPACES,
     OVERFLOWING_SPACES,
@@ -21,6 +28,7 @@ from test_cute_warpdrive_scheduling import (
     _check_gemm,
     _count_items,
     compile_count_toy,
+    compile_toy,
     run_toy,
 )
 
@@ -28,7 +36,9 @@ from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_te
 from transformer_nuggets.cute.warpdrive import (
     Clc,
     CtaPair,
+    CutlassStaticPersistent,
     DynamicPersistent,
+    Fa4Scheduler,
     OneShot,
     Policy,
     ProtocolError,
@@ -42,6 +52,11 @@ from transformer_nuggets.cute.warpdrive import (
     role,
 )
 
+# The vendored CUTLASS oracle still creates V1 fast-divmod divisors (the adapter does not).
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:FastDivmodDivisor is deprecated:DeprecationWarning"
+)
+
 
 @pytest.fixture
 def requires_blackwell() -> None:
@@ -49,6 +64,10 @@ def requires_blackwell() -> None:
         pytest.skip("CUDA not available")
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("scheduling tests require SM100-family (CLC)")
+
+
+def fa4_tile_scheduler():
+    return pytest.importorskip("flash_attn.cute.tile_scheduler")
 
 
 # --------------------------------------------------------------------------- #
@@ -150,6 +169,32 @@ def test_custom_policy_keys_and_launch_needs():
         TileStream(policy=DynamicPersistent()).problem((1, 1, 1))
 
 
+def test_adapters_import_without_flash_attn(monkeypatch):
+    """warpdrive imports without flash_attn; only constructing Fa4Scheduler needs it."""
+    monkeypatch.setitem(sys.modules, "flash_attn", None)
+    monkeypatch.setitem(sys.modules, "flash_attn.cute", None)
+    monkeypatch.setitem(sys.modules, "flash_attn.cute.tile_scheduler", None)
+    for name in [m for m in sys.modules if m.startswith("transformer_nuggets.cute.warpdrive")]:
+        monkeypatch.delitem(sys.modules, name)
+    warpdrive = importlib.import_module("transformer_nuggets.cute.warpdrive")
+    warpdrive.TileStream(order=warpdrive.CutlassStaticPersistent(swizzle=4))
+    with pytest.raises(ImportError, match="flash-attn-4"):
+        warpdrive.Fa4Scheduler(object)
+
+
+def test_adapter_validation():
+    with pytest.raises(ValueError, match="along"):
+        CutlassStaticPersistent(along="k")
+    with pytest.raises(ValueError, match="swizzle"):
+        CutlassStaticPersistent(swizzle=0)
+    assert CutlassStaticPersistent(swizzle=8).skips and not CutlassStaticPersistent().skips
+    ts = fa4_tile_scheduler()
+    with pytest.raises(ValueError, match="one linear index"):
+        Fa4Scheduler(ts.SingleTileScheduler)
+    assert Fa4Scheduler(ts.StaticPersistentTileScheduler).native_policy == StaticPersistent()
+    assert Fa4Scheduler(ts.SingleTileLPTScheduler).native_policy == OneShot()
+
+
 def test_work_item_rejects_persistent_policies():
     stream = TileStream(policy=StaticPersistent())
     with pytest.raises(ProtocolError, match="non-persistent local policy"):
@@ -196,32 +241,263 @@ def test_custom_policy_with_skips(requires_blackwell, policy, ready):
 
 
 # --------------------------------------------------------------------------- #
+# External schedulers: item order equals the library's own sequence.
+# --------------------------------------------------------------------------- #
+
+MAX_REF = ScheduleToy.MAX_ITEMS
+
+
+class ExternalReference:
+    """Runs an external scheduler the way its library does (``create``,
+    ``initial_work_tile_info``, ``advance_to_next_work``) and logs each unit's raw
+    ``(m, n, l)`` coordinates in ``log[unit, k]``. CUTLASS: the vendored BSD-3 CuTeDSL helper
+    (``cutlass_static_persistent_tile_scheduler.py``) over the space's tiles. FA4: its params
+    built here from ``TileSchedulerArguments`` the way FA4's bf16 head-dim-128 forward builds
+    them, independently of the adapter's ``bind``; ``lpt`` holds the LPT flags."""
+
+    def __init__(self, adapter, kind: str, seqlen_k: int = 0, lpt=(True, False)):
+        self.adapter, self.kind, self.seqlen_k, self.lpt = adapter, kind, seqlen_k, lpt
+        self.unit_axis = 2 if kind == "cutlass" else 0  # CUTLASS launches (1, 1, units)
+
+    def fa4_params(self, em, en, el):
+        ts = fa4_tile_scheduler()
+        args = ts.TileSchedulerArguments(
+            num_block=em,
+            num_head=en,
+            num_batch=el,
+            num_splits=Int32(1),
+            seqlen_k=Int32(self.seqlen_k),
+            headdim=128,
+            headdim_v=128,
+            total_q=Int32(0),
+            tile_shape_mn=(128, 128),
+            element_size=2,
+            lpt=self.lpt[0],
+            lpt_global=self.lpt[1],
+        )
+        return self.adapter.scheduler.to_underlying_arguments(args)
+
+    def _create(self, params):
+        if self.kind == "cutlass":
+            return StaticPersistentTileScheduler.create(
+                params, cute.arch.block_idx(), cute.arch.grid_dim()
+            )
+        return self.adapter.scheduler.create(params)
+
+    @cute.kernel
+    def kernel(self, log: cute.Tensor, params):
+        unit = cute.arch.block_idx()[self.unit_axis]
+        scheduler = self._create(params)
+        work = scheduler.initial_work_tile_info()
+        k = Int32(0)
+        while work.is_valid_tile:
+            if (cute.arch.thread_idx()[0] == 0) & (k < MAX_REF):
+                for a in cutlass.range_constexpr(3):
+                    log[unit, k, a] = Int32(work.tile_idx[a])
+            k += 1
+            scheduler.advance_to_next_work()
+            work = scheduler.get_current_work()
+
+    @cute.jit
+    def __call__(self, log: cute.Tensor, em: Int32, en: Int32, el: Int32, units: Int32,
+                 stream: cuda.CUstream):  # fmt: skip
+        if cutlass.const_expr(self.kind == "cutlass"):
+            a = self.adapter
+            params = PersistentTileSchedulerParams(
+                (em, en, el), (1, 1, 1), a.swizzle, a.along == "m"
+            )
+            grid = (1, 1, units)
+        else:
+            params = self.fa4_params(em, en, el)
+            grid = (units, 1, 1)
+        self.kernel(log, params).launch(grid=grid, block=(32, 1, 1), stream=stream)
+
+
+def reference_sequences(ref: ExternalReference, ext, units: int) -> list[list[int]]:
+    """Per unit, the tile ids the external scheduler visits inside the space (CUTLASS hands
+    out padded swizzle tiles too; the adapter skips them)."""
+    em, en, el = ext
+    log = torch.full((units, MAX_REF, 3), -1, dtype=torch.int32, device="cuda")
+    i32 = cutlass.Int32
+    fn = compile_tvm_ffi(
+        ref,
+        make_fake_compact_tensor(i32, (cute.sym_int(), MAX_REF, 3)),
+        Int32(1),
+        Int32(1),
+        Int32(1),
+        Int32(1),
+        name=f"warpdrive_external_reference_{ref.adapter.get_key()}",
+    )
+    fn(log, em, en, el, units)
+    torch.cuda.synchronize()
+    out = []
+    for row in log.cpu().tolist():
+        out.append([(li * en + n) * em + m for m, n, li in row if m >= 0 and m < em and n < en])
+    return out
+
+
+def padded_count(adapter: CutlassStaticPersistent, ext) -> int:
+    em, en, el = ext
+    s = adapter.swizzle
+    if adapter.along == "m":
+        en = -(-en // s) * s
+    else:
+        em = -(-em // s) * s
+    return em * en * el
+
+
+def check_external_order(op, ref, ext, max_ctas, items):
+    """Every tile reaches both roles once, and each unit's sequence (up to ``MAX_ITEMS``)
+    equals the external scheduler's."""
+    log, hits, _ = run_toy(op, ext, max_ctas, items=items)
+    assert (hits == 1).all(), f"tiles missed or repeated: {hits}"
+    assert torch.equal(log[0], log[1])
+    units = max(min(items, max_ctas), 1) if op.tiles.policy.uses_max_ctas else max(items, 1)
+    for b, want in enumerate(reference_sequences(ref, ext, units)):
+        want = want[:MAX_REF]
+        got = [t for t in log[0, b].tolist() if t >= 0]
+        assert got == want, (b, got, want)
+
+
+EXTERNAL_SHAPES = [((5, 3, 1), 148), ((13, 29, 3), 148), ((7, 17, 2), 5)]
+
+
+@pytest.mark.parametrize("ext,max_ctas", EXTERNAL_SHAPES)
+@pytest.mark.parametrize(
+    "adapter",
+    [
+        CutlassStaticPersistent(),
+        CutlassStaticPersistent(along="n"),
+        CutlassStaticPersistent(swizzle=3),
+        CutlassStaticPersistent(swizzle=8, along="n"),
+    ],
+    ids=lambda a: a.get_key(),
+)
+def test_cutlass_static_persistent_order(requires_blackwell, adapter, ext, max_ctas):
+    op = ScheduleToy(adapter.native_policy, order=adapter, mode="ext")
+    ref = ExternalReference(adapter, "cutlass")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        compile_toy(op)
+    assert not [w for w in caught if issubclass(w.category, DeprecationWarning)], caught
+    check_external_order(op, ref, ext, max_ctas, padded_count(adapter, ext))
+
+
+@pytest.mark.parametrize("ext,max_ctas", EXTERNAL_SHAPES)
+def test_fa4_static_persistent_order(requires_blackwell, ext, max_ctas):
+    ts = fa4_tile_scheduler()
+    adapter = Fa4Scheduler(ts.StaticPersistentTileScheduler)
+    op = ScheduleToy(adapter.native_policy, order=adapter, mode="ext")
+    ref = ExternalReference(adapter, "fa4")
+    check_external_order(op, ref, ext, max_ctas, ext[0] * ext[1] * ext[2])
+
+
+# 4096 keys of head dim 128 in bf16 give 16-head L2 sections, so 29 * 3 heads exercise FA4's
+# residual section.
+SEQLEN_K = 4096
+
+
+class LptToy(ScheduleToy):
+    """Binds ``(num_block, num_head, num_batch, seqlen_k)``."""
+
+    seqlen_k = SEQLEN_K
+
+    def space(self, em, en, el):
+        return (em, en, el, Int32(self.seqlen_k))
+
+
+class LptCountToy(CountToy):
+    seqlen_k = SEQLEN_K
+
+    def space(self, em, en, el):
+        return (em, en, el, Int32(self.seqlen_k))
+
+
+class EmptyKvCountToy(LptCountToy):
+    seqlen_k = 0  # FA4 would divide by the zero K/V bytes per head
+
+
+@pytest.mark.parametrize("lpt", [(True, False), (False, False), (True, True)], ids=str)
+@pytest.mark.parametrize("ext", [(5, 3, 1), (13, 29, 3), (2, 40, 1)])
+def test_fa4_lpt_order(requires_blackwell, ext, lpt):
+    ts = fa4_tile_scheduler()
+    adapter = Fa4Scheduler(ts.SingleTileLPTScheduler, lpt=lpt[0], lpt_global=lpt[1])
+    op = LptToy(adapter.native_policy, order=adapter, mode="ext")
+    ref = ExternalReference(adapter, "fa4", SEQLEN_K, lpt)
+    check_external_order(op, ref, ext, 148, ext[0] * ext[1] * ext[2])
+
+
+def test_fa4_adapter_spaces_and_keys():
+    ts = fa4_tile_scheduler()
+    with pytest.raises(ValueError, match="seqlen_k"):
+        Fa4Scheduler(ts.SingleTileLPTScheduler).bind((1, 2, 3))
+    with pytest.raises(ValueError, match="num_batch\\)"):
+        Fa4Scheduler(ts.StaticPersistentTileScheduler).bind((1, 2, 3, 4))
+    with pytest.raises(ValueError, match="head_dim"):
+        Fa4Scheduler(ts.SingleTileLPTScheduler, head_dim=0)
+    # Every compile-time argument of the LPT scheduler is in the key.
+    keys = {
+        Fa4Scheduler(ts.SingleTileLPTScheduler, **kw).get_key()
+        for kw in [{}, {"lpt": False}, {"lpt_global": True}, {"head_dim": 64}, {"element_size": 1}]
+    }
+    assert len(keys) == 5
+
+
+@pytest.mark.parametrize("policy", ["dynamic", "clc", "reverse_broadcast"])
+def test_external_mapping_under_other_policies(requires_blackwell, policy):
+    """An adapter is a mapping: any policy distributes its items."""
+    policies = {"dynamic": DynamicPersistent(), "clc": Clc(), **CUSTOM}
+    adapter = CutlassStaticPersistent(swizzle=8)
+    op = ScheduleToy(policies[policy], order=adapter, mode="ext")
+    ext = (13, 29, 3)
+    _, hits, ws = run_toy(op, ext, 16, reps=2, items=padded_count(adapter, ext))
+    assert (hits == 1).all() and ws[:2].tolist() == [0, 0]
+
+
+# --------------------------------------------------------------------------- #
 # Pairs, empty spaces and overflow for custom policies and adapters
 # --------------------------------------------------------------------------- #
 
 
+def fa4_or_none():
+    try:
+        return importlib.import_module("flash_attn.cute.tile_scheduler")
+    except ImportError:
+        return None
+
+
 def count_cases():
-    """name -> (toy class, policy, order, overflow detected at launch)."""
+    """name -> (toy class, policy, order)."""
     cases = {
-        "reverse_static": (CountToy, ReverseStatic(), Raster(along="n", swizzle=3), True),
-        "reverse_broadcast": (CountToy, ReverseBroadcast(), Raster(along="n", swizzle=3), True),
+        "reverse_static": (CountToy, ReverseStatic(), Raster(along="n", swizzle=3)),
+        "reverse_broadcast": (CountToy, ReverseBroadcast(), Raster(along="n", swizzle=3)),
+        "cutlass_static": (CountToy, StaticPersistent(), CutlassStaticPersistent(swizzle=4)),
+        "cutlass_clc": (CountToy, Clc(), CutlassStaticPersistent(swizzle=4, along="n")),
     }
+    ts = fa4_or_none()
+    if ts is not None:
+        static = Fa4Scheduler(ts.StaticPersistentTileScheduler)
+        lpt_global = Fa4Scheduler(ts.SingleTileLPTScheduler, lpt_global=True)
+        lpt = Fa4Scheduler(ts.SingleTileLPTScheduler)
+        cases["fa4_static"] = (CountToy, static.native_policy, static)
+        cases["fa4_lpt_global"] = (LptCountToy, OneShot(), lpt_global)
+        cases["fa4_lpt_empty_kv"] = (EmptyKvCountToy, OneShot(), lpt)
     return cases
 
 
 @pytest.mark.parametrize("cluster", [SingleCta(), CtaPair()], ids=["single", "pair"])
 @pytest.mark.parametrize("case", list(count_cases()))
 def test_swapped_schedules_cover_empty_and_overflowing_spaces(requires_blackwell, case, cluster):
-    """Every CTA of a unit sees each item; empty spaces run nothing (and never divide by zero in
-    the entry point); spaces past Int32 are rejected at launch (custom ``reach`` default and
-    CUTLASS's Int64 ``size64``)."""
-    toy, policy, order, rejects_overflow = count_cases()[case]
+    """Every CTA of a unit sees each item; empty spaces (and an empty KV) run nothing or never
+    divide by zero in the entry point; spaces past Int32 are rejected at launch (custom
+    ``reach`` default and the adapters' Int64 ``size64``)."""
+    toy, policy, order = count_cases()[case]
     op = toy(policy, order, cluster)
     fn = compile_count_toy(op)
     ws, _ = op.tiles.launch_args("cuda")
     for space in EMPTY_SPACES:
         assert _count_items(fn, ws, space, 148) == [0, 0], space
-    for space in OVERFLOWING_SPACES if rejects_overflow else []:
+    for space in OVERFLOWING_SPACES:
         with pytest.raises(Exception, match="CUDA launch failed"):
             _count_items(fn, ws, space, 148)
     want = 5 * 3 * 2 * cluster.size
@@ -290,9 +566,10 @@ class RawItemToy(WarpSpecialized):
         (Raster(), "grid", (3, 70000, 1), CtaPair()),
         (Raster(swizzle=3, reverse="m"), "grid", (7, 5, 2), CtaPair()),
         (SkipOdd(swizzle=2), "grid", (9, 7, 2), SingleCta()),
+        (CutlassStaticPersistent(swizzle=4), "grid", (7, 5, 2), SingleCta()),
         (Raster(), "grid", (0, 3, 1), SingleCta()),  # empty: one unit, no valid item
     ],
-    ids=["tile_grid", "fallback", "hand_1d", "pair_fallback", "pair_swizzle", "skip",
+    ids=["tile_grid", "fallback", "hand_1d", "pair_fallback", "pair_swizzle", "skip", "cutlass",
          "empty"],
 )  # fmt: skip
 def test_raw_role_work_item(requires_blackwell, order, mode, ext, cluster):
@@ -329,6 +606,7 @@ def test_raw_role_work_item(requires_blackwell, order, mode, ext, cluster):
 
 
 def gemm_schedules():
+    ts = fa4_or_none()
     schedules = {
         "oneshot": (OneShot(), None),
         "static": (StaticPersistent(), None),
@@ -336,7 +614,13 @@ def gemm_schedules():
         "clc": (Clc(), None),
         "reverse_static": (ReverseStatic(), None),
         "reverse_broadcast": (ReverseBroadcast(), None),
+        "cutlass_native": (StaticPersistent(), CutlassStaticPersistent(swizzle=8)),
+        "cutlass_clc": (Clc(), CutlassStaticPersistent(swizzle=2, along="n")),
     }
+    if ts is not None:
+        adapter = Fa4Scheduler(ts.StaticPersistentTileScheduler)
+        schedules["fa4_native"] = (adapter.native_policy, adapter)
+        schedules["fa4_dynamic"] = (DynamicPersistent(), adapter)
     return schedules
 
 

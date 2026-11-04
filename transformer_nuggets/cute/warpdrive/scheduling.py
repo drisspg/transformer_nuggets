@@ -69,7 +69,8 @@ reset. A workspace must not be shared by concurrently running launches.
 Custom schedules subclass the same public protocols as the built-ins: ``Policy`` (next index),
 ``WorkMapping`` (index -> item, optional ``skip``), and ``Readiness`` (wait before the first
 decode). Their docstrings say which methods run on the host (in the ``@cute.jit`` entry point)
-and which on the device, and what each must guarantee.
+and which on the device, and what each must guarantee. ``adapters.py`` wraps external schedulers
+(CUTLASS, FA4) as mappings.
 """
 
 from __future__ import annotations

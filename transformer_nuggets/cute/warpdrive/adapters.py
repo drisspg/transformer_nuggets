@@ -1,0 +1,256 @@
+"""External tile schedulers as warpdrive work mappings.
+
+An adapter reuses an external scheduler's ``index -> tile`` mapping and leaves distribution to
+the warpdrive policy, so it swaps in with one line and runs under every policy::
+
+    self.tiles = TileStream(order=CutlassStaticPersistent(swizzle=8), policy=StaticPersistent())
+    self.tiles = TileStream(order=CutlassStaticPersistent(swizzle=8), policy=Clc())
+
+Each adapter's ``native_policy`` is the built-in policy that reproduces the external scheduler's
+own per-CTA sequence. The kernel keeps binding the same ``(m_tiles, n_tiles, l)`` space; the
+adapter derives the external space (FA4: its ``Params``) from it in the entry point.
+
+What carries over and what does not:
+
+* Only *index-addressable* schedulers adapt: those whose state is one linear work index and
+  whose current tile is a pure function of it. CUTLASS's ``StaticPersistentTileScheduler``
+  (its order, reimplemented from the BSD-3 CuTeDSL helper) and FA4's
+  ``StaticPersistentTileScheduler`` and ``SingleTileLPTScheduler`` (``STATIC`` mode) are.
+  FA4's ``SingleTileScheduler`` reads a 3-D ``blockIdx`` and is rejected; QuACK's and the
+  CLC/dynamic schedulers own their own pipelines, SMEM and barriers, which would duplicate the
+  layer's distribution.
+* The external ``initial_work_tile_info``/``advance_to_next_work``/``prefetch_next_work``/
+  ``producer_tail`` and ``get_grid_shape`` are not called: the warpdrive policy picks indices
+  and launches its own grid.
+* Indices count warpdrive work units, so a ``CtaPair`` maps one item per cluster: tiles are
+  work-unit tiles (FA4's params use a ``(1, 1)`` cluster shape).
+* Empty spaces (an extent <= 0) have no items. FA4's params are then built over one tile (and
+  an empty KV as one key), so no external arithmetic divides by zero, and the item count is
+  forced to 0.
+* Both adapters have an exact Int64 count (``size64``), so a space past ``2**31`` items is
+  rejected at launch like a ``Raster`` space.
+"""
+
+from __future__ import annotations
+
+import importlib
+from dataclasses import dataclass
+
+import cutlass
+from cutlass import Int32, Int64
+
+from transformer_nuggets.cute.warpdrive.scheduling import (
+    OneShot,
+    Policy,
+    Raster,
+    StaticPersistent,
+    WorkMapping,
+)
+
+
+def _at_least_one(value):
+    return max(value, 1) if isinstance(value, int) else cutlass.max(value, 1)
+
+
+def _bind_extents(space):
+    """``(extents, external, has_items)`` for a ``(m, n, l)`` space: the ``Raster``-normalized
+    extents (an empty space is ``(1, 1, 0)``), the same with ``l`` at least 1 (an empty space
+    becomes one tile, so no external arithmetic divides by zero), and 1 or 0 to scale the
+    external item count."""
+    em, en, el = Raster().bind(space)
+    has_items = min(el, 1) if isinstance(el, int) else cutlass.min(el, 1)
+    return (em, en, el), (em, en, _at_least_one(el)), has_items
+
+
+def _round_up(extent, multiple: int):
+    """``extent`` rounded up to ``multiple``, in Int64 for DSL values (never wraps Int32)."""
+    if isinstance(extent, int):
+        return -(-extent // multiple) * multiple
+    return (Int64(extent) + (multiple - 1)) // multiple * multiple
+
+
+@dataclass(frozen=True)
+class CutlassStaticPersistent(WorkMapping):
+    """The tile order of CUTLASS's ``StaticPersistentTileScheduler`` over
+    ``space = (m_tiles, n_tiles, l)``: ``along`` is the raster axis (CUTLASS ``raster_along_m``)
+    and ``swizzle`` the band width in tiles (CUTLASS ``swizzle_size``).
+
+    Reimplemented from the BSD-3 CuTeDSL helper (NVIDIA/cutlass
+    ``examples/python/CuTeDSL/helpers/static_persistent_tile_scheduler.py`` at ``e13f5cd``, which
+    replaces the deprecated ``cutlass.utils`` copy): its problem layout pads the banded axis to a
+    multiple of ``swizzle``, and on that padded space its order is exactly ``Raster(along,
+    swizzle)``, whose bands are then all full. CUTLASS hands the padded tiles to the kernel; this
+    adapter skips them, so roles only see tiles inside the space. The tests check the order
+    against the helper itself. ``bind`` normalizes extents like ``Raster`` (an empty space has
+    no items).
+    """
+
+    swizzle: int = 1
+    along: str = "m"
+    words = 3
+    native_policy = StaticPersistent()
+
+    def __post_init__(self):
+        if self.along not in ("m", "n"):
+            raise ValueError(
+                f"CutlassStaticPersistent.along must be 'm' or 'n', got {self.along!r}"
+            )
+        if type(self.swizzle) is not int or self.swizzle < 1:
+            raise ValueError(
+                f"CutlassStaticPersistent.swizzle must be a positive int, got {self.swizzle!r}"
+            )
+
+    @property
+    def skips(self) -> bool:
+        return self.swizzle > 1
+
+    @property
+    def _raster(self) -> Raster:
+        return Raster(along=self.along, swizzle=self.swizzle)
+
+    def _pad(self, extents, round_up):
+        """``extents`` with the banded axis (the one ``along`` does not name) rounded up to a
+        multiple of ``swizzle``."""
+        em, en, el = extents
+        if self.along == "m":
+            return em, round_up(en), el
+        return round_up(em), en, el
+
+    def bind(self, space):
+        extents = Raster().bind(space)
+        s = self.swizzle
+        # Int32 like CUTLASS: it wraps only for spaces size64 rejects at launch.
+        padded = extents if s == 1 else self._pad(extents, lambda e: (e + s - 1) // s * s)
+        return padded, extents
+
+    def size(self, space):
+        padded, _ = space
+        return Raster().size(padded)
+
+    def size64(self, space):
+        _, extents = space
+        return Raster().size64(self._pad(extents, lambda e: _round_up(e, self.swizzle)))
+
+    def decode(self, index, space):
+        padded, _ = space
+        return self._raster.decode(index, padded)
+
+    def skip(self, item, space):
+        _, (em, en, _) = space
+        m, n, _ = item
+        return (m >= em) | (n >= en)
+
+    def get_key(self) -> str:
+        return f"cutlasssp{self.along}{self.swizzle}"
+
+    def describe(self) -> str:
+        return f"CutlassStaticPersistent(along={self.along}, swizzle={self.swizzle})"
+
+
+def _fa4_tile_scheduler():
+    try:
+        return importlib.import_module("flash_attn.cute.tile_scheduler")
+    except ImportError as exc:
+        raise ImportError(
+            "Fa4Scheduler needs flash_attn.cute (FlashAttention 4, package flash-attn-4)"
+        ) from exc
+
+
+@dataclass(frozen=True)
+class Fa4Scheduler(WorkMapping):
+    """The tile mapping of a FlashAttention 4 scheduler class from
+    ``flash_attn.cute.tile_scheduler``: ``StaticPersistentTileScheduler`` or
+    ``SingleTileLPTScheduler`` (``STATIC`` mode). Items are ``(block, head, batch)``.
+
+    ``space`` is ``(num_block, num_head, num_batch)``; ``SingleTileLPTScheduler`` also takes
+    ``seqlen_k`` as a fourth entry, since it sizes its L2 sections from the K/V bytes per head.
+    Extents are normalized like ``Raster``. ``num_block`` counts work-unit blocks (one per
+    cluster of a ``CtaPair``): the FA4 params are built with a ``(1, 1)`` cluster shape. Its
+    compile-time arguments are fields here, so ``get_key`` names them: ``lpt`` (reverse block
+    order), ``lpt_global`` (one L2 section), ``head_dim``/``head_dim_v`` and ``element_size``
+    (the K/V bytes per key). ``StaticPersistentTileScheduler`` ignores them. No split-KV.
+    """
+
+    scheduler: type
+    lpt: bool = True
+    lpt_global: bool = False
+    head_dim: int = 128
+    head_dim_v: int = 128
+    element_size: int = 2
+    words = 3
+
+    def __post_init__(self):
+        ts = _fa4_tile_scheduler()
+        if self.scheduler not in (ts.StaticPersistentTileScheduler, ts.SingleTileLPTScheduler):
+            raise ValueError(
+                "Fa4Scheduler adapts StaticPersistentTileScheduler or SingleTileLPTScheduler, "
+                f"whose tile is a function of one linear index; got {self.scheduler!r}"
+            )
+        for name in ("head_dim", "head_dim_v", "element_size"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"Fa4Scheduler.{name} must be a positive int, got {value!r}")
+        for name in ("lpt", "lpt_global"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"Fa4Scheduler.{name} must be a bool")
+
+    @property
+    def _persistent(self) -> bool:
+        return self.scheduler is _fa4_tile_scheduler().StaticPersistentTileScheduler
+
+    @property
+    def native_policy(self) -> Policy:
+        return StaticPersistent() if self._persistent else OneShot()
+
+    def bind(self, space):
+        rank = 3 if self._persistent else 4
+        if len(space) != rank:
+            what = "(num_block, num_head, num_batch" + ("" if rank == 3 else ", seqlen_k") + ")"
+            raise ValueError(f"{self.describe()} space is {what}, got {space!r}")
+        extents, (num_block, num_head, num_batch), has_items = _bind_extents(space[:3])
+        # FA4 divides by the K/V bytes per head: an empty KV sizes its sections as one key.
+        seqlen_k = Int32(0) if self._persistent else _at_least_one(Int32(space[3]))
+        args = _fa4_tile_scheduler().TileSchedulerArguments(
+            num_block,
+            num_head,
+            num_batch,
+            Int32(1),  # num_splits
+            seqlen_k,
+            self.head_dim,
+            self.head_dim_v,
+            Int32(0),  # total_q, varlen only
+            (1, 1),  # tile_shape_mn, unused by these schedulers
+            element_size=self.element_size,
+            lpt=self.lpt,
+            lpt_global=self.lpt_global,
+        )
+        return self.scheduler.to_underlying_arguments(args), extents, has_items
+
+    def size(self, space):
+        params, _, has_items = space
+        count = params.total_blocks_cluster if self._persistent else params.total_blocks
+        return count * has_items
+
+    def size64(self, space):
+        # With a (1, 1) cluster and no splits both FA4 counts are num_block * num_head *
+        # num_batch, the Raster count, which is exact in Int64.
+        _, extents, _ = space
+        return Raster().size64(extents)
+
+    def decode(self, index, space):
+        params, _, _ = space
+        if self._persistent:
+            scheduler = self.scheduler(params, Int32(index))
+        else:
+            scheduler = self.scheduler(params, Int32(index), Int32(0))
+        return tuple(scheduler.get_current_work().tile_idx[:3])
+
+    def get_key(self) -> str:
+        if self._persistent:
+            return "fa4sp"
+        flags = ("lpt" if self.lpt else "") + ("global" if self.lpt_global else "")
+        sizes = f"{self.head_dim}_{self.head_dim_v}_{self.element_size}"
+        return f"fa4single{flags}_{sizes}"
+
+    def describe(self) -> str:
+        return f"Fa4Scheduler({self.scheduler.__name__})"
