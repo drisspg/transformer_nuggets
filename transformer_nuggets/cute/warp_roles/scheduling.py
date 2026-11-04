@@ -21,8 +21,12 @@ Three independent, compile-time choices:
   for empty items.
 * **launch grid**: ``OneShot`` with the default ``Raster()`` (along m, no swizzle or reversal)
   launches the tile space itself, ``(m_tiles, n_tiles, l)`` CTAs (times the cluster size along
-  x), and reads the item from ``blockIdx`` with no division; ``n_tiles`` and ``l`` are then
-  limited to 65535. Every other combination launches a 1-D grid and decodes the index.
+  x), and reads the item from ``blockIdx`` with no division. A launch whose ``n_tiles`` or ``l``
+  exceeds the 65535 limit of ``gridDim.y``/``z`` falls back to the 1-D grid; host and kernel
+  make the same runtime choice from the extents, and the kernel decodes the index in a skipped
+  branch of the prologue (about 25-45 ns on 512^3 to 2048^2 GEMMs, measured against reading
+  ``blockIdx`` unconditionally; the 1-D decode on every launch cost about 200 ns). Every other
+  combination launches a 1-D grid and decodes the index.
 * **distribution**, derived by the layer from the policy. Index sequences every role can compute
   (``OneShot``, ``StaticPersistent``) are decoded locally in each role with no synchronization.
   Claimed indices (``DynamicPersistent``, ``Clc``) are claimed by a layer-owned scheduler warp,
@@ -494,10 +498,20 @@ class TileProblem:
             unit = unit + em * (bidy + en * bidz)
         return unit
 
+    def start(self):
+        """Device-side, in the kernel prologue (``begin_roles``): the first item's words of a
+        ``_tile_grid`` stream, shared by every role so the fallback branch stays off their
+        paths."""
+        self.first_words = self.grid_item_words() if _tile_grid(self.stream) else None
+
     def grid_item_words(self):
-        """Device-side: this CTA's item words read from a tile-space grid (``_tile_grid``)."""
+        """Device-side: this CTA's item words for a ``_tile_grid`` stream, from ``blockIdx``
+        when the launch is the tile grid, decoded from the 1-D index when it fell back."""
         bidx, bidy, bidz = cute.arch.block_idx()
-        return [Int32(bidx if self.cs == 1 else bidx // self.cs), Int32(bidy), Int32(bidz)]
+        unit = bidx if self.cs == 1 else bidx // self.cs
+        return list(
+            _grid_item(self.stream.order, self.space, Int32(unit), Int32(bidy), Int32(bidz))
+        )
 
     def _uses_workspace(self) -> bool:
         return isinstance(self.stream.policy, DynamicPersistent) or bool(self.stream.record)
@@ -528,8 +542,7 @@ class TileProblem:
         if uses_cap and self.cs > 1:
             cap = cutlass.max(cap // self.cs, 1)
         if _tile_grid(self.stream):
-            em, en, el = self.space
-            return (em * self.cs, en, el)
+            return tile_grid_dims(self.space, self.cs)
         return (policy.grid_size(self.total, cap) * self.cs, 1, 1)
 
 
@@ -615,6 +628,39 @@ def _is_while_body(block, cond_block) -> bool:
     )
 
 
+MAX_GRID_YZ = 65535  # gridDim.y and gridDim.z limit
+
+
+def tile_grid_dims(space, cs: int = 1):
+    """Launch grid of a ``_tile_grid`` stream over ``space = (m_tiles, n_tiles, l)``: the tile
+    space (at least one CTA per axis) when ``n_tiles`` and ``l`` fit ``gridDim.y``/``z``, else
+    the 1-D grid of ``total`` items. Works on Python ints and on DSL extents."""
+    em, en, el = space
+    if all(isinstance(e, int) for e in space):
+        if en <= MAX_GRID_YZ and el <= MAX_GRID_YZ:
+            return (max(em, 1) * cs, max(en, 1), max(el, 1))
+        return (max(em * en * el, 1) * cs, 1, 1)
+    fits = (en <= MAX_GRID_YZ) & (el <= MAX_GRID_YZ)
+    one = Int32(1)
+    return (
+        Int32(cutlass.select_(fits, cutlass.max(em, one), cutlass.max(em * en * el, one))) * cs,
+        Int32(cutlass.select_(fits, cutlass.max(en, one), one)),
+        Int32(cutlass.select_(fits, cutlass.max(el, one), one)),
+    )
+
+
+@cute.jit
+def _grid_item(order, space, m, n, l):
+    """Item words of a ``_tile_grid`` stream: ``blockIdx`` as is, or, after the 1-D fallback
+    (where ``m`` is the linear index and ``n = l = 0``), the decoded index."""
+    decode = order.decode  # a method call on `order` in the branch would carry it
+    _, en, el = space
+    if (en > MAX_GRID_YZ) | (el > MAX_GRID_YZ):
+        dm, dn, dl = decode(m, space)
+        m, n, l = Int32(dm), Int32(dn), Int32(dl)
+    return m, n, l
+
+
 def _tile_grid(stream) -> bool:
     """One item per CTA in plain raster order: launch the tile space as the grid and take the item
     from ``blockIdx``. Decoding a 1-D index divides by the extents, which sits on the load warp's
@@ -675,7 +721,7 @@ class TileCursor:
             cur._first_item()
             return cur
         if end is None and _tile_grid(stream):
-            cur._words = problem.grid_item_words()
+            cur._words = list(problem.first_words)
         else:
             cur._words = _decode(stream, cur.index, problem)
         cur._first_item()

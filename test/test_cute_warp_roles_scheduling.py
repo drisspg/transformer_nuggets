@@ -27,6 +27,7 @@ from transformer_nuggets.cute.warp_roles import (
     WarpSpecialized,
     role,
 )
+from transformer_nuggets.cute.warp_roles.scheduling import tile_grid_dims
 
 POLICIES = {
     "oneshot": OneShot(),
@@ -293,10 +294,26 @@ def test_every_role_sees_every_tile_once(requires_blackwell, policy, ext, max_ct
     assert ws[:2].tolist() == [0, 0], "dynamic counter must self-reset"
 
 
-@pytest.mark.parametrize("ext", [(1, 1, 1), (5, 3, 1), (13, 29, 3)])
+@pytest.mark.parametrize(
+    "space, cs, grid",
+    [
+        ((5, 3, 2), 1, (5, 3, 2)),
+        ((5, 3, 2), 2, (10, 3, 2)),
+        ((0, 0, 1), 1, (1, 1, 1)),  # empty problem: one CTA that sees no item
+        ((7, 65535, 65535), 1, (7, 65535, 65535)),
+        ((3, 65536, 1), 1, (3 * 65536, 1, 1)),  # n_tiles over gridDim.y: 1-D fallback
+        ((3, 2, 65536), 2, (2 * 3 * 2 * 65536, 1, 1)),  # l over gridDim.z
+    ],
+)
+def test_tile_grid_dims_respect_the_grid_limit(space, cs, grid):
+    assert tile_grid_dims(space, cs) == grid
+
+
+@pytest.mark.parametrize("ext", [(1, 1, 1), (5, 3, 1), (13, 29, 3), (1, 65536, 1)])
 def test_oneshot_launches_the_tile_grid(requires_blackwell, ext):
     """OneShot over plain Raster() launches (m_tiles, n_tiles, l) CTAs and reads each item from
-    blockIdx; every tile still reaches every role once."""
+    blockIdx, or a 1-D grid it decodes once n_tiles exceeds gridDim.y; every tile still reaches
+    every role once."""
     op = ScheduleToy(OneShot(), order=Raster(), mode="tile_grid")
     _, hits, _ = run_toy(op, ext, 148, reps=2)
     assert (hits == 1).all(), f"tiles missed or repeated: {hits}"

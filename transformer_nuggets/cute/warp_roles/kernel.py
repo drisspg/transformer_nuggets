@@ -724,6 +724,8 @@ class WarpSpecialized:
                 f"got {sorted(problems)}"
             )
         self._ws_problems = problems
+        for problem in problems.values():
+            problem.start()  # per-CTA start values, computed once ahead of role dispatch
         self._ws_tma = {}
         self._ws_uses = {}  # (role, channel) -> acquires/waits per work item (0: inner loop)
         take_opt_outs()  # drop opt-outs left over from an earlier, failed trace
