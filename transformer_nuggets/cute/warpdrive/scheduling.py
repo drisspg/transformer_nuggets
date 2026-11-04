@@ -149,7 +149,7 @@ class Raster(WorkMapping):
     def __post_init__(self):
         if self.along not in ("m", "n"):
             raise ValueError(f"Raster.along must be 'm' or 'n', got {self.along!r}")
-        if not isinstance(self.swizzle, int) or self.swizzle < 1:
+        if type(self.swizzle) is not int or self.swizzle < 1:
             raise ValueError(f"Raster.swizzle must be a positive int, got {self.swizzle!r}")
         if isinstance(self.reverse, str):
             object.__setattr__(self, "reverse", (self.reverse,))
@@ -378,8 +378,20 @@ class TileStream:
     _workspaces: dict = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self):
-        if self.order.words < 1:
-            raise ValueError("work items need at least one word")
+        if type(self.order.words) is not int or self.order.words < 1:
+            raise ValueError("work items need at least one word (a positive int)")
+        if self.scheduler_warp is not None and (
+            type(self.scheduler_warp) is not int or not 0 <= self.scheduler_warp < 32
+        ):
+            raise ValueError(
+                f"TileStream.scheduler_warp must be an int in [0, 32), got {self.scheduler_warp!r}"
+            )
+        if type(self.record) is not int or self.record < 0:
+            raise ValueError(f"TileStream.record must be a nonnegative int, got {self.record!r}")
+        if self.policy.broadcast and (
+            type(self.policy.stages) is not int or self.policy.stages <= 0
+        ):
+            raise ValueError("broadcast policy stages must be a positive int")
 
     @property
     def cluster_size(self) -> int:

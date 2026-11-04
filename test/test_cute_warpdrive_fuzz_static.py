@@ -8,8 +8,10 @@ from test.warpdrive_fuzz.static import collect_roles, declaration_role
 from transformer_nuggets.cute.warpdrive import (
     Barriers,
     ProtocolError,
+    Raster,
     Ring,
     Threads,
+    TileStream,
     Tma,
     TmemPlan,
     Umma,
@@ -85,3 +87,20 @@ def test_role_rejects_illegal_setmaxnreg_budget(regs):
 def test_kernel_without_roles_has_clear_declaration_error():
     with pytest.raises(ValueError, match="at least one role"):
         collect_roles({})
+
+
+@pytest.mark.parametrize("warp", [-1, 32, True, 1.5])
+def test_stream_scheduler_warp_has_cuda_block_domain(warp):
+    with pytest.raises(ValueError, match="scheduler_warp"):
+        TileStream(scheduler_warp=warp)
+
+
+@pytest.mark.parametrize("record", [-1, True, 1.5])
+def test_stream_record_is_nonnegative_integer(record):
+    with pytest.raises(ValueError, match="record"):
+        TileStream(record=record)
+
+
+def test_raster_swizzle_rejects_bool():
+    with pytest.raises(ValueError, match="positive int"):
+        Raster(swizzle=True)
