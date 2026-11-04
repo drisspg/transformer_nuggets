@@ -12,6 +12,8 @@ counts, phases, barrier init, TMEM allocation/free, warpgroup padding and CTA-pa
 Role bodies are ordinary CuTeDSL; raw barriers and `cutlass.pipeline` can live alongside them.
 
 Experimental. Requires `nvidia-cutlass-dsl` 4.8 and a Blackwell SM100/SM103 GPU.
+See [the guarantee contract](GUARANTEES.md) for the supported program, checked rejections,
+caller obligations and known gaps; successful compilation is not a deadlock-freedom proof.
 
 ## A GEMM
 
