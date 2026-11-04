@@ -657,6 +657,7 @@ def _extend_stream(ext: random.Random, s: StreamSpec) -> StreamSpec:
 
 
 MMA_M = 128
+MMA_MIN_REGS = 40
 PRODUCER_THREADS = 128  # the packed table's PDL producer kernel
 MMA_TILES_MAX_COLS = 512
 
@@ -674,7 +675,10 @@ def _extend_roles(ext, roles, channels, geom, sched, tmem_regions):
     first_new = len(roles)
     mma, smem = None, 0
     used_cols = sum(c * k for _, c, k in tmem_regions)
-    if geom.size == 1 and ext.random() < 0.25 and w + 6 <= MAX_WARPS:
+    # F-C3: next to tcgen05 MMA code, ptxas cannot always allocate role budgets of 24 or 32
+    # (C7600, a compile error); keep the MMA subgraph to kernels whose budgets are >= 40.
+    low = any(r["regs"] is not None and r["regs"] < MMA_MIN_REGS for r in roles)
+    if geom.size == 1 and not low and ext.random() < 0.25 and w + 6 <= MAX_WARPS:
         n, k = ext.choice([32, 64]), 64
         ab_n, acc_n, kb = ext.randint(1, 3), ext.randint(1, 2), ext.randint(1, 3)
         if used_cols + n * acc_n <= MMA_TILES_MAX_COLS:
@@ -800,7 +804,9 @@ def _budget_new_groups(ext, roles, first_new, sched) -> bool:
     for g in groups:
         members = [r for r in roles[first_new:] if any(w // WARPGROUP == g for w in _owned([r]))]
         heavy = any(r.get("kind") in ("mma", "mma_epi") for r in members)
-        options = [None, *range(64 if heavy else 24, 257, 8)]
+        mma = any(r.get("kind", "").startswith("mma") for r in roles)
+        floor = 64 if heavy else MMA_MIN_REGS if mma else 24
+        options = [None, *range(floor, 257, 8)]
         ext.shuffle(options)
         for regs in options:
             for r in members:
