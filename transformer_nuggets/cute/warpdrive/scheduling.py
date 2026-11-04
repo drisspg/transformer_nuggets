@@ -29,6 +29,8 @@ Three independent, compile-time choices:
   every launch cost about 200 ns (GB300, CuTeDSL 4.8.0, CUDA-graph replay of
   examples/gemm.py). A hand-built ``(total, 1, 1)`` grid is also correct, just not
   division-free. Every other combination launches a 1-D grid and decodes the index.
+  An empty space (an extent <= 0) launches one work unit; a space whose indices or grid would
+  exceed Int32 gets a zero-wide grid that CUDA rejects (``TileProblem.grid``).
 * **distribution**, derived by the layer from the policy. Index sequences every role can compute
   (``OneShot``, ``StaticPersistent``) are decoded locally in each role with no synchronization.
   Claimed indices (``DynamicPersistent``, ``Clc``) are claimed by a layer-owned scheduler warp,
@@ -70,7 +72,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import cutlass
-from cutlass import Int32, cute
+from cutlass import Int32, Int64, cute
 
 from transformer_nuggets.cute.warpdrive.channels import Ring, Slots, Threads, Tma
 from transformer_nuggets.cute.warpdrive.protocol import ProtocolError, current_block, user_site
@@ -98,10 +100,14 @@ class WorkMapping:
     """Protocol for ``order=``. ``words``: Int32 words per item. ``bind(space)`` normalizes the
     runtime space (a DSL value), ``size(space)`` counts items, ``decode(index, space)`` returns
     ``words`` Int32 values, and ``item(words)`` builds what ``tiles.work`` returns.
+    ``size64(space)`` is the item count without Int32 wraparound, for the launch's range check
+    (``TileProblem.grid``); the default widens ``size``, so a mapping whose count can exceed
+    Int32 overrides it.
 
-    ``decode`` may be called with ``index >= size`` (its result is then ignored) and must not
-    fault there. ``skip(item, space)`` (optional, only called for valid indices) permanently
-    removes items no role should see; it is not a readiness wait.
+    ``decode`` and ``size`` receive the bound space. ``decode`` may be called with
+    ``index >= size`` (its result is then ignored), including on an empty space, and must not
+    fault or divide by zero there. ``skip(item, space)`` (optional, only called for valid
+    indices) permanently removes items no role should see; it is not a readiness wait.
     """
 
     words: int = 1
@@ -112,6 +118,9 @@ class WorkMapping:
 
     def size(self, space):
         raise NotImplementedError
+
+    def size64(self, space):
+        return Int64(self.size(space))
 
     def decode(self, index, space):
         raise NotImplementedError
@@ -138,7 +147,12 @@ class Raster(WorkMapping):
     visited high to low (``reverse="m"`` is longest-processing-time-first for causal attention).
 
     ``decode`` uses only ``+ - * // %`` and ``min``, so it runs on Python ints (tests) and on
-    device ``Int32`` values alike.
+    device ``Int32`` values alike. Its intermediates are bounded by the item count, so any space
+    whose count fits Int32 decodes without overflow.
+
+    ``bind`` treats a negative extent as zero and maps an empty space to
+    ``(max(m, 1), max(n, 1), 0)``: no items, and no zero divisor in ``decode``. It runs in the
+    host part of the jit entry point, so kernels pay nothing for it.
     """
 
     along: str = "m"
@@ -160,11 +174,17 @@ class Raster(WorkMapping):
     def bind(self, space):
         if len(space) != 3:
             raise ValueError(f"Raster space is (m_tiles, n_tiles, l), got {space!r}")
-        return tuple(Int32(e) for e in space)
+        em, en, el = (Int32(e) for e in space)
+        nonempty = cutlass.max(cutlass.min(cutlass.min(em, en), 1), 0)  # 1 if m, n > 0 else 0
+        return cutlass.max(em, 1), cutlass.max(en, 1), cutlass.max(el, 0) * nonempty
 
     def size(self, space):
         em, en, el = space
         return em * en * el
+
+    def size64(self, space):
+        em, en, el = space
+        return Int64(em) * en * el
 
     def decode(self, index, space):
         em, en, el = space
@@ -176,7 +196,8 @@ class Raster(WorkMapping):
             b = r // e_along
             a = r - b * e_along
         else:
-            band_tiles = self.swizzle * e_along
+            # A band never holds more than the whole layer, so this stays within the count.
+            band_tiles = _min(self.swizzle, e_band) * e_along
             start = (r // band_tiles) * self.swizzle
             width = _min(self.swizzle, e_band - start)
             local = r - start * e_along
@@ -238,6 +259,12 @@ class _Policy:
     def grid_size(self, total, max_units):
         return cutlass.max(cutlass.min(total, max_units), 1)
 
+    def reach(self, total, units, cs: int):
+        """Largest launch-grid x extent or linear index the launch computes, from the Int64 item
+        count ``total`` and ``units`` launched work units: the last unit's terminal index
+        overshoots ``total`` by less than the stride (``units``)."""
+        return total + units - 1
+
     def describe(self) -> str:
         return type(self).__name__ + (f"(stages={self.stages})" if self.broadcast else "()")
 
@@ -254,6 +281,9 @@ class OneShot(_Policy):
 
     def grid_size(self, total, max_units):
         return cutlass.max(total, 1)
+
+    def reach(self, total, units, cs: int):
+        return total * cs  # the 1-D grid; the terminal index is ``total``
 
     def step(self, index, problem):
         return problem.total
@@ -322,6 +352,9 @@ class Clc(_Policy):
 
     def grid_size(self, total, max_units):
         return cutlass.max(total, 1)
+
+    def reach(self, total, units, cs: int):
+        return total * cs  # the grid; a failed cancel returns the terminal index ``total``
 
     def fetch_channels(self) -> dict:
         # The scheduler's private response slot: try_cancel completes 16 bytes on the full
@@ -553,7 +586,8 @@ class TileProblem:
     def grid(self):
         """Launch grid for this policy: ``(ctas, 1, 1)``, or the tile space for a ``OneShot``
         over plain ``Raster()`` (``tile_grid_dims``); ``max_ctas`` caps CTAs, so a pair launches
-        at most ``max_ctas // 2`` clusters."""
+        at most ``max_ctas // 2`` clusters. An empty space launches one work unit. A space whose
+        ``policy.reach`` exceeds Int32 gets a zero-wide grid, which CUDA rejects at launch."""
         policy = self.stream.policy
         uses_cap = isinstance(policy, (StaticPersistent, DynamicPersistent))
         if uses_cap and self.max_ctas is None:
@@ -561,9 +595,16 @@ class TileProblem:
         cap = self.max_ctas
         if uses_cap and self.cs > 1:
             cap = cutlass.max(cap // self.cs, 1)
+        units = policy.grid_size(self.total, cap)
         if _tile_grid(self.stream):
-            return tile_grid_dims(self.space, self.cs)
-        return (policy.grid_size(self.total, cap) * self.cs, 1, 1)
+            x, y, z = tile_grid_dims(self.space, self.cs)
+        else:
+            x, y, z = units * self.cs, 1, 1
+        # Every grid extent and index must fit Int32. Past that the grid is zero-wide, so CUDA
+        # rejects the launch instead of the kernel covering a wrapped space. This is host code
+        # in the jit entry point: kernels pay nothing for the check.
+        reach = policy.reach(self.stream.order.size64(self.space), Int64(units), self.cs)
+        return Int32(cutlass.select_(reach <= INT32_MAX, x, Int32(0))), y, z
 
 
 # --------------------------------------------------------------------------- #
@@ -657,23 +698,28 @@ def _is_while_body(block, cond_block) -> bool:
 
 
 MAX_GRID_YZ = 65535  # gridDim.y and gridDim.z limit
+INT32_MAX = 2**31 - 1
 
 
 def tile_grid_dims(space, cs: int = 1):
     """Launch grid of a ``_tile_grid`` stream over ``space = (m_tiles, n_tiles, l)``: the tile
-    space (at least one CTA per axis) when ``n_tiles`` and ``l`` fit ``gridDim.y``/``z``, else
-    the 1-D grid of ``total`` items. Works on Python ints and on DSL extents."""
+    space when ``n_tiles`` and ``l`` fit ``gridDim.y``/``z``, else the 1-D grid of ``total``
+    items; one work unit when the space is empty (an extent <= 0). Works on Python ints and on
+    DSL extents."""
     em, en, el = space
     if all(isinstance(e, int) for e in space):
+        if min(space) <= 0:
+            return (cs, 1, 1)
         if en <= MAX_GRID_YZ and el <= MAX_GRID_YZ:
-            return (max(em, 1) * cs, max(en, 1), max(el, 1))
-        return (max(em * en * el, 1) * cs, 1, 1)
-    fits = (en <= MAX_GRID_YZ) & (el <= MAX_GRID_YZ)
+            return (em * cs, en, el)
+        return (em * en * el * cs, 1, 1)
+    nonempty = (em > 0) & (en > 0) & (el > 0)
+    tiles = nonempty & (en <= MAX_GRID_YZ) & (el <= MAX_GRID_YZ)
     one = Int32(1)
     return (
-        Int32(cutlass.select_(fits, cutlass.max(em, one), cutlass.max(em * en * el, one))) * cs,
-        Int32(cutlass.select_(fits, cutlass.max(en, one), one)),
-        Int32(cutlass.select_(fits, cutlass.max(el, one), one)),
+        Int32(cutlass.select_(tiles, em, cutlass.select_(nonempty, em * en * el, one))) * cs,
+        Int32(cutlass.select_(tiles, en, one)),
+        Int32(cutlass.select_(tiles, el, one)),
     )
 
 

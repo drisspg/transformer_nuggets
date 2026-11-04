@@ -254,6 +254,19 @@ smem = self.begin_roles(tiles=work)
 Static/dynamic policies need `max_ctas`. The dynamic int32 counter starts zeroed and resets after
 each launch; don't share its workspace across concurrent launches.
 
+Extents are runtime Int32 values, so the space is checked in the entry point's host code, not in
+the kernel:
+
+- A zero or negative extent is an empty space. Every policy launches one work unit (one
+  cluster for a pair), every role's `tiles.valid` is false at once, and the dynamic counter is
+  left zeroed. `Raster.bind` stores it as `(max(m, 1), max(n, 1), 0)`, so the kernel's
+  `work.space` reads that rather than the raw extents, and decoding never divides by zero.
+- Item count, grid and indices are Int32. `OneShot`/`Clc` need `total * cluster_size` <= 2^31-1;
+  static/dynamic need `total + launched units - 1` <= 2^31-1 (the last unit's terminal index).
+  `work.grid()` makes a larger space zero-wide, so the launch raises a CUDA
+  invalid-configuration error instead of covering a wrapped space. A hand-built grid gets no
+  check.
+
 ## CTA pairs
 
 ```python

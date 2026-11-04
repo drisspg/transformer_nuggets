@@ -16,11 +16,13 @@ from cutlass import Int32, cute
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
     Clc,
+    CtaPair,
     DynamicPersistent,
     OneShot,
     PdlWait,
     ProtocolError,
     Raster,
+    SingleCta,
     StaticPersistent,
     Tiles,
     TileStream,
@@ -120,6 +122,47 @@ def test_raster_validation():
         Raster(swizzle=0)
     with pytest.raises(ValueError):
         Raster(reverse=("k",))
+
+
+# Empty work spaces: a zero extent, or a negative one (treated as empty).
+EMPTY_SPACES = [
+    (0, 5, 3),
+    (5, 0, 3),
+    (5, 3, 0),
+    (0, 0, 0),
+    (0, 70000, 1),  # n_tiles over gridDim.y: the OneShot tile grid would fall back to 1-D
+    (-2, -3, 1),  # two negative extents multiply to a positive count
+    (-1, 4, 2),
+    (3, -5, -1),
+]
+
+
+@pytest.mark.parametrize("space", EMPTY_SPACES, ids=str)
+@pytest.mark.parametrize("order", ORDERS, ids=lambda o: o.get_key())
+def test_bound_empty_space_has_no_items_and_decodes(order, space):
+    """Host Int32 arithmetic folds like the device's (and raises on division by zero): a bound
+    empty space counts no items, and decode, which runs past the end, never divides by zero."""
+    bound = order.bind(space)
+    assert int(order.size(bound)) == 0
+    for index in range(4):
+        order.decode(Int32(index), bound)
+
+
+@pytest.mark.parametrize("ext", EXTENTS)
+def test_bind_keeps_nonempty_spaces(ext):
+    assert tuple(int(e) for e in Raster().bind(ext)) == ext
+
+
+@pytest.mark.parametrize("order", [Raster(swizzle=8), Raster(along="n", swizzle=8)])
+def test_swizzled_decode_does_not_overflow_int32(order):
+    """``swizzle * along-extent`` exceeds Int32 although the item count fits; Int32 decoding
+    still matches exact Python-int decoding."""
+    ext = (2**29, 3, 1) if order.along == "m" else (3, 2**29, 1)
+    bound = order.bind(ext)
+    total = 3 * 2**29
+    for index in [0, 5, 2**29 + 7, total - 2**29 - 1, total - 1]:
+        got = tuple(int(w) for w in order.decode(Int32(index), bound))
+        assert got == order.decode(index, ext)
 
 
 def test_stream_keys_exclude_runtime_values():
@@ -305,6 +348,8 @@ def test_every_role_sees_every_tile_once(requires_blackwell, policy, ext, max_ct
         ((5, 3, 2), 1, (5, 3, 2)),
         ((5, 3, 2), 2, (10, 3, 2)),
         ((0, 0, 1), 1, (1, 1, 1)),  # empty problem: one CTA that sees no item
+        ((1000, 0, 1), 1, (1, 1, 1)),  # not one idle CTA per m tile
+        ((7, -3, 2), 2, (2, 1, 1)),  # negative extents are empty: one cluster
         ((7, 65535, 65535), 1, (7, 65535, 65535)),
         ((3, 65536, 1), 1, (3 * 65536, 1, 1)),  # n_tiles over gridDim.y: 1-D fallback
         ((3, 2, 65536), 2, (2 * 3 * 2 * 65536, 1, 1)),  # l over gridDim.z
@@ -360,6 +405,119 @@ def test_all_items_skipped_terminates(requires_blackwell, policy):
     op = ScheduleToy(POLICIES[policy], order=SkipAll(), mode="skipall")
     _, hits, ws = run_toy(op, (5, 4, 1), 3, reps=2)
     assert (hits == 0).all() and ws[:2].tolist() == [0, 0]
+
+
+class CountToy(WarpSpecialized):
+    """Roles ``a`` (warp 0) and ``b`` (warps 1-2), in every CTA of the cluster, count the work
+    items they see in ``count[role]``."""
+
+    def __init__(self, policy, order, cluster):
+        self.cluster = cluster
+        self.tiles = TileStream(order=order, policy=policy)
+
+    def get_name(self) -> str:
+        return f"warpdrive_count_toy_{self.tiles.get_key()}_cs{self.cluster.size}"
+
+    @cute.jit
+    def _count(self, r: int, ctx):
+        if cute.arch.lane_idx() == 0 and cute.arch.warp_idx() == r:
+            cute.arch.atomic_add(ctx.count.iterator + r, Int32(1))
+
+    @role(warps=0)
+    @cute.jit
+    def a(self, tiles: Tiles, ctx):
+        while tiles.valid:
+            self._count(0, ctx)
+            tiles.advance()
+
+    @role(warps=range(1, 3))
+    @cute.jit
+    def b(self, tiles: Tiles, ctx):
+        while tiles.valid:
+            self._count(1, ctx)
+            tiles.advance()
+
+    @cute.kernel
+    def kernel(self, count: cute.Tensor, work):
+        self.begin_roles(tiles=work)
+        self.run_roles(SimpleNamespace(count=count))
+
+    @cute.jit
+    def __call__(
+        self,
+        count: cute.Tensor,
+        workspace: cute.Tensor,
+        em: Int32,
+        en: Int32,
+        el: Int32,
+        max_ctas: Int32,
+        stream: cuda.CUstream,
+    ):
+        work = self.tiles.problem((em, en, el), workspace, max_ctas)
+        self.kernel.set_name_prefix(self.get_name())
+        self.kernel(count, work).launch(**self.launch_config(work), stream=stream)
+
+
+def compile_count_toy(op: CountToy):
+    key = op.get_name()
+    if key not in _TOYS:
+        count, ws = (make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),)) for _ in range(2))
+        _TOYS[key] = compile_tvm_ffi(op, count, ws, Int32(1), Int32(1), Int32(1), Int32(1))
+    return _TOYS[key]
+
+
+SWIZZLED = Raster(along="n", swizzle=3, reverse=("m", "l"))
+COUNT_CASES = {
+    "oneshot_tile_grid": (OneShot(), Raster()),
+    "oneshot_1d": (OneShot(), SWIZZLED),
+    "static": (StaticPersistent(), SWIZZLED),
+    "dynamic": (DynamicPersistent(stages=2), SWIZZLED),
+    "clc": (Clc(stages=2), SWIZZLED),
+}
+
+
+def _count_items(fn, ws, space, max_ctas):
+    count = torch.zeros(2, dtype=torch.int32, device="cuda")
+    fn(count, ws, *space, max_ctas)
+    torch.cuda.synchronize()
+    return count.tolist()
+
+
+@pytest.mark.parametrize("cluster", [SingleCta(), CtaPair()], ids=["single", "pair"])
+@pytest.mark.parametrize("case", list(COUNT_CASES))
+def test_empty_space_runs_no_items(requires_blackwell, case, cluster):
+    """An empty (or negative) space launches one work unit, every role sees no item, and the
+    launch leaves the dynamic counter zeroed, so a later nonempty launch covers its space."""
+    op = CountToy(*COUNT_CASES[case], cluster)
+    fn = compile_count_toy(op)
+    ws, _ = op.tiles.launch_args("cuda")
+    cs = cluster.size
+    for space in EMPTY_SPACES:
+        for max_ctas in (148, 1):
+            assert _count_items(fn, ws, space, max_ctas) == [0, 0], (space, max_ctas)
+            assert ws[:2].tolist() == [0, 0], (space, max_ctas)
+    # 30 items over a capped grid: persistent units run several items each.
+    assert _count_items(fn, ws, (5, 3, 2), 4) == [30 * cs, 30 * cs]
+    assert ws[:2].tolist() == [0, 0]
+
+
+@pytest.mark.parametrize("case", list(COUNT_CASES))
+def test_space_overflowing_int32_is_rejected(requires_blackwell, case):
+    """An item count, grid, or persistent overshoot index past Int32 makes the launch fail
+    (no partial or wrapped coverage), and the next valid launch is unaffected."""
+    policy, order = COUNT_CASES[case]
+    op = CountToy(policy, order, SingleCta())
+    fn = compile_count_toy(op)
+    ws, _ = op.tiles.launch_args("cuda")
+    spaces = [(65537, 65537, 1)]  # 2**32 + 131073 items wrap to 131073 in Int32
+    if isinstance(policy, (StaticPersistent, DynamicPersistent)):
+        # Fits Int32, but the last unit's terminal index (total - 1 + units) does not.
+        spaces.append((2**31 - 100, 1, 1))
+    for space in spaces:
+        with pytest.raises(Exception, match="launch"):
+            _count_items(fn, ws, space, 148)
+    assert _count_items(fn, ws, (5, 3, 2), 4) == [30, 30]
+    assert ws[:2].tolist() == [0, 0]
 
 
 def test_record_needs_a_bound_stream(requires_blackwell):
