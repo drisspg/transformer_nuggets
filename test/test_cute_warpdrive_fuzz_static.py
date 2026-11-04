@@ -4,7 +4,15 @@ import pytest
 
 pytest.importorskip("cutlass.cute")
 
-from transformer_nuggets.cute.warpdrive import Barriers, Ring, Threads, Tma, Umma
+from transformer_nuggets.cute.warpdrive import (
+    Barriers,
+    ProtocolError,
+    Ring,
+    Threads,
+    Tma,
+    TmemPlan,
+    Umma,
+)
 
 
 @pytest.mark.parametrize("value", [0, -1, 1.5, True])
@@ -36,3 +44,26 @@ def test_stage_count_requires_integer(declaration, value):
 def test_raw_barrier_counts_require_positive_integers(counts):
     with pytest.raises(ValueError, match="positive ints"):
         Barriers(1, counts=counts)
+
+
+@pytest.mark.parametrize("value", [0, -1, 1.5, True])
+def test_tmem_rejects_nonpositive_or_noninteger_widths(value):
+    with pytest.raises(ValueError, match="positive"):
+        TmemPlan().region("a", value)
+    with pytest.raises(ValueError, match="positive int"):
+        TmemPlan().region("a", 32).alias("b", of="a", offset=0, cols=value)
+
+
+def test_tmem_rejects_duplicate_names_before_plan_corruption():
+    plan = TmemPlan().region("a", 32, 2).alias("b", of="a", offset=8, cols=16)
+    with pytest.raises(ValueError, match="already declared"):
+        plan.region("a", 16)
+    with pytest.raises(ValueError, match="already declared"):
+        plan.alias("a", of="a", offset=0, cols=16)
+    assert plan.used_cols == 64
+    assert plan.col("b", 1) == 40
+
+
+def test_tmem_unknown_alias_parent_is_protocol_error():
+    with pytest.raises(ProtocolError, match="no TMEM region"):
+        TmemPlan().alias("b", of="missing", offset=0, cols=16)

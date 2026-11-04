@@ -31,13 +31,23 @@ class TmemPlan:
         self._next = 0
 
     def region(self, name: str, cols: int, slots: int = 1) -> TmemPlan:
-        if cols <= 0 or slots <= 0:
-            raise ValueError(f"TMEM region {name}: cols and slots must be positive")
+        if name in self.regions:
+            raise ValueError(f"TMEM region {name!r} is already declared")
+        if type(cols) is not int or type(slots) is not int or cols <= 0 or slots <= 0:
+            raise ValueError(f"TMEM region {name}: cols and slots must be positive ints")
         self.regions[name] = _Region(name, cols, slots, offset=self._next)
         self._next += cols * slots
         return self
 
     def alias(self, name: str, of: str, offset: int, cols: int) -> TmemPlan:
+        if name in self.regions:
+            raise ValueError(f"TMEM region {name!r} is already declared")
+        if of not in self.regions:
+            raise ProtocolError(f"no TMEM region named {of!r}")
+        if type(cols) is not int or cols <= 0:
+            raise ValueError(f"TMEM alias {name}: cols must be a positive int")
+        if type(offset) is not int:
+            raise ValueError(f"TMEM alias {name}: offset must be a nonnegative int")
         parent = self.regions[of]
         if offset < 0 or offset + cols > parent.cols:
             raise ValueError(
@@ -50,7 +60,7 @@ class TmemPlan:
         if name not in self.regions:
             raise ProtocolError(f"no TMEM region named {name!r}")
         r = self.regions[name]
-        if not isinstance(slot, int) or not 0 <= slot < r.slots:
+        if type(slot) is not int or not 0 <= slot < r.slots:
             raise ProtocolError(f"TMEM region {name} has {r.slots} slots; got slot {slot!r}")
         if r.alias_of is None:
             return r.offset + slot * r.cols
