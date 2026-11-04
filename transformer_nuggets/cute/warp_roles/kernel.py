@@ -377,11 +377,23 @@ class WarpSpecialized:
                     raise ProtocolError(
                         f"channel {name}: slot {counts.index(0)} has no {side} role"
                     )
-                if mech is not Threads and len(bound) > 1:
+                if mech is Threads:
+                    continue
+                how = getattr(mech, "__name__", repr(mech))  # Umma, or Tma(tx_bytes=...)
+                if len(bound) > 1:
                     raise ProtocolError(
-                        f"channel {name}: {side} side signals once ({mech}) but has several "
+                        f"channel {name}: {side} side signals once ({how}) but has several "
                         f"roles {[r.name for r, _ in bound]}"
                     )
+                # One elected thread signals; every warp of a wider role would issue its own
+                # arrive (and its own TMA copies or MMAs).
+                for r, _ in bound:
+                    if r.num_warps > 1:
+                        raise ProtocolError(
+                            f"channel {name}: {side} side signals once ({how}) from one "
+                            f"elected thread, but role {r.name} spans {r.num_warps} warps and "
+                            "each would signal; issue it from a single-warp role"
+                        )
         for name, ts in turns.items():
             if len(ts.parties) < 2 or len({r.role for r in ts.parties}) != 1:
                 raise ProtocolError(f"turnstile {name} needs >= 2 instances of one role")

@@ -16,6 +16,7 @@ from transformer_nuggets.cute.warp_roles import (
     Instance,
     Producer,
     ProtocolError,
+    Ring,
     Slots,
     Threads,
     Tma,
@@ -318,6 +319,37 @@ def test_bound_slot_arrival_counts():
         BoundSlotsToy(n=1).describe()
     with pytest.raises(ProtocolError, match="signals once"):
         BoundSlotsToy(producer=Umma).describe()
+
+
+class WideRolesToy(WarpSpecialized):
+    """One producer role on warps 0-3, one consumer role on warps 4-7."""
+
+    def __init__(self, producer, consumer):
+        self.ch = Ring(2, producer, consumer)
+
+    @role(warps=range(4))
+    @cute.jit
+    def prod(self, ch: Producer, c):
+        pass
+
+    @role(warps=range(4, 8))
+    @cute.jit
+    def cons(self, ch: Consumer, c):
+        pass
+
+
+@pytest.mark.parametrize(
+    "producer, consumer, wide",
+    [(Tma(1024), Umma, "prod"), (Umma, Threads, "prod"), (Threads, Umma, "cons")],
+    ids=["tma_producer", "umma_producer", "umma_consumer"],
+)
+def test_single_signal_side_rejects_multi_warp_role(producer, consumer, wide):
+    """Tma/Umma sides expect one arrival; each warp of a wider role would signal."""
+    with pytest.raises(ProtocolError, match=f"role {wide} spans 4 warps"):
+        WideRolesToy(producer, consumer).describe()
+    toy = WideRolesToy(Threads, Threads)
+    toy.describe()
+    assert toy.ch.slot_counts("producer") == [128, 128]
 
 
 def test_declaration_errors():

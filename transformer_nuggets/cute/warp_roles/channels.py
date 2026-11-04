@@ -10,7 +10,8 @@ mechanism, which fixes how many arrivals the barrier expects:
 
 The layer derives each slot's arrival count from the role instances bound to it, so a channel
 with several consumer roles (fan-out) has a join barrier that completes only when all of them
-have released.
+have released. A ``Tma`` or ``Umma`` side signals once, so it must be bound to one single-warp
+role (the warp that issues the copies or MMAs).
 """
 
 from __future__ import annotations
