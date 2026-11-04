@@ -356,6 +356,24 @@ no unexpected outcomes after hardening. Of the compile mutations, 2,150 rejected
 The full warpdrive suite including these regressions/quick checks passed **494 tests**.
 The three examples' normalized SASS was unchanged by rejection-only hardening.
 
-**Runtime fuzz results:** the generated-runtime campaign is separate and is not certified by
-those host/compile counts. Consult its findings and independently checked event model before
-claiming a wider runtime domain or attributing a timeout to the layer.
+**Runtime fuzz results** (`test/warpdrive_fuzz/{gen,oracle,runtime}.py`, GB300, November 2026):
+generated valid programs (2-6 roles, holes, instances, Rings/Slots up to 31, Threads/Umma/Tma
+including 2-CTA TMA, fan-in and joins, overlapping and nested handles, turnstiles, TMEM users,
+all four tile policies with skips, caps, the 65535 fallback, runtime-shape relaunches, CUDA
+graphs, and CtaPair) are checked for progress (process timeout), exact per-handle epochs and
+counts, placement, per-unit item sequences and coverage, and bitwise determinism.
+
+- About 12,800 kernels before the G6 fix and 2,545 after it (plus 500 zero-work spaces) passed.
+- One bug found and fixed: F-A1, the inserted scheduler warp took the smallest declared budget
+  instead of its warpgroup's `regs=None` (`test_scheduler_takes_its_warpgroups_default_budget`).
+- compute-sanitizer racecheck/synccheck/memcheck and CUTracer random delays (5k-100k ns) on 56
+  sampled seeds: no hazards or mismatches.
+- Layer mutants caught by the oracle: short joins (single and pair), wrong ring parity, shared
+  slot phases, static over-stride, dynamic counter never reset, turnstile without waits.
+  Blind spots: a work-ring consumer releasing before it reads (window too narrow) and a dropped
+  pair tail (no value changes).
+- Not covered: real MMA/TMEM data (the example tests cover those), raw roles, `Barriers`,
+  overrides, `unchecked`, IKET, concurrent launches sharing a workspace, real PDL.
+
+Run `pytest -m fuzz test/test_cute_warpdrive_fuzz_*.py` for the fixed-seed quick mode and
+`python scripts/fuzz_warpdrive.py {runtime,static,mutate} --help` for long campaigns.
