@@ -51,6 +51,8 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 from cuda.bindings import driver as cuda
 from cutlass import Float32, cute
+from cutlass.base_dsl import BaseDSL
+from cutlass.base_dsl.enums import Arch
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.tensor_utils import LayoutEnum
 from flash_attn.cute.softmax import SoftmaxSm100
@@ -166,11 +168,15 @@ class FlashAttentionForward(WarpSpecialized):
         roles: Fa4Roles | None = None,
         mapping: WorkMap | None = None,
         overlap_o_q: bool = False,
+        use_ldred_rowmax: bool = False,
     ):
+        if use_ldred_rowmax and not BaseDSL._get_dsl().get_arch_enum().is_family_of(Arch.sm_103f):
+            raise ValueError("use_ldred_rowmax requires an SM103-family target")
         self.roles = roles if roles is not None else Fa4Roles()
         self.cluster = cluster or SingleCta()
         self.split_p = split_p
         self.overlap_o_q = overlap_o_q
+        self.use_ldred_rowmax = use_ldred_rowmax
         schedule = schedule or OneShot()
         if overlap_o_q and schedule.persistent:
             raise ValueError(
@@ -225,6 +231,7 @@ class FlashAttentionForward(WarpSpecialized):
     def get_name(self) -> str:
         ts = ("_ts" if self.mufu.enabled else "") + ("_splitp" if self.split_p else "")
         ts += "_oq" if self.overlap_o_q else ""
+        ts += "_ldred" if self.use_ldred_rowmax else ""
         return (
             f"warpdrive_fa4_fwd_{self.cluster.get_key()}_kv{self.kv_stages}{ts}_"
             f"{self.work.get_key()}{self.iket_key()}{self.trace_key()}"
@@ -458,9 +465,12 @@ class FlashAttentionForward(WarpSpecialized):
         )
         mma_m = M_BLOCK * self.cluster.size
         tScS = thr_qk.partition_C(cute.make_identity_tensor((mma_m, N_BLOCK)))[(None, None), 0, 0]
-        ld_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), Float32
+        ld_op = (
+            tcgen05.copy.LdRed32x32bOp(tcgen05.copy.Repetition(32))
+            if self.use_ldred_rowmax
+            else tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32))
         )
+        ld_atom = cute.make_copy_atom(ld_op, Float32)
         thr_ld = tcgen05.make_tmem_copy(ld_atom, tSAcc).get_slice(tidx)
         st_atom = cute.make_copy_atom(
             tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)), Float32
@@ -500,8 +510,17 @@ class FlashAttentionForward(WarpSpecialized):
         sh = s.wait(stage)
         rS = cute.make_rmem_tensor(t.rS_shape, Float32)
         t.tmem.access("S", stage, read=True)
-        cute.copy(t.thr_ld, t.tStS, rS)
-        row_max, acc_scale = sm.update_row_max(rS.load(), is_first)
+        if cutlass.const_expr(self.use_ldred_rowmax):
+            # The unmasked x32 loads each return a row max alongside their scores.
+            rMax = cute.make_rmem_tensor(((1, 1), *rS.shape[1:]), Float32)
+            cute.copy(t.thr_ld, t.tStS, (rS, rMax))
+            hw_max = Float32(-Float32.inf)
+            for i in range(cute.size(rMax)):
+                hw_max = cute.arch.fmax(hw_max, rMax[i])
+            row_max, acc_scale = sm.update_row_max_precomputed(hw_max, is_first)
+        else:
+            cute.copy(t.thr_ld, t.tStS, rS)
+            row_max, acc_scale = sm.update_row_max(rS.load(), is_first)
         with stats.produce(stage) as st:
             st.data[t.tidx, 0] = Float32(1.0) if is_first else acc_scale
         sm.scale_subtract_rowmax(rS, row_max)
@@ -842,6 +861,7 @@ def fa4_fwd(
     split_p: bool = False,
     roles: Fa4Roles | None = None,
     mapping: WorkMap | None = None,
+    use_ldred_rowmax: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Attention forward for ``(batch, seqlen, heads, 128)`` bf16 tensors; returns (O, LSE).
 
@@ -852,6 +872,9 @@ def fa4_fwd(
     runs FA4's default 2-CTA schedule (512-row work items, 6 KV stages by default).
     ``mapping``: the order of the ``(query block, head, batch)`` items (default
     ``Raster(along="m")``; e.g. ``Raster(reverse="m")`` or ``Fa4Mapping(...)``).
+    ``use_ldred_rowmax`` (SM103-family targets) reduces unmasked score tiles' maxima during the
+    TMEM load instead of in registers. Both paths keep the same rescale threshold and softmax
+    arithmetic.
     """
     if any(t.dtype != torch.bfloat16 for t in (q, k, v)):
         raise TypeError("fa4_fwd expects bfloat16 q, k, v")
@@ -866,7 +889,7 @@ def fa4_fwd(
     scale = softmax_scale if softmax_scale is not None else HEAD_DIM**-0.5
     out = torch.empty_like(q)
     lse = torch.empty(q.shape[0], q.shape[2], q.shape[1], device=q.device, dtype=torch.float32)
-    key = (kv_stages, turnstile, schedule, cluster, split_p, roles, mapping)
+    key = (kv_stages, turnstile, schedule, cluster, split_p, roles, mapping, use_ldred_rowmax)
     op = _OPS.get(key)
     if op is None:
         op = _OPS[key] = FlashAttentionForward(
@@ -877,6 +900,7 @@ def fa4_fwd(
             split_p=split_p,
             roles=roles,
             mapping=mapping,
+            use_ldred_rowmax=use_ldred_rowmax,
         )
     fn = compile_fa4_fwd(op)
     workspace, sms = op.work.launch_args(q.device)
