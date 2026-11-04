@@ -4,7 +4,7 @@ import pytest
 
 pytest.importorskip("cutlass.cute")
 
-from test.warpdrive_fuzz.static import collect_roles, declaration_role
+from test.warpdrive_fuzz.static import collect_pair, collect_roles, declaration_role
 from transformer_nuggets.cute.warpdrive import (
     Barriers,
     ProtocolError,
@@ -104,3 +104,17 @@ def test_stream_record_is_nonnegative_integer(record):
 def test_raster_swizzle_rejects_bool():
     with pytest.raises(ValueError, match="positive int"):
         Raster(swizzle=True)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"full_counts": 1.5},
+        {"full_counts": [True]},
+        {"full_mask": True},
+        {"full_counts": {False: [1]}},
+    ],
+)
+def test_overrides_reject_noninteger_counts_and_masks(override):
+    with pytest.raises(ProtocolError, match="override"):
+        collect_pair(Ring(1, override=override))

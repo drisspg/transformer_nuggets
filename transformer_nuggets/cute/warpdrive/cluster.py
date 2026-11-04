@@ -223,7 +223,7 @@ def apply_overrides(chan, scope: Scope, cluster) -> Scope:
     for key, value in chan.override.items():
         if key in ("full_counts", "empty_counts"):
             changes[key] = _per_rank_counts(chan, key, value, cluster)
-        elif not isinstance(value, int) or value < 0:
+        elif type(value) is not int or value < 0:
             raise ProtocolError(f"channel {chan.name}: override {key} must be an int >= 0")
         else:
             changes[key] = value
@@ -235,15 +235,23 @@ def apply_overrides(chan, scope: Scope, cluster) -> Scope:
 def _per_rank_counts(chan, key: str, value, cluster) -> dict:
     ranks = range(cluster.size)
     if isinstance(value, dict):
-        if set(value) != set(ranks):
+        if any(type(rank) is not int for rank in value) or set(value) != set(ranks):
             raise ProtocolError(f"channel {chan.name}: override {key} needs ranks {list(ranks)}")
         per_rank = value
     else:
         per_rank = dict.fromkeys(ranks, value)
     out = {}
     for rank, counts in per_rank.items():
-        counts = [counts] * chan.n if isinstance(counts, int) else list(counts)
-        if len(counts) != chan.n or any(not isinstance(c, int) or c <= 0 for c in counts):
+        if type(counts) is int:
+            counts = [counts] * chan.n
+        else:
+            try:
+                counts = list(counts)
+            except TypeError as exc:
+                raise ProtocolError(
+                    f"channel {chan.name}: override {key} needs {chan.n} positive counts, got {counts!r}"
+                ) from exc
+        if len(counts) != chan.n or any(type(c) is not int or c <= 0 for c in counts):
             raise ProtocolError(
                 f"channel {chan.name}: override {key} needs {chan.n} positive counts, got {counts}"
             )
