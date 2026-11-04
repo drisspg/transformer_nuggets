@@ -16,6 +16,7 @@ from cutlass import Int32, cute
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
     AtomicPersistent,
+    Cluster,
     ClusterLaunchControl,
     CtaPair,
     OneShot,
@@ -516,7 +517,7 @@ class CountToy(WarpSpecialized):
         self.work = WorkStream(mapping=mapping, schedule=schedule)
 
     def get_name(self) -> str:
-        return f"warpdrive_count_toy_{self.work.get_key()}_cs{self.cluster.size}"
+        return f"warpdrive_count_toy_{self.work.get_key()}_{self.cluster.get_key()}"
 
     @cute.jit
     def _count(self, r: int, ctx):
@@ -589,7 +590,8 @@ COUNT_CASES = {
     "atomic_checked_skip": (AtomicPersistent(stages=1), CheckedRaster(drop_odd=True)),
     "clc_checked_skip": (ClusterLaunchControl(stages=2), CheckedRaster(drop_odd=True)),
 }
-PAIR_IDS = ["single", "pair"]
+CLUSTERS = [SingleCta(), CtaPair(), Cluster(2, 2, pair=True)]
+CLUSTER_IDS = ["single", "pair", "2x2"]
 
 
 @dataclass(frozen=True)
@@ -660,7 +662,7 @@ def _check_valid_launch(op, fn, ws):
     assert ws[:2].tolist() == [0, 0]
 
 
-@pytest.mark.parametrize("cluster", [SingleCta(), CtaPair()], ids=PAIR_IDS)
+@pytest.mark.parametrize("cluster", CLUSTERS, ids=CLUSTER_IDS)
 @pytest.mark.parametrize("case", list(COUNT_CASES))
 def test_empty_space_runs_no_items(requires_blackwell, case, cluster):
     """An empty (or negative) space launches one work unit, every role sees no item, and the
@@ -683,7 +685,7 @@ OVERFLOWING_SPACES = [
 ]
 
 
-@pytest.mark.parametrize("cluster", [SingleCta(), CtaPair()], ids=PAIR_IDS)
+@pytest.mark.parametrize("cluster", CLUSTERS, ids=CLUSTER_IDS)
 @pytest.mark.parametrize("case", list(COUNT_CASES))
 def test_space_overflowing_int32_is_rejected(requires_blackwell, case, cluster):
     """An item count, grid, or persistent terminal index past Int32 makes the launch fail (no
@@ -694,8 +696,9 @@ def test_space_overflowing_int32_is_rejected(requires_blackwell, case, cluster):
     ws, _ = op.work.launch_args("cuda")
     spaces = list(OVERFLOWING_SPACES)
     if isinstance(schedule, (StaticPersistent, AtomicPersistent)):
-        # Fits Int32, but the last unit's terminal index (total - 1 + units) does not.
-        spaces.append((2**31 - 50, 1, 1))
+        # Fits Int32, but the last unit's terminal index (total - 1 + units) does not (every
+        # cluster shape launches more than 10 units here).
+        spaces.append((2**31 - 10, 1, 1))
     for space in spaces:
         with pytest.raises(Exception, match="CUDA launch failed"):
             _count_items(fn, ws, space, 148)
