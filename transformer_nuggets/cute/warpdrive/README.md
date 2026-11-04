@@ -18,7 +18,7 @@ caller obligations and known gaps; successful compilation is not a deadlock-free
 ## A GEMM
 
 BF16 `D = A @ B.T`: warp 4 loads A/B, warp 5 issues MMA, warps 0-3 store the result, and a
-`TileStream` hands out output tiles. Abridged from
+`WorkStream` hands out output tiles. Abridged from
 [examples/persistent_gemm.py](examples/persistent_gemm.py):
 
 ```python
@@ -27,7 +27,7 @@ from dataclasses import dataclass
 import cutlass
 from cutlass import cute
 from transformer_nuggets.cute.warpdrive import (
-    Consumer, Producer, Raster, Ring, StaticPersistent, Threads, Tiles, TileStream, Tma, Tmem,
+    Consumer, Producer, Raster, Ring, StaticPersistent, Threads, WorkCursor, WorkStream, Tma, Tmem,
     TmemPlan, Umma, WarpSpecialized, role,
 )
 
@@ -40,51 +40,51 @@ class PersistentGemmParams:  # prologue values every role reads
     ...
 
 class PersistentGemm(WarpSpecialized):  # abridged: the real one sizes stages per cluster
-    def __init__(self, policy=None, ab_stages=4, acc_stages=2):
+    def __init__(self, schedule=None, ab_stages=4, acc_stages=2):
         self.ab = Ring(ab_stages, Tma((128 + 256) * 64 * 2), Umma)   # TMA fills, MMA drains
         self.acc = Ring(acc_stages, Umma, Threads)                   # MMA fills, epilogue drains
         self.tmem_plan = TmemPlan().region("acc", 256, acc_stages)
-        self.tiles = TileStream(order=Raster(swizzle=8), policy=policy or StaticPersistent())
+        self.work = WorkStream(mapping=Raster(swizzle=8), schedule=schedule or StaticPersistent())
 
     @role(warps=4, regs=40)
     @cute.jit
-    def load(self, params: PersistentGemmParams, *, ab: Producer, tiles: Tiles):
-        while tiles.valid:
-            m, n, _ = tiles.work
+    def load(self, params: PersistentGemmParams, *, ab: Producer, work: WorkCursor):
+        while work.valid:
+            m, n, _ = work.item
             for k in cutlass.range(params.num_k_tiles, unroll=1):
                 with ab.produce() as s:
                     cute.copy(params.tma_a, params.tAgA[None, m, k], params.tAsA[None, s.index],
                               tma_bar_ptr=s.barrier)
                     cute.copy(params.tma_b, params.tBgB[None, n, k], params.tBsB[None, s.index],
                               tma_bar_ptr=s.barrier)
-            tiles.advance()
-        return ab, tiles
+            work.advance()
+        return ab, work
 
     @role(warps=5, regs=40, cta="leader")  # leader-only in a CTA pair
     @cute.jit
-    def mma(self, params: PersistentGemmParams, *, ab: Consumer, acc: Producer, tiles: Tiles, tmem: Tmem):
+    def mma(self, params: PersistentGemmParams, *, ab: Consumer, acc: Producer, work: WorkCursor, tmem: Tmem):
         tAcc = cute.make_tensor(tmem.ptr("acc"), params.acc_layout)
-        while tiles.valid:
+        while work.valid:
             with acc.produce() as a:
                 for k in cutlass.range(params.num_k_tiles, unroll=1):
                     with ab.consume() as s:
                         ...  # cute.gemm into tAcc[..., a.index], reading A/B stage s.index
-            tiles.advance()
-        return ab, acc, tiles
+            work.advance()
+        return ab, acc, work
 
     @role(warps=range(4), regs=160)
     @cute.jit
-    def epilogue(self, params: PersistentGemmParams, *, acc: Consumer, tiles: Tiles, tmem: Tmem):
-        while tiles.valid:
-            m, n, _ = tiles.work
+    def epilogue(self, params: PersistentGemmParams, *, acc: Consumer, work: WorkCursor, tmem: Tmem):
+        while work.valid:
+            m, n, _ = work.item
             with acc.consume() as a:
                 ...  # TMEM -> registers -> SMEM -> TMA store of tile (m, n)
-            tiles.advance()
-        return acc, tiles
+            work.advance()
+        return acc, work
 
     @cute.kernel
     def kernel(self, tiled_mma, tma_a, mA, tma_b, mB, tma_c, mC, ..., work):
-        smem = self.begin_roles(tiles=work)
+        smem = self.begin_roles(work=bound)
         ...  # allocate SMEM tiles, TMA-partition them, build the context
         params = PersistentGemmParams(tma_a=tma_a, tAgA=tAgA, tAsA=tAsA, num_k_tiles=..., ...)
         self.run_roles(params)
@@ -96,9 +96,9 @@ with it, so editors know every field's type and the object reaches the roles as 
 means read-only: write into the tensors it holds, but its fields can't be rebound. A
 `SimpleNamespace` still works too, with an unannotated `params`.
 
-Swapping the schedule is the `policy=` argument: `OneShot()`, `StaticPersistent()`,
-`DynamicPersistent()`, `Clc()` or your own `Policy`; the tile order is `order=` (a `Raster`, your
-own `WorkMapping`, or a wrapped CUTLASS/FA4 scheduler). The role code doesn't change. The
+Swapping the schedule is the `schedule=` argument: `OneShot()`, `StaticPersistent()`,
+`AtomicPersistent()`, `ClusterLaunchControl()` or your own `IndexSchedule`; the work order is
+`mapping=` (a `Raster`, your own `WorkMap`, or a wrapped CUTLASS/FA4 scheduler order). The role code doesn't change. The
 accumulator ring has two stages so the epilogue of one tile overlaps the mainloop of the next.
 
 `begin_roles()` allocates and initializes barriers and payloads, and returns the
@@ -129,7 +129,7 @@ Arguments come from annotations. Named dependencies match attributes on the kern
 | `s: Producer[Instance]` / `s: Consumer[Instance]` | a `self.s` end bound to this instance's slot |
 | `stage: Instance` | the instance index, a Python int |
 | `tmem: Tmem` | the kernel's TMEM view |
-| `tiles: Tiles` | the `self.tiles` work cursor |
+| `work: WorkCursor` | the `self.work` work cursor |
 | `mufu: Turn` | a seat in `self.mufu`, a `Turnstile` |
 | `bars: Barriers` | the base pointer of `self.bars` |
 | `params: GemmParams`, or the one unannotated parameter | the object passed to `run_roles` |
@@ -137,7 +137,7 @@ Arguments come from annotations. Named dependencies match attributes on the kern
 A parameter receives `params` when it is annotated with the context's type (or a base class of it)
 or is the role's only unannotated parameter. Anything else raises `ProtocolError` naming the
 parameter: a missing channel name, an annotation that doesn't resolve (`ab: "Consumr"`), a layer
-class used as an annotation (`tiles: TileStream`, which suggests `Tiles`), two context
+class used as an annotation (`work: WorkStream`, which suggests `WorkCursor`), two context
 parameters, or roles annotating unrelated context types. `run_roles` checks the object it gets
 against the annotated type and rejects mutable dataclasses.
 
@@ -228,18 +228,18 @@ single-/two-CTA kernels. No need to work out which endpoints need cleanup:
 ```python
 @role(warps=5, regs=40)
 @cute.jit
-def mma(self, params: GemmParams, *, ab: Consumer, acc: Producer, tiles: Tiles, tmem: Tmem):
-    while tiles.valid:
+def mma(self, params: GemmParams, *, ab: Consumer, acc: Producer, work: WorkCursor, tmem: Tmem):
+    while work.valid:
         ...  # use params, ab, acc, tiles and tmem
-        tiles.advance()
-    return ab, acc, tiles
+        work.advance()
+    return ab, acc, work
 ```
 
 `self` and `params` are input-only. The injected instance index, TMEM view and raw barrier
 pointer are also inputs, not loop-carried state, so they are not returned. Stage handles must
 be committed/released inside the role; they are not endpoint state to return.
 
-Return one object or a tuple. Tuple order and local names do not matter: `return tiles, acc, ab`
+Return one object or a tuple. Tuple order and local names do not matter: `return work, acc, ab`
 is equivalent. Missing, duplicate, unsupported or foreign state is an error. The layer uses the
 returned state for the cleanup that applies (producer tails and remaining IKET work ranges),
 without recovering execution state from Python frames. Raw role results are ignored.
@@ -359,79 +359,85 @@ accesses to aliased regions.
 ## Scheduling
 
 ```python
-self.tiles = TileStream(order=Raster(swizzle=8), policy=Clc(stages=2))
+self.work = WorkStream(mapping=Raster(swizzle=8), schedule=ClusterLaunchControl(stages=2))
 
 
 @role(warps=4, regs=40)
 @cute.jit
-def load(self, params: PersistentGemmParams, *, ab: Producer, tiles: Tiles):
-    while tiles.valid:
-        m, n, _ = tiles.work
+def load(self, params: PersistentGemmParams, *, ab: Producer, work: WorkCursor):
+    while work.valid:
+        m, n, _ = work.item
         ...
-        tiles.advance()
-    return ab, tiles
+        work.advance()
+    return ab, work
 ```
 
-A schedule is three independent pieces, each swapped by one argument:
+A work stream is three independent pieces, each swapped by one argument:
 
-- `policy=`: how a work unit (a CTA, or a cluster of a pair) gets its next linear index.
-- `order=`: the mapping from an index to the work item `tiles.work` returns.
-- `ready=`: an optional wait before the first decode, such as `PdlWait()`.
+- `schedule=` (an `IndexSchedule`): how a work unit (a CTA, or a cluster of a pair) gets its
+  next linear index.
+- `mapping=` (a `WorkMap`): the mapping from an index to the work item `work.item` returns.
+- `ready=` (a `Readiness`): an optional wait before the first decode, such as `PdlWait()`.
 
-Role code doesn't change when any of them does. `TileStream()` defaults to
-`Raster(along="m", swizzle=1)` and `OneShot()`. The built-in policies:
+Role code doesn't change when any of them does. A role parameter `work: WorkCursor` receives the
+cursor over the stream declared as `self.work`. `WorkStream()` defaults to
+`Raster(along="m", swizzle=1)` and `OneShot()`. The built-in schedules:
 
 - `OneShot()`: one work item per CTA. With the default `Raster()` the launch grid is the tile
   space, `(m_tiles, n_tiles, l)`, and the item is read from `blockIdx`. When `n_tiles` or `l`
   exceeds the 65535 limit of `gridDim.y`/`z`, the launch falls back to a 1-D grid and the
   kernel decodes the index. The check costs about 25-50 ns on 512^3 to 2048^2 GEMMs (GB300).
-  Launch with `self.launch_config(work)` or `work.grid()` to get the tile grid; a hand-built
-  `(total, 1, 1)` grid also works, through the decode.
+  Launch with `self.launch_config(bound)` or `bound.grid()` to get the tile grid; a
+  hand-built `(total, 1, 1)` grid also works, through the decode.
 - `StaticPersistent()`: each CTA strides by the persistent grid size.
-- `DynamicPersistent()`: claims work through a global atomic counter.
-- `Clc(stages=2)`: Blackwell cluster launch control.
+- `AtomicPersistent()`: claims work through a global atomic counter.
+- `ClusterLaunchControl(stages=2)`: Blackwell cluster launch control.
 
-One-shot/static decode work locally. Dynamic/CLC add a scheduler warp and broadcast work through
-a ring. Counts, batch and SM count are runtime values. `TileStream(ready=PdlWait())` waits for a
-programmatic dependent launch before the first item.
+One-shot/static decode work locally. Atomic/CLC add a scheduler warp and broadcast work through
+a ring. Counts, batch and SM count are runtime values. `WorkStream(ready=PdlWait())` waits for a
+programmatic dependent launch before the first decode.
 
-Use `while tiles.valid`, with exactly one `tiles.advance()` directly in the loop body.
-Every managed role must drain the stream under a persistent policy.
+Use `while work.valid`, with exactly one `work.advance()` directly in the loop body.
+Every managed role must drain the stream under a persistent schedule.
 
 The host/entry-point setup, from [persistent_gemm.py](examples/persistent_gemm.py):
 
 ```python
-workspace, max_ctas = op.tiles.launch_args(device)  # host, outside the compiled entry point
+workspace, max_ctas = op.work.launch_args(device)  # host, outside the compiled entry point
 # In __call__ (@cute.jit):
-work = self.tiles.problem((m_tiles, n_tiles, 1), workspace, max_ctas)
-self.kernel(..., work).launch(**self.launch_config(work), stream=stream)
+bound = self.work.bind((m_tiles, n_tiles, 1), workspace, max_ctas)
+self.kernel(..., bound).launch(**self.launch_config(bound), stream=stream)
 # In the kernel:
-smem = self.begin_roles(tiles=work)
+smem = self.begin_roles(work=bound)
 ```
 
-Static/dynamic policies need `max_ctas`. The dynamic int32 counter starts zeroed and resets after
-each launch; don't share its workspace across concurrent launches. Keep the `launch_args`
-pair in the entry point's signature even for policies that don't read it, so swapping the policy
-leaves the ABI alone.
+`bind` returns a `BoundWork`: the mapping's bound space, the Int32 item count `total` and the
+workspace. Static/atomic schedules need `max_ctas`. The atomic int32 counter starts zeroed and
+resets after each launch; don't share its workspace across concurrent launches. Keep the
+`launch_args` pair in the entry point's signature even for schedules that don't read it, so
+swapping the schedule leaves the ABI alone.
 
 Extents are runtime values converted to Int32, so the space is checked in the entry point's host
 code, not in the kernel:
 
-- A zero or negative extent is an empty space. Every policy launches one work unit (one
-  cluster for a pair), every role's `tiles.valid` is false at once, and the dynamic counter is
-  left zeroed. `Raster.bind` stores it as `(1, 1, 0)`, so the kernel's `work.space` reads
-  that rather than the raw extents, and decoding never divides by zero.
-- Item count, grid and indices are Int32. `OneShot`/`Clc` need `total * cluster_size` <= 2^31-1;
-  static/dynamic need `total + launched units - 1` <= 2^31-1 (the last unit's terminal index).
-  `work.grid()` makes a larger space zero-wide, so the launch raises a CUDA
-  invalid-configuration error instead of covering a wrapped space. A hand-built grid gets no
-  check.
+- The mapping counts its items once, on the host (`count64`, an Int64 that saturates at 2^31),
+  and `bind` narrows the count to the Int32 `total` the kernel receives.
+- A zero or negative extent is an empty space. Every schedule launches one work unit (one
+  cluster for a pair), every role's `work.valid` is false at once, and the atomic counter is
+  left zeroed. `Raster.bind` stores it as `(1, 1, 0)`, so the kernel's `bound.space` reads
+  that rather than the raw extents.
+- Item count, grid and indices are Int32. `OneShot`/`ClusterLaunchControl` need
+  `total * cluster_size` <= 2^31-1; static/atomic need `total + launched units - 1` <= 2^31-1
+  (the last unit's terminal index). `bound.grid()` makes a larger space zero-wide, so the
+  launch raises a CUDA invalid-configuration error instead of covering a wrapped space. A
+  hand-built grid gets no check.
 
-### Custom policies and mappings
+### Custom schedules and mappings
 
-`Policy`, `WorkMapping` and `Readiness` are the public protocols the built-ins implement.
+`IndexSchedule`, `WorkMap` and `Readiness` are the public protocols the built-ins implement.
 Subclass them; their docstrings in [scheduling.py](scheduling.py) list every method, where it runs
-and what it must guarantee. A local policy defines `step`, and optionally `first`:
+and what it must guarantee. A local schedule defines `next_index`, and optionally
+`first_index`:
 
 ```python
 @cute.jit
@@ -440,90 +446,136 @@ def _countdown(index, problem):  # a valid index, or the terminal index `total`
 
 
 @dataclass(frozen=True)
-class ReverseStatic(Policy):
+class ReverseStatic(IndexSchedule):
     """Unit b runs total-1-b, total-1-b-U, ... (U = launched units)."""
 
-    def first(self, problem):  # runs in every role: launch values and `problem` only
+    def first_index(self, problem):  # runs in every role: launch values and `problem` only
         return _countdown(problem.total - 1 - problem.first_unit(), problem)
 
-    def step(self, index, problem):  # the next index after a valid `index`
+    def next_index(self, index, problem):  # the next index after a valid `index`
         return _countdown(index - problem.units(), problem)
 
 
-self.tiles = TileStream(order=Raster(swizzle=8), policy=ReverseStatic())
+self.work = WorkStream(mapping=Raster(swizzle=8), schedule=ReverseStatic())
 ```
 
-A broadcast policy sets `broadcast = True` and `stages`, and defines
-`claim(fetch, problem, index)` (plus `finish` and `fetch_channels` if it needs them). It runs on
-the layer's scheduler warp, which receives the previous index, so a stateful sequence needs no
-extra storage. The layer still owns distribution: the work ring and its counts, publication to
-both CTAs of a pair, leader-only claims, the drain and the scheduler's register budget.
+A broadcast schedule sets `broadcast = True` and `stages`, and defines
+`claim_next(fetch, problem, index)` (plus `close_claims` and `fetch_channels` if it needs them).
+It runs on the layer's scheduler warp, which receives the previous index, so a stateful sequence
+needs no extra storage. The layer still owns distribution: the work ring and its counts,
+publication to both CTAs of a pair, leader-only claims, the drain and the scheduler's register
+budget. `close_claims` closes claim state once the unit stops claiming (`AtomicPersistent`
+reports and resets its counter there). It is not a teardown or fixup hook: ring consumers
+release a slot when they receive an item, so when it runs no item's work is known to be done.
 
-Rules for every policy: return a valid index in `[0, total)` or a terminal index `>= total`,
-never a negative one; compute `first`/`step` identically in every role; `uses_max_ctas` and
-`uses_workspace` declare which launch arguments it reads; `reach` must bound the largest
-index or grid extent (the default, `total + units - 1`, bounds strided sequences); `get_key()`
-names every compile-time field. A mapping defines `words`, `bind`, `size`, `decode` and
-`get_key`, and optionally `size64`, `item`, `skips`/`skip`. `bind` runs in the entry point and
-must make an empty space safe; `decode` may see indices past the end.
+Rules for every schedule: return a valid index in `[0, total)` or a terminal index `>= total`,
+never a negative one; compute `first_index`/`next_index` identically in every role;
+`uses_max_ctas` and `uses_workspace` declare which launch arguments it reads; `index_limit`
+must bound the largest index or grid extent (the default, `total + units - 1`, bounds strided
+sequences); `get_key()` names every compile-time field.
+
+A mapping defines `words`, `bind`, `count64`, `decode` and `get_key`, and optionally `unpack`
+and `skips`:
+
+```python
+@dataclass(frozen=True)
+class ReverseM(WorkMap):
+    words = 3
+    decodes_any_index = True  # Raster arithmetic: defined for every index
+
+    def bind(self, space):  # entry point: normalize; an empty space must stay safe
+        return Raster().bind(space)
+
+    def count64(self, space):  # entry point: Int64 item count, saturating at 2**31
+        return Raster().count64(space)
+
+    def decode(self, index, space):  # device: (keep, words) of a valid index
+        keep, (m, n, batch) = Raster().decode(index, space)
+        return keep, (space[0] - 1 - m, n, batch)
+
+    def get_key(self):
+        return "reverse_m"
+```
+
+- `decode` returns `(keep, words)`. The layer calls it only for valid indices, `0 <= index <
+  total`, after `ready`, so it may read per-item tables. `keep = False` drops the item for
+  every role; only a mapping that sets `skips = True` may return a runtime `keep` (any other
+  returns the constant `True`, checked at trace time).
+- `decodes_any_index = True` is the one exception to "never decoded past the end": set it only
+  when `decode` is a pure function defined for every nonnegative Int32 index, including empty
+  spaces (no table reads, no division by a runtime value that may be zero). The layer then
+  decodes unconditionally after each step and discards terminal results, which keeps a branch
+  off the decoding warps. `Raster`, `CutlassRaster` and `Fa4Mapping` set it.
+- A work list built on the device binds its host-visible capacity as the count and reads the
+  true length in `decode`'s `keep`; the host never reads device memory.
+  [packed_work.py](examples/packed_work.py) is such a mapping (`PackedWork`, rows of an int32
+  table plus a device-side length, consumed with `ready=PdlWait()`).
+- Repeated outputs don't need repeated indices. Split-K maps distinct `(tile, split)` items with
+  their K ranges and drops empty ranges; the partials are reduced by a later kernel, not by the
+  schedule. FA4 split-KV decode adds split id and count columns the same way.
 
 ### External schedulers
 
 [adapters.py](adapters.py) wraps an external scheduler's index-to-tile mapping as a
-`WorkMapping`, so it swaps in through `order=` and runs under any policy. `native_policy`
-reproduces the library's own per-CTA sequence:
+`WorkMap`, so it swaps in through `mapping=` and runs under any schedule. Composing it with
+`StaticPersistent()` reproduces the library's own per-CTA index sequence (not its lifecycle):
 
 ```python
 from flash_attn.cute.tile_scheduler import StaticPersistentTileScheduler
 
-order = CutlassStaticPersistent(swizzle=8)  # CUTLASS StaticPersistentTileScheduler order
-self.tiles = TileStream(order=order, policy=order.native_policy)  # CUTLASS's own schedule
-self.tiles = TileStream(order=order, policy=Clc())  # the same tiles, claimed through CLC
-self.tiles = TileStream(order=Fa4Scheduler(StaticPersistentTileScheduler), policy=Clc())
+cutlass_order = CutlassRaster(swizzle=8)  # CUTLASS StaticPersistentTileScheduler order
+self.work = WorkStream(mapping=cutlass_order, schedule=StaticPersistent())  # CUTLASS's sequence
+self.work = WorkStream(mapping=cutlass_order, schedule=ClusterLaunchControl())  # claimed by CLC
+self.work = WorkStream(
+    mapping=Fa4Mapping(StaticPersistentTileScheduler), schedule=ClusterLaunchControl()
+)
 ```
 
 The kernel keeps binding `(m_tiles, n_tiles, l)`; the adapter derives the external space from it.
-`Fa4Scheduler(SingleTileLPTScheduler)` sizes its L2 sections from the K/V bytes per head, so its
-stream binds `(num_block, num_head, num_batch, seqlen_k)`; its compile-time arguments (`lpt`,
-`lpt_global`, `head_dim`, `head_dim_v`, `element_size`) are adapter fields and in its key. Limits:
+`Fa4Mapping(SingleTileLPTScheduler)` (FA4 runs it with `OneShot()`) sizes its L2 sections from
+the K/V bytes per head, so its stream binds `(num_block, num_head, num_batch, seqlen_k)`; its
+compile-time arguments (`lpt`, `lpt_global`, `head_dim`, `head_dim_v`, `element_size`) are
+adapter fields and in its key. The FA4 example takes `mapping=` too. Limits:
 
 - Only index-addressable schedulers adapt: those whose state is one linear index and whose tile
   is a function of it. FA4's `SingleTileScheduler` (3-D `blockIdx`) is rejected. QuACK's and
   the CLC/dynamic schedulers own pipelines, SMEM and barriers that would duplicate the layer's
-  distribution; use their mapping with a warpdrive policy instead.
+  distribution; use their mapping with a warpdrive schedule instead.
 - The external `advance_to_next_work`/`prefetch_next_work`/`producer_tail`/`get_grid_shape`
-  aren't called; the policy picks indices and the layer launches its own grid.
+  aren't called; the schedule picks indices and the layer launches its own grid.
 - Items are per work unit: tiles are work-unit tiles (FA4's params use a `(1, 1)` cluster
   shape), so a `CtaPair` gets one item per cluster.
-- CUTLASS pads swizzle bands and hands out the padded tiles; the adapter skips them. Both
-  adapters have an exact `size64`, so spaces past Int32 are rejected at launch like `Raster`'s.
+- CUTLASS pads swizzle bands and hands out the padded tiles; the adapter drops them
+  (`keep = False`). Both adapters have an exact `count64`, so spaces past Int32 are rejected at
+  launch like `Raster`'s.
 - An empty space has no items: CUTLASS's order binds like `Raster`; FA4's params are built
-  over one tile (an empty KV as one key) with the count forced to 0, so no external arithmetic
-  divides by zero. No FA4 split-KV.
-- `CutlassStaticPersistent` reimplements CUTLASS's order natively (it is `Raster` over the
+  over one tile (an empty KV as one key), so no external arithmetic divides by zero, and the
+  count comes from the normalized extents. The FA4 adapter has no split-KV; a split-KV mapping
+  carries split columns itself (see above).
+- `CutlassRaster` reimplements CUTLASS's order natively (it is `Raster` over the
   padded space) rather than wrapping the deprecated `cutlass.utils` copy, so it imports no
   CUTLASS scheduler and emits no deprecation warning. Provenance: the BSD-3 CuTeDSL helper
   NVIDIA/cutlass `examples/python/CuTeDSL/helpers/static_persistent_tile_scheduler.py` at
   `e13f5cd`, vendored as the test oracle in `test/cutlass_static_persistent_tile_scheduler.py`;
   the tests compare per-CTA sequences against it.
-- `Fa4Scheduler` imports `flash_attn.cute` when constructed; warpdrive itself doesn't need it.
+- `Fa4Mapping` imports `flash_attn.cute` when constructed; warpdrive itself doesn't need it.
 
 ### Raw roles
 
-A raw role takes no `Tiles` cursor. Under `OneShot` it reads its unit's item with
-`self.tiles.work_item()`, not `blockIdx`, which is wrong on the 1-D fallback grid, a hand-built
+A raw role takes no `WorkCursor`. Under `OneShot` it reads its unit's item with
+`self.work.single_item()`, not `blockIdx`, which is wrong on the 1-D fallback grid, a hand-built
 grid, a pair or a non-`Raster` mapping:
 
 ```python
 @role(warps=range(4), regs=160, raw=True)
 @cute.jit
 def epilogue(self, params, *, tmem: Tmem):
-    valid, (m, n, _) = self.tiles.work_item()  # runs ready= and skip like a managed role
+    valid, (m, n, _) = self.work.single_item()  # runs ready= and drops items like a managed role
     ...
 ```
 
-`valid` is false for an empty space or a skipped item. Persistent and broadcast policies raise
-`ProtocolError`: a role with several items takes `tiles: Tiles` and loops.
+`valid` is false for an empty space or a dropped item. Persistent and broadcast schedules raise
+`ProtocolError`: a role with several items takes `work: WorkCursor` and loops.
 
 ## CTA pairs
 
@@ -539,7 +591,7 @@ The persistent GEMM and FA4 examples have both versions.
 
 The layer derives barrier locations, per-CTA counts, remote targets, commit masks, TMA byte
 scaling, producer tails, TMEM allocation/free and the exit cluster barrier. Work items are per
-cluster; dynamic/CLC claims run on the leader and publish to both CTAs.
+cluster; atomic/CLC claims run on the leader and publish to both CTAs.
 
 `remote_scope` defaults to `"cta"` without a payload and `"cluster"` with one. CTA scope is for
 TMA/MMA/TMEM handoffs ordered by their own fences. If your pair channel publishes DSMEM or global
@@ -551,7 +603,7 @@ Layer-owned payloads are CTA-local, so pair-scoped channels cannot have them.
 For the 2-CTA persistent GEMM with CLC:
 
 ```python
-op = PersistentGemm(policy=Clc(), cluster=CtaPair())
+op = PersistentGemm(schedule=ClusterLaunchControl(), cluster=CtaPair())
 compile_persistent_gemm(op)  # fills in the TMA check status
 print(op.describe())
 ```
@@ -562,42 +614,42 @@ PersistentGemm: 8 warps, 256 threads
   params   PersistentGemmParams
 
 Roles
-  warps  role             regs  cta     raw
-  0-3    epilogue          160  all
-  4      load               40  all
-  5      mma                40  leader
-  6      tiles.scheduler    40  leader
-  7      (padding)          40
+  warps  role            regs  cta     raw
+  0-3    epilogue         160  all
+  4      load              40  all
+  5      mma               40  leader
+  6      work.scheduler    40  leader
+  7      (padding)         40
 
 Channels
-  ab          Ring(6)  load -> mma
-              signal    Tma(32768 B) -> Umma
-              full      leader 1 x6, tx 65536 B (leader-armed)
-              empty     leader 1 x6, peer 1 x6
-              scope     pair-scoped, release_mask 0b11, tail
-              tma       verified CtaGroup.TWO, 32768 B/stage per CTA @ persistent_gemm.py:146,149
-  acc         Ring(2)  mma -> epilogue
-              signal    Umma -> Threads
-              full      leader 1 x2, peer 1 x2
-              empty     leader 256 x2
-              scope     pair-scoped, commit_mask 0b11, remote_scope cta
-  tiles_work  Ring(2)  tiles.scheduler -> epilogue, load, mma, tiles.scheduler
-              signal    Tma(16 B) -> Threads
-              full      leader 1 x2, peer 1 x2, tx 16 B (leader-armed)
-              empty     leader 384 x2
-              scope     pair-scoped, remote_scope cluster
-              storage   payload Int32(4,)
-  tiles_clc   Slots(1) tiles.scheduler -> tiles.scheduler
-              signal    Tma(16 B) -> Threads
-              full      1, tx 16 B
-              empty     32
-              scope     CTA-local
-              storage   payload Int32(4,), release_fence smem_async
+  ab         Ring(6)  load -> mma
+             signal    Tma(32768 B) -> Umma
+             full      leader 1 x6, tx 65536 B (leader-armed)
+             empty     leader 1 x6, peer 1 x6
+             scope     pair-scoped, release_mask 0b11, tail
+             tma       verified CtaGroup.TWO, 32768 B/stage per CTA @ persistent_gemm.py:151,157
+  acc        Ring(2)  mma -> epilogue
+             signal    Umma -> Threads
+             full      leader 1 x2, peer 1 x2
+             empty     leader 256 x2
+             scope     pair-scoped, commit_mask 0b11, remote_scope cta
+  work_ring  Ring(2)  work.scheduler -> epilogue, load, mma, work.scheduler
+             signal    Tma(16 B) -> Threads
+             full      leader 1 x2, peer 1 x2, tx 16 B (leader-armed)
+             empty     leader 384 x2
+             scope     pair-scoped, remote_scope cluster
+             storage   payload Int32(4,)
+  work_clc   Slots(1) work.scheduler -> work.scheduler
+             signal    Tma(16 B) -> Threads
+             full      1, tx 16 B
+             empty     32
+             scope     CTA-local
+             storage   payload Int32(4,), release_fence smem_async
 
 Streams
-  tiles  Clc(stages=2), Raster(along=m, swizzle=8)
-         scheduler warp 6 broadcasts over tiles_work
-         roles: epilogue, load, mma
+  work  ClusterLaunchControl(stages=2), Raster(along=m, swizzle=8)
+        scheduler warp 6 broadcasts over work_ring
+        roles: epilogue, load, mma
 
 TMEM: 512 columns used, 512 allocated
   tmem acc [0, 256), [256, 512)
@@ -644,8 +696,8 @@ def epilogue(self, params, *, acc_bars: Barriers, tmem: Tmem):
     ...
 ```
 
-Raw roles take `Instance`, `Tmem`, `Barriers` and the context, not channel ends, tile cursors or
-turnstile seats; under `OneShot` they read their item with `self.tiles.work_item()`. They skip
+Raw roles take `Instance`, `Tmem`, `Barriers` and the context, not channel ends, work cursors or
+turnstile seats; under `OneShot` they read their item with `self.work.single_item()`. They skip
 protocol checks and the persistent-stream requirement but still participate in register padding
 and TMEM teardown. Build your own `cutlass.pipeline` with `self.barrier_ptr("acc_bars")` and
 `defer_sync=True` between `begin_roles` and `run_roles`.
@@ -681,12 +733,12 @@ it suppressed; explicit TMA opt-outs are distinguished from unverified copies.
 Enable before compiling; include `iket_key()` in custom compile-cache keys (the examples do):
 
 ```python
-op = PersistentGemm(policy=StaticPersistent()).enable_iket(waits=False)
+op = PersistentGemm(schedule=StaticPersistent()).enable_iket(waits=False)
 fn = compile_persistent_gemm(op)
 ```
 
 `enable_iket()` adds role ranges and blocking waits named `ab.acquire`, `ab.wait`, `ab.tail`,
-`mufu.turn`, etc. `waits=False` omits wait ranges. Roles taking `Tiles` get one range per work
+`mufu.turn`, etc. `waits=False` omits wait ranges. Roles taking `WorkCursor` get one range per work
 item; other roles get one over their body. Add a region inside a role:
 
 ```python
@@ -730,11 +782,13 @@ See the [pipeline profiler](../profiler/README.md#declarative-pipeline-analysis)
 ## Examples and timings
 
 - [gemm.py](examples/gemm.py): three roles, two rings, one CTA per tile through
-  `TileStream(policy=OneShot())`.
-- [persistent_gemm.py](examples/persistent_gemm.py): all four policies, double-buffered
-  accumulators, TMA stores, `CtaPair()` and configurable `tile_n`.
+  `WorkStream(schedule=OneShot())`.
+- [persistent_gemm.py](examples/persistent_gemm.py): all four schedules, any `mapping=`,
+  double-buffered accumulators, TMA stores, `CtaPair()` and configurable `tile_n`.
 - [fa4_fwd.py](examples/fa4_fwd.py): FA4-style forward, two softmax instances, correction, slots,
-  fan-out/join, turnstile, S/P aliasing, split-P, persistence and CTA pairs.
+  fan-out/join, turnstile, S/P aliasing, split-P, persistence, `mapping=` and CTA pairs.
+- [packed_work.py](examples/packed_work.py): `PackedWork`, a work list built on the device
+  (capacity on the host, length read in `decode`).
 
 GEMMs take contiguous, 16-byte-aligned bf16 `a: (M, K)`, `b: (N, K)` on one device, with K and N
 multiples of 8. `out` must be bf16 `(M, N)` on the same device, contiguous, aligned and disjoint

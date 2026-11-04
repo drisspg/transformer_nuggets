@@ -364,7 +364,10 @@ class IndexSchedule:
       warp. ``index`` is the unit's previous index (valid or skipped), ``fetch`` maps each
       ``fetch_channels`` name to its ``(producer end, consumer end)``. Called only when a
       ring slot is free and the previous claim was valid.
-    * ``close_claims(fetch, problem)`` (broadcast): once, after the unit's last claim.
+    * ``close_claims(fetch, problem)`` (broadcast): once, after the unit's last claim. It
+      closes claim state only (``AtomicPersistent`` reports and resets its counter). Roles may
+      still be computing earlier items then (ring consumers release a slot on receipt), so it
+      is not a teardown, fixup or reduction point.
 
     All values are Int32. Extents past Int32 are rejected at launch through ``index_limit``.
     """
