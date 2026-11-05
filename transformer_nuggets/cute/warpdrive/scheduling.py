@@ -89,7 +89,12 @@ import cutlass
 from cutlass import Int32, Int64, cute
 
 from transformer_nuggets.cute.warpdrive.channels import Ring, Slots, Threads, Tma
-from transformer_nuggets.cute.warpdrive.protocol import ProtocolError, current_block, user_site
+from transformer_nuggets.cute.warpdrive.protocol import (
+    Lineage,
+    ProtocolError,
+    current_block,
+    user_site,
+)
 from transformer_nuggets.cute.warpdrive.tracing import pop, push_if
 
 AXES = ("m", "n", "l")
@@ -1002,6 +1007,7 @@ class _CursorRecord:
     advances: list = field(default_factory=list)  # (site, block)
     valid_reads: list = field(default_factory=list)  # (block, valid SSA value identity)
     trace: object = None
+    lineage: Lineage = field(default_factory=Lineage)
 
     def check(self):
         if not self.advances:
@@ -1141,6 +1147,7 @@ class WorkCursor:
         self._count, self._slot = count, slot  # recording: items seen, (role ordinal, warp)
         self._iket = iket  # IKET range name of one work item (the role name), or None
         self._state = state  # WorkMap.decode state of a decoding cursor (None: stateless)
+        self._copy = rec.lineage.add()
 
     @staticmethod
     def create(stream, problem, end, trace, *, scheduler: bool = False, slot=None):
@@ -1223,8 +1230,14 @@ class WorkCursor:
             state,
         )
 
+    def _check_current(self, returned_by: str | None = None):
+        """Reject this copy if a newer copy advanced past it (``Lineage``)."""
+        rec = self._rec
+        rec.lineage.check(self._copy, rec.trace, rec.cursor, "cursor", returned_by)
+
     @property
     def valid(self):
+        self._check_current()
         valid = self.index < self._problem.total
         # Keep SSA identity opaque: a raw Value in a shared dataclass becomes loop-carried
         # state during CuTeDSL serialization, rather than trace-only bookkeeping.
@@ -1234,6 +1247,7 @@ class WorkCursor:
     @property
     def item(self):
         """The current work item (``Raster``: ``(m, n, l)`` tile coordinates)."""
+        self._check_current()
         block = current_block()
         while block is not None:
             if any(block == advanced for _, advanced in self._rec.advances):
@@ -1248,6 +1262,8 @@ class WorkCursor:
 
     def advance(self):
         """Move to this CTA's next work item (``valid`` turns false when there is none)."""
+        self._check_current()
+        self._rec.lineage.advanced(self._copy)
         self._rec.advances.append((user_site(), current_block()))
         self._rec.trace.item_block = current_block()
         if self._iket is not None:

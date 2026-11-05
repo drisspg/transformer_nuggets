@@ -66,7 +66,12 @@ from transformer_nuggets.cute.warpdrive.cluster import (
     rank_in,
     rank_value,
 )
-from transformer_nuggets.cute.warpdrive.protocol import ProtocolError, current_block, user_site
+from transformer_nuggets.cute.warpdrive.protocol import (
+    Lineage,
+    ProtocolError,
+    current_block,
+    user_site,
+)
 from transformer_nuggets.cute.warpdrive.storage import SmemBuffer, StageView, project, stage_extent
 from transformer_nuggets.cute.warpdrive.tma import TmaUse, stage_closed
 from transformer_nuggets.cute.warpdrive.tracing import wait_range
@@ -789,14 +794,15 @@ class Token:
 class _EndRecord:
     """Trace-time record shared by loop-carried copies of one end: the fixed ``slots`` it used
     (a tail drains only those), the acquires/waits traced per slot (``None`` for a ring) and
-    raw accesses to ``end.state`` (together a token's epoch), and the previews no wait has
-    adopted yet."""
+    raw accesses to ``end.state`` (together a token's epoch), the previews no wait has
+    adopted yet, and the copies' lineage (which copies hold out-of-date phases)."""
 
     slots: set = field(default_factory=set)
     advances: dict = field(default_factory=dict)
     resets: int = 0
     previews: list = field(default_factory=list)
     checked: bool = False  # the role-exit check of unadopted previews is registered
+    lineage: Lineage = field(default_factory=Lineage)
 
 
 class _End:
@@ -830,6 +836,7 @@ class _End:
         self._cta = cta
         self._rec = rec if rec is not None else _EndRecord()
         self._views = views or {}  # {buffer name: StageView} registered with views()
+        self._copy = self._rec.lineage.add()
 
     def __extract_mlir_values__(self):
         if self._chan.fixed:
@@ -853,6 +860,10 @@ class _End:
             self._views,
             self._stride,
         )
+
+    def _check_current(self, returned_by: str | None = None):
+        """Reject this copy if a newer copy advanced past it (``Lineage``)."""
+        self._rec.lineage.check(self._copy, self._trace, self._chan.name, "end", returned_by)
 
     def views(self, **named: StageView):
         """This end with partitions of its channel's buffers: ``ab = ab.views(A=StageView(tAsA,
@@ -977,23 +988,28 @@ class _End:
         Assign a new value to resynchronize after raw waits or signals on this edge. Reading
         it hands out the live state, which raw code may advance in place, so it invalidates
         the end's outstanding try tokens and unadopted previews, as assigning it does."""
+        self._check_current()
         self._rec.resets += 1
+        self._rec.lineage.advanced(self._copy)
         return self._state
 
     @state.setter
     def state(self, value):
         self._state = value
         self._rec.resets += 1  # outstanding tokens no longer name the end's epoch
+        self._rec.lineage.advanced(self._copy)
 
     @property
     def index(self):
         """Ring: the stage the next acquire/wait takes."""
         if self._chan.fixed:
             raise ProtocolError(f"{self._chan.name} is Slots: the caller names the slot")
+        self._check_current()
         return self._state.index
 
     def phase(self, slot=None):
         """The parity the next acquire/wait on the stage (Ring) or ``slot`` (Slots) waits for."""
+        self._check_current()
         if not self._chan.fixed:
             return self._state.phase
         if not isinstance(slot, int):
@@ -1078,11 +1094,13 @@ class _End:
         else:
             self._state.advance(self._stride)
         self._rec.advances[slot] = self._rec.advances.get(slot, 0) + 1
+        self._rec.lineage.advanced(self._copy)
         return index, phase, label
 
     def _current(self, slot, op):
         """(index, phase, label) of the next use, without advancing."""
         self._check_slot(slot, op)
+        self._check_current()
         if not self._chan.fixed:
             return self._state.index, self._state.phase, "i"
         return slot, (self._state >> slot) & 1, slot
@@ -1235,6 +1253,7 @@ class ProducerEnd(_End):
     def tail(self):
         """Wait until every stage this end filled has been released (layer-emitted at role
         exit for pair-scoped channels whose consumer signals from another CTA)."""
+        self._check_current()
         self._trace.record(self._chan.name, "tail", None)
         n = self._chan.n
         with wait_range(self._trace, f"{self._chan.name}.tail"):
@@ -1299,9 +1318,11 @@ class ConsumerEnd(_End):
                 f"({self._rec.previews[0].describe()} at {self._rec.previews[0]._site}): the "
                 "next wait would take another epoch than the one previewed"
             )
+        self._check_current()
         self._trace.record(chan.name, "skip", None, count=n)
         self._state.advance(n)
         self._rec.advances[None] = self._rec.advances.get(None, 0) + 1
+        self._rec.lineage.advanced(self._copy)
 
     def peek(self, slot=None) -> Preview:
         """Wait until the stage the next ``wait`` takes is full and return a read-only

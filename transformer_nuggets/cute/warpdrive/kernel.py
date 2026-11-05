@@ -1509,7 +1509,7 @@ class WarpSpecialized(metaclass=_KernelType):
                 for (pname, _), arg in zip(r.params, args)
                 if isinstance(arg, _ROLE_STATE_TYPES)
             ]
-            final = _returned_state(r.name, result, state_args)
+            final = _returned_state(r, result, state_args)
             if self.iket:
                 for _, arg in state_args:
                     if isinstance(arg, WorkCursor):
@@ -1671,13 +1671,15 @@ def _state_identity(state):
     return id(state._rec)
 
 
-def _returned_state(role_name: str, result, state_args: list[tuple[str, object]]) -> dict:
+def _returned_state(r: RoleInstance, result, state_args: list[tuple[str, object]]) -> dict:
     """Match explicit state results to inputs, independent of names and tuple order.
 
     Reconstructed endpoints/cursors share a record; turnstile copies share a role, turnstile
-    and seat. This checks ownership, not freshness: the author must return loop-carried state
-    rather than a snapshot saved before the loop.
+    and seat. A returned end or cursor must also be current: not a snapshot saved before a
+    loop or branch that advanced it, nor an argument a helper advanced and returned in a copy
+    the role dropped (``Lineage``). Turnstile seats are checked for ownership only.
     """
+    role_name = r.name
     values = () if result is None else result if isinstance(result, tuple) else (result,)
     owned = {_state_identity(arg) for _, arg in state_args}
     final = {}
@@ -1692,6 +1694,8 @@ def _returned_state(role_name: str, result, state_args: list[tuple[str, object]]
             raise ProtocolError(f"{role_name}: returned state does not belong to this role")
         if key in final:
             raise ProtocolError(f"{role_name}: returned the same state argument more than once")
+        if not isinstance(value, TurnEnd):
+            value._check_current(returned_by=getattr(r.fn, "__name__", role_name))
         final[key] = value
     missing = [name for name, arg in state_args if _state_identity(arg) not in final]
     if missing:

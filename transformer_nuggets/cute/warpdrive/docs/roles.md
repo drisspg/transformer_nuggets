@@ -111,9 +111,12 @@ Helpers need the same state carry:
 ab = load_next(ab, params)
 ```
 
-Return the current value, not a snapshot saved before a loop. The checks detect ownership
-and missing returns, not stale snapshots. Returned ends supply the final phases for producer
-tails; returned cursors also let tracing close any remaining work range.
+Return the current value, not a snapshot saved before a loop. The checks reject ownership
+and return errors, and channel-end/work-cursor state superseded by an advancing helper,
+including a discarded helper result inside a loop: assign it, as in `ab = load_next(ab, params)`.
+They do not prove freshness of reconstructed/laundered snapshots, manually supplied raw state
+or turnstile seats. Returned ends supply the final phases for producer tails; returned cursors
+also let tracing close any remaining work range.
 
 ## Choose placement in the constructor
 

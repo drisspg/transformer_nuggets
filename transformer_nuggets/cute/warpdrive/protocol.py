@@ -8,11 +8,15 @@ import os
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from types import FrameType
 
+import cutlass
 from cutlass._mlir import ir
 
 _PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 _CONTEXTLIB = os.path.abspath(contextlib.__file__)  # frames of @contextmanager wrappers
+# CuTeDSL calls into this package when it carries a value through a dynamic region.
+_CUTEDSL_DIR = os.path.dirname(os.path.abspath(cutlass.__file__)) + os.sep
 
 
 class ProtocolError(Exception):
@@ -93,15 +97,38 @@ def take_opt_outs() -> list[OptOut]:
     return seen
 
 
-def user_site() -> str:
-    """``file:line`` of the innermost caller outside this package."""
-    frame = sys._getframe(1)
+def _user_frame(frame: FrameType | None = None) -> FrameType | None:
+    """The innermost frame outside this package and CuTeDSL, or None."""
+    frame = sys._getframe(1) if frame is None else frame
     while frame is not None:
         path = os.path.abspath(frame.f_code.co_filename)
-        if os.path.dirname(path) != _PACKAGE_DIR and path != _CONTEXTLIB:
-            return f"{os.path.basename(path)}:{frame.f_lineno}"
+        if (
+            os.path.dirname(path) != _PACKAGE_DIR
+            and path != _CONTEXTLIB
+            and not path.startswith(_CUTEDSL_DIR)
+        ):
+            return frame
         frame = frame.f_back
-    return "?"
+    return None
+
+
+def _function(frame) -> str | None:
+    """The user function of ``frame``: CuTeDSL traces loop and branch bodies as functions
+    nested in it (``fill.<locals>.while_region_0``)."""
+    if frame is None:
+        return None
+    return frame.f_code.co_qualname.split(".<locals>.")[0].rsplit(".", 1)[-1]
+
+
+def _frame_site(frame) -> str:
+    if frame is None:
+        return "?"
+    return f"{os.path.basename(frame.f_code.co_filename)}:{frame.f_lineno}"
+
+
+def user_site() -> str:
+    """``file:line`` of the innermost caller outside this package."""
+    return _frame_site(_user_frame())
 
 
 def current_block():
@@ -133,6 +160,86 @@ def _ancestors(block, root) -> list:
     except (AttributeError, ValueError, RuntimeError):
         pass
     return chain
+
+
+@dataclass
+class _Copy:
+    seen: int  # the lineage's advance count when this copy was made or last advanced
+    site: str
+    function: str | None  # the user function that made it
+    callee: str | None  # its bound or standalone spelling, for schematic reassignment advice
+
+
+class Lineage:
+    """The copies of one loop-carried DSL value (a channel end or work cursor), to reject a
+    copy whose phases are out of date.
+
+    CuTeDSL traces each loop or branch body once and carries a value through it by rebuilding
+    it: the body gets a copy and the region's result is a new copy after the region. A copy
+    is stale once a copy made after it has seen more advances: the copy a caller still holds
+    after dropping the result of a helper that advanced the value in a loop or branch,
+    including inside a loop body that does not carry the value itself. Branch bodies are
+    traced in order and the else branch gets its copy after the then branch, so a copy
+    nothing advanced since (a read-only helper's result, an unused ``views()``) supersedes
+    nothing.
+
+    Checked: uses that read or advance the phases, and the role's return. Not checked:
+    barrier-pointer accessors, so a saved snapshot may still hand out barriers. A snapshot a
+    region rebuilds gets a copy as new as the live one, so returning or using that copy is not
+    caught.
+    """
+
+    def __init__(self):
+        self._advances = 0  # of any copy
+        self._copies: list[_Copy] = []  # in creation order
+
+    def add(self) -> int:
+        """Register a new copy; returns its id."""
+        frame = _user_frame()
+        function = _function(frame)
+        callee = function
+        caller = frame
+        # A generated loop body may omit self; check its enclosing helper, not the outer role.
+        while caller is not None and _function(caller) == function:
+            if "self" in caller.f_locals:
+                callee = f"self.{function}"
+                break
+            caller = _user_frame(caller.f_back) if caller.f_back is not None else None
+        self._copies.append(_Copy(self._advances, _frame_site(frame), function, callee))
+        return len(self._copies) - 1
+
+    def advanced(self, copy: int) -> None:
+        """Copy ``copy`` advanced, handed out its raw state, or was assigned new phases."""
+        self._advances += 1
+        self._copies[copy].seen = self._advances
+
+    def check(
+        self, copy: int, trace: RoleTrace, name: str, kind: str, returned_by: str | None = None
+    ) -> None:
+        """Raise if copy ``copy`` of ``name`` is stale. ``returned_by``: the role function
+        returning it at role exit (else a use here)."""
+        seen = self._copies[copy].seen
+        hit = next((c for c in self._copies[copy + 1 :] if c.seen > seen), None)
+        if hit is None:
+            return
+        if returned_by is not None:
+            where, function = "returned at role exit", returned_by
+        else:
+            frame = _user_frame()
+            where, function = f"used at {_frame_site(frame)}", _function(frame)
+        if hit.function is not None and hit.function != function:
+            fix = (
+                f"assign the helper's returned {kind} to the argument you passed "
+                f"(schematically: `{name} = {hit.callee}({name}, ...)`; "
+                "use your actual argument or alias)"
+            )
+        else:
+            fix = f"use the {kind} the loop or branch carried, not a copy saved before it"
+        raise ProtocolError(
+            f"{trace.role_name}: the {name} {kind} {where} is stale: a newer copy made at "
+            f"{hit.site} (in {hit.function}) has advanced past it, so its phases are lost; "
+            f"{fix}"
+        )
 
 
 @dataclass

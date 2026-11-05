@@ -47,7 +47,9 @@ more than a ring lap of skips needs a rendezvous with the epoch's previous owner
 **Carry current state.** Return every managed endpoint, work cursor and turnstile seat from a
 role. Helpers return updated state and callers reassign it. Close each handle once, in its
 opening dynamic region, and do not access its storage after closing. The checker detects
-missing returns and local lifetime errors, not stale snapshots or all post-close accesses.
+missing returns, local lifetime errors and discarded advancing-helper results for managed
+channel ends/work cursors, including inside loops; it does not prove freshness of reconstructed
+snapshots, manually supplied raw state or turnstile seats, or all post-close accesses.
 
 **Drain the work loop.** Use `while work.valid:`, read `work.item` before advancing, and call
 `work.advance()` once directly at the end of the body. Return the cursor. The layer checks
