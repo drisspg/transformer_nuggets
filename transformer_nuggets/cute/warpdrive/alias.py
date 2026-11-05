@@ -1,32 +1,21 @@
-"""Alias-hazard diagnostic: a bug finder for declared SMEM/TMEM overlaps. Never a prover.
+"""Alias-hazard diagnostic for declared SMEM/TMEM overlaps. A bug finder, never a prover.
 
-Scope (phase 1): single-CTA kernels, declared overlaps only (``TmemPlan.alias`` regions and
-``SmemPlan.buffer(..., overlaps=...)`` buffers), and only accesses the author annotates:
-``tmem.view``/``tmem.access`` and ``handle.view``/``handle.access`` with ``read=``/``write=`` and
-an agent (``by="threads"``, ``"tma"``, ``"umma"``). Footprints are whole regions or buffer stages,
-narrowed by optional TMEM ``lanes``/``cols`` per warp. Ordering comes from the traced managed
-channel operations and the recording wrappers below; raw ``cute.arch`` ordering instructions stay
-legal but are invisible, so what they would order is reported ``unverified``.
+Phase 1 models single-CTA kernels and author-annotated ``tmem.view``/``tmem.access`` and
+``handle.view``/``handle.access`` calls. Footprints cover whole regions or buffer stages,
+narrowed by optional TMEM lanes/columns per warp. A conflict needs overlapping footprints,
+at least one write and two different declared names.
 
-For every pair of conflicting annotated accesses (overlapping footprints, at least one write,
-through two different declared names) the diagnostic looks for an ordering edge in both
-directions and reports, per alias:
+Same-channel/slot handles order whole-region handoffs when each access completes before its
+close signals. Other pairs use a happens-before graph with epoch-matched channel edges,
+loops unrolled twice and two persistent work items (one otherwise). ``RULES`` carries the
+PTX citations; raw ordering instructions are legal but invisible.
 
-* ``potential hazard``: a conflicting pair and the edge that is missing, with source lines;
-* ``unverified``: an access it cannot see (raw acquisition, raw signal, raw ordering
-  instruction, a CTA pair), or an edge only a raw instruction could supply;
-* ``no hazard found``: no finding among the annotated accesses, which is not a proof.
-
-Two orderings are modeled. Accesses inside handles of the same channel (and slot) are ordered by
-the channel's whole-region handoff, provided each access completes before its handle's close
-signals (``RULES``). Other pairs are checked on a happens-before graph over the traced roles,
-with loops unrolled twice and two work items under a persistent schedule (one otherwise), linked
-by epoch-matched channel edges. Every rule lives in ``RULES`` with its PTX ISA citation.
-
-Default ``alias_check = "warn"``: the report is in ``describe()`` and one warning names the
-findings. ``"strict"`` raises ``ProtocolError`` on a potential hazard; ``"off"`` skips the
-analysis. ``with unchecked("alias", reason=...)`` leaves the accesses annotated inside the block
-out. The diagnostic is host-only: annotations and wrappers emit no extra device code.
+Reports distinguish ``potential hazard`` (a conflicting pair with a missing edge),
+``unverified`` (an invisible access/edge or an unmodeled cluster) and ``no hazard found``
+(only among annotated accesses, not a proof). Default ``alias_check="warn"`` puts the report
+in ``describe()`` and warns once about findings; ``"strict"`` raises on potential hazards;
+``"off"`` skips analysis. ``unchecked("alias", reason=...)`` excludes enclosed annotations.
+Annotations and wrappers add no device code. Usage and limits: ``docs/storage.md``.
 """
 
 from __future__ import annotations
@@ -34,6 +23,8 @@ from __future__ import annotations
 import warnings
 from collections import deque
 from dataclasses import dataclass, field
+from functools import cache
+from itertools import combinations
 
 from cutlass import cute
 
@@ -260,37 +251,30 @@ class AliasReport:
 
 
 def _overlap(a: range | None, b: range | None) -> bool:
-    if a is None or b is None:
-        return True
-    return a.start < b.stop and b.start < a.stop
+    return a is None or b is None or (a.start < b.stop and b.start < a.stop)
 
 
 def _declared_pairs(kernel) -> list[tuple[str, tuple[str, str]]]:
     pairs = []
     plan = kernel.tmem_plan
     if plan is not None:
-        regions = list(plan.regions.values())
-        for i, x in enumerate(regions):
-            for y in regions[i + 1 :]:
-                if x.alias_of is None and y.alias_of is None:
-                    continue  # plan regions never overlap each other
-                spans = [
-                    range(plan.col(r.name, j), plan.col(r.name, j) + r.cols)
-                    for r in (x, y)
-                    for j in range(r.slots)
-                ]
-                xs, ys = spans[: x.slots], spans[x.slots :]
-                if any(_overlap(p, q) for p in xs for q in ys):
-                    pairs.append(("tmem", (y.name, x.name)))
-    for i, (xn, x) in enumerate(kernel._ws_smem.items()):
-        for yn, y in list(kernel._ws_smem.items())[i + 1 :]:
-            if x.buffer.root is not y.buffer.root:
-                continue
-            if _overlap(
-                range(x.nbytes) if x.nbytes is not None else None,
-                range(y.nbytes) if y.nbytes is not None else None,
-            ):
-                pairs.append(("smem", (yn, xn)))
+        for x, y in combinations(plan.regions.values(), 2):
+            if x.alias_of is None and y.alias_of is None:
+                continue  # plan regions never overlap each other
+            spans = [
+                range(plan.col(r.name, j), plan.col(r.name, j) + r.cols)
+                for r in (x, y)
+                for j in range(r.slots)
+            ]
+            xs, ys = spans[: x.slots], spans[x.slots :]
+            if any(_overlap(p, q) for p in xs for q in ys):
+                pairs.append(("tmem", (y.name, x.name)))
+    for (xn, x), (yn, y) in combinations(kernel._ws_smem.items(), 2):
+        if x.buffer.root is y.buffer.root and _overlap(
+            range(x.nbytes) if x.nbytes is not None else None,
+            range(y.nbytes) if y.nbytes is not None else None,
+        ):
+            pairs.append(("smem", (yn, xn)))
     return pairs
 
 
@@ -329,20 +313,19 @@ def _parts(kernel, ev, role: RoleEvents) -> list:
             parts.append((w, lanes, range(base + cols.start, base + cols.stop)))
         return parts
     res = kernel._ws_smem[name]
-    span = None  # a ring stage (dynamic) or a layout without static stage spans
-    if ev.data["slot"] is not None and res.stage_span(ev.data["slot"]) is not None:
-        span = range(*res.stage_span(ev.data["slot"]))
-    return [(None, None, span)]
+    # None for a dynamic ring stage or a layout without static stage spans.
+    span = res.stage_span(ev.data["slot"]) if ev.data["slot"] is not None else None
+    return [(None, None, range(*span) if span is not None else None)]
 
 
 def _conflicts(a: Access, b: Access) -> list[tuple]:
     """Warp pairs whose footprints overlap (``(None, None)`` for SMEM)."""
-    out = []
-    for wa, la, sa in a.parts:
-        for wb, lb, sb in b.parts:
-            if _overlap(la, lb) and _overlap(sa, sb):
-                out.append((wa, wb))
-    return out
+    return [
+        (wa, wb)
+        for wa, la, sa in a.parts
+        for wb, lb, sb in b.parts
+        if _overlap(la, lb) and _overlap(sa, sb)
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -358,23 +341,18 @@ def _between(role: RoleEvents, seq: list[int], lo: int, hi: int):
 def _bulk_done(role: RoleEvents, seq: list[int], pos_a: int, pos_e: int) -> bool:
     """Does a recorded wait_group.read between the TMA store at ``pos_a`` and ``pos_e`` cover
     the store's bulk group?"""
-    commits = sum(1 for p in range(pos_a) if role.events[seq[p]].kind == "bulk_commit")
-    group = commits  # the store joins the next committed group
-    seen = commits
-    committed = False
+    groups = 0  # commits since the store, which joins the first of these groups
     for p in range(pos_a + 1, pos_e):
         ev = role.events[seq[p]]
         if ev.kind == "bulk_commit":
-            seen += 1
-            committed = True
-        elif ev.kind == "bulk_wait" and committed:
-            if seen - ev.data["n"] > group:
-                return True
+            groups += 1
+        elif ev.kind == "bulk_wait" and groups and groups > ev.data["n"]:
+            return True
     return False
 
 
 def _completion(
-    a: Access, role: RoleEvents, seq: list[int], pos_a: int, pos_e: int, close, other: str
+    a: Access, seq: list[int], pos_a: int, pos_e: int, close, other: str
 ) -> Finding | None:
     """None when access ``a`` (at ``pos_a``) has completed, and is published to a thread
     synchronizing with the signal at ``pos_e`` (a close event), for a conflicting access by
@@ -404,7 +382,7 @@ def _completion(
                 f"{where}: nothing waits for the TMA store's source reads",
                 "wait_group_read",
             )
-        if _bulk_done(role, seq, pos_a, pos_e):
+        if _bulk_done(a.role, seq, pos_a, pos_e):
             return None
         return Finding(
             UNVERIFIED,
@@ -434,7 +412,7 @@ def _completion(
             "tmem_store",
         )
     if other in ("tma", "umma") and a.storage[0] == "smem":
-        fences = {e.data["kind"] for e in _between(role, seq, pos_a, pos_e) if e.kind == "fence"}
+        fences = {e.data["kind"] for e in _between(a.role, seq, pos_a, pos_e) if e.kind == "fence"}
         if fence != "smem_async" and "smem_async" not in fences:
             return Finding(
                 UNVERIFIED,
@@ -451,21 +429,15 @@ def _completion(
 
 
 def _pipelined(first: Access, second: Access) -> bool:
-    if first.storage[0] == "smem":
-        return first.agent == second.agent == "threads"
     if first.agent == second.agent == "threads":
-        return True  # st -> ld, st -> st, ld -> st (ld -> ld does not conflict)
-    if first.agent == second.agent == "umma":
-        if first.read and not first.write:
-            return True  # A-operand read -> D write
-        same_acc = first.storage == second.storage and first.slot == second.slot
-        return same_acc and second.write and not second.read  # D write -> D write
-    return False
-
-
-def _role_barrier(role: RoleEvents, between) -> bool:
-    """A recorded named_barrier over every thread of the role among ``between``."""
-    return any(e.kind == "barrier" and e.data["threads"] == 32 * len(role.warps) for e in between)
+        return True  # SMEM program order; TMEM st -> ld, st -> st, ld -> st
+    # Conflicts are between distinct declared names, never the same accumulator.
+    return (
+        first.storage[0] == "tmem"
+        and first.agent == second.agent == "umma"
+        and first.read
+        and not first.write  # A-operand read -> D write
+    )
 
 
 def _same_period(
@@ -478,9 +450,11 @@ def _same_period(
     first, second = (a, b) if first_is_a else (b, a)
     if between is None:
         between = first.role.events[first.index + 1 : second.index]
-    barrier = _role_barrier(first.role, between)
+    barrier = any(
+        e.kind == "barrier" and e.data["threads"] == 32 * len(first.role.warps) for e in between
+    )
     for wa, wb in warp_pairs:
-        if wa is not None and wb is not None and wa != wb:
+        if wa != wb:  # TMEM warp indices, or (None, None) for SMEM
             if not barrier:
                 return Finding(
                     UNVERIFIED,
@@ -571,7 +545,7 @@ def _handoff(a: Access, b: Access, chan, slot, warp_pairs) -> Finding | None:
             return Finding(
                 UNVERIFIED, f"{x.describe()}: its {chan.name} handle never closes", "channel"
             )
-        found = _completion(x, x.role, seq, x.index, close, x.role.events[close], other.agent)
+        found = _completion(x, seq, x.index, close, x.role.events[close], other.agent)
         if found is not None:
             return found
     return None
@@ -699,19 +673,16 @@ class _Graph:
         equal = all(len(releases.get(i, [])) == len(acquires.get(i, [])) for i in span)
         flat_r = [p for i in span for p in releases.get(i, [])]
         flat_a = [p for i in span for p in acquires.get(i, [])]
-        if equal and chan.fixed:
-            for k, r in enumerate(flat_r):
-                if k + 1 < len(flat_a):
-                    self._edge(src, r, dst, flat_a[k + 1])
-        elif equal:  # a ring: exact only when no op of the channel sits in an inner loop
-            if any(
+        if equal:
+            # A ring is exact only when no channel op sits in an inner loop.
+            if not chan.fixed and any(
                 len(releases.get(i, [])) != len(set(self._events(src, releases.get(i, []))))
                 for i in span
             ):
                 return
-            for k, r in enumerate(flat_r):
-                if k + chan.n < len(flat_a):
-                    self._edge(src, r, dst, flat_a[k + chan.n])
+            distance = 1 if chan.fixed else chan.n
+            for release, acquire in zip(flat_r, flat_a[distance:]):
+                self._edge(src, release, dst, acquire)
         elif chan.fixed:  # unmatched counts: the next item's first acquire follows them all
             for i in span:
                 nxt = acquires.get(i + 1, [])
@@ -744,7 +715,7 @@ class _Graph:
             if raw:
                 edges = edges + self.raw_edges.get((rid, p), [])
             for dst, q in edges:
-                if not left and rid == id(a.role) and not check(p):
+                if not left and not check(p):
                     continue
                 nxt.append((id(dst), q, True))
             for state in nxt:
@@ -819,7 +790,7 @@ def _reach(graph: _Graph, x: Access, px: int, other: str) -> tuple[set, list, se
         def check(pos_e):
             if pos_e not in verdicts:
                 close = x.role.events[seq[pos_e]]
-                verdicts[pos_e] = _completion(x, x.role, seq, px, pos_e, close, other)
+                verdicts[pos_e] = _completion(x, seq, px, pos_e, close, other)
                 if verdicts[pos_e] is not None:
                     failures.append(verdicts[pos_e])
             return verdicts[pos_e] is None
@@ -861,9 +832,7 @@ def _same_role(graph: _Graph, a: Access, b: Access, warp_pairs) -> Finding | Non
     first = None
     for pa in graph.pos.get((id(a.role), a.index), []):
         for pb in graph.pos.get((id(b.role), b.index), []):
-            if pa == pb:
-                continue
-            (x, px), (y, py) = sorted(((a, pa), (b, pb)), key=lambda t: t[1])
+            x, px, y, py = (a, pa, b, pb) if pa < pb else (b, pb, a, pa)
             between = [a.role.events[e] for e, _ in seq[px + 1 : py]]
             found = _same_period(a, b, warp_pairs, between, first_is_a=x is a)
             if found is None:
@@ -924,15 +893,13 @@ def check(kernel, roles: list[RoleEvents]) -> AliasReport:
                 )
     streams = getattr(kernel, "_ws_streams", {})
     items = 2 if any(st.schedule.persistent for st in streams.values()) else 1
-    graph: list = []  # built on the first cross-channel pair
 
+    @cache
     def get_graph() -> _Graph | str:
-        if not graph:
-            try:
-                graph.append(_Graph([r for r in roles if not r.raw], items))
-            except _TooLarge as exc:
-                graph.append(f"role {exc} unrolls past {UNROLL_LIMIT} events; not modeled")
-        return graph[0]
+        try:
+            return _Graph([r for r in roles if not r.raw], items)
+        except _TooLarge as exc:
+            return f"role {exc} unrolls past {UNROLL_LIMIT} events; not modeled"
 
     for kind, (x, y) in pairs:
         res = AliasResult((x, y), kind)
@@ -1016,9 +983,10 @@ def report(rep: AliasReport, mode: str, kernel_name: str):
     """Warn once (or raise in strict mode) about the findings of ``rep``."""
     if mode == "strict" and rep.hazards:
         raise ProtocolError(f"warpdrive alias diagnostic (strict):\n{rep.describe()}")
-    if rep.flagged:
-        names = ", ".join(f"{r.names[0]}~{r.names[1]}" for r in rep.flagged)
-        first = rep.flagged[0].findings[0].describe()
+    flagged = rep.flagged
+    if flagged:
+        names = ", ".join(f"{r.names[0]}~{r.names[1]}" for r in flagged)
+        first = flagged[0].findings[0].describe()
         warnings.warn(
             f"warpdrive: alias diagnostic flagged {names} in {kernel_name} (no error raised; see "
             f"describe()): {first}",
