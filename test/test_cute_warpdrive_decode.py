@@ -27,6 +27,7 @@ from transformer_nuggets.cute.warpdrive import (
     Producer,
     ProtocolError,
     Ring,
+    RoleConfig,
     Slots,
     Threads,
     Turn,
@@ -487,6 +488,9 @@ def test_decode_rejects_unfit_configurations(decode):
         decode.SwapABDecode(8, s_stages=3)
     with pytest.raises(ValueError, match="room for"):
         decode.SwapABDecode(32, tile_n=256, p_stages=12)
+    # The one-shot stats flags count one load warp and one correction warpgroup.
+    with pytest.raises(ValueError, match=r"roles\['load'\] must be one instance of 1 warp"):
+        decode.SwapABDecode(8, roles={"load": RoleConfig(range(16, 18))})
 
 
 @pytest.mark.parametrize(

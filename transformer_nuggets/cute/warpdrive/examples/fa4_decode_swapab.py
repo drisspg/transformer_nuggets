@@ -279,6 +279,13 @@ class SwapABDecode(WarpSpecialized):
                 "correction": RoleConfig(range(12, 16), regs=208),
             }
         self.roles = {**defaults, **(roles or {})}
+        # The stats flags below count one load warp and one correction warpgroup.
+        for name, warps in (("load", 1), ("correction", WARPS_PER_WG)):
+            config = self.roles.get(name)
+            if config is not None and [len(r) for r in config.warps] != [warps]:
+                raise ValueError(
+                    f"roles[{name!r}] must be one instance of {warps} warp(s), got {config.warps}"
+                )
         n, bf16 = self.tile_hq_mma, cutlass.BFloat16
         n_k, n_v = self.kv_stages
 
@@ -960,6 +967,11 @@ class SwapABDecode(WarpSpecialized):
         sO_layout,
         bound,
     ):
+        if cutlass.const_expr(self.work.schedule.persistent):
+            raise ValueError(
+                "SwapABDecode runs at most one work item per CTA: its round-robin rings and "
+                f"one-shot stats flags assume it, got {self.work.schedule.describe()}"
+            )
         layouts = {"P": sP_layout, "Q": sQ_layout, "K": sK_layout, "V": sV_layout, "O": sO_layout}
         smem = self.begin_roles(work=bound, layouts=layouts)
         thr_qk = mma_qk.get_slice(0)
