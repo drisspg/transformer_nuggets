@@ -14,6 +14,8 @@
 - [fa4_decode_swapab.py](../examples/fa4_decode_swapab.py): FA4's swap-AB single-token decode:
   split-KV work items with per-sequence split counts, round-robin softmax warpgroups,
   named-barrier mailboxes and P staged through SMEM.
+- [bench_overhead.py](../examples/bench_overhead.py): handoff and fixed-cost microbenchmarks
+  against hand-written twins ([results](#warpdrive-fixed-costs)).
 
 ## GEMM
 
@@ -367,8 +369,8 @@ Run the benchmark with `--output` to save versions, source hashes, kernel names 
 replay sample. It now uses three seconds of warmup and seven alternating rounds, reporting
 the median of round medians. In the matched A/B above, the updated port still trails FA4
 by 7.4-9.3% on 1x8192, 1x32768 and 8x65536 ragged, and by 1.7% at 4x16384; long splits
-approximately tie. The ragged gap and the remaining body/tail delay are not yet attributed
-to a specific instruction sequence.
+approximately tie. [Where the remaining gap was](#where-the-remaining-gap-was) locates that
+delay and narrows it.
 
 ```bash
 gpu-run --timeout 1800 auto -- timeout --signal=TERM --kill-after=5s 900s \
@@ -384,6 +386,66 @@ prepare/combine where present; filter the reports to `attn_kernel|warpdrive_fa4_
 Original code size, counting lines that are neither blank, comments nor docstrings: FA4's file
 had 1,496, of which 1,347 were the kernel without the interface adapter, including paging,
 masks, score mods and varlen Q. The initial port had 993, including its wrappers and mapping.
+
+### Where the remaining gap was
+
+`clock64` stamps from lane 0 of every warp, in instrumented copies of both kernels (1x8192,
+8/1, 16 splits, partials still bitwise equal), put the port's Q-store finish about 970 cycles
+behind FA4's. About 550 cycles came at the head: the port reads `seqused_k` after the CTA
+sync and issues Q's TMA after that, while FA4 has a static length and issues Q before its
+sync. The other ~450 came in the correction tail: the port waited for both final O slots
+before its row-sum/1/L round trip with the stats warp, FA4 does the round trip first. The
+stamps perturb the port more than FA4 (+384 ns versus +128 ns uninstrumented), so they
+locate phases but do not price them; the kernel times below do.
+
+The correction now runs the round trip first, and one CTA allocates TMEM off the
+barrier-init warp (see [fixed costs](#warpdrive-fixed-costs)). CUPTI decode-kernel medians
+of nine interleaved rounds, GB300, November 2026, in microseconds:
+
+| batch x kv_len, heads/kv_heads | FA4 | port before | port now | now / FA4 |
+|---|---:|---:|---:|---:|
+| 1x8192, 8/1 | 4.224 | 4.672 | 4.447 | 1.053 |
+| 1x32768, 32/1 | 7.072 | 7.936 | 7.361 | 1.041 |
+| 4x16384, 32/8 | 39.87 | 40.61 | 40.23 | 1.009 |
+| 8x65536 ragged, 8/1 | 26.27 | 28.32 | 28.03 | 1.067 |
+| 2x131072 ragged, 16/1 | 9.184 | 9.216 | 8.928 | 0.972 |
+
+"Before" is the port at the configuration-knob commit with the allocator change, so the
+column isolates the tail order. Tried and not kept, with the tail order in place: a static
+length without `seqused_k` (no load before the first TMA, as FA4 does) moved 1x8192 by one
+CUPTI tick (-31 ns) and 1x32768 by +31 ns; computing the split range in the kernel prologue
+added nothing on top. Before the allocator change, both had been worth about 2%. Try-wait-
+first channel waits, patched in for every wait of the port, changed nothing.
+
+## warpdrive fixed costs
+
+[bench_overhead.py](../examples/bench_overhead.py) times the layer against hand-written
+`cute.arch` twins. Per one-way handoff, in SM cycles on GB300 (warpdrive / raw with
+`cute.arch.mbarrier_wait` / raw with one hintless `try_wait` first): Threads 170 / 166 / 107,
+named 53 / 53 / 53, UMMA commit 164 / 164 / 105, TMA 317 / 317 / 257, round robin
+170 / 172 / 119; streams through 1- and 4-stage rings match as well. The channel code adds
+nothing; a try-wait first is about 60 cycles faster when the waiter is already parked
+(`mbarrier_wait` lowers to `TRYWAIT`, then `NANOSLEEP.SYNCS` with its 10 ms hint), but on
+the decode, GEMM and FA4 kernels it did not help (see above and the setup-cost section).
+
+The fixed-cost suite runs the decode example's 16-warp layout, 48 mbarriers, TMEM and a
+OneShot stream with empty roles. On 148 CTAs it took 2.14 us against 1.95 us for a twin
+that allocates TMEM from warp 0 and 1.82 us for one that allocates from warp 1, as FA4 does.
+Teardown (role end to kernel end) costs about 70 cycles in both. The CTA sync to the first
+role instruction took about 600 cycles longer than the warp-1 twin, for three reasons:
+
+1. Warp 0 initialized every barrier and then allocated TMEM. One CTA now allocates from the
+   lowest other warp of a TMEM role: role start 1260 -> 925 cycles, 1.89-1.92 us.
+2. LLVM folds the role dispatch's compares on the warp index into a switch, which ptxas
+   lowers to an indexed constant load and an indirect branch (`BRX`), here worth about 116
+   cycles. It appears with three or more consecutive single-warp roles, as in the decode,
+   not in the other examples. Opaque per-test copies of the warp index removed it but made
+   the decode 2% and single-CTA GEMM/FA4 about 1% slower; not kept.
+3. Each role decodes its first item behind an `index < total` guard after the sync, so the
+   guard's constant load and then the mapping's divisor loads are serialized there; the
+   twin's unguarded decode is hoisted above the barrier. A mapping that sets
+   `decodes_any_index` drops the guard (role start 924 -> 858 cycles). Decoding the first
+   item once in `begin_roles` instead lengthened warp 0's path to the sync and cost 80 ns.
 
 ## Historical timings
 
