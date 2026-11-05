@@ -1,0 +1,1150 @@
+"""FlashAttention-4 backward (SM100, 1-CTA) main kernel written with ``warpdrive``.
+
+Scope: bf16 Q/K/V/dO, fp32 accumulation, head_dim 128, 128 x 128 tiles, MHA (no GQA), no
+varlen/paging/block sparsity/score mods, non-causal or causal (bottom-right aligned, as FA4).
+Ragged sequence lengths are allowed: TMA zero-fills the loads of the last Q/K/V/dO tiles, keys
+past ``seqlen_k`` are masked and the dK/dV stores are clipped. The pre- and post-processing
+kernels (``dPsum = rowsum(dO * O)``, ``LSE * log2(e)``, zeroing and converting the fp32 dQ
+accumulator) are FA4's own (``flash_attn.cute.interface._bwd_preprocess`` and
+``_bwd_postprocess_convert``), reused as is; this file ports the main kernel,
+``flash_attn/cute/flash_bwd_sm100.py`` at its 1-CTA, hdim-128 configuration (``split_P_dS``
+off, ``Q_stage=2``, ``dO_stage=1``, registers 152/136/88, or 136/144/88 when causal).
+
+A work item is one 128-key K/V tile ``(n_block, head, batch)`` (FA4's ``SingleTileScheduler``
+order, which ``Raster`` over ``(n_blocks, heads, batch)`` reproduces). The CTA keeps K, V, dK and
+dV for the item and loops over the Q tiles that see its keys. Per Q tile t:
+
+    S^T = K Q_t^T          P^T = exp2(S^T * scale_log2 - LSE_t)     (in TMEM over S)
+    dP^T = V dO_t^T        dS^T = P^T * (dP^T - dPsum_t)             (in TMEM over dP, and SMEM)
+    dV += P^T dO_t         dK += dS^T Q_t          dQ_t = dS K        (TMA reduce-add into fp32)
+
+Roles (FA4's warp layout; 14 warps, padded to 16 for the register budgets):
+
+    warps 0-3   reduce   dQ_t: TMEM -> SMEM -> cp.reduce.async.bulk.add.f32 into dQaccum
+    warps 4-11  compute  P and dS for each tile; the dK/dV epilogue (TMEM -> SMEM -> TMA store)
+    warp 12     mma      the five GEMMs, software-pipelined as FA4's 1-CTA schedule
+    warp 13     load     K, V once; Q, LSE, dO, dPsum per Q tile
+
+Channels (all mbarriers; epochs per item with n Q tiles). Thread sides are ``Warps``: every
+thread signals, one elected lane per warp arrives, as FA4's pipelines count:
+
+    load --k, v (TMA, 1 stage)--> mma                  1 each; held for the whole item
+    load --q (TMA, 2 stages)--> mma                    n; Q_t released after dK += dS_t^T Q_t
+    load --do (TMA, 1 stage)--> mma                    n; released after dV += P_t^T dO_t
+    load --lse (bulk copy, 2) / dpsum (1)--> compute   n each
+    mma --s (UMMA)--> compute                          n; empty = "P_t stored over S_t"
+    mma --dp (UMMA)--> compute                         n; empty = "dS_t stored over dP_t"
+    compute --ds--> mma                                n; dS_t in sdS; empty = dQ_t MMA done
+    mma --dq (UMMA)--> reduce                          n; empty = dQ_t read out of TMEM
+    mma --dkv[0] dV, dkv[1] dK (UMMA)--> compute       1 each, after the last dV / dK MMA
+
+Every ring starts empty, so the MMA's first acquires of s, dp, dq and dkv pass, and the load
+runs ahead by the q/do stage counts. Per tile t the MMA warp issues dP_t, dV_t, S_{t+1}, dK_t,
+dQ_t, FA4's order. Q_t is read by S_t (issued during tile t-1) and by dK_t, so S_{t+1} reads
+the q ring's next stage after a raw wait on its full barrier, without consuming it: carrying a
+handle from one loop iteration to the next is not checkable (see docs/examples.md). With one
+Q stage that read would wait for the release of Q_t, which comes after S_{t+1}: a deadlock,
+so ``Q_STAGE`` is fixed at 2. The last tile's s acquire is retired (there is no S_{t+1}),
+which is why the kernel runs one item per CTA, as FA4's 1-CTA kernel does.
+
+TMEM (512 columns): S [0,128), dV [128,256), dP [256,384), dK [384,512). P (bf16 pairs) aliases
+S's first 64 columns, dS aliases dP's first 64, and dQ aliases all of dP (FA4's 1-CTA map).
+The MMA warp holds the dq handle from before dP_t (which overwrites dQ_{t-1}'s columns) until
+after dQ_t, and the s handle for tile t+1 from before dV_t (which reads P_t) until after S_{t+1}:
+overlapping handle lifetimes, not nested ``with`` blocks. An MMA's TMEM read and a later MMA's
+write from the same thread are pipelined (PTX ISA 9.7.18.6.2), so P_t is read by dV_t before
+S_{t+1} overwrites it, and dS_t by dK_t before dQ_t overwrites it. The compute warpgroups
+share every TMEM lane (each takes alternate 32-column groups), so a named barrier over both
+separates the S loads from the P stores and each dP load from the dS stores.
+
+SMEM is an ``SmemPlan``: Q (2 stages) with its MN-major view Qt, K with Kt, V, dO with dOt, dS,
+the dQ staging buffer (``dq_stages``), LSE/dPsum rows, and the dK/dV epilogue tiles over Q
+and dO (FA4 reuses those bytes once the last MMA reading them has committed, which again needs
+one work item per CTA). 231 KB of the 232 KB limit.
+"""
+
+import math
+from dataclasses import dataclass
+from types import SimpleNamespace
+
+import cutlass
+import cutlass.utils.blackwell_helpers as sm100_utils
+import torch
+from cuda.bindings import driver as cuda
+from cutlass import Float32, Int32, cute
+from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.tensor_utils import LayoutEnum
+from flash_attn.cute import blackwell_helpers as fa_mma
+from flash_attn.cute import copy_utils as fa_copy_utils
+from flash_attn.cute import mask as fa_mask
+from flash_attn.cute import utils as fa_utils
+
+from transformer_nuggets.cute.jit_cache import jit_cache
+from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
+from transformer_nuggets.cute.warpdrive import (
+    Consumer,
+    OneShot,
+    Producer,
+    Raster,
+    Ring,
+    RoleConfig,
+    Slots,
+    SmemPlan,
+    StageView,
+    Tma,
+    Tmem,
+    TmemPlan,
+    Umma,
+    Warps,
+    WarpSpecialized,
+    WorkCursor,
+    WorkStream,
+    bulk_commit_group,
+    bulk_wait_group,
+    fence_async_shared,
+    named_barrier,
+    role,
+)
+
+TILE_M = 128  # Q rows per tile (the MMA N of S^T and dP^T)
+TILE_N = 128  # keys per work item (the MMA M; one compute thread pair per key row)
+HEAD_DIM = 128
+# S_{t+1} reads Q_{t+1} before dK_t releases Q_t, so one Q stage deadlocks this schedule.
+Q_STAGE = 2
+DQ_COLS = 32  # dQ columns per TMA reduce-add (FA4's dQ_reduce_ncol at 1-CTA)
+EPI_COLS = 64  # dK/dV columns per compute warpgroup (one 128-byte-row TMA store box)
+LOG2_E = math.log2(math.e)
+# Named barriers inside roles (the layer owns 1 and 2; this kernel declares no named channels).
+COMPUTE_BAR = 3  # the 8 compute warps: P over S, dS over dP
+REDUCE_BAR = 4  # the 4 reduce warps: dQ staging buffer
+EPI_BAR = 5  # 5 and 6: one per compute warpgroup's dK/dV epilogue tile
+
+
+@dataclass(frozen=True)
+class BwdParams:
+    """Kernel-prologue values the roles read; built once in ``FlashAttentionBackward.kernel``."""
+
+    mma_s: cute.TiledMma  # S^T = K Q^T
+    mma_dp: cute.TiledMma  # dP^T = V dO^T
+    mma_dv: cute.TiledMma  # dV += P^T dO, P from TMEM
+    mma_dk: cute.TiledMma  # dK += dS^T Q, dS from TMEM
+    mma_dq: cute.TiledMma  # dQ = dS K, dS from SMEM
+    tma_q: cute.CopyAtom
+    tma_k: cute.CopyAtom
+    tma_v: cute.CopyAtom
+    tma_do: cute.CopyAtom
+    tma_dk: cute.CopyAtom
+    tma_dv: cute.CopyAtom
+    mQ: cute.Tensor  # (s, d, h, b) TMA views; dO is (d, s, h, b)
+    mK: cute.Tensor
+    mV: cute.Tensor
+    mdO: cute.Tensor
+    mdK: cute.Tensor
+    mdV: cute.Tensor
+    mLSE: cute.Tensor  # (s_rounded, h, b): LSE * log2(e), +inf past seqlen_q
+    mdPsum: cute.Tensor  # (s_rounded, h, b)
+    mdQacc: cute.Tensor  # (s_rounded * d, h, b), FA4's TMEM_FRAG_1CTA tile order
+    sQ: cute.Tensor
+    sQt: cute.Tensor
+    sK: cute.Tensor
+    sKt: cute.Tensor
+    sV: cute.Tensor
+    sdO: cute.Tensor
+    sdOt: cute.Tensor
+    sdS: cute.Tensor
+    sLSE: cute.Tensor
+    sdPsum: cute.Tensor
+    sdQacc: cute.Tensor
+    sdK: cute.Tensor  # epilogue tiles over Q / dO
+    sdV: cute.Tensor
+    p_layout: cute.ComposedLayout  # P / dS as TMEM A operands
+    ds_layout: cute.ComposedLayout
+    softmax_scale: Float32
+    scale_log2: Float32
+    seqlen_q: Int32
+    seqlen_k: Int32
+    m_blocks: Int32
+
+
+def cols(warp: int, st: int, width: int) -> range:
+    """Columns of stage ``st`` of a compute warp's ``width``-column S/dP loads or P/dS stores,
+    for the alias diagnostic: the warpgroups interleave, warps 8-11 taking the first ``width``
+    columns of each pair of stages."""
+    first = 2 * width * st + width * (warp < 8)
+    return range(first, first + width)
+
+
+def half_cols(t, wg):
+    """Warpgroup ``wg``'s half of mode 1 of a TMEM copy partition (FA4's split_wg)."""
+    shape = cute.product_each(t.shape)
+    t = cute.logical_divide(t, (shape[0], shape[1] // 2))
+    return t[(None, (None, wg)) + (None,) * (cute.rank(t) - 2)]
+
+
+def umma(tiled_mma, acc, a, b, accumulate):
+    """Issue one tile MMA as K-block ``tcgen05.mma`` instructions; ``accumulate`` may be
+    dynamic (plain Python: inlined)."""
+    atom = cute.make_mma_atom(tiled_mma.op)
+    for k in range(cute.size(a.shape[2])):
+        atom.set(tcgen05.Field.ACCUMULATE, accumulate if k == 0 else True)
+        cute.gemm(atom, acc, a[None, None, k], b[None, None, k], acc)
+
+
+class FlashAttentionBackward(WarpSpecialized):
+    def __init__(
+        self,
+        causal: bool = False,
+        roles: dict[str, RoleConfig] | None = None,
+        dq_stages: int = 2,
+        trace: bool = False,
+    ):
+        if dq_stages not in (1, 2):
+            raise ValueError(f"dq_stages must be 1 or 2 (SMEM), got {dq_stages}")
+        self.causal, self.dq_stages = causal, dq_stages
+        # FA4's causal split moves 8 registers from the dQ reduce to the compute warps.
+        defaults = {}
+        if causal:
+            defaults = {
+                "reduce": RoleConfig(range(4), regs=136),
+                "compute": RoleConfig(range(4, 12), regs=144),
+            }
+        self.roles = {**defaults, **(roles or {})}  # by role name, over the @role defaults
+        bf16 = cutlass.BFloat16
+        self.smem_plan = plan = SmemPlan()
+        lse_buf = plan.buffer("LSE", Float32, align=128)
+        dpsum_buf = plan.buffer("dPsum", Float32, align=128)
+        q_buf = plan.buffer("Q", bf16, align=1024)
+        qt_buf = plan.buffer("Qt", bf16, align=1024, overlaps=q_buf)
+        k_buf = plan.buffer("K", bf16, align=1024)
+        kt_buf = plan.buffer("Kt", bf16, align=1024, overlaps=k_buf)
+        v_buf = plan.buffer("V", bf16, align=1024)
+        do_buf = plan.buffer("dO", bf16, align=1024)
+        dot_buf = plan.buffer("dOt", bf16, align=1024, overlaps=do_buf)
+        ds_buf = plan.buffer("dS", bf16, align=1024)
+        plan.buffer("dQacc", Float32, align=1024)
+        # FA4 stores dK over Q and dV over dO: both are dead once the item's last dK / dV MMA
+        # has committed (dkv), and one item per CTA means no later load refills them.
+        plan.buffer("dKepi", bf16, align=1024, overlaps=q_buf)
+        plan.buffer("dVepi", bf16, align=1024, overlaps=do_buf)
+        tile_bytes = TILE_M * HEAD_DIM * 2
+        self.k = Ring(1, Tma(tile_bytes), Umma, buffer={"K": k_buf, "Kt": kt_buf})
+        self.v = Ring(1, Tma(tile_bytes), Umma, buffer=v_buf)
+        self.q = Ring(Q_STAGE, Tma(tile_bytes), Umma, buffer={"Q": q_buf, "Qt": qt_buf})
+        self.do = Ring(1, Tma(tile_bytes), Umma, buffer={"dO": do_buf, "dOt": dot_buf})
+        # LSE/dPsum rows are read with ordinary loads and refilled by the async proxy.
+        self.lse = Ring(
+            Q_STAGE, Tma(TILE_M * 4), Warps, buffer=lse_buf, release_fence="smem_async"
+        )
+        self.dpsum = Ring(1, Tma(TILE_M * 4), Warps, buffer=dpsum_buf, release_fence="smem_async")
+        self.s = Ring(1, Umma, Warps, release_fence="tmem_store")  # P stored over S
+        self.dp = Ring(1, Umma, Warps, release_fence="tmem_store")  # dS stored over dP
+        self.ds = Ring(1, Warps, Umma, buffer=ds_buf, commit_fence="smem_async")
+        self.dq = Ring(1, Umma, Warps)
+        self.dkv = Slots(2, Umma, Warps)  # slot 0: dV, slot 1: dK
+        self.tmem_plan = (
+            TmemPlan()
+            .region("S", TILE_M)
+            .region("dV", HEAD_DIM)
+            .region("dP", TILE_M)
+            .region("dK", HEAD_DIM)
+            .alias("P", of="S", offset=0, cols=TILE_M // 2)
+            .alias("dS", of="dP", offset=0, cols=TILE_M // 2)
+            .alias("dQ", of="dP", offset=0, cols=HEAD_DIM)
+        )
+        self.work = WorkStream(mapping=Raster(), schedule=OneShot())
+        self.trace_protocol = trace
+
+    def get_name(self) -> str:
+        suffix = ("_causal" if self.causal else "") + (
+            f"_dq{self.dq_stages}" if self.dq_stages != 2 else ""
+        )
+        return (
+            f"warpdrive_fa4_bwd{suffix}_{self.work.get_key()}{self.iket_key()}{self.trace_key()}"
+        )
+
+    @cute.jit
+    def m_block_range(self, params: BwdParams, n_block):
+        """The Q tiles that see key tile ``n_block`` (causal: bottom-right aligned)."""
+        m_lo = Int32(0)
+        if cutlass.const_expr(self.causal):
+            first_q = n_block * TILE_N + params.seqlen_q - params.seqlen_k
+            m_lo = cutlass.max(first_q, 0) // TILE_M
+        return m_lo, params.m_blocks
+
+    # ------------------------------------------------------------------ roles
+
+    @role(warps=13, regs=88)
+    @cute.jit
+    def load(
+        self,
+        params: BwdParams,
+        *,
+        k: Producer,
+        v: Producer,
+        q: Producer,
+        do: Producer,
+        lse: Producer,
+        dpsum: Producer,
+        work: WorkCursor,
+    ):
+        thr_s, thr_dp = params.mma_s.get_slice(0), params.mma_dp.get_slice(0)
+        thr_dv = params.mma_dv.get_slice(0)
+        one = cute.make_layout(1)
+        copy_stats = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), Float32)
+        while work.valid:
+            n_block, head, batch = work.item
+            m_lo, m_hi = self.m_block_range(params, n_block)
+            gK = cute.local_tile(
+                params.mK[None, None, head, batch], (TILE_N, HEAD_DIM), (n_block, 0)
+            )
+            gV = cute.local_tile(
+                params.mV[None, None, head, batch], (TILE_N, HEAD_DIM), (n_block, 0)
+            )
+            gQ = cute.local_tile(params.mQ[None, None, head, batch], (TILE_M, HEAD_DIM), (None, 0))
+            gdO = cute.local_tile(
+                params.mdO[None, None, head, batch], (HEAD_DIM, TILE_M), (0, None)
+            )
+            gLSE = cute.local_tile(params.mLSE[None, head, batch], (TILE_M,), (None,))
+            gdPsum = cute.local_tile(params.mdPsum[None, head, batch], (TILE_M,), (None,))
+            tKsK, tKgK = cpasync.tma_partition(
+                params.tma_k,
+                0,
+                one,
+                cute.group_modes(params.sK, 0, 3),
+                cute.group_modes(thr_s.partition_A(gK), 0, 3),
+            )
+            tVsV, tVgV = cpasync.tma_partition(
+                params.tma_v,
+                0,
+                one,
+                cute.group_modes(params.sV, 0, 3),
+                cute.group_modes(thr_dp.partition_A(gV), 0, 3),
+            )
+            tQsQ, tQgQ = cpasync.tma_partition(
+                params.tma_q,
+                0,
+                one,
+                cute.group_modes(params.sQ, 0, 3),
+                cute.group_modes(thr_s.partition_B(gQ), 0, 3),
+            )
+            tOsO, tOgO = cpasync.tma_partition(
+                params.tma_do,
+                0,
+                one,
+                cute.group_modes(params.sdO, 0, 3),
+                cute.group_modes(thr_dv.partition_B(gdO), 0, 3),
+            )
+            k, v = k.views(K=StageView(tKsK, axis=1)), v.views(V=StageView(tVsV, axis=1))
+            q, do = q.views(Q=StageView(tQsQ, axis=1)), do.views(dO=StageView(tOsO, axis=1))
+            # FA4's order: K, Q_0, LSE_0, V, dO_0, dPsum_0, then (Q, LSE, dO, dPsum) per tile.
+            with k.produce() as h:
+                cute.copy(
+                    params.tma_k, tKgK, h.view("K", write=True, by="tma"), tma_bar_ptr=h.barrier
+                )
+            for m in cutlass.range(m_lo, m_hi, unroll=1):
+                with q.produce() as h:
+                    cute.copy(
+                        params.tma_q,
+                        tQgQ[None, m],
+                        h.view("Q", write=True, by="tma"),
+                        tma_bar_ptr=h.barrier,
+                    )
+                with lse.produce() as h, cute.arch.elect_one():
+                    cute.copy(
+                        copy_stats,
+                        gLSE[None, m],
+                        h.view(write=True, by="tma"),
+                        mbar_ptr=h.barrier,
+                    )
+                if m == m_lo:
+                    with v.produce() as h:
+                        cute.copy(
+                            params.tma_v, tVgV, h.view(write=True, by="tma"), tma_bar_ptr=h.barrier
+                        )
+                with do.produce() as h:
+                    cute.copy(
+                        params.tma_do,
+                        tOgO[None, m],
+                        h.view("dO", write=True, by="tma"),
+                        tma_bar_ptr=h.barrier,
+                    )
+                with dpsum.produce() as h, cute.arch.elect_one():
+                    cute.copy(
+                        copy_stats,
+                        gdPsum[None, m],
+                        h.view(write=True, by="tma"),
+                        mbar_ptr=h.barrier,
+                    )
+            work.advance()
+        return k, v, q, do, lse, dpsum, work
+
+    @role(warps=12, regs=88)
+    @cute.jit
+    def mma(
+        self,
+        params: BwdParams,
+        *,
+        k: Consumer,
+        v: Consumer,
+        q: Consumer,
+        do: Consumer,
+        s: Producer,
+        dp: Producer,
+        ds: Consumer,
+        dq: Producer,
+        dkv: Producer,
+        work: WorkCursor,
+        tmem: Tmem,
+    ):
+        thr = SimpleNamespace(
+            s=params.mma_s.get_slice(0),
+            dp=params.mma_dp.get_slice(0),
+            dv=params.mma_dv.get_slice(0),
+            dk=params.mma_dk.get_slice(0),
+            dq=params.mma_dq.get_slice(0),
+        )
+        # P and dS as TMEM A operands: bf16 views of the S / dP columns (2 elements per column).
+        rP = thr.dv.make_fragment_A(cute.make_tensor(tmem.base, params.p_layout.outer))
+        rP = rP[None, None, None, 0]
+        rdS = thr.dk.make_fragment_A(cute.make_tensor(tmem.base, params.ds_layout.outer))
+        rdS = rdS[None, None, None, 0]
+        t = SimpleNamespace(
+            thr=thr,
+            tS=self.acc(thr.s, tmem, "S", (TILE_N, TILE_M)),
+            tdP=self.acc(thr.dp, tmem, "dP", (TILE_N, TILE_M)),
+            tdV=self.acc(thr.dv, tmem, "dV", (TILE_N, HEAD_DIM)),
+            tdK=self.acc(thr.dk, tmem, "dK", (TILE_N, HEAD_DIM)),
+            tdQ=self.acc(thr.dq, tmem, "dQ", (TILE_M, HEAD_DIM)),
+            rP=cute.make_tensor(rP.iterator + tmem.cols("P") * 2, rP.layout),
+            rdS=cute.make_tensor(rdS.iterator + tmem.cols("dS") * 2, rdS.layout),
+        )
+        while work.valid:
+            n_block, _, _ = work.item
+            m_lo, m_hi = self.m_block_range(params, n_block)
+            kh = k.wait()
+            dkv_h = (dkv.acquire(0), dkv.acquire(1))  # dV, dK of this item
+            with s.produce():  # S_0 = K Q_0^T
+                self.issue_s(params, q, kh, t, tmem)
+            vh = v.wait()  # V lands after Q_0: S_0 does not wait for it
+            # FA4's 1-CTA order, rotated so each handle closes in the iteration that opened it:
+            # tile t issues dP_t, dV_t, S_{t+1}, dK_t, dQ_t.
+            for i in cutlass.range(m_hi - m_lo - 1, unroll=1):
+                q, do, s, dp, ds, dq = self.mma_tile(
+                    params, q, do, s, dp, ds, dq, kh, vh, t, tmem, i == 0
+                )
+            q, do, s, dp, ds, dq = self.mma_tile(
+                params, q, do, s, dp, ds, dq, kh, vh, t, tmem, m_hi - m_lo == 1, dkv_h
+            )
+            kh.release()
+            vh.release()
+            work.advance()
+        return k, v, q, do, s, dp, ds, dq, dkv, work
+
+    def smem_mma(self, tiled_mma, thr, acc, a, b, zero_init, ta=None):
+        """``acc (+)= a b`` with SMEM operands given as stage views (``a``: a TMEM fragment
+        instead when ``ta``, its TMEM address, is given). FA4's ``gemm_ptx_w_idx``, which
+        issues the K blocks from precomputed descriptors (plain Python: inlined)."""
+        rA = a if ta is not None else thr.make_fragment_A(a)
+        sA = None if ta is not None else a
+        rB = thr.make_fragment_B(b)
+        fa_mma.gemm_ptx_w_idx(tiled_mma, acc, rA, rB, sA=sA, sB=b, zero_init=zero_init, tA_addr=ta)
+
+    def issue_s(self, params: BwdParams, q, kh, t, tmem):
+        """S^T = K Q^T for the q ring's next stage, which this does not consume: Q_t is read by
+        S_t, issued during tile t-1, and by dK_t, whose ``q.wait()`` handle releases it. A raw
+        wait on that stage's full barrier stands in for a non-consuming wait; the handle's wait
+        later passes on the same, still unreleased, phase (plain Python: inlined)."""
+        cute.arch.mbarrier_wait(q.full_barrier(q.index), q.phase())
+        tmem.access("S", write=True, by="umma")
+        sK, sQ = kh.view("K", read=True, by="umma"), params.sQ[None, None, None, q.index]
+        self.smem_mma(params.mma_s, t.thr.s, t.tS, sK, sQ, True)
+
+    def mma_tile(
+        self, params: BwdParams, q, do, s, dp, ds, dq, kh, vh, t, tmem, first, dkv_h=None
+    ):
+        """One Q tile t: dP_t, dV_t, S_{t+1}, dK_t, dQ_t. The last tile (``dkv_h``, the item's
+        dV and dK handles) has no S_{t+1} and publishes dV and dK as soon as their last MMA is
+        issued. Returns the ends (plain Python: inlined into the role)."""
+        qh, doh = q.wait(), do.wait()
+        dqh = dq.acquire()  # dP_t overwrites dQ_{t-1}'s columns: the reduce warps have read them
+        with dp.produce():  # dS_{t-1} was stored over dP_{t-1}
+            tmem.access("dP", write=True, by="umma")
+            sV, sdOt = vh.view("V", read=True, by="umma"), doh.view("dOt", read=True, by="umma")
+            self.smem_mma(params.mma_dp, t.thr.dp, t.tdP, sV, sdOt, True)
+        sh = s.acquire()  # P_t stored over S_t
+        tmem.access("P", read=True, by="umma")
+        tmem.access("dV", write=True, by="umma")
+        sdO = doh.view("dO", read=True, by="umma")
+        self.smem_mma(params.mma_dv, t.thr.dv, t.tdV, t.rP, sdO, first, tmem.ptr("P").toint())
+        doh.release()
+        if cutlass.const_expr(dkv_h is not None):
+            dkv_h[0].commit()  # dV final: the commit covers every MMA issued so far
+            sh.retire()  # no S_{t+1}: one item per CTA, so nothing consumes this stage
+        else:
+            # S_{t+1} overwrites P_t behind the dV MMA that read it (same-thread MMA order).
+            self.issue_s(params, q, kh, t, tmem)
+            sh.commit()
+        with ds.consume() as dsh:  # dS_t in TMEM (over dP_t) and in sdS
+            tmem.access("dS", read=True, by="umma")
+            tmem.access("dK", write=True, by="umma")
+            sQt = qh.view("Qt", read=True, by="umma")
+            self.smem_mma(
+                params.mma_dk, t.thr.dk, t.tdK, t.rdS, sQt, first, tmem.ptr("dS").toint()
+            )
+            qh.release()
+            if cutlass.const_expr(dkv_h is not None):
+                dkv_h[1].commit()  # dK final
+            tmem.access("dQ", write=True, by="umma")
+            sdS, sKt = dsh.view("dS", read=True, by="umma"), kh.view("Kt", read=True, by="umma")
+            umma(
+                params.mma_dq,
+                t.tdQ,
+                t.thr.dq.make_fragment_A(sdS),
+                t.thr.dq.make_fragment_B(sKt),
+                False,
+            )
+            dqh.commit()
+        return q, do, s, dp, ds, dq
+
+    def acc(self, thr_mma, tmem, name, shape):
+        """The fp32 TMEM accumulator ``name`` for an MMA tile of ``shape`` (plain Python)."""
+        layout = thr_mma.make_fragment_C(thr_mma.partition_shape_C(shape)).layout
+        return cute.make_tensor(tmem.ptr(name), layout)
+
+    @role(warps=range(4, 12), regs=136)
+    @cute.jit
+    def compute(
+        self,
+        params: BwdParams,
+        *,
+        lse: Consumer,
+        dpsum: Consumer,
+        s: Consumer,
+        dp: Consumer,
+        ds: Producer,
+        dkv: Consumer,
+        work: WorkCursor,
+        tmem: Tmem,
+    ):
+        # Both warpgroups work on every tile: each thread holds 64 of a key row's 128 columns
+        # (FA4's make_tmem_copy with two warpgroups). tidx 0-127 are warps 8-11 (FA4's wg 0).
+        tidx = cute.arch.thread_idx()[0] % 256
+        thr_s, thr_dp = params.mma_s.get_slice(0), params.mma_dp.get_slice(0)
+        tStS = self.acc(thr_s, tmem, "S", (TILE_N, TILE_M))
+        tdPtdP = self.acc(thr_dp, tmem, "dP", (TILE_N, TILE_M))
+        p_cols = TILE_M // 2  # P / dS: bf16 pairs in half the S / dP columns
+        half = (cute.make_layout((TILE_N, p_cols)), 1, 1)
+        tStP = cute.make_tensor(tmem.ptr("P"), cute.composition(tStS, half).layout)
+        tdPtdS = cute.make_tensor(tmem.ptr("dS"), cute.composition(tdPtdP, half).layout)
+        tScS = thr_s.partition_C(cute.make_identity_tensor((TILE_N, TILE_M)))
+        tScP = cute.composition(tScS, half)
+        ld_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), Float32
+        )
+        st_atom = cute.make_copy_atom(
+            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)), Float32
+        )
+        thr_ld = fa_copy_utils.make_tmem_copy(ld_atom, 2).get_slice(tidx)
+        thr_st = fa_copy_utils.make_tmem_copy(st_atom, 2).get_slice(tidx)
+        tStS_t2r = thr_ld.partition_S(tStS)  # (((32, 32), 1), 2, 1, 1): two 32-column stages
+        tdPtdP_t2r = thr_ld.partition_S(tdPtdP)
+        tScS_t2r = thr_ld.partition_D(tScS)
+        tStP_r2t = thr_st.partition_D(tStP)
+        tdPtdS_r2t = thr_st.partition_D(tdPtdS)
+        rP_shape = thr_st.partition_S(tScP).shape
+
+        # LSE / dPsum broadcast along the key rows: (tile_n, tile_m, stage) views of the rows.
+        def stats(buf, stages):
+            t = cute.make_tensor(
+                buf.iterator, cute.make_layout((TILE_N, TILE_M, stages), stride=(0, 1, TILE_M))
+            )
+            return thr_ld.partition_D(thr_s.partition_C(t))  # ((32, 1), 2, 1, 1, stage)
+
+        lse = lse.views(LSE=StageView(stats(params.sLSE, Q_STAGE), axis=4))
+        dpsum = dpsum.views(dPsum=StageView(stats(params.sdPsum, 1), axis=4))
+        # dS also goes to SMEM for the dQ MMA, as the row-major (key, query) epilogue tile:
+        # the dQ MMA's M-major A layout with the same 128-byte swizzle.
+        r2s_atom = sm100_utils.get_smem_store_op(
+            LayoutEnum.ROW_MAJOR, cutlass.BFloat16, Float32, thr_ld
+        )
+        thr_r2s = cute.make_tiled_copy_D(r2s_atom, thr_ld).get_slice(tidx)
+        epi = sm100_utils.make_smem_layout_epi(
+            cutlass.BFloat16, LayoutEnum.ROW_MAJOR, (TILE_N, TILE_M), 1
+        )
+        sdS_2d = cute.slice_(epi.outer, (None, None, 0))
+        sdS_epi = cute.make_layout((sdS_2d.shape,), stride=(sdS_2d.stride,))
+        key = tScS_t2r[0][0]  # this thread's key row within the tile
+
+        n_stages = cute.size(tScS_t2r, mode=[1])
+        while work.valid:
+            n_block, head, batch = work.item
+            m_lo, m_hi = self.m_block_range(params, n_block)
+            key_oob = key >= params.seqlen_k - n_block * TILE_N
+            for m in cutlass.range(m_lo, m_hi, unroll=1):
+                lh, sh = lse.wait(), s.wait()
+                rS = cute.make_rmem_tensor(tScS_t2r.shape, Float32)
+                for st in cutlass.range_constexpr(n_stages):
+                    tmem.access("S", read=True, cols=lambda w, st=st: cols(w, st, 32))
+                cute.copy(thr_ld, tStS_t2r, rS)
+                if cutlass.const_expr(self.causal):
+                    rS = self.mask_causal(params, rS, tScS_t2r, n_block, m)
+                else:
+                    if key_oob:  # keys past seqlen_k (the causal mask covers them too)
+                        for i in cutlass.range_constexpr(cute.size(rS)):
+                            rS[i] = -Float32.inf
+                rP32 = cute.make_rmem_tensor(rP_shape, Float32)
+                rP = cute.recast_tensor(rP32, cutlass.BFloat16)
+                for st in cutlass.range_constexpr(n_stages):
+                    rS_st = rS[None, st, 0, 0]
+                    rLSE = cute.make_rmem_tensor(tScS_t2r[None, 0, 0, 0].shape, Float32)
+                    cute.autovec_copy(lh.view(None, None, st, 0, 0, read=True), rLSE)
+                    for e in cutlass.range_constexpr(cute.size(rS_st) // 2):
+                        rS_st[2 * e], rS_st[2 * e + 1] = cute.arch.fma_packed_f32x2(
+                            (rS_st[2 * e], rS_st[2 * e + 1]),
+                            (params.scale_log2, params.scale_log2),
+                            (-rLSE[2 * e], -rLSE[2 * e + 1]),
+                        )
+                        rS_st[2 * e] = cute.math.exp2(rS_st[2 * e], fastmath=True)
+                        rS_st[2 * e + 1] = cute.math.exp2(rS_st[2 * e + 1], fastmath=True)
+                    fa_utils.cvt_f16(rS_st, rP[None, st, 0, 0])
+                    if cutlass.const_expr(st == 0):
+                        # P overwrites S columns that the other warpgroup may still be loading.
+                        cute.arch.fence_view_async_tmem_load()
+                        named_barrier(COMPUTE_BAR, 256)
+                    tmem.access("P", write=True, cols=lambda w, st=st: cols(w, st, 16))
+                    cute.copy(thr_st, rP32[None, st, None, None], tStP_r2t[None, st, None, None])
+                sh.release()  # layer fences the tcgen05.st of P
+                lh.release()
+                # dS^T = P^T * (dP^T - dPsum); rS holds P in fp32.
+                dh, dph = dpsum.wait(), dp.wait()
+                dsh = None
+                for st in cutlass.range_constexpr(n_stages):
+                    rdP = cute.make_rmem_tensor(tScS_t2r[None, 0, None, None].shape, Float32)
+                    tmem.access("dP", read=True, cols=lambda w, st=st: cols(w, st, 32))
+                    cute.copy(thr_ld, tdPtdP_t2r[None, st, None, None], rdP)
+                    cute.arch.fence_view_async_tmem_load()
+                    # dS overwrites dP columns the other warpgroup may still be loading.
+                    named_barrier(COMPUTE_BAR, 256)
+                    rdP_st, rS_st = rdP[None, 0, 0], rS[None, st, 0, 0]
+                    rdPsum = cute.make_rmem_tensor(tScS_t2r[None, 0, 0, 0].shape, Float32)
+                    cute.autovec_copy(dh.view(None, None, st, 0, 0, read=True), rdPsum)
+                    for e in cutlass.range_constexpr(cute.size(rdP_st) // 2):
+                        rdP_st[2 * e], rdP_st[2 * e + 1] = cute.arch.sub_packed_f32x2(
+                            (rdP_st[2 * e], rdP_st[2 * e + 1]), (rdPsum[2 * e], rdPsum[2 * e + 1])
+                        )
+                        rdP_st[2 * e], rdP_st[2 * e + 1] = cute.arch.mul_packed_f32x2(
+                            (rS_st[2 * e], rS_st[2 * e + 1]), (rdP_st[2 * e], rdP_st[2 * e + 1])
+                        )
+                    rdS = cute.make_fragment_like(rdP_st, cutlass.BFloat16)
+                    fa_utils.cvt_f16(rdP_st, rdS)
+                    if cutlass.const_expr(st == 0):
+                        dsh = ds.acquire()  # the previous dQ MMA has read sdS
+                        tRS_sdS = thr_r2s.partition_D(
+                            cute.make_tensor(dsh.view("dS", write=True).iterator, sdS_epi)
+                        )
+                    tmem.access("dS", write=True, cols=lambda w, st=st: cols(w, st, 16))
+                    cute.copy(thr_st, cute.recast_tensor(rdS, Float32), tdPtdS_r2t[None, st, 0, 0])
+                    cute.autovec_copy(rdS, tRS_sdS[None, st])
+                dph.release()  # layer fences the tcgen05.st of dS
+                dh.release()
+                dsh.commit()  # layer fences the sdS stores for the dQ MMA
+            dkv = self.epilogue(params, dkv, tmem, tidx, n_block, head, batch)
+            work.advance()
+        return lse, dpsum, s, dp, ds, dkv, work
+
+    @cute.jit
+    def mask_causal(self, params: BwdParams, rS, tScS_t2r, n_block, m_block):
+        """S^T = -inf where key > query + seqlen_k - seqlen_q (FA4's bottom-right causal mask,
+        with its R2P bitmasks over the two warpgroups' interleaved query columns)."""
+        key_limit = params.seqlen_k - n_block * TILE_N - tScS_t2r[0][0]
+        query_limit = params.seqlen_q - m_block * TILE_M - tScS_t2r[0][1]
+        first = query_limit - key_limit  # this thread's first unmasked query column
+        if key_limit <= 0:
+            first = TILE_M
+        first = fa_mask.row_to_r2p_idx(first, cute.size(tScS_t2r, mode=[0]), 2)
+        fa_mask.mask_r2p_lambda(rS, lambda c: fa_mask.r2p_bitmask_above(first, c), rank1=True)
+        return rS
+
+    @cute.jit
+    def epilogue(self, params: BwdParams, dkv, tmem, tidx, n_block, head, batch):
+        """dV, then dK * softmax_scale: TMEM -> bf16 SMEM tile (64 columns per warpgroup) -> TMA
+        store (FA4 epilogue_dK_or_dV_tma). Returns the end for the caller."""
+        wg = tidx // 128
+        r2s = cute.make_tiled_copy_tv(
+            cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128
+            ),
+            cute.make_ordered_layout((128, 1), order=(1, 0)),
+            cute.make_ordered_layout((1, 8), order=(1, 0)),
+        ).get_slice(tidx % 128)
+        ld_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), Float32
+        )
+        leader = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4 == 0
+        for j in cutlass.range_constexpr(2):  # slot 0: dV (scale 1), slot 1: dK (softmax_scale)
+            name, mma, tma, mD, sD = (
+                ("dV", params.mma_dv, params.tma_dv, params.mdV, params.sdV)
+                if j == 0
+                else ("dK", params.mma_dk, params.tma_dk, params.mdK, params.sdK)
+            )
+            thr_mma = mma.get_slice(0)
+            tAcc = self.acc(thr_mma, tmem, name, (TILE_N, HEAD_DIM))
+            thr_ld = tcgen05.make_tmem_copy(ld_atom, tAcc).get_slice(tidx % 128)
+            tAcc_t2r = half_cols(thr_ld.partition_S(tAcc), wg)[None, None, 0, 0]
+            cAcc = thr_mma.partition_C(cute.make_identity_tensor((TILE_N, HEAD_DIM)))
+            rAcc = cute.make_rmem_tensor(
+                half_cols(thr_ld.partition_D(cAcc), wg)[None, None, 0, 0].shape, Float32
+            )
+            with dkv.consume(j):
+                tmem.access(name, read=True)
+                cute.copy(thr_ld, tAcc_t2r, rAcc)
+                cute.arch.fence_view_async_tmem_load()
+            if cutlass.const_expr(j == 1):
+                for e in cutlass.range_constexpr(cute.size(rAcc) // 2):
+                    rAcc[2 * e], rAcc[2 * e + 1] = cute.arch.mul_packed_f32x2(
+                        (rAcc[2 * e], rAcc[2 * e + 1]),
+                        (params.softmax_scale, params.softmax_scale),
+                    )
+            rD = cute.make_rmem_tensor(rAcc.shape, cutlass.BFloat16)
+            rD.store(rAcc.load().to(cutlass.BFloat16))
+            sD_wg = sD[None, None, wg]
+            tDsD_r2s = r2s.partition_D(sD_wg)
+            cute.copy(r2s, cute.make_tensor(rD.iterator, tDsD_r2s.shape), tDsD_r2s)
+            fence_async_shared()
+            named_barrier(EPI_BAR + wg, 128)
+            gD = cute.local_tile(mD[None, None, head, batch], (TILE_N, EPI_COLS), (n_block, wg))
+            tDsD, tDgD = cpasync.tma_partition(
+                tma,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sD_wg, 0, 2),
+                cute.group_modes(gD, 0, 2),
+            )
+            if leader:
+                cute.copy(tma, tDsD, tDgD)
+                bulk_commit_group()
+        if leader:
+            bulk_wait_group(0, read=True)  # the tiles' SMEM is read before the CTA exits
+        return dkv
+
+    @role(warps=range(4), regs=152)
+    @cute.jit
+    def reduce(self, params: BwdParams, *, dq: Consumer, work: WorkCursor, tmem: Tmem):
+        tidx = cute.arch.thread_idx()[0] % 128
+        thr_dq = params.mma_dq.get_slice(0)
+        tdQ = self.acc(thr_dq, tmem, "dQ", (TILE_M, HEAD_DIM))
+        ld_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(DQ_COLS)), Float32
+        )
+        thr_ld = tcgen05.make_tmem_copy(ld_atom, tdQ).get_slice(tidx)
+        tdQ_t2r = thr_ld.partition_S(tdQ)
+        rdQ_shape = thr_ld.partition_D(
+            thr_dq.partition_C(cute.make_identity_tensor((TILE_M, HEAD_DIM)))
+        ).shape
+        thr_r2s = fa_copy_utils.tiled_copy_1d(Float32, 128, num_copy_elems=4).get_slice(tidx)
+        tdQsdQ = thr_r2s.partition_D(params.sdQacc)
+        tma_warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) == 0
+        chunks = HEAD_DIM // DQ_COLS
+        while work.valid:
+            n_block, head, batch = work.item
+            m_lo, m_hi = self.m_block_range(params, n_block)
+            gdQ = cute.local_tile(params.mdQacc[None, head, batch], (TILE_M * HEAD_DIM,), (None,))
+            gdQ = cute.flat_divide(gdQ, (TILE_M * DQ_COLS,))  # (chunk elements, chunk, m_block)
+            for m in cutlass.range(m_lo, m_hi, unroll=1):
+                rdQ = cute.make_rmem_tensor(rdQ_shape, Float32)
+                with dq.consume():
+                    tmem.access("dQ", read=True)
+                    cute.copy(thr_ld, tdQ_t2r, rdQ)
+                    cute.arch.fence_view_async_tmem_load()
+                rdQ_chunks = cute.make_tensor(rdQ.iterator, (DQ_COLS, chunks))
+                for c in cutlass.range_constexpr(chunks):
+                    buf = c % self.dq_stages
+                    dst = tdQsdQ[None, None, buf]
+                    cute.copy(
+                        thr_r2s, cute.make_tensor(rdQ_chunks[None, c].iterator, dst.shape), dst
+                    )
+                    fence_async_shared()
+                    named_barrier(REDUCE_BAR, 128)
+                    if tma_warp:
+                        with cute.arch.elect_one():
+                            fa_copy_utils.cpasync_reduce_bulk_add_f32(
+                                params.sdQacc[None, buf].iterator,
+                                gdQ[None, c, m].iterator,
+                                TILE_M * DQ_COLS * 4,
+                            )
+                        bulk_commit_group()
+                        bulk_wait_group(self.dq_stages - 1, read=True)  # the other buffer is free
+                    named_barrier(REDUCE_BAR, 128)
+            work.advance()
+        if tma_warp:
+            bulk_wait_group(0, read=True)
+        return dq, work
+
+    # ----------------------------------------------------------------- kernel
+
+    @cute.kernel
+    def kernel(
+        self,
+        mmas,
+        tmas,
+        mQ,
+        mK,
+        mV,
+        mdO,
+        mdK,
+        mdV,
+        mLSE,
+        mdPsum,
+        mdQacc,
+        layouts,
+        p_layout,
+        ds_layout,
+        softmax_scale,
+        scale_log2,
+        bound,
+    ):
+        self.begin_roles(work=bound, layouts=layouts)
+        b = self.buffer
+        mma_s, mma_dp, mma_dv, mma_dk, mma_dq = mmas
+        tma_q, tma_k, tma_v, tma_do, tma_dk, tma_dv = tmas
+        params = BwdParams(
+            mma_s=mma_s,
+            mma_dp=mma_dp,
+            mma_dv=mma_dv,
+            mma_dk=mma_dk,
+            mma_dq=mma_dq,
+            tma_q=tma_q,
+            tma_k=tma_k,
+            tma_v=tma_v,
+            tma_do=tma_do,
+            tma_dk=tma_dk,
+            tma_dv=tma_dv,
+            mQ=mQ,
+            mK=mK,
+            mV=mV,
+            mdO=mdO,
+            mdK=mdK,
+            mdV=mdV,
+            mLSE=mLSE,
+            mdPsum=mdPsum,
+            mdQacc=mdQacc,
+            sQ=b("Q"),
+            sQt=b("Qt"),
+            sK=b("K"),
+            sKt=b("Kt"),
+            sV=b("V"),
+            sdO=b("dO"),
+            sdOt=b("dOt"),
+            sdS=b("dS"),
+            sLSE=b("LSE"),
+            sdPsum=b("dPsum"),
+            sdQacc=b("dQacc"),
+            sdK=b("dKepi"),
+            sdV=b("dVepi"),
+            p_layout=p_layout,
+            ds_layout=ds_layout,
+            softmax_scale=softmax_scale,
+            scale_log2=scale_log2,
+            seqlen_q=mQ.shape[0],
+            seqlen_k=mK.shape[0],
+            m_blocks=cute.ceil_div(mQ.shape[0], TILE_M),
+        )
+        self.run_roles(params)
+
+    # ------------------------------------------------------------------- host
+
+    @cute.jit
+    def __call__(
+        self,
+        q: cute.Tensor,
+        k: cute.Tensor,
+        v: cute.Tensor,
+        do: cute.Tensor,
+        lse_log2: cute.Tensor,
+        dpsum: cute.Tensor,
+        dq_acc: cute.Tensor,
+        dk: cute.Tensor,
+        dv: cute.Tensor,
+        softmax_scale: Float32,
+        workspace: cute.Tensor,
+        max_ctas: Int32,
+        stream: cuda.CUstream,
+    ):
+        bf16 = cutlass.BFloat16
+        # (b, s, h, d) -> (s, d, h, b); dO -> (d, s, h, b), the MN-major B operand of dV.
+        mQ, mK, mV, mdO, mdK, mdV = (
+            cute.make_tensor(t.iterator, cute.select(t.layout, mode=[1, 3, 2, 0]))
+            for t in (q, k, v, do, dk, dv)
+        )
+        mdO = cute.make_tensor(mdO.iterator, cute.select(mdO.layout, mode=[1, 0, 2, 3]))
+        # (b, h, s) -> (s, h, b)
+        mLSE, mdPsum, mdQacc = (
+            cute.make_tensor(t.iterator, cute.select(t.layout, mode=[2, 1, 0]))
+            for t in (lse_log2, dpsum, dq_acc)
+        )
+        major, one = cute.nvgpu.OperandMajorMode, tcgen05.CtaGroup.ONE
+        tmem_a = tcgen05.OperandSource.TMEM
+
+        def mma(a_major, b_major, tiler, a_source=tcgen05.OperandSource.SMEM):
+            return sm100_utils.make_trivial_tiled_mma(
+                bf16, bf16, a_major, b_major, Float32, one, tiler[:2], a_source
+            )
+
+        tiler_s = (TILE_N, TILE_M, HEAD_DIM)  # S^T = K Q^T
+        tiler_dp = (TILE_N, TILE_M, HEAD_DIM)  # dP^T = V dO^T
+        tiler_dv = (TILE_N, HEAD_DIM, TILE_M)  # dV = P^T dO
+        tiler_dk = (TILE_N, HEAD_DIM, TILE_M)  # dK = dS^T Q
+        tiler_dq = (TILE_M, HEAD_DIM, TILE_N)  # dQ = dS K
+        mma_s = mma(major.K, major.K, tiler_s)
+        mma_dp = mma(major.K, major.K, tiler_dp)
+        mma_dv = mma(major.K, major.MN, tiler_dv, tmem_a)
+        mma_dk = mma(major.K, major.MN, tiler_dk, tmem_a)
+        mma_dq = mma(major.MN, major.MN, tiler_dq)
+        sK = sm100_utils.make_smem_layout_a(mma_s, tiler_s, bf16, 1)
+        sQ = sm100_utils.make_smem_layout_b(mma_s, tiler_s, bf16, Q_STAGE)
+        sV = sm100_utils.make_smem_layout_a(mma_dp, tiler_dp, bf16, 1)
+        sdOt = sm100_utils.make_smem_layout_b(mma_dp, tiler_dp, bf16, 1)
+        p_layout = sm100_utils.make_smem_layout_a(mma_dv, tiler_dv, bf16, 1)
+        sdO = sm100_utils.make_smem_layout_b(mma_dv, tiler_dv, bf16, 1)
+        ds_layout = sm100_utils.make_smem_layout_a(mma_dk, tiler_dk, bf16, 1)
+        sQt = sm100_utils.make_smem_layout_b(mma_dk, tiler_dk, bf16, Q_STAGE)
+        sdS = sm100_utils.make_smem_layout_a(mma_dq, tiler_dq, bf16, 1)
+        sKt = sm100_utils.make_smem_layout_b(mma_dq, tiler_dq, bf16, 1)
+        s_epi = sm100_utils.make_smem_layout_epi(bf16, LayoutEnum.ROW_MAJOR, (TILE_N, EPI_COLS), 2)
+        layouts = {
+            "LSE": cute.make_layout((TILE_M, Q_STAGE), stride=(1, TILE_M)),
+            "dPsum": cute.make_layout((TILE_M, 1)),
+            "Q": sQ,
+            "Qt": sQt,
+            "K": sK,
+            "Kt": sKt,
+            "V": sV,
+            "dO": sdO,
+            "dOt": sdOt,
+            "dS": sdS,
+            "dQacc": cute.make_layout((TILE_M * DQ_COLS, self.dq_stages)),
+            "dKepi": s_epi,
+            "dVepi": s_epi,
+        }
+        load_op = cpasync.CopyBulkTensorTileG2SOp(one)
+        vmnk = self.cluster.layout_vmnk().shape
+        sel = lambda layout: cute.select(layout, mode=[0, 1, 2])
+        tma_k, mK_t = cute.nvgpu.make_tiled_tma_atom_A(load_op, mK, sel(sK), tiler_s, mma_s, vmnk)
+        tma_q, mQ_t = cute.nvgpu.make_tiled_tma_atom_B(load_op, mQ, sel(sQ), tiler_s, mma_s, vmnk)
+        tma_v, mV_t = cute.nvgpu.make_tiled_tma_atom_A(
+            load_op, mV, sel(sV), tiler_dp, mma_dp, vmnk
+        )
+        tma_do, mdO_t = cute.nvgpu.make_tiled_tma_atom_B(
+            load_op, mdO, sel(sdO), tiler_dv, mma_dv, vmnk
+        )
+        store_op = cpasync.CopyBulkTensorTileS2GOp()
+        epi_tile = cute.select(s_epi, mode=[0, 1])
+        tma_dk, mdK_t = cpasync.make_tiled_tma_atom(store_op, mdK, epi_tile, (TILE_N, EPI_COLS))
+        tma_dv, mdV_t = cpasync.make_tiled_tma_atom(store_op, mdV, epi_tile, (TILE_N, EPI_COLS))
+        n_blocks = cute.ceil_div(mK.shape[0], TILE_N)
+        bound = self.work.bind((n_blocks, mQ.shape[2], mQ.shape[3]), workspace, max_ctas)
+        self.kernel.set_name_prefix(self.get_name())
+        self.kernel(
+            (mma_s, mma_dp, mma_dv, mma_dk, mma_dq),
+            (tma_q, tma_k, tma_v, tma_do, tma_dk, tma_dv),
+            mQ_t,
+            mK_t,
+            mV_t,
+            mdO_t,
+            mdK_t,
+            mdV_t,
+            mLSE,
+            mdPsum,
+            mdQacc,
+            layouts,
+            p_layout,
+            ds_layout,
+            softmax_scale,
+            softmax_scale * LOG2_E,
+            bound,
+        ).launch(**self.launch_config(bound), stream=stream, min_blocks_per_mp=1)
+
+
+# The roles trace FA4's MMA issue, mask, conversion and reduce-add helpers: key on their source.
+@jit_cache(
+    uncached=lambda op: op.trace_protocol,
+    extra_sources=tuple(m.__file__ for m in (fa_mma, fa_copy_utils, fa_mask, fa_utils)),
+)
+def compile_fa4_bwd(op: FlashAttentionBackward):
+    """Compile once with dynamic batch, heads and sequence lengths."""
+    if op.work.schedule.persistent:
+        # The retired last S acquire and the epilogue tiles over Q/dO hold for one item.
+        raise ValueError("FlashAttentionBackward runs one work item per CTA (OneShot)")
+    b, h = cute.sym_int(), cute.sym_int()
+    sq, sk, sq_pad = cute.sym_int(), cute.sym_int(), cute.sym_int(divisibility=TILE_M)
+    bf16 = cutlass.BFloat16
+    qo = (b, sq, h, HEAD_DIM)
+    kv = (b, sk, h, HEAD_DIM)
+    return compile_tvm_ffi(
+        op,
+        make_fake_compact_tensor(bf16, qo),
+        make_fake_compact_tensor(bf16, kv),
+        make_fake_compact_tensor(bf16, kv),
+        make_fake_compact_tensor(bf16, qo),
+        make_fake_compact_tensor(Float32, (b, h, sq_pad)),
+        make_fake_compact_tensor(Float32, (b, h, sq_pad)),
+        make_fake_compact_tensor(Float32, (b, h, cute.sym_int(divisibility=TILE_M * HEAD_DIM))),
+        make_fake_compact_tensor(bf16, kv),
+        make_fake_compact_tensor(bf16, kv),
+        Float32(1.0),
+        make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),)),
+        cutlass.Int32(1),
+        name=op.get_name(),
+    )
+
+
+_OPS: dict = {}
+
+
+def _op(causal, roles, dq_stages) -> tuple:
+    key = (causal, None if roles is None else tuple(sorted(roles.items())), dq_stages)
+    op = _OPS.get(key)
+    if op is None:
+        op = _OPS[key] = FlashAttentionBackward(causal, roles, dq_stages)
+    return op, key
+
+
+def fa4_bwd_main(
+    q,
+    k,
+    v,
+    dout,
+    lse_log2,
+    dpsum,
+    dq_accum,
+    dk,
+    dv,
+    softmax_scale,
+    *,
+    causal=False,
+    roles=None,
+    dq_stages=2,
+):
+    """The main kernel alone, on FA4's preprocessed buffers (``_bwd_preprocess``): accumulates
+    ``dq_accum`` and writes ``dk``/``dv``. The keywords are ``FlashAttentionBackward``'s."""
+    op, key = _op(causal, roles, dq_stages)
+    fn = compile_fa4_bwd.by_static_key(key, lambda: compile_fa4_bwd(op))
+    workspace, sms = op.work.launch_args(q.device)
+    fn(q, k, v, dout, lse_log2, dpsum, dq_accum, dk, dv, softmax_scale, workspace, sms)
+
+
+def fa4_bwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    dout: torch.Tensor,
+    lse: torch.Tensor,
+    softmax_scale: float | None = None,
+    *,
+    causal: bool = False,
+    roles: dict[str, RoleConfig] | None = None,
+    dq_stages: int = 2,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Attention backward for ``(batch, seqlen, heads, 128)`` bf16 tensors; returns
+    ``(dq, dk, dv)``. ``lse`` is the forward's ``(batch, heads, seqlen_q)`` fp32 natural-log LSE.
+    FA4's preprocess and dQ postprocess kernels run around the warpdrive main kernel.
+    ``causal`` is bottom-right aligned as in FA4; ``roles`` and ``dq_stages`` (dQ staging
+    buffers, 1 or 2) go to ``FlashAttentionBackward``."""
+    from flash_attn.cute.bwd_accum_tile import AccumTileOrder
+    from flash_attn.cute.cute_dsl_utils import torch2cute_dtype_map
+    from flash_attn.cute.interface import (
+        _bwd_postprocess_convert,
+        _bwd_preprocess,
+        _get_device_arch,
+    )
+
+    check_fa4_bwd_args(q, k, v, out, dout, lse)
+    b, sq, h, d = q.shape
+    scale = softmax_scale if softmax_scale is not None else d**-0.5
+    dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+    if q.numel() == 0 or k.numel() == 0:
+        return dq.zero_(), dk.zero_(), dv.zero_()
+    sq_pad = -(-sq // TILE_M) * TILE_M
+    dq_accum = torch.empty(b, h, sq_pad * d, device=q.device, dtype=torch.float32)
+    dpsum = torch.empty(b, h, sq_pad, device=q.device, dtype=torch.float32)
+    lse_log2 = torch.empty_like(dpsum)
+    dtype = torch2cute_dtype_map[q.dtype]
+    _bwd_preprocess(
+        out, dout, dpsum, lse, lse_log2, dq_accum, None, None, None, dtype, d, d, TILE_M,
+        fake_mode=False,
+    )  # fmt: skip
+    fa4_bwd_main(
+        q,
+        k,
+        v,
+        dout,
+        lse_log2,
+        dpsum,
+        dq_accum,
+        dk,
+        dv,
+        scale,
+        causal=causal,
+        roles=roles,
+        dq_stages=dq_stages,
+    )
+    _bwd_postprocess_convert(
+        dq_accum, dq, scale, None, None, _get_device_arch(), dtype, d, TILE_M, 128, 1, False,
+        accum_order=AccumTileOrder.TMEM_FRAG_1CTA, fake_mode=False,
+    )  # fmt: skip
+    return dq, dk, dv
+
+
+def fa4_config(q, k, causal: bool, disable_2cta: bool = True):
+    """FA4's ``BwdConfig`` for these inputs; ``disable_2cta=True`` gives the 1-CTA one this
+    port matches (for comparisons through ``_flash_attn_bwd(..., config=...)``)."""
+    from flash_attn.cute.config import select_bwd_config
+    from flash_attn.cute.interface import _get_bwd_inputs, _get_device_arch
+
+    b, sq, h, d = q.shape
+    inputs = _get_bwd_inputs(
+        arch=_get_device_arch(),
+        device_index=q.device.index,
+        causal=causal,
+        local=False,
+        deterministic=False,
+        dtype=str(q.dtype),
+        head_dim=d,
+        head_dim_v=d,
+        num_heads=h,
+        num_heads_kv=k.shape[2],
+        batch_size=b,
+        total_q=b * sq,
+        total_k=b * k.shape[1],
+        max_seqlen_q=sq,
+        max_seqlen_k=k.shape[1],
+        has_cu_seqlens=False,
+        block_sparse_tensors=None,
+        V_in_regs=False,
+        has_score_mod=False,
+        has_score_mod_bwd=False,
+        has_softcap=False,
+        zero_softmax_scale=False,
+        has_mask_mod=False,
+        has_learnable_sink=False,
+    )
+    return select_bwd_config(inputs._replace(disable_2cta=disable_2cta))
+
+
+def check_fa4_bwd_args(q, k, v, out, dout, lse):
+    tensors = (q, k, v, out, dout)
+    if any(t.dtype != torch.bfloat16 for t in tensors) or lse.dtype != torch.float32:
+        raise TypeError("fa4_bwd expects bf16 q, k, v, out, dout and fp32 lse")
+    if q.ndim != 4 or q.shape[-1] != HEAD_DIM or k.shape != v.shape:
+        raise ValueError(f"expected (b, s, h, {HEAD_DIM}) tensors and k.shape == v.shape")
+    if k.shape[0] != q.shape[0] or k.shape[2:] != q.shape[2:]:
+        raise ValueError("q and k/v must share batch, heads and head_dim (no GQA)")
+    if out.shape != q.shape or dout.shape != q.shape:
+        raise ValueError("out and dout must have q's shape")
+    if lse.shape != (q.shape[0], q.shape[2], q.shape[1]):
+        raise ValueError("lse must be (batch, heads, seqlen_q)")
+    if len({t.device for t in (*tensors, lse)}) != 1 or not q.is_cuda:
+        raise ValueError("all tensors must be on one CUDA device")
+    if any(not t.is_contiguous() or t.data_ptr() % 16 for t in (*tensors, lse)):
+        raise ValueError("inputs must be contiguous and 16-byte aligned")
