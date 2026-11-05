@@ -7,7 +7,6 @@ predicate. ``tile_n`` (default 256), the stage counts and the roles' placement a
 budgets are constructor arguments.
 """
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 
 import cutlass
@@ -71,7 +70,7 @@ class Gemm(WarpSpecialized):
         acc_stages: int = 1,
         trace: bool = False,
         tile_n: int = 256,
-        roles: Mapping[str, RoleConfig] | None = None,
+        roles: dict[str, RoleConfig] | None = None,
     ):
         """``tile_n``: output tile width, a multiple of ``EPI_COLS`` up to the MMA's 256.
         ``roles``: placement and register budgets by role name over the ``@role`` defaults."""

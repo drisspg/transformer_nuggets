@@ -727,6 +727,18 @@ def test_persistent_gemm_configs(requires_blackwell, config):
     _check_gemm_config(persistent_gemm, 1000, 1000, 264, **config)
 
 
+def test_persistent_gemm_wrapper_keys_roles_by_content(requires_blackwell):
+    """Two role dicts with the same entries in another order reuse one kernel."""
+    from transformer_nuggets.cute.warpdrive.examples import persistent_gemm as pg
+
+    load, mma = RoleConfig(4, regs=48), RoleConfig(5, regs=48)
+    before = len(pg._OPS)
+    _check_gemm_config(persistent_gemm, 256, 256, 64, roles={"load": load, "mma": mma})
+    assert len(pg._OPS) == before + 1
+    _check_gemm_config(persistent_gemm, 256, 256, 64, roles={"mma": mma, "load": load})
+    assert len(pg._OPS) == before + 1
+
+
 def test_persistent_gemm_rejects_unfit_configurations():
     from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import PersistentGemm
 
@@ -734,8 +746,9 @@ def test_persistent_gemm_rejects_unfit_configurations():
         PersistentGemm(epi_tile_n=128)
     with pytest.raises(ValueError, match="multiple of epi_tile_n=64"):
         PersistentGemm(tile_n=224, epi_tile_n=64)
-    with pytest.raises(ValueError, match="c_stages must be positive"):
-        PersistentGemm(c_stages=0)
+    for c_stages in (0, 9):
+        with pytest.raises(ValueError, match="c_stages must be in"):
+            PersistentGemm(c_stages=c_stages)
     with pytest.raises(ValueError, match="mixed register budgets"):
         PersistentGemm(roles={"load": RoleConfig(4, regs=48)}).describe()  # warpgroup of mma
     tuned = PersistentGemm(roles={"epilogue": RoleConfig(range(4), regs=152)})

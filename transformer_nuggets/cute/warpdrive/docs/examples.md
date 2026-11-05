@@ -128,8 +128,13 @@ sharing an address does not create that edge.
 from transformer_nuggets.cute.warpdrive import ClusterLaunchControl, CtaPair
 
 out, lse = fa4_fwd(
-    q, k, v, cluster=CtaPair(), schedule=ClusterLaunchControl(),
-    split_p=True, use_ldred_rowmax=True,
+    q,
+    k,
+    v,
+    cluster=CtaPair(),
+    schedule=ClusterLaunchControl(),
+    split_p=True,
+    use_ldred_rowmax=True,
 )
 ```
 
@@ -221,7 +226,7 @@ A port of FA4's `flash_fwd_decode_sm100.py`: S^T = K Q^T and O^T = V^T P^T, so 1
 fill the MMA's M and the query heads of one KV head fill N. Q is `(batch, 1, heads, d)`, K
 `(batch, kv_len, kv_heads, d)` and V `(batch, kv_len, kv_heads, d_v)`, all BF16 and contiguous,
 with up to 32 query heads per KV head; `d` is a multiple of the K step (64 by default) and
-`d_v` of 128, within TMEM (128/128 by default, 256 for either with 8-head tiles).
+`d_v` of 128 (128/128 by default; 256 works for either).
 `seqused_k` (int32 per sequence) shortens sequences; KV rows past it must be finite, since
 FA4's bounded V descriptor isn't ported. `splits_per_seq` caps each sequence's splits, as FA4's
 prepare kernel does. `decode_partials` returns the fp32 split partials in FA4's combine layout;

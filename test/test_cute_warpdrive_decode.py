@@ -456,6 +456,22 @@ def test_decode_role_overrides(requires_blackwell, decode):
     check_against_reference(decode, (2, 1500, 32, 1, 8, [300, 1500], [8, 3]), roles=roles)
 
 
+def test_decode_combines_wider_v(requires_blackwell, decode):
+    """head_dim_v=256 through fa4_decode: the wider partials go through FA4's combine."""
+    pytest.importorskip("flash_attn.cute.interface")
+    q, k, v, splits, used_t, counts_t = decode_inputs((2, 1000, 10, 2, 3, None, None), 128, 256)
+    out, lse = decode.fa4_decode(q, k, v, splits, seqused_k=used_t, splits_per_seq=counts_t)
+    qf, kf, vf = (x.float().transpose(1, 2) for x in (q, k, v))  # (b, h, s, d)
+    kf, vf = (x.repeat_interleave(q.shape[2] // k.shape[2], 1) for x in (kf, vf))
+    scores = qf @ kf.transpose(-1, -2) / math.sqrt(q.shape[-1])
+    ref = (torch.softmax(scores, -1) @ vf).transpose(1, 2)
+    assert out.shape == (2, 1, 10, 256)
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=0)
+    torch.testing.assert_close(
+        lse[..., 0], torch.logsumexp(scores, -1)[:, :, 0], atol=1e-4, rtol=0
+    )
+
+
 def test_decode_rejects_unfit_configurations(decode):
     with pytest.raises(ValueError, match="TMEM plan needs"):
         decode.SwapABDecode(32, tile_n=512)

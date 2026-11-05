@@ -60,7 +60,6 @@ Differences from FA4 (see docs/examples.md for the measured effect):
 """
 
 import math
-from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import partial
 
@@ -215,7 +214,7 @@ class SwapABDecode(WarpSpecialized):
         p_stages: int = 4,
         head_dim: int = 128,
         head_dim_v: int = 128,
-        roles: Mapping[str, RoleConfig] | None = None,
+        roles: dict[str, RoleConfig] | None = None,
     ):
         """``tile_hq``: query heads per KV head, a power of two up to 32. ``tile_n``: KV tokens
         per block, a power-of-two multiple of 128 (FA4: 256). ``tile_k``: MMA K step, one of

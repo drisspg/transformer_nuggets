@@ -52,7 +52,7 @@ and the decode port still matches FA4's partials bit for bit.
 |---|---|
 | `tile_n` (224 for a pair, 256 otherwise) | Constructor, measured defaults ([examples](examples.md#gemm)). |
 | `ab_stages` (fills ~192 KB), `acc_stages` (2) | Constructor. |
-| `c_stages` (2), `epi_tile_n` (32) | Constructor. 16, 32 or 64 columns: 32- to 128-byte bf16 rows of the TMA store box; `tile_n` must divide. |
+| `c_stages` (2), `epi_tile_n` (32) | Constructor. 1 to 8 staging buffers; 16, 32 or 64 columns: 32- to 128-byte bf16 rows of the TMA store box, which must divide `tile_n`. |
 | `schedule`, `mapping`, `cluster` | Constructor. |
 | Roles 0-3 / 4 / 5 at 160 / 40 / 40 | `@role` defaults; `roles=` overrides. |
 | `CTA_TILE_M = 128`, `TILE_K = 64` | Fixed as in gemm.py (CUTLASS's epilogue partition helpers assume 128 rows per CTA). |
@@ -81,7 +81,7 @@ and the decode port still matches FA4's partials bit for bit.
 | `tile_n` (256) | Constructor. A power-of-two multiple of 128 whose `tile_hq x tile_n / 128` S load stays within one 128-column `tcgen05.ld` repetition. |
 | `tile_k` (64) | Constructor. 16, 32 or 64: 32- to 128-byte K-major rows; the K and V^T tiles keep equal bytes. |
 | `s_stages`, `p_stages` (4, 4) | Constructor. Even, one half per softmax warpgroup. |
-| `head_dim`, `head_dim_v` (128, from the tensors) | Constructor. Multiples of `tile_k` and of 128; 256 fits TMEM for 8-head tiles (`S + L + O <= 512` columns). |
+| `head_dim`, `head_dim_v` (128, from the tensors) | Constructor. `head_dim` is a multiple of `tile_k` and only sizes Q and the QK K steps; `head_dim_v` is a multiple of 128 and adds O tiles to TMEM (`S + L + O <= 512` columns: 256 fits at every `tile_hq` with the default S ring). |
 | `kv_stages` (FA4's total split 7:5) | Constructor. |
 | Roles at 64 / 120 / 208 for 32-head tiles, unadjusted otherwise | Defaults computed from `tile_hq`; `roles=` overrides. |
 | `O_STAGES = 2` | Fixed by the algorithm: one O slot per softmax warpgroup (even and odd blocks), merged by the correction tail. |
@@ -90,5 +90,6 @@ and the decode port still matches FA4's partials bit for bit.
 | `lookahead = 2` (K issued two blocks ahead of V) | Fixed: FA4's issue order. The K ring already bounds the lead, and a larger value with a shallow P ring deadlocks (the load waits for a K stage the QK MMA cannot free until a P stage the PV MMA cannot read without the V the load has not issued), which the layer cannot check. |
 
 A combination that does not fit raises at construction (`ValueError` from the TMEM plan or
-the SMEM budget) or at first collection (`ProtocolError`/`ValueError` from the role checks),
-never at launch.
+the default K/V stage budget) or at first collection (`ProtocolError`/`ValueError` from the
+role checks). SMEM is not budgeted at construction: an explicit `kv_stages`, `ab_stages` or
+`c_stages` beyond the capacity fails when the kernel compiles.

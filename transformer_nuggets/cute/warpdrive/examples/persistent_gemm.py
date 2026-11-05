@@ -32,7 +32,6 @@ One compile serves every M, N, K: tile counts, the persistent grid cap, and the 
 are runtime values; schedule, mapping, cluster, and stage counts are compile-time.
 """
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 
 import cutlass
@@ -75,6 +74,7 @@ from transformer_nuggets.cute.warpdrive.examples.gemm import check_gemm_args
 
 CTA_TILE_M, TILE_K = 128, 64  # per-CTA output rows and K step; tile N is a constructor argument
 EPI_TILE_NS = (16, 32, 64)  # TMA store box widths: 32 B to 128 B bf16 rows, up to the SW128 atom
+MAX_C_STAGES = 8  # cp.async.bulk.wait_group takes a small immediate; 8 x 8 KB boxes is plenty
 EPI_BARRIER_ID = 3  # named barrier for the 4 epilogue warps (layer owns 1 and 2)
 
 
@@ -120,7 +120,7 @@ class PersistentGemm(WarpSpecialized):
         tile_n: int | None = None,
         c_stages: int = 2,
         epi_tile_n: int = 32,
-        roles: Mapping[str, RoleConfig] | None = None,
+        roles: dict[str, RoleConfig] | None = None,
     ):
         """``ab_stages``: A/B ring depth (default: what fills ~192 KB). ``acc_stages``: TMEM
         accumulators (2 overlaps a tile's epilogue with the next mainloop). ``tile_n``: output
@@ -137,8 +137,8 @@ class PersistentGemm(WarpSpecialized):
             raise ValueError(
                 f"tile_n must be a multiple of epi_tile_n={epi_tile_n} in (0, 256], got {tile_n}"
             )
-        if c_stages < 1:
-            raise ValueError(f"c_stages must be positive, got {c_stages}")
+        if not 1 <= c_stages <= MAX_C_STAGES:
+            raise ValueError(f"c_stages must be in [1, {MAX_C_STAGES}], got {c_stages}")
         self.tile_n = tile_n
         self.epi_tile = (CTA_TILE_M, epi_tile_n)
         self.c_stages = c_stages

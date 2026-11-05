@@ -116,16 +116,15 @@ tails; returned cursors also let tracing close any remaining work range.
 ## Choose placement in the constructor
 
 The decorator declares the default. A kernel instance replaces any role's placement or
-budget through `self.roles`, a mapping from the method name to a `RoleConfig`, set in
+budget through `self.roles`, a dict from the method name to a `RoleConfig`, set in
 `__init__` from a constructor argument:
 
 ```python
-from collections.abc import Mapping
 from transformer_nuggets.cute.warpdrive import RoleConfig
 
 
 class Attention(WarpSpecialized):
-    def __init__(self, tile_hq: int, roles: Mapping[str, RoleConfig] | None = None):
+    def __init__(self, tile_hq: int, roles: dict[str, RoleConfig] | None = None):
         defaults = {}  # computed from the other arguments
         if tile_hq > 16:
             defaults["softmax"] = RoleConfig([range(4), range(4, 8)], regs=120)

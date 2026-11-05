@@ -46,7 +46,6 @@ the leader's barrier) and keeps stats/epi/turnstile CTA-local.
 """
 
 import math
-from collections.abc import Mapping
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -152,7 +151,7 @@ class FlashAttentionForward(WarpSpecialized):
         schedule=None,
         cluster=None,
         split_p: bool = False,
-        roles: Mapping[str, RoleConfig] | None = None,
+        roles: dict[str, RoleConfig] | None = None,
         mapping: WorkMap | None = None,
         overlap_o_q: bool = False,
         use_ldred_rowmax: bool = False,
@@ -878,7 +877,7 @@ def fa4_fwd(
     max_ctas: int | None = None,
     cluster=None,
     split_p: bool = False,
-    roles: Mapping[str, RoleConfig] | None = None,
+    roles: dict[str, RoleConfig] | None = None,
     mapping: WorkMap | None = None,
     use_ldred_rowmax: bool = False,
     tile_n: int = 128,

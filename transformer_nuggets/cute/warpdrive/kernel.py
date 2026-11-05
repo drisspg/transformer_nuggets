@@ -363,8 +363,9 @@ class WarpSpecialized(metaclass=_KernelType):
     smem_plan: SmemPlan | None = None  # SMEM buffers channels bind with buffer= (storage.py)
     # Per-instance role placement and budgets: ``{method name: RoleConfig}`` replaces the
     # ``@role`` declaration of each named role. Set it in ``__init__`` from a constructor
-    # argument so the compile key sees it; unknown names raise at collection.
-    roles: Mapping[str, RoleConfig] | None = None
+    # argument (a dict: the compile key canonicalizes dicts, not other mappings) so the key
+    # sees it; unknown names raise at collection.
+    roles: dict[str, RoleConfig] | None = None
     # Alias diagnostic (alias.py): "warn" (describe() plus one warning on findings), "strict"
     # (raise on a potential hazard), or "off". Host-only; it never changes the generated code.
     alias_check: str = "warn"
