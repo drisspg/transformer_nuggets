@@ -23,8 +23,8 @@ STREAM_CASES = [("stream", k, s) for k in bench.STREAM_KINDS for s in (1, 4)]
 def test_handoff_probes_finish_and_time_their_iterations(
     requires_blackwell, impl, mode, kind, stages
 ):
-    """Each probe runs its handoffs to completion (an odd count wraps every phase), and more
-    iterations take longer."""
+    """Each probe runs 7 and 70 iterations to completion (both past every ring's stage count,
+    so stages are reused), and more iterations take longer."""
     fn = bench.compiled(impl, mode, kind, stages)
     short, long = bench.run_probe(fn, 7), bench.run_probe(fn, 70)
     assert 0 < short["cycles"] < long["cycles"]

@@ -39,6 +39,7 @@ import cutlass
 import torch
 from cuda.bindings import driver as cuda
 from cutlass import BFloat16, Int32, Int64, cute, pipeline
+from cutlass._mlir.dialects import nvvm
 from cutlass.cute.nvgpu import cpasync
 
 from transformer_nuggets.cute.jit_cache import jit_cache
@@ -67,8 +68,8 @@ TMA_BYTES = TMA_ELEMS * 2
 HANDOFF_KINDS = ("threads", "named", "umma", "tma", "round_robin")
 STREAM_KINDS = ("threads", "named", "umma", "tma")
 WAITS = ("wait", "try")
-# stamps: a clock start/end, a globaltimer start/end, b clock start/end
-NUM_STAMPS = 8
+# stamps: clock start/end, globaltimer start/end of the timed interval
+NUM_STAMPS = 4
 
 
 @dataclass(frozen=True)
@@ -261,16 +262,6 @@ def raw_wait(style: cutlass.Constexpr, bar, phase):
         cute.arch.mbarrier_wait(bar, phase)
 
 
-class RawWait:
-    """``raw_wait`` bound to a style."""
-
-    def __init__(self, style: str):
-        self.style = style
-
-    def __call__(self, bar, phase):
-        raw_wait(self.style, bar, phase)
-
-
 def raw_arrive(mech: str, bar):
     if cutlass.const_expr(mech == "umma"):
         with cute.arch.elect_one():
@@ -279,12 +270,15 @@ def raw_arrive(mech: str, bar):
         cute.arch.mbarrier_arrive(bar)
 
 
-def named_sync(barrier_id: int, threads: int):
-    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=threads)
+def named_sync(barrier_id, threads: int):
+    """Unaligned ``barrier.cta.sync``, as the layer's named channels emit."""
+    nvvm.barrier_cta_sync(
+        Int32(barrier_id).ir_value(), thread_count=Int32(threads).ir_value(), aligned=False
+    )
 
 
-def named_arrive(barrier_id: int, threads: int):
-    cute.arch.barrier_arrive(barrier_id=barrier_id, number_of_threads=threads)
+def named_arrive(barrier_id, threads: int):
+    cute.arch.barrier_arrive(barrier_id=barrier_id, number_of_threads=threads, aligned=False)
 
 
 class RawProbe:
@@ -293,11 +287,11 @@ class RawProbe:
 
     def __init__(self, kind: str, stages: int, mode: str, wait: str):
         self.kind, self.stages, self.mode = kind, stages, mode
-        self.wait = RawWait(wait)
+        self.wait_style = wait
         self.num_warps = 3 if kind == "round_robin" else 2
 
     def get_name(self) -> str:
-        return f"raw_overhead_{self.mode}_{self.kind}_n{self.stages}_{self.wait.style}"
+        return f"raw_overhead_{self.mode}_{self.kind}_n{self.stages}_{self.wait_style}"
 
     @cute.jit
     def __call__(self, stamps: cute.Tensor, src: cute.Tensor, n: Int32, stream: cuda.CUstream):
@@ -337,7 +331,7 @@ class RawProbe:
 
     @cute.jit
     def mbarrier_roles(self, ctx, warp, buf, full_f, empty_f, full_b, empty_b):
-        kind, stages, wait = self.kind, self.stages, self.wait
+        kind, stages, style = self.kind, self.stages, self.wait_style
         prod = pipeline.PipelineUserType.Producer
         cons = pipeline.PipelineUserType.Consumer
         fwd_commit = "umma" if kind == "umma" else "threads"
@@ -346,7 +340,7 @@ class RawProbe:
             b = pipeline.make_pipeline_state(cons, stages)
             t0, g0 = cute.arch.clock64(), cute.arch.globaltimer()
             for _ in cutlass.range(ctx.n, unroll=1):
-                wait(empty_f + f.index, f.phase)
+                raw_wait(style, empty_f + f.index, f.phase)
                 if cutlass.const_expr(kind == "tma"):
                     with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive_and_expect_tx(full_f + f.index, TMA_BYTES)
@@ -355,7 +349,7 @@ class RawProbe:
                     raw_arrive(fwd_commit, full_f + f.index)
                 f.advance()
                 if cutlass.const_expr(self.mode == "pingpong"):
-                    wait(full_b + b.index, b.phase)
+                    raw_wait(style, full_b + b.index, b.phase)
                     raw_arrive("umma" if kind == "umma" else "threads", empty_b + b.index)
                     b.advance()
             t1, g1 = cute.arch.clock64(), cute.arch.globaltimer()
@@ -368,11 +362,11 @@ class RawProbe:
             f = pipeline.make_pipeline_state(cons, stages)
             b = pipeline.make_pipeline_state(prod, stages)
             for _ in cutlass.range(ctx.n, unroll=1):
-                wait(full_f + f.index, f.phase)
+                raw_wait(style, full_f + f.index, f.phase)
                 cute.arch.mbarrier_arrive(empty_f + f.index)
                 f.advance()
                 if cutlass.const_expr(self.mode == "pingpong"):
-                    wait(empty_b + b.index, b.phase)
+                    raw_wait(style, empty_b + b.index, b.phase)
                     cute.arch.mbarrier_arrive(full_b + b.index)
                     b.advance()
             if cutlass.const_expr(self.mode == "stream"):
@@ -382,7 +376,7 @@ class RawProbe:
 
     @cute.jit
     def round_robin_roles(self, ctx, warp, full_f, empty_f, full_b, empty_b):
-        stages, wait = self.stages, self.wait
+        stages, style = self.stages, self.wait_style
         prod = pipeline.PipelineUserType.Producer
         cons = pipeline.PipelineUserType.Consumer
         if warp == 0:
@@ -390,10 +384,10 @@ class RawProbe:
             b = pipeline.make_pipeline_state(cons, stages)
             t0, g0 = cute.arch.clock64(), cute.arch.globaltimer()
             for _ in cutlass.range(ctx.n, unroll=1):
-                wait(empty_f + f.index, f.phase)
+                raw_wait(style, empty_f + f.index, f.phase)
                 cute.arch.mbarrier_arrive(full_f + f.index)
                 f.advance()
-                wait(full_b + b.index, b.phase)
+                raw_wait(style, full_b + b.index, b.phase)
                 cute.arch.mbarrier_arrive(empty_b + b.index)
                 b.advance()
             t1, g1 = cute.arch.clock64(), cute.arch.globaltimer()
@@ -409,10 +403,10 @@ class RawProbe:
                 f.advance()
                 b.advance()
             for _ in cutlass.range(turn, ctx.n, 2, unroll=1):
-                wait(full_f + f.index, f.phase)
+                raw_wait(style, full_f + f.index, f.phase)
                 cute.arch.mbarrier_arrive(empty_f + f.index)
                 f.advance(2)
-                wait(empty_b + b.index, b.phase)
+                raw_wait(style, empty_b + b.index, b.phase)
                 cute.arch.mbarrier_arrive(full_b + b.index)
                 b.advance(2)
 
@@ -693,9 +687,7 @@ def compile_empty_roles(impl: str):
     )
 
 
-def make_probe(impl: str, mode: str, kind: str, stages: int):
-    if impl != "warpdrive":
-        return RawProbe(kind, stages, mode, impl)
+def make_probe(mode: str, kind: str, stages: int) -> ProbeBase:
     if mode == "stream":
         return Stream(kind, stages)
     if kind == "round_robin":
@@ -725,7 +717,7 @@ def _compile(op):
 
 def compiled(impl: str, mode: str, kind: str, stages: int):
     if impl == "warpdrive":
-        return compile_warpdrive_probe(make_probe(impl, mode, kind, stages))
+        return compile_warpdrive_probe(make_probe(mode, kind, stages))
     return compile_raw_probe(kind, stages, mode, impl)
 
 
@@ -739,16 +731,12 @@ def run_probe(fn, n: int) -> dict:
     return {"cycles": s[1] - s[0], "ns": s[3] - s[2]}
 
 
-def handoff_cost(fn, mode: str, n: int, rounds: int) -> dict:
+def handoff_cost(fn, mode: str, n: int) -> dict:
     """Per one-way handoff (pingpong) or per item (stream), from the difference between ``n`` and
-    ``2n`` iterations so loop entry and exit cancel; median over ``rounds`` launches."""
+    ``2n`` iterations so loop entry and exit cancel."""
     per = 2 if mode == "pingpong" else 1
-    cyc, ns = [], []
-    for _ in range(rounds):
-        lo, hi = run_probe(fn, n), run_probe(fn, 2 * n)
-        cyc.append((hi["cycles"] - lo["cycles"]) / (per * n))
-        ns.append((hi["ns"] - lo["ns"]) / (per * n))
-    return {"cycles": statistics.median(cyc), "ns": statistics.median(ns), "samples": cyc}
+    lo, hi = run_probe(fn, n), run_probe(fn, 2 * n)
+    return {k: (hi[k] - lo[k]) / (per * n) for k in ("cycles", "ns")}
 
 
 FIXED_IMPLS = ("warpdrive", "raw_w0", "raw_w1")
@@ -850,7 +838,7 @@ def run_handoff(n: int, rounds: int) -> list[dict]:
         order = impls if r % 2 == 0 else impls[::-1]
         for case in cases:
             for impl in order:
-                res = handoff_cost(fns[(impl, *case)], case[0], n, 1)
+                res = handoff_cost(fns[(impl, *case)], case[0], n)
                 rows.append(
                     {
                         "suite": "handoff",
