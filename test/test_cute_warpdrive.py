@@ -35,6 +35,7 @@ from transformer_nuggets.cute.warpdrive import (
     WorkStream,
     role,
 )
+from transformer_nuggets.cute.warpdrive import kernel as kernel_module
 from transformer_nuggets.cute.warpdrive.examples.gemm import gemm
 from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import persistent_gemm
 
@@ -378,14 +379,27 @@ class TmemOnTwoRoles(TmemPlacementToy):
         (TmemOnTwoRoles, ("epilogue", 2), [1, 0, 1, 0]),
     ],
 )
-def test_tmem_allocator_avoids_the_barrier_warp(requires_blackwell, toy, allocator, warps):
+def test_tmem_allocator_avoids_the_barrier_warp(
+    requires_blackwell, traced_compiles, monkeypatch, toy, allocator, warps
+):
+    """The traced kernel allocates from the expected warp, inside the role that frees, and
+    every CTA frees its columns (the CTAs sharing an SM would otherwise wait forever)."""
+    allocator_warps = []
+    real = kernel_module.memory.TmemAllocator
+
+    def spy(*args, **kwargs):
+        allocator_warps.append(kwargs["allocator_warp_id"])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(kernel_module.memory, "TmemAllocator", spy)
     op = toy()
-    op._collect()
-    r, warp = op._tmem_allocator()
-    assert (r.name, warp) == allocator
+    compile_toy.cache_clear()
+    fn = compile_toy(op)
+    monkeypatch.undo()
+    assert (op._ws_tmem_alloc_role.name, allocator_warps) == (allocator[0], [allocator[1]])
     ctas = 4 * torch.cuda.get_device_properties(0).multi_processor_count  # several per SM
     out = torch.zeros(ctas * 4, device="cuda", dtype=torch.int32)
-    compile_toy(op)(out, ctas)
+    fn(out, ctas)
     torch.cuda.synchronize()
     assert out.view(ctas, 4).tolist() == [warps] * ctas
 
