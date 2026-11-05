@@ -134,23 +134,26 @@ class SplitKV(WorkMap):
     words = 4
     skips = True
 
+    def bind(self, space):
+        splits, heads, batch, _table = space
+        # These divisors depend only on launch shapes, not the PDL-produced split table.
+        major = heads * batch if self.per_sequence else splits
+        return (*space, cute.FastDivmodDivisorV2(major), cute.FastDivmodDivisorV2(heads))
+
     def count64(self, space):
-        splits, heads, batch, _ = space
+        splits, heads, batch, *_ = space
         return Int64(splits) * heads * batch
 
     def decode(self, index, space):
-        splits, heads, batch, table = space
+        splits, _, _, table, major_divisor, head_divisor = space
         if self.per_sequence:
-            split = index // (heads * batch)
-            rest = index - split * (heads * batch)
-            b = rest // heads
-            head = rest - b * heads
+            split, rest = divmod(index, major_divisor)
+            b, head = divmod(rest, head_divisor)
             count = table[b]
             return split < count, (split, head, b, count)
-        bh = index // splits
-        split = index - bh * splits
-        b = bh // heads
-        return True, (split, bh - b * heads, b, splits)
+        bh, split = divmod(index, major_divisor)
+        b, head = divmod(bh, head_divisor)
+        return True, (split, head, b, splits)
 
     def get_key(self) -> str:
         return "splitkv_seq" if self.per_sequence else "splitkv"
