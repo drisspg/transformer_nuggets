@@ -1385,8 +1385,9 @@ def _wait(bar, phase, token):
 
 
 def _named_sync(barrier_id, threads: int):
-    """Unaligned ``barrier.cta.sync``: roles reach a channel's barriers from different code
-    sites, and lanes of one warp may arrive from divergent paths."""
+    """Unaligned ``barrier.cta.sync``: roles reach a named barrier (a channel's, a
+    ``NamedBarrier``, TMEM teardown) from different code sites, and lanes of one warp may
+    arrive from divergent paths."""
     _nvvm.barrier_cta_sync(
         Int32(barrier_id).ir_value(), thread_count=Int32(threads).ir_value(), aligned=False
     )

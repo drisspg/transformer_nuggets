@@ -14,7 +14,6 @@ from typing import TypeVar
 
 import cutlass
 from cutlass import Int32, cute, memory, pipeline
-from cutlass._mlir.dialects import nvvm
 
 from transformer_nuggets.cute.jit_cache import canonical_key, module_source_digest
 from transformer_nuggets.cute.warpdrive import alias
@@ -30,6 +29,7 @@ from transformer_nuggets.cute.warpdrive.channels import (
     Turnstile,
     Umma,
     Warps,
+    _named_sync,
     arrivals,
 )
 from transformer_nuggets.cute.warpdrive.cluster import (
@@ -1539,7 +1539,7 @@ class WarpSpecialized(metaclass=_KernelType):
             count = rank_value({c: tmem_threads[c] for c in ctas}, self.cluster.rank)
             # Roles reach this from different code sites after per-lane mbarrier spins, so use
             # the unaligned form (compute-sanitizer synccheck flags the aligned bar.sync).
-            _barrier_unaligned(TMEM_TEARDOWN_BARRIER_ID, count)
+            _named_sync(TMEM_TEARDOWN_BARRIER_ID, count)
             if r is self._ws_tmem_alloc_role:
                 ptr = self._ws_tmem.retrieve_ptr(cutlass.Float32)
                 # Pair: the allocator warps of both CTAs meet on the dealloc mbarrier first.
@@ -1804,12 +1804,6 @@ def _allocate_named(chans: dict, named_bars: dict) -> dict:
     for barrier_id, nb in enumerate(named_bars.values(), FIRST_FREE_BARRIER_ID):
         nb._id = barrier_id
     return out
-
-
-def _barrier_unaligned(barrier_id: int, num_threads):
-    nvvm.barrier_cta_sync(
-        Int32(barrier_id).ir_value(), thread_count=Int32(num_threads).ir_value(), aligned=False
-    )
 
 
 def _runs(warps: list[int]) -> list[range]:
