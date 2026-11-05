@@ -85,7 +85,7 @@ landing core synchronization/scheduling changes.
   `pytest -n 12 -m fuzz test/test_cute_warpdrive*.py`.
 - Long campaigns, sanitizer and CUTracer runs, SASS/perf A/Bs: only when the user asks.
   Use `scripts/fuzz_warpdrive.py {runtime,static,mutate}` under `gpu-run`.
-  `CUTE_DSL_ARCH=sm_100a python scripts/warpdrive_sass.py dump OUTDIR` records the seven standard configs; `compare BEFORE AFTER` checks normalized SASS.
+  `CUTE_DSL_ARCH=sm_100a python scripts/warpdrive_sass.py dump OUTDIR` records the seven standard configs; `compare BEFORE AFTER` gates on PTX and compiler identity and prints SASS diffs (`--strict-sass` also requires identical SASS). ptxas can assign registers differently from identical PTX (seen on the small decode configs), so a SASS-only diff with identical PTX is not a code change.
 - Before pushing, run CI's full pre-commit suite: `prek run --all-files`. It pins ruff 0.14.9,
   which flags rules the dev ruff does not (e.g. E741), and runs pyupgrade, which ruff alone
   does not cover.
