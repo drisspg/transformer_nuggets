@@ -1330,21 +1330,28 @@ class WarpSpecialized(metaclass=_KernelType):
                     "unverified (some roles use it once per work item, others once per launch)"
                 )
                 continue
+            per_item = any(scope for scope, _ in traced.values())
+            unit = "work item" if per_item else "launch"
             seqs = {who: seq for who, (_, seq) in traced.items()}
-            # A retired acquire (a final unused stage) is an epoch nobody may wait for.
-            total = sum(count for op, count in seqs[producer] if op == "acquire")
-            epochs = total - sum(op == "retire" for op, _ in seqs[producer])
-            owners: list[list[str]] = [[] for _ in range(epochs)]
+            total = sum(op == "acquire" for op, _ in seqs[producer])
+            # A retired acquire publishes nothing: its epoch has no owner, only skips.
+            retired = {n for op, n in seqs[producer] if op == "retire"}
+            owners: list[list[str]] = [[] for _ in range(total)]
+            continues = persistent and per_item  # each end carries on into the next work item
             waited = {who: [] for who in consumers}
             blind = None  # (consumer, epoch) of the first wait that needs a rendezvous
             for who in consumers:
                 e, seen = 0, -1  # the next epoch; the last one this consumer waited for
                 for op, count in seqs[who]:
                     if op == "wait":
-                        if e >= epochs:
+                        if e >= total or e in retired:
                             raise ProtocolError(
                                 f"channel {name}: {who} waits on epoch {e}, but {producer} "
-                                f"fills only {epochs} per work item"
+                                + (
+                                    "retires it unpublished"
+                                    if e in retired
+                                    else f"fills only {total} per {unit}"
+                                )
                             )
                         owners[e].append(who)
                         waited[who].append(e)
@@ -1354,25 +1361,28 @@ class WarpSpecialized(metaclass=_KernelType):
                     e += count
                 # The next item's first wait follows this item's last one.
                 mine = waited[who]
-                if persistent and mine and mine[0] + epochs - mine[-1] > ch.n:
-                    blind = blind or (who, mine[0] + epochs)
+                if continues and mine and mine[0] + total - mine[-1] > ch.n:
+                    blind = blind or (who, mine[0] + total)
                 # A persistent role continues into the next item: it must cover every epoch.
-                if e > total or (persistent and e != total):
+                if e > total or (continues and e != total):
                     raise ProtocolError(
-                        f"channel {name}: {who} advances {e} epochs per work item (waits and "
+                        f"channel {name}: {who} advances {e} epochs per {unit} (waits and "
                         f"skips), but {producer} acquires {total}"
                     )
-            bad = next(((e, o) for e, o in enumerate(owners) if len(o) != 1), None)
+            bad = next(
+                ((e, o) for e, o in enumerate(owners) if len(o) != 1 and e not in retired), None
+            )
             if bad is not None:
                 e, o = bad
                 who = "no consumer" if not o else " and ".join(o)
                 raise ProtocolError(
-                    f"channel {name}: epoch {e} of {epochs} per work item is waited by {who}; "
+                    f"channel {name}: epoch {e} of {total} per {unit} is waited by {who}; "
                     "each epoch of an exclusive ring has exactly one owner, which the other "
                     "consumers skip()"
                 )
             share = ", ".join(f"{who} {len(mine)}" for who, mine in waited.items())
-            verdict = f"verified: {epochs} epochs per work item ({share})"
+            published = total - len(retired)
+            verdict = f"verified: {published} epochs per {unit} ({share})"
             if blind is not None:
                 who, e = blind
                 verdict += (

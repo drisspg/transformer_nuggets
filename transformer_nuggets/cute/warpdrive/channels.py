@@ -435,6 +435,7 @@ class HandleRecord:
     chan: object = None  # the Channel
     slot: int | None = None  # the Slots slot; None for a Ring stage (dynamic)
     producer: bool = False
+    order: int = 0  # how many acquires/waits of its end (and slot) were traced before it
 
 
 @dataclass(frozen=True)
@@ -537,13 +538,15 @@ class Handle(_Stage):
         self._label = label
         self._is_producer = is_producer
         # Trace-time lifetime record, shared by loop-carried copies of this handle.
+        key = index if end._chan.fixed else None
         self.rec = HandleRecord(
             self.describe(),
             user_site(),
             current_block(),
             chan=end._chan,
-            slot=index if end._chan.fixed else None,
+            slot=key,
             producer=is_producer,
+            order=end._rec.advances.get(key, 0) - 1,  # its own acquire/wait already counted
         )
         end._trace.opened(self.rec)
         end._trace.event("open", handle=self.rec)
@@ -652,7 +655,7 @@ class Handle(_Stage):
                 "commit or retire, consumer handles release"
             )
         trace.closed(self.rec, op)
-        trace.record(self._end._chan.name, op, self._label)
+        trace.record(self._end._chan.name, op, self._label, order=self.rec.order)
         trace.event(
             "close", handle=self.rec, signal=op in ("commit", "release"), retire=op == "retire"
         )

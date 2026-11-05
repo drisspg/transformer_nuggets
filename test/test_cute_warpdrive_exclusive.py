@@ -334,9 +334,9 @@ class Wide(Static):
         ("dynamic_count", r"kv\.skip\(.*\) at .*must be a positive Python int"),
         ("token", r"stale token probed at test_cute_warpdrive_exclusive\.py:\d+"),
         ("preview", r"kv\.skip\(\) at .* with an unconsumed preview \(kv\[i\] peek"),
-        ("double", r"epoch 0 of 6 per work item is waited by a and b"),
-        ("gap", r"epoch 5 of 6 per work item is waited by no consumer"),
-        ("past", r"b waits on epoch 7, but prod fills only 6 per work item"),
+        ("double", r"epoch 0 of 6 per launch is waited by a and b"),
+        ("gap", r"epoch 5 of 6 per launch is waited by no consumer"),
+        ("past", r"b waits on epoch 7, but prod fills only 6 per launch"),
     ],
 )
 def test_misuse_raises_while_tracing(mode, error):
@@ -344,18 +344,29 @@ def test_misuse_raises_while_tracing(mode, error):
 
 
 class Retired(Static):
-    """Two published epochs (a, b) and a final acquire the producer retires unpublished."""
+    """The producer acquires three epochs and retires one unpublished: the last (``kind``
+    "last"), or the middle one while it holds all three ("middle"); a owns epoch 0, b the other
+    published one. "wait_retired": b waits for the retired middle epoch instead."""
 
-    def __init__(self):
-        super().__init__("retired")
+    B_SKIPS = {"last": 1, "middle": 2, "wait_retired": 1}
+
+    def __init__(self, kind: str):
+        self.kind = kind
+        super().__init__(f"retired_{kind}")
 
     @role(warps=0)
     @cute.jit
     def prod(self, ctx, *, kv: Producer, join: Producer):
-        for _ in cutlass.range_constexpr(2):
-            with kv.produce():
-                pass
-        kv.acquire().retire()
+        if cutlass.const_expr(self.kind == "last"):
+            for _ in cutlass.range_constexpr(2):
+                with kv.produce():
+                    pass
+            kv.acquire().retire()
+        else:
+            h0, h1, h2 = kv.acquire(), kv.acquire(), kv.acquire()
+            h1.retire()
+            h0.commit()
+            h2.commit()
         return kv, join
 
     @role(warps=1)
@@ -367,21 +378,30 @@ class Retired(Static):
     @role(warps=2)
     @cute.jit
     def b(self, ctx, *, kv: Consumer, join: Consumer):
-        kv.skip(1)
+        kv.skip(self.B_SKIPS[self.kind])
         kv.wait().release()
         return kv, join
 
 
-def test_static_ownership_leaves_a_retired_epoch_unowned():
-    op = Retired()
-    compile_toy(op, "static_retired")
-    assert "epochs    verified: 2 epochs per work item (a 1, b 1)\n" in op.describe()
+@pytest.mark.parametrize("kind", ["last", "middle"])
+def test_static_ownership_leaves_a_retired_epoch_unowned(kind):
+    op = Retired(kind)
+    compile_toy(op, f"static_retired_{kind}")
+    assert "epochs    verified: 2 epochs per launch (a 1, b 1)\n" in op.describe()
+
+
+def test_static_ownership_rejects_a_wait_for_a_retired_epoch():
+    _raises_protocol(
+        "b waits on epoch 1, but prod retires it unpublished",
+        lambda: compile_toy(Retired("wait_retired"), "static_retired_wait_retired"),
+    )
 
 
 class PerItem(WarpSpecialized):
     """``a`` takes even and ``b`` odd epochs of each work item's two. ``mode``: "ok"; "short"
     (a does not skip b's trailing epoch, so under a persistent schedule its next item starts on
-    the wrong epoch); "prologue" (the producer fills both epochs once, before its work loop).
+    the wrong epoch); "prologue" (the producer fills both epochs once, before its work loop);
+    "launch" (every role uses the ring once, before its work loop; a skips nothing).
     Compiled only."""
 
     def __init__(self, schedule, mode: str):
@@ -392,12 +412,13 @@ class PerItem(WarpSpecialized):
     @role(warps=0)
     @cute.jit
     def prod(self, ctx, *, kv: Producer, work: WorkCursor):
-        if cutlass.const_expr(self.mode == "prologue"):
+        once = self.mode in ("prologue", "launch")
+        if cutlass.const_expr(once):
             for _ in cutlass.range_constexpr(2):
                 with kv.produce():
                     pass
         while work.valid:
-            if cutlass.const_expr(self.mode != "prologue"):
+            if cutlass.const_expr(not once):
                 for _ in cutlass.range_constexpr(2):
                     with kv.produce():
                         pass
@@ -407,19 +428,26 @@ class PerItem(WarpSpecialized):
     @role(warps=1)
     @cute.jit
     def a(self, ctx, *, kv: Consumer, work: WorkCursor):
-        while work.valid:
+        if cutlass.const_expr(self.mode == "launch"):
             kv.wait().release()
-            if cutlass.const_expr(self.mode != "short"):
-                kv.skip(1)
+        while work.valid:
+            if cutlass.const_expr(self.mode != "launch"):
+                kv.wait().release()
+                if cutlass.const_expr(self.mode != "short"):
+                    kv.skip(1)
             work.advance()
         return kv, work
 
     @role(warps=2)
     @cute.jit
     def b(self, ctx, *, kv: Consumer, work: WorkCursor):
-        while work.valid:
+        if cutlass.const_expr(self.mode == "launch"):
             kv.skip(1)
             kv.wait().release()
+        while work.valid:
+            if cutlass.const_expr(self.mode != "launch"):
+                kv.skip(1)
+                kv.wait().release()
             work.advance()
         return kv, work
 
@@ -461,13 +489,18 @@ def test_static_ownership_per_work_item():
         "a advances 1 epochs per work item .*, but prod acquires 2",
         lambda: compile_items(PerItem(StaticPersistent(), "short")),
     )
+    # Used once per launch, the ring has no next item to line up, even under a persistent
+    # schedule.
+    op = PerItem(StaticPersistent(), "launch")
+    compile_items(op)
+    assert "epochs    verified: 2 epochs per launch (a 1, b 1)\n" in op.describe()
 
 
 def test_static_check_names_a_wait_that_needs_a_rendezvous():
     op = Wide()
     compile_toy(op, "static_wide")
     assert (
-        "epochs    verified: 6 epochs per work item (a 5, b 1); b's wait of epoch 5 is exact only "
+        "epochs    verified: 6 epochs per launch (a 5, b 1); b's wait of epoch 5 is exact only "
         "after epoch 2 was filled, which it did not observe: order it with a rendezvous"
     ) in op.describe()
 
@@ -479,7 +512,7 @@ def test_static_ownership_is_verified_and_described(requires_blackwell):
     assert "kv    Ring(3)  prod -> a, b" in text, text
     assert "empty     32 x3" in text  # one consumer's arrivals, not the join's 64
     assert "owners    exclusive: one of a, b owns each epoch, the others skip it" in text
-    assert "epochs    verified: 6 epochs per work item (a 4, b 2)\n" in text
+    assert "epochs    verified: 6 epochs per launch (a 4, b 2)\n" in text
     for _ in range(3):
         out = torch.full((7,), -1, device="cuda", dtype=torch.int32)
         out[-1] = 0
