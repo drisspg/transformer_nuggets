@@ -756,19 +756,23 @@ class _Graph:
             else:
                 del self.guess_edges[key]
 
+    def _next_search_state(self, todo: deque[tuple]) -> tuple:
+        self.steps += 1
+        if self.steps > SEARCH_LIMIT:
+            raise _TooLarge(f"the ordering search passed {SEARCH_LIMIT} steps")
+        return todo.popleft()
+
+    def _channel_edges(self, rid: int, p: int, raw: bool) -> list[tuple[RoleEvents, int]]:
+        edges = self.edges.get((rid, p), [])
+        return edges + self.raw_edges.get((rid, p), []) if raw else edges
+
     def _forward(self, rid, p) -> set:
         """Every instance ``(role id, position)`` the established order puts after one."""
         seen, todo = {(rid, p)}, deque([(rid, p)])
         while todo:
-            self.steps += 1
-            if self.steps > SEARCH_LIMIT:
-                raise _TooLarge(f"the ordering search passed {SEARCH_LIMIT} steps")
-            rid, p = todo.popleft()
+            rid, p = self._next_search_state(todo)
             nxt = [(rid, p + 1)] if p + 1 < len(self.seq[rid]) else []
-            nxt += [
-                (id(dst), q)
-                for dst, q in self.edges.get((rid, p), []) + self.raw_edges.get((rid, p), [])
-            ]
+            nxt += [(id(dst), q) for dst, q in self._channel_edges(rid, p, raw=True)]
             for state in nxt:
                 if state not in seen:
                     seen.add(state)
@@ -782,17 +786,11 @@ class _Graph:
         start = (id(a.role), pos_a, False)
         seen, todo = {start}, deque([start])
         while todo:
-            self.steps += 1
-            if self.steps > SEARCH_LIMIT:
-                raise _TooLarge(f"the ordering search passed {SEARCH_LIMIT} steps")
-            rid, p, left = todo.popleft()
+            rid, p, left = self._next_search_state(todo)
             nxt = []
             if p + 1 < len(self.seq[rid]):
                 nxt.append((rid, p + 1, left))
-            edges = self.edges.get((rid, p), [])
-            if raw:
-                edges = edges + self.raw_edges.get((rid, p), [])
-            for dst, q in edges:
+            for dst, q in self._channel_edges(rid, p, raw):
                 if not left and not check(p):
                     continue
                 nxt.append((id(dst), q, True))
@@ -813,14 +811,11 @@ class _Graph:
         parent: dict = {start: None}
         todo = deque([start])
         while todo:
-            self.steps += 1
-            if self.steps > SEARCH_LIMIT:
-                raise _TooLarge(f"the ordering search passed {SEARCH_LIMIT} steps")
-            rid, p, left = todo.popleft()
+            rid, p, left = self._next_search_state(todo)
             nxt = []
             if p + 1 < len(self.seq[rid]):
                 nxt.append(((rid, p + 1, left), None))
-            for dst, q in self.edges.get((rid, p), []) + self.raw_edges.get((rid, p), []):
+            for dst, q in self._channel_edges(rid, p, raw=True):
                 nxt.append(((id(dst), q, True), None))
             for dst, q, why in self.guess_edges.get((rid, p), []):
                 nxt.append(((id(dst), q, True), why))
