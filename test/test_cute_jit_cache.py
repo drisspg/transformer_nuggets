@@ -13,6 +13,8 @@ from typing import NamedTuple
 
 import pytest
 
+pytest.importorskip("cutlass")  # transformer_nuggets.cute imports CuTeDSL
+
 from transformer_nuggets.cute.jit_cache import _key as cute_key
 from transformer_nuggets.cute.jit_cache import cache as cute_cache
 from transformer_nuggets.cute.jit_cache import compile as cute_compile
