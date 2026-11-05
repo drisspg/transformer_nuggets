@@ -51,9 +51,13 @@ other roles through a ring. In a cluster, rank 0 sends it to every CTA.
 
 `stages` is the work ring's depth, not the number of A/B stages. A free work-ring slot is
 acquired before claiming more work. Roles release the slot when they receive the item, not
-when they finish computing it. Every ring consumer also receives the terminal marker, which
-is not work. The scheduler uses the lowest free warp unless you set
-`WorkStream(scheduler_warp=...)`.
+when they finish computing it. In a cluster the leader fills every CTA's slot with `st.async`,
+which completes the receiving CTA's full barrier by bytes, and the receivers' releases are
+CTA-scope arrivals (`remote_scope cta`): they hand the slot back and publish nothing. A
+cluster-scope release there cost the 2-CTA persistent GEMM 0.7-1.2 us per work item in every
+role, comparable to a short-K tile's mainloop ([examples](examples.md#tile-boundaries)).
+Every ring consumer also receives the terminal marker, which is not work. The scheduler uses
+the lowest free warp unless you set `WorkStream(scheduler_warp=...)`.
 
 Use `while work.valid:` and one `work.advance()` directly at the end of that loop's body.
 Read the item before advancing, and return the cursor. Every managed role must drain the

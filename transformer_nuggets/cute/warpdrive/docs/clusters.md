@@ -144,13 +144,20 @@ that your role started.
 
 ## Memory scope
 
-Without a payload, `remote_scope` defaults to `"cta"`. That is the normal setting for
-TMA/MMA/TMEM handoffs ordered by their own mechanisms. If ordinary SMEM or global writes must
-be read by the peer, set `remote_scope="cluster"` and address the peer's storage correctly.
-warpdrive cannot infer that requirement from the channel declaration.
+`remote_scope` derives from what the channel's thread arrivals publish. Without a payload it
+is `"cta"`: the normal setting for TMA/MMA/TMEM handoffs ordered by their own mechanisms, and
+for releases that only hand a stage back. A payload that a thread producer writes and commits
+derives `"cluster"`, since the commit itself must publish those words to a remote reader. A
+payload filled by a `Tma` producer (completed by bytes on the reader's full barrier) derives
+`"cta"` again: its consumers' releases publish nothing. If ordinary SMEM or global writes
+outside a payload must be read by the peer, set `remote_scope="cluster"` and address the peer's
+storage correctly; warpdrive cannot infer that requirement from the channel declaration. The
+cluster scope is a GPU-scope membar per arriving thread
+([measured](examples.md#tile-boundaries) on the 2-CTA persistent GEMM's work ring).
 
 Layer-owned `payload=` buffers are CTA-local and disallowed on user pair-scoped channels.
-The internal work ring is a separate case: its scheduler explicitly fills every CTA's payload.
+The internal work ring is the one pair-scoped payload channel: its scheduler fills every CTA's
+payload with `st.async`.
 
 `SmemPlan` buffers can bind to pair-scoped channels. They still allocate separately in each
 CTA at matching offsets, and `buffer=` neither changes `remote_scope` nor adds a fence.
@@ -255,7 +262,7 @@ Channels
              signal    Tma(16 B) -> Threads
              full      rank 0 1 x2, rank 1 1 x2, rank 2 1 x2, rank 3 1 x2, tx 16 B (leader-armed)
              empty     rank 0 736 x2
-             scope     cross-CTA, remote_scope cluster
+             scope     cross-CTA, remote_scope cta
              storage   payload Int32(4,)
   ...
 ```

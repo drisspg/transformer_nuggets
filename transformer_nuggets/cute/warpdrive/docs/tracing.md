@@ -50,7 +50,7 @@ Channels
              signal    Tma(16 B) -> Threads
              full      leader 1 x2, peer 1 x2, tx 16 B (leader-armed)
              empty     leader 384 x2
-             scope     pair-scoped, remote_scope cluster
+             scope     pair-scoped, remote_scope cta
              storage   payload Int32(4,)
   work_clc   Slots(1) work.scheduler -> work.scheduler
              signal    Tma(16 B) -> Threads

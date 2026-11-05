@@ -190,7 +190,8 @@ class Channel:
     ``remote_scope``: memory scope of thread arrivals on a pair-scoped channel's barriers in the
     other CTA. ``"cta"`` (default without a payload; what CUTLASS and FA4 pipelines use) only
     counts arrivals: right for TMEM/TMA/MMA handoffs ordered by their own fences and for
-    stage reuse. ``"cluster"`` (default with a layer payload) is a cluster-scope release.
+    stage reuse. ``"cluster"`` (default with a layer payload that thread arrivals publish; a
+    ``Tma``-filled payload keeps ``"cta"``) is a cluster-scope release.
     **Rule:** a pair-scoped channel whose signal publishes ordinary memory (SMEM read through
     DSMEM, or global memory) that the other CTA reads outside a layer payload must set
     ``remote_scope="cluster"``. The layer cannot detect this. The cluster scope is measurably
@@ -323,7 +324,14 @@ class Channel:
         unknown = set(self.override or {}) - set(SCOPE_OVERRIDES)
         if unknown:
             raise ValueError(f"unknown override keys {sorted(unknown)}; one of {SCOPE_OVERRIDES}")
-        self.derived_remote_scope = "cluster" if self.payload is not None else "cta"
+        # A payload is published by its producer's thread arrivals, so a remote reader needs a
+        # cluster-scope release. A Tma producer completes the payload by bytes instead (the
+        # scheduler's st.async into the work ring), leaving the consumers' release as the only
+        # thread arrival: it hands the slot back and publishes nothing, so it counts at CTA
+        # scope as CUTLASS's pipelines do; the cluster-scope release is a GPU-scope membar per
+        # thread (measured in docs/examples.md).
+        published = self.payload is not None and not isinstance(self.producer, Tma)
+        self.derived_remote_scope = "cluster" if published else "cta"
         self.remote_scope_overridden = self.remote_scope is not None
         if self.remote_scope is None:
             self.remote_scope = self.derived_remote_scope

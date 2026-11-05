@@ -24,6 +24,7 @@ from transformer_nuggets.cute.warpdrive import (
     StageView,
     StaticPersistent,
     Threads,
+    Tma,
     WarpSpecialized,
     role,
 )
@@ -171,6 +172,11 @@ def test_buffer_keeps_remote_scope_and_pair_channels():
     from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import PersistentGemm
 
     assert Ring(2, buffer=SmemPlan().buffer("A", cutlass.Int32)).remote_scope == "cta"
+    # A payload that thread arrivals publish derives a cluster-scope release; one a Tma producer
+    # completes by bytes (the cluster work ring) leaves only slot hand-backs, at CTA scope.
+    payload = (cutlass.Int32, (4,))
+    assert Ring(2, Threads, Threads, payload=payload).remote_scope == "cluster"
+    assert Ring(2, Tma(16), Threads, payload=payload).remote_scope == "cta"
     text = PersistentGemm(cluster=CtaPair()).describe()
     ab = text[text.index("  ab ") : text.index("  acc ")]
     assert "pair-scoped" in ab and "storage   buffer A, B" in ab

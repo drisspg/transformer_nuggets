@@ -629,7 +629,9 @@ class WorkStream:
 
     def channel(self) -> Ring:
         """The broadcast ring. In a cluster rank 0's scheduler fills every CTA's slot with
-        ``st.async`` (TMA-like: one armed arrival plus payload bytes per CTA)."""
+        ``st.async`` (TMA-like: one armed arrival plus payload bytes per CTA), so the consumers'
+        releases publish nothing and the ring derives ``remote_scope="cta"`` (a cluster-scope
+        release per receiving thread was measurably slower: docs/examples.md)."""
         payload = (Int32, (self.payload_words,))
         if self.cluster_size == 1:
             return Ring(self.schedule.stages, Threads, Threads, payload=payload)

@@ -314,6 +314,10 @@ def test_pair_gemm_declared_graph():
     work = chans["work_ring"].scope
     assert work.full_counts == {0: [1, 1], 1: [1, 1]} and work.tx == 16
     assert work.empty_ctas == (0,) and work.empty_counts[0] == [384, 384]
+    # The st.async payload completes by bytes; the releases only hand the slot back, so they
+    # count at CTA scope (a cluster-scope release per thread cost ~1 us per item: examples.md).
+    assert chans["work_ring"].remote_scope == "cta"
+    assert not chans["work_ring"].remote_scope_overridden
     clc = chans["work_clc"].scope
     assert not clc.pair and clc.full_counts[0] == [1]
     # Golden lines.
@@ -321,6 +325,10 @@ def test_pair_gemm_declared_graph():
     assert "full      leader 1 x6, tx 65536 B (leader-armed)\n" in text
     assert "scope     pair-scoped, release_mask 0b11, tail\n" in text
     assert "  work_ring  Ring(2)  work.scheduler -> epilogue, load, mma, work.scheduler\n" in text
+    assert (
+        "scope     pair-scoped, remote_scope cta\n             storage   payload Int32(4,)\n"
+        in text
+    )
 
 
 def test_fa4_pair_declared_graph():
