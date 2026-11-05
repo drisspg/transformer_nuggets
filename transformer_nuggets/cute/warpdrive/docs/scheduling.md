@@ -142,7 +142,8 @@ runtime input in the entry point; it can return tuples, tensors or another DSL v
 `count64(bound_space)` returns a nonnegative host-visible count, exact through `2**31` or saturating at that value,
 never wrapping. Both run before the kernel; neither can read a device-built length.
 
-On the device, `decode(index, bound_space)` returns `(keep, words)`. Set `skips = True` if
+On the device, `decode(index, bound_space, state)` returns `(keep, words, state)`. A stateless
+mapping passes `state` (`None`) through; see [Decode state](#decode-state). Set `skips = True` if
 `keep` can be false. Otherwise `keep` must be the constant Python `True`, which is checked
 while tracing. Dropping an index permanently removes it from every role's sequence. `unpack(words)`
 returns the public `work.item`; its default is a tuple.
@@ -162,6 +163,61 @@ not runtime extents, using lowercase letters, digits and underscores. Every kept
 represent a distinct work item, and every needed item must be reachable among `[0, count)`;
 the layer does not check either property.
 
+### Decode state
+
+Some decodes are cheap only incrementally. The grouped GEMM numbers its groups' m-tiles back to
+back, so finding a tile's group takes a prefix sum of the groups' tile counts over device
+offsets. A unit's indices increase under the built-in persistent schedules, so the prefix
+reached for one item is where the walk for the next one starts. `start(space)` returns that
+carried state, and `decode` receives and returns it:
+
+```python
+class Window(NamedTuple):
+    group: Int32
+    tile_lo: Int32  # group's m-tiles [tile_lo, tile_hi), rows [row_lo, row_hi)
+    tile_hi: Int32
+    row_lo: Int32
+    row_hi: Int32
+
+
+class GroupedTiles(WorkMap):
+    def start(self, space):
+        return Window(Int32(-1), Int32(0), Int32(0), Int32(0), Int32(0))  # before group 0
+
+    def decode(self, index, space, state):
+        offsets, total_m, n_tiles = space
+        mt = index // n_tiles
+        w = _seek(state, mt, offsets, total_m, self.tile_m)  # no load while mt stays in w
+        row0 = w.row_lo + (mt - w.tile_lo) * self.tile_m
+        rows = cutlass.min(w.row_hi - row0, self.tile_m)
+        return row0 < w.row_hi, (w.group, row0, rows, index % n_tiles), w
+```
+
+Each decoding site owns one state: every role of a local schedule, the scheduler warp of a
+broadcast one, and `single_item`. The site calls `start` once, after the readiness hook, even
+when the stream is empty, and then passes each decode the state the previous one returned,
+dropped items included. Ring receivers decode nothing, so they hold no state.
+
+The state is a cache, never an input to the answer. From any state reachable from `start`,
+`decode` must return the `keep`, and for a kept index the words, that `start`'s own state would.
+Indices can arrive in any order: strided by the unit count, claimed by other units in between,
+or backwards under a custom schedule. Make the common increasing case fast and the rest correct;
+the grouped GEMM walks forward from its window and restarts from group 0 when an index goes
+backwards.
+
+`start` must be safe for every bound space, because it also runs for empty streams. It may read
+what readiness made visible, but item-table reads belong in the guarded `decode`. Build the
+state from DSL values (`Int32(0)`, not `0`) in tuples or a `NamedTuple`; a plain dataclass's
+fields are not carried. `decode` must return the same structure and types it received. These
+rules are checked while tracing. The state lives in registers of every decoding warp, so keep it
+to a few words and name it in `describe()`: the grouped GEMM's 5-word window is
+`GroupedTiles(tile_m=128, state=Window: 5 x Int32)`.
+
+Prefer a broadcast schedule when the decode stays expensive even with a state. The scheduler
+warp then decodes once per item, ahead of the roles, instead of every role decoding between
+items. Choose a local schedule when the carried state makes the decode cheap; it needs no
+scheduler warp or workspace. The grouped GEMM's static and atomic schedules perform the same.
+
 ### A device-built list
 
 [PackedWork](../examples/packed_work.py) is a small table-backed mapping:
@@ -176,7 +232,7 @@ bound = self.work.bind((table, length), workspace, max_ctas)
 ```
 
 `count64()` returns the table capacity. `decode()` reads the row and keeps it when
-`index < length[0]`. The schedule still visits the unused capacity, so don't oversize it
+`index < length[0]`; its state stays `None`. The schedule still visits the unused capacity, so don't oversize it
 needlessly. The row read is within capacity even for a dropped item; its words are ignored.
 
 `PdlWait()` issues `griddepcontrol.wait` once before decoding, in each local role or in the
@@ -236,9 +292,10 @@ computing: this closes claim state, not work. Do not use it for teardown, fixups
 Only the rank-0 scheduler warp calls `claim_next`, after acquiring a free work-ring slot and
 while the previous claim is valid. The layer publishes `[index, *words]` to all stream users
 and owns the ring's counts, payload, fences, tails and drain; extra `fetch_channels` use the
-same channel derivation. If readiness or skipping may change the first item, the scheduler
-decodes and broadcasts it too. Otherwise every role decodes `first_index` locally from
-launch-time data and only later items come from the ring.
+same channel derivation. The scheduler decodes and broadcasts the first item too, so roles
+never decode, unless the mapping sets `decodes_any_index` and the stream neither skips nor
+waits for readiness. Then every role decodes `first_index` locally from launch-time data and
+only later items come from the ring.
 
 The host methods are `launch_units(total, max_units)` and `index_limit(total, units, cs)`.
 The former receives the cap in work units when `uses_max_ctas`, otherwise `None`.

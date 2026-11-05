@@ -111,16 +111,25 @@ out = grouped_gemm(a, b, offsets)  # out[s_g:e_g] = a[s_g:e_g] @ b[g].T
 `offsets` holds each group's end row (`torch._grouped_mm`'s `offs`) and is read only on the
 device, so one compiled kernel serves every `G`, `total_M`, `N`, `K` and routing; groups may be
 empty or any size. Rows past `offsets[-1]` are left untouched. Operand limits are those of
-the GEMMs above. Keyword options: `schedule` (default `AtomicPersistent()`), `cluster`
+the GEMMs above. Keyword options: `schedule` (default `StaticPersistent()`), `cluster`
 (`SingleCta()` or `CtaPair()`), `max_ctas`, `tile_n`, `ab_stages`, `acc_stages`, `c_stages`,
 `epi_tile_n` and `roles`.
 
 The host cannot count the groups' tiles, so `GroupedTiles` declares
-`ceil(total_M / tile_m) + G` m-tiles (each group's ragged tail adds at most one) and the
-device decode drops the unused slot per group: a binary search over the offsets finds the
-group of an m-tile in `log2(G)` loads. Under a local schedule (`StaticPersistent`, `OneShot`)
-every role repeats that search between tiles, which measured 10-27% slower than the broadcast
-schedules (`AtomicPersistent`, `ClusterLaunchControl`) on the shapes below; hence the default.
+`ceil(total_M / tile_m) + G` m-tiles, an upper bound (each group's ragged tail adds at most
+one). The decode numbers the groups' real m-tiles back to back and drops only the indices
+past the last one. Finding a tile's group then takes a prefix sum of the groups' tile counts,
+which the mapping's [decode state](scheduling.md#decode-state) carries from item to item: each
+decode resumes the walk where the previous one stopped, testing eight groups per round trip.
+
+The state made exact tile numbering affordable, and that is what fixed static persistence.
+The earlier stateless decode found a group by binary search over a padded space with one
+unused slot per group. Those dropped slots were scattered through each unit's strided
+sequence, so static units got unequal work (up to 40 items against an even 36 at G=128) and
+drifted apart; static ran 10-27% slower than the broadcast schedules. Carrying the search's
+group in a state alone changed nothing, because a unit's next index is usually several groups
+on. With exact numbering every tile costs the same and static ties `AtomicPersistent` and
+`ClusterLaunchControl` within 2%. It needs no scheduler warp or workspace, hence the default.
 
 A and `out` use one TMA descriptor each, addressed at the item's row with
 `cute.domain_offset`; B is a 3-D `(N, K, G)` view so the group is a TMA coordinate. The output
@@ -138,34 +147,34 @@ an identity epilogue (its untuned pick, a 128 x 128 tile on a 2-CTA MMA with a d
 persistent scheduler) and `QUACK tuned` the same with Inductor's `tuned=True` shortlist;
 `pair` is `CtaPair()`:
 
-| G, tokens, N x K | `grouped_mm` | `mm loop` | `Triton` | `QUACK` | `QUACK tuned` | 1 CTA atomic | 1 CTA CLC | pair atomic |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 8, 4096, 2048 x 7168 | 116 (1038) | 123 | 102 | 104 (1151) | 120 | 111 (1085) | 94 (1286) | 119 |
-| 8, 16384, 7168 x 2048 | 324 (1486) | 319 | 361 | 383 (1258) | 325 | 334 (1440) | 337 | 327 |
-| 64, 8192, 4096 x 4096 | 407 (676) | 530 | 384 | 376 (730) | 392 | 377 (728) | 379 | 412 |
-| 64, 32768, 2048 x 7168 | 810 (1188) | 935 | 798 | 887 (1085) | 820 | 791 (1216) | 805 | 809 |
-| 128, 16384, 7168 x 2048 | 701 (686) | 855 | 658 | 675 (713) | 658 | 631 (763) | 629 | 699 |
-| 128, 32768, 4096 x 4096 | 1067 (1031) | 1244 | 1117 | 1195 (920) | 1122 | 1093 (1006) | 1098 | 1137 |
+| G, tokens, N x K | `grouped_mm` | `mm loop` | `Triton` | `QUACK` | `QUACK tuned` | 1 CTA static | 1 CTA atomic | 1 CTA CLC | pair static |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8, 4096, 2048 x 7168 | 115 (1049) | 121 | 102 | 106 (1135) | 122 | 95 (1268) | 94 | 92 | 116 |
+| 8, 16384, 7168 x 2048 | 318 (1511) | 319 | 361 | 382 (1260) | 323 | 337 (1429) | 335 | 338 | 319 |
+| 64, 8192, 4096 x 4096 | 397 (693) | 533 | 382 | 370 (742) | 381 | 378 (726) | 373 | 378 | 396 |
+| 64, 32768, 2048 x 7168 | 788 (1220) | 936 | 808 | 890 (1081) | 837 | 767 (1255) | 787 | 783 | 810 |
+| 128, 16384, 7168 x 2048 | 700 (687) | 860 | 661 | 681 (706) | 657 | 639 (753) | 628 | 624 | 688 |
+| 128, 32768, 4096 x 4096 | 1065 (1032) | 1252 | 1119 | 1207 (911) | 1136 | 1091 (1007) | 1104 | 1102 | 1131 |
 
 Small skewed groups waste rows in 128-row tiles for every kernel (1.5x the real rows at
 G=64 with 8192 tokens and G=128 with 16384, 1.13-1.25x at 32768); a pair's 256-row tiles
-waste about twice that, so `CtaPair()` only ties on the G=8 shapes.
+waste about twice that, so `CtaPair()` leads only on the G=8 shape with N=7168.
 
-The untuned QUACK kernel beats 1 CTA atomic only on the smallest shape (and not 1 CTA CLC),
-ties at G=64 with 8192 tokens, where its 64-row-per-CTA tiles waste the fewest rows, and
-trails the 1 CTA kernels by 7-15% on the other four. Tuning helps QUACK on the G=8 shape with N=7168 (a 256 x 256 tile on a 2-CTA MMA with a
+The untuned QUACK kernel leads only at G=64 with 8192 tokens (by 1-2%), where its
+64-row-per-CTA tiles waste the fewest rows, and trails 1 CTA static by 7-16% on the other
+five. Tuning helps QUACK on the G=8 shape with N=7168 (a 256 x 256 tile on a 2-CTA MMA with a
 2 x 2 cluster, so A is multicast across the two n-neighbours; it ties `pair` there) but hurts
 on the smallest: Inductor benchmarks the shortlist with evenly spaced offsets, so the winner
 is picked for balanced routing. FlexGEMM's TRITON backend without `max_autotune` lowers to
 the extern `_grouped_mm`, and its NVGEMM backend has no grouped GEMM choice
-(`NoValidChoicesError`). Besides tile choice, QUACK's varlen scheduler counts the groups'
-tiles exactly (a warp prefix sum over the offsets, cached per group) where ours walks an
-upper bound and drops one empty slot per group, and it rasters a group's tiles in swizzled
-bands for L2 reuse; neither shows up as a gap in these timings.
+(`NoValidChoicesError`). Like ours, QUACK's varlen scheduler numbers the groups' tiles
+exactly with a prefix sum it caches across tiles (a warp prefix sum over the offsets). It
+also rasters a group's tiles in swizzled bands for L2 reuse, which shows up as no gap in
+these timings.
 
 `offsets` must be nonnegative, nondecreasing and at most `total_M`, and must not change while
-the kernel runs; the kernel clamps them to `A`, so other values compute wrong rows but stay in
-bounds. `out` must not overlap `a`, `b` or `offsets`.
+the kernel runs; the kernel clamps each group's end to the previous end and to `A`, so other
+values compute wrong rows but stay in bounds. `out` must not overlap `a`, `b` or `offsets`.
 
 ## Attention forward
 
