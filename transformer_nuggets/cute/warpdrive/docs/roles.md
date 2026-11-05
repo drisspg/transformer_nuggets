@@ -167,13 +167,11 @@ roles = {
 out, lse = fa4_fwd(q, k, v, roles=roles)
 ```
 
-When the placement itself is computed and no decorator default makes sense,
-`@role(config=selector)` takes a host callable returning a `RoleConfig`; a named function
-works too. `describe()`, tracing or a compile-cache lookup can trigger the first collection;
-the result is then fixed for that kernel instance. Construct another instance to change it;
-mutating or recollecting declarations after the first collection is unsupported. Selectors
-are host code and must not depend on runtime tensor contents. Don't mix `config=` with
-explicit placement arguments. An entry in `self.roles` overrides a selector too.
+When the placement itself is computed, build `self.roles` in `__init__` and keep the
+decorator as the readable default. `describe()`, tracing or a compile-cache lookup triggers
+the first collection; the result is then fixed for that kernel instance. Construct another
+instance to change it; mutating or recollecting declarations after the first collection is
+unsupported.
 
 ## Compile keys
 

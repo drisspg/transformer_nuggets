@@ -69,8 +69,7 @@ class FillToy(WarpSpecialized):
         self.cluster = cluster
         self.fills, self.mode, self.slow = fills, multicast or None, slow
         load_cta = {"pair": "leader", "cluster": "rank0", None: "all"}[fills]
-        self.load_config = RoleConfig(0, cta=load_cta)
-        self.use_config = RoleConfig(1, cta=consumer)
+        self.roles = {"load": RoleConfig(0, cta=load_cta), "use": RoleConfig(1, cta=consumer)}
         self.consumer_cta = consumer
         self.ld = Ring(2, Tma(TILE_BYTES, multicast=multicast, fills=fills), Threads)
         # Leader-only consumers in a pair read 2-CTA copies (bytes of both CTAs complete on the
@@ -96,7 +95,7 @@ class FillToy(WarpSpecialized):
             return list(range(self.cluster.size))
         return [rank]
 
-    @role(config=lambda k: k.load_config)
+    @role(warps=0)
     @cute.jit
     def load(self, ld: Producer, ctx):
         rank = self.cluster.rank()
@@ -144,7 +143,7 @@ class FillToy(WarpSpecialized):
             while cute.arch.clock64() - start < 20000:
                 pass
 
-    @role(config=lambda k: k.use_config)
+    @role(warps=1)
     @cute.jit
     def use(self, ld: Consumer, ctx):
         return self.drain(ld, ctx, ctx.out)
@@ -310,15 +309,14 @@ class _Placed(WarpSpecialized):
     def __init__(self, cluster, tma, load, use):
         self.cluster = cluster
         self.ld = Ring(2, tma, Threads)
-        self.load_config = RoleConfig(0, cta=load)
-        self.use_config = RoleConfig(1, cta=use)
+        self.roles = {"load": RoleConfig(0, cta=load), "use": RoleConfig(1, cta=use)}
 
-    @role(config=lambda k: k.load_config)
+    @role(warps=0)
     @cute.jit
     def load(self, ld: Producer, ctx):
         return ld
 
-    @role(config=lambda k: k.use_config)
+    @role(warps=1)
     @cute.jit
     def use(self, ld: Consumer, ctx):
         return ld
@@ -415,7 +413,8 @@ def test_fill_mask_needs_a_fills_channel(requires_blackwell):
         def __init__(self):
             super().__init__(CtaPair(), fills="pair")
             self.ld = Ring(2, Tma(TILE_BYTES), Threads)
-            self.load_config = RoleConfig(0)  # every CTA fills "its pair" without the declaration
+            # Every CTA fills "its pair" without the declaration.
+            self.roles = {**self.roles, "load": RoleConfig(0)}
 
         def copies(self, rank):
             return [rank]

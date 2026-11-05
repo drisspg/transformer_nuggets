@@ -7,11 +7,10 @@ import functools
 import inspect
 import pickle
 import warnings
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, is_dataclass, replace
 from types import SimpleNamespace
-from typing import TypeVar
 
 import cutlass
 from cutlass import Int32, cute, memory, pipeline
@@ -270,27 +269,19 @@ class RoleConfig:
         object.__setattr__(self, "warps", ranges)
 
 
-KernelT = TypeVar("KernelT", bound="WarpSpecialized")
-
-
 def role(
-    warps: int | range | list[range] | tuple[range, ...] | None = None,
+    warps: int | range | list[range] | tuple[range, ...],
     regs: int | None = None,
     cta: str = ALL,
     raw: bool = False,
-    *,
-    config: Callable[[KernelT], RoleConfig] | None = None,
 ):
-    """Mark a method as a warp role, using fixed placement or a per-instance config selector.
+    """Mark a method as a warp role with its default placement.
 
-    ``@role(warps=4, regs=40)`` supplies a fixed RoleConfig: the default placement. A kernel
-    instance replaces it per role through ``self.roles``, a ``{method name: RoleConfig}``
-    mapping set in ``__init__`` (typically from a constructor argument merged over the kernel's
-    computed defaults). Alternatively, ``@role(config=lambda kernel: kernel.setting)`` selects
-    one after construction, on first collection (describe, compile-cache lookup, or tracing). A
-    named function or callable object works too. The selector is host code, never a device call.
-    Either way the result is snapshotted for that kernel instance on first collection. Construct
-    a new instance to change a collected configuration.
+    ``@role(warps=4, regs=40)`` is the role's default ``RoleConfig``. A kernel instance replaces
+    it per role through ``self.roles``, a ``{method name: RoleConfig}`` mapping set in
+    ``__init__`` (typically from a constructor argument merged over the kernel's computed
+    defaults). The result is fixed for that kernel instance on first collection (describe,
+    compile-cache lookup, or tracing); construct a new instance to change it.
 
     A list of warp ranges instantiates the method once per range; an Instance parameter receives
     its index. ``cta="leader"`` restricts execution to the leader of each MMA pair (a no-op without
@@ -299,14 +290,7 @@ def role(
     work cursors. Raw roles still take part in register allocation and TMEM teardown. Put this
     decorator directly above ``@cute.jit``; CuTeDSL re-applies it when preprocessing the source.
     """
-    if config is not None:
-        if not callable(config):
-            raise TypeError("role config must be a callable returning RoleConfig")
-        if warps is not None or regs is not None or cta != ALL or raw is not False:
-            raise ValueError("role config cannot be combined with warps, regs, cta, or raw")
-        declaration = config
-    else:
-        declaration = RoleConfig(warps, regs, cta, raw)
+    declaration = RoleConfig(warps, regs, cta, raw)
 
     def deco(fn):
         fn._warpdrive = declaration
@@ -498,15 +482,7 @@ class WarpSpecialized(metaclass=_KernelType):
         overrides = _role_overrides(self.roles, declared)
         for name, meta in declared.items():
             fn = getattr(type(self), name)
-            if name in overrides:
-                resolved = overrides[name]
-            else:
-                resolved = meta if isinstance(meta, RoleConfig) else meta(self)
-            if not isinstance(resolved, RoleConfig):
-                raise ProtocolError(
-                    f"role {name}: config selector must return RoleConfig, "
-                    f"got {type(resolved).__name__}"
-                )
+            resolved = overrides.get(name, meta)
             ranges, regs, cta, raw = resolved.warps, resolved.regs, resolved.cta, resolved.raw
             if not hasattr(fn, "__wrapped__"):
                 raise TypeError(f"role {name}: put @role(...) directly above @cute.jit")
@@ -896,8 +872,8 @@ class WarpSpecialized(metaclass=_KernelType):
             ]
 
     def role_config_key(self) -> tuple:
-        """Resolved placement/budgets, independent of selector identity. First use collects and
-        freezes the role configuration. ``__cute_cache_key__`` includes it."""
+        """Resolved placement/budgets. First use collects and freezes the role configuration.
+        ``__cute_cache_key__`` includes it."""
         self._collect()
         return tuple(
             (r.role, r.index, r.first_warp, r.num_warps, r.regs, r.cta, r.raw)

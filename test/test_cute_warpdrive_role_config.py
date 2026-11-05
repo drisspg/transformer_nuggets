@@ -1,8 +1,7 @@
-"""Constructor-configured roles (``roles=`` overrides and ``config=`` selectors): binding,
-validation, specialization reuse, and real handoffs."""
+"""Constructor-configured roles (``roles=`` overrides): binding, validation, specialization
+reuse, and real handoffs."""
 
 from dataclasses import FrozenInstanceError, dataclass, field, replace
-from operator import attrgetter
 
 import pytest
 import torch
@@ -99,27 +98,12 @@ class CopyRoles:
     consume: RoleConfig = field(default_factory=lambda: CONSUME)
 
 
-def load_config(kernel: "SelectedCopy") -> RoleConfig:
-    # Named functions and lambdas have the same host-only selector contract.
-    return kernel.placement.load
-
-
 class SelectedCopy(ConfiguredCopy):
-    """The same kernel with ``config=`` selectors reading a constructor-built dataclass."""
+    """The same kernel with ``self.roles`` computed in ``__init__`` from a dataclass."""
 
     def __init__(self, placement: CopyRoles | None = None):
-        super().__init__()
-        self.placement = placement if placement is not None else CopyRoles()
-
-    @role(config=load_config)
-    @cute.jit
-    def load(self, data: Producer, ctx: CopyCtx):
-        return data
-
-    @role(config=lambda kernel: kernel.placement.consume)
-    @cute.jit
-    def consume(self, data: Consumer, ctx: CopyCtx):
-        return data
+        placement = placement if placement is not None else CopyRoles()
+        super().__init__({"load": placement.load, "consume": placement.consume})
 
 
 def test_config_matches_shorthand_and_normalizes_warps():
@@ -157,39 +141,30 @@ def test_roles_override_diagnostics():
 
 
 def test_resolution_is_per_instance_and_frozen_after_collection():
-    selections = []
-
-    def select(kernel):
-        selections.append(kernel)
-        return kernel.setting
-
     class Selected(WarpSpecialized):
         def __init__(self, setting):
-            self.setting = setting
+            self.roles = {"worker": setting}
 
-        @role(config=select)
+        @role(warps=7)
         @cute.jit
         def worker(self, ctx):
             pass
 
     first, second = Selected(RoleConfig(0)), Selected(RoleConfig(4, regs=40))
     key = first.role_config_key()
-    assert selections == [first]
-    first.setting = RoleConfig(2)
-    assert first.role_config_key() == key  # snapshot, not a second selector invocation
+    first.roles["worker"] = RoleConfig(2)  # an in-place change after collection: not seen
+    assert first.role_config_key() == key
     second.describe()
-    assert selections == [first, second]
     assert second.role_config_key() != key
 
 
-@pytest.mark.parametrize("selector", [attrgetter("setting"), lambda kernel: kernel.setting])
-def test_callable_object_and_lambda_instances(selector):
+def test_override_instantiates_a_single_warp_default():
     class Instanced(WarpSpecialized):
         def __init__(self):
-            self.setting = RoleConfig([range(1), range(1, 2)])
+            self.roles = {"load": RoleConfig([range(1), range(1, 2)])}
             self.data = Slots(2, Threads, Threads)
 
-        @role(config=selector)
+        @role(warps=0)
         @cute.jit
         def load(self, index: Instance, data: Producer[Instance], ctx):
             return data
@@ -237,32 +212,12 @@ def test_invalid_selected_register_budget(value):
         RoleConfig(0, regs=value)
 
 
-@pytest.mark.parametrize("kwargs", [{"warps": 0}, {"regs": 40}, {"cta": "leader"}, {"raw": True}])
-def test_cannot_mix_selector_with_fixed_placement(kwargs):
-    with pytest.raises(ValueError, match="cannot be combined"):
-        role(config=lambda kernel: kernel.setting, **kwargs)
-
-
-def test_bad_selector_diagnostics():
-    with pytest.raises(TypeError, match="callable returning RoleConfig"):
-        role(config=RoleConfig(0))
-
-    class Bad(WarpSpecialized):
-        @role(config=lambda kernel: None)
-        @cute.jit
-        def worker(self, ctx):
-            pass
-
-    with pytest.raises(ProtocolError, match="role worker: config selector must return RoleConfig"):
-        Bad().describe()
-
-
 def test_raw_role_config_and_key():
     class Raw(WarpSpecialized):
         def __init__(self, raw):
-            self.setting = RoleConfig(0, raw=raw)
+            self.roles = {"worker": RoleConfig(0, raw=raw)}
 
-        @role(config=lambda kernel: kernel.setting)
+        @role(warps=0)
         @cute.jit
         def worker(self, ctx):
             pass
@@ -317,7 +272,7 @@ def test_omitted_registers_emit_no_adjustment(requires_blackwell, monkeypatch, t
 
 
 def test_cache_key_is_the_resolved_config(tmp_path, monkeypatch):
-    """jit_cache keys the resolved roles, not the selector or the name (compile only)."""
+    """jit_cache keys the resolved roles and the class, not the name (compile only)."""
     monkeypatch.setenv("TRANSFORMER_NUGGETS_CUTE_CACHE_DIR", str(tmp_path))
     built = []
 

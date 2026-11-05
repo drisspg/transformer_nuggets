@@ -35,10 +35,10 @@ class CopyParams:
 
 class KeywordCopy(WarpSpecialized):
     def __init__(self):
-        self.load_config = RoleConfig([range(1), range(1, 2)])
+        self.roles = {"load": RoleConfig([range(1), range(1, 2)])}
         self.ch = Slots(2, Threads, Threads, payload=(cutlass.Int32, (32,)))
 
-    @role(config=lambda kernel: kernel.load_config)
+    @role(warps=0)
     @cute.jit
     def load(self, params: CopyParams, *, stage: Instance, ch: Producer[Instance]):
         lane = cute.arch.lane_idx()
