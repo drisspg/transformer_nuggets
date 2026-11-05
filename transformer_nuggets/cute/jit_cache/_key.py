@@ -273,7 +273,8 @@ def _pickle_sort_key(item: Any) -> bytes:
 
 
 def _canonicalize(item: Any) -> Any:
-    custom_key = getattr(item, "__cute_cache_key__", None)
+    # A class passed as a value keys by name below, even if its instances define the hook.
+    custom_key = None if isinstance(item, type) else getattr(item, "__cute_cache_key__", None)
     if custom_key is not None:
         value = custom_key() if callable(custom_key) else custom_key
         return (
@@ -328,6 +329,13 @@ def _canonicalize(item: Any) -> Any:
             "pass static pickleable values or define __cute_cache_key__"
         ) from error
     return item
+
+
+def canonical_key(item: Any) -> Any:
+    """Return the content-addressed, picklable encoding the cache keys ``item`` by. Freezing
+    it early (warpdrive freezes a kernel's constructor call) keeps later in-place changes to
+    ``item`` out of the key."""
+    return _canonicalize(item)
 
 
 def make_runtime_key(

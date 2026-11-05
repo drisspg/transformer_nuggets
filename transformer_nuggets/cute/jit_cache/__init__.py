@@ -4,6 +4,7 @@ See ``cache.jit_cache`` for the contract and ``_key`` for what the key covers.
 """
 
 from transformer_nuggets.cute.jit_cache._key import (
+    canonical_key,
     function_cache_key,
     module_closure,
     module_source_digest,
@@ -28,6 +29,7 @@ __all__ = [
     "CacheLockError",
     "CompileTarget",
     "cache_enabled",
+    "canonical_key",
     "compile_many",
     "detect_compile_target",
     "function_cache_key",

@@ -164,14 +164,16 @@ def compile_kernel(op: MyKernel):
     return compile_tvm_ffi(op, *fake_args, name=op.get_name())
 ```
 
-The kernel's key is `op.__cute_cache_key__()`: its constructor call (defaults filled in), the
-cluster, each work stream, `iket`/`iket_waits`/`trace_protocol`/`alias_check`, the resolved
-roles, and the source of the modules defining the kernel's classes. So `Gemm()` and
+The kernel's key is `op.__cute_cache_key__()`: its constructor call (defaults filled in,
+frozen when the constructor returns), the cluster, each work stream,
+`iket`/`iket_waits`/`trace_protocol`/`alias_check`, the resolved roles, and the source of the
+modules defining the kernel's classes. So `Gemm()` and
 `Gemm(ab_stages=3)` share an entry, a changed budget or placement does not, and editing a
 kernel subclass in your own file recompiles it. Pass static choices to the constructor:
 assigning another public attribute after construction (`op.tile_n = 128`) makes the key raise
 `TypeError`, because the constructor call no longer describes the kernel. The cluster, work
-streams and those four settings may be reassigned.
+streams and those four settings may be reassigned. Changes inside objects the constructor
+built (`op.ab.n = 4`) are not seen at all, so don't make them.
 
 A cached kernel was not traced, but `describe()` still shows the trace's findings: `jit_cache`
 restores the TMA, SMEM and alias reports and the opt-outs saved with the build, and repeats

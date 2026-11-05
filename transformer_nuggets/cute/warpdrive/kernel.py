@@ -16,7 +16,7 @@ import cutlass
 from cutlass import Int32, cute, memory, pipeline
 from cutlass._mlir.dialects import nvvm
 
-from transformer_nuggets.cute.jit_cache import module_source_digest
+from transformer_nuggets.cute.jit_cache import canonical_key, module_source_digest
 from transformer_nuggets.cute.warpdrive import alias
 from transformer_nuggets.cute.warpdrive.channels import (
     Barriers,
@@ -323,7 +323,25 @@ def _rebuild(cls, args, kwargs, settings):
     return kernel
 
 
-class WarpSpecialized:
+class _KernelType(type):
+    """Brackets construction. What any ``__init__`` of the call assigns belongs to the
+    constructor; when the call returns, its bound arguments are frozen as the kernel's cache key
+    (so later in-place changes to an argument cannot alter it) and kept for pickling."""
+
+    def __call__(cls, *args, **kwargs):
+        kernel = super().__call__(*args, **kwargs)
+        call = _init_signature(cls).bind(kernel, *args, **kwargs)
+        call.apply_defaults()
+        try:
+            frozen = canonical_key(tuple(call.arguments.items())[1:])  # without self
+        except TypeError as error:  # raised by __cute_cache_key__, only if the kernel is cached
+            frozen = error
+        object.__setattr__(kernel, "_ws_init_key", frozen)
+        object.__setattr__(kernel, "_ws_init", (args, kwargs))
+        return kernel
+
+
+class WarpSpecialized(metaclass=_KernelType):
     """Base for warp-specialized kernels.
 
     Subclasses declare ``Ring``/``Slots``/``Turnstile`` attributes and an optional
@@ -348,41 +366,21 @@ class WarpSpecialized:
     iket_waits: bool = True  # with iket: also a range around every blocking channel wait
     cluster: Cluster = SingleCta()  # or CtaPair(): one line switches to 2-CTA MMAs
 
-    def __new__(cls, *args, **kwargs):
-        self = super().__new__(cls)
-        # The constructor call, for pickling: a fresh compiler process rebuilds the kernel.
-        object.__setattr__(self, "_ws_init", (args, kwargs))
-        return self
-
     def __reduce__(self):
-        """Pickle as the constructor call plus the host settings set after it (``alias_check``,
-        IKET, ``trace_protocol``); other attributes assigned after construction are not kept."""
-        settings = {k: vars(self)[k] for k in _HOST_SETTINGS if k in vars(self)}
+        """Pickle as the constructor call (a fresh compiler process rebuilds the kernel) plus
+        what the cache key allows after it: the host settings, the cluster, and work streams.
+        Other attributes assigned after construction make the key raise, so none are kept."""
+        state = vars(self)
+        settings = {k: state[k] for k in (*_HOST_SETTINGS, "cluster") if k in state}
+        # A stream refers back to its owner; ship its declaration and let setattr re-own it.
+        settings |= {k: replace(v) for k, v in state.items() if isinstance(v, WorkStream)}
         return _rebuild, (type(self), *self._ws_init, settings)
-
-    def __init_subclass__(cls, **kwargs):
-        super().__init_subclass__(**kwargs)
-        init = cls.__dict__.get("__init__")
-        if init is None:
-            return
-
-        @functools.wraps(init)
-        def tracked_init(self, *args, **kwargs):
-            # Assignments made while any __init__ of the call runs belong to the constructor.
-            depth = vars(self).get("_ws_init_depth", 0)
-            object.__setattr__(self, "_ws_init_depth", depth + 1)
-            try:
-                init(self, *args, **kwargs)
-            finally:
-                object.__setattr__(self, "_ws_init_depth", depth)
-
-        cls.__init__ = tracked_init
 
     def __setattr__(self, name, value):
         if isinstance(value, WorkStream):
             value.owner = self  # the stream's work unit follows this kernel's cluster
         elif not (
-            vars(self).get("_ws_init_depth")
+            "_ws_init" not in vars(self)  # still constructing
             or name.startswith("_")
             or name in (*_HOST_SETTINGS, "cluster", "num_warps", "default_regs")
         ):
@@ -839,28 +837,31 @@ class WarpSpecialized:
         """This kernel's key as a ``jit_cache`` compile argument (the examples' ``compile_*``).
 
         ``jit_cache`` adds the class's module and name. The key is the constructor call (its
-        bound arguments, defaults filled in) plus what may change after it: the cluster, each
-        work stream, and the host settings (IKET, ``trace_protocol``, ``alias_check``: a
-        "warn" build must not satisfy a "strict" one). The resolved role placement and budgets
+        bound arguments, defaults filled in, frozen when construction returns, so changing a
+        list argument in place later does not change it) plus what may change after it: the
+        cluster, each work stream, and the host settings (IKET, ``trace_protocol``,
+        ``alias_check``: a "warn" build must not satisfy a "strict" one). The resolved role placement and budgets
         and the source of every module defining the kernel's, cluster's, and streams' classes
         complete it, so editing a kernel the compile function does not import (a test's
         subclass) recompiles it. Other public attributes assigned after construction raise a
-        ``TypeError`` here: set them in ``__init__``."""
+        ``TypeError`` here: set them in ``__init__``. In-place changes to objects the
+        constructor built (``op.ab.n = 4``) are not keyed: don't make them."""
         late = vars(self).get("_ws_late")
         if late:
             raise TypeError(
-                f"{type(self).__name__}: {sorted(late)} assigned after construction; a cached "
-                "compile keys the constructor call, so set them in __init__ (or a subclass)"
+                f"{type(self).__name__}: {sorted(late)} assigned after construction, but a "
+                "cached compile keys the constructor call. Pass the value to the constructor or "
+                "set it in __init__ (a subclass works); only cluster, work streams, alias_check, "
+                "trace_protocol and the IKET settings may change after construction"
             )
-        args, kwargs = self._ws_init
-        call = _init_signature(type(self)).bind(self, *args, **kwargs)
-        call.apply_defaults()
+        if isinstance(self._ws_init_key, TypeError):
+            raise self._ws_init_key
         streams = [v for v in vars(self).values() if isinstance(v, WorkStream)]
         parts = [self, self.cluster]
         parts += [part for s in streams for part in (s.schedule, s.mapping, s.ready)]
         modules = sorted({c.__module__ for part in parts for c in type(part).__mro__})
         return (
-            tuple(call.arguments.items())[1:],  # without self
+            self._ws_init_key,
             self.cluster,
             tuple((s.schedule, s.mapping, s.ready, s.record, s.scheduler_warp) for s in streams),
             tuple(getattr(self, k) for k in _HOST_SETTINGS),
@@ -889,7 +890,8 @@ class WarpSpecialized:
 
     def __cute_restore_trace__(self, record: dict) -> None:
         """Take a cached build's trace record, so ``describe()`` and the warnings match a cold
-        compile. An instance that traced (or already took a record) keeps its own."""
+        compile. An instance that traced (or already took a record) keeps its own. The restored
+        SMEM entries have no tensors: ``buffer()`` works only while tracing."""
         self._collect()
         if record is None or getattr(self, "_ws_traced", False):
             return

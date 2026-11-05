@@ -201,6 +201,23 @@ def test_qk_overwriting_p_before_pv_is_a_potential_hazard():
     assert status(op, "V ~ K") == "no hazard found"
 
 
+def test_cached_build_reports_like_a_cold_one(tmp_path, monkeypatch):
+    """A kernel loaded from disk reports the traced findings and repeats the warning."""
+    monkeypatch.setenv("TRANSFORMER_NUGGETS_CUTE_CACHE_DIR", str(tmp_path))
+    monkeypatch.delenv("CUTE_DSL_NO_CACHE", raising=False)
+    compile_fa4_fwd.cache_clear()
+    cold = QkBeforePv()
+    _, cold_alias = compile_quietly(cold)
+    compile_fa4_fwd.cache_clear()  # a warm process: the build is on disk
+    warm = QkBeforePv()
+    _, warm_alias = compile_quietly(warm)
+    info = compile_fa4_fwd.cache_info()
+    assert (info.hits, info.misses) == (1, 0)
+    assert warm_alias == cold_alias and len(cold_alias) == 1
+    assert warm.describe() == cold.describe()
+    assert "potential hazard" in alias_section(warm)
+
+
 def test_strict_mode_raises_and_unchecked_opts_out():
     compile_quietly(QkBeforePv())  # a cached "warn" build must not satisfy a "strict" one
     strict = QkBeforePv()

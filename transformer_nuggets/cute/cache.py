@@ -95,6 +95,12 @@ def _generate_cache_key(*args, use_hashing: bool = False, **kwargs) -> str:
 
 def _cache_name(func: Callable) -> str:
     """CuteOp instances (they define get_key) are keyed by class; plain functions by name."""
+    owner = getattr(func, "__self__", func)
+    if hasattr(owner, "__cute_cache_key__"):
+        raise TypeError(
+            f"{type(owner).__name__} keys on __cute_cache_key__, which this string-keyed cache "
+            "ignores: compile it through transformer_nuggets.cute.jit_cache.jit_cache"
+        )
     return func.__class__.__name__ if hasattr(func, "get_key") else func.__name__
 
 

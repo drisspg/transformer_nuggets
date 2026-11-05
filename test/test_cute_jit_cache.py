@@ -257,6 +257,17 @@ class TracedConfig:
         self.found = record
 
 
+def test_a_class_argument_keys_by_name_even_with_an_instance_hook():
+    target = cute_target.CompileTarget("test")
+
+    def compile_kernel(kind):
+        return kind
+
+    first = cute_cache._make_key(compile_kernel, (TracedConfig,), {}, target)
+    assert first == cute_cache._make_key(compile_kernel, (TracedConfig,), {}, target)
+    assert first != cute_cache._make_key(compile_kernel, (CompileConfig,), {}, target)
+
+
 def test_cached_calls_restore_the_trace_record(isolated_cache):
     compile_count = 0
 

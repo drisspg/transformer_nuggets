@@ -1,7 +1,8 @@
 # jit_cache
 
 A persistent compile cache for TVM-FFI CuTeDSL kernels, ported from Attention Gym
-(`attn_gym/_backends/cute/cache.py` and `_key.py`) with the same keys and invalidation rules.
+(`attn_gym/_backends/cute/cache.py` and `_key.py`) with the same keys and invalidation rules,
+plus trace records and `uncached=` (below).
 Decorate a module-level compile function; its arguments are static values that decide the
 generated code:
 
@@ -57,7 +58,8 @@ a `__cute_cache_key__` that includes `module_source_digest(cls.__module__)`.
 A kernel loaded from disk was never traced, so anything the trace left on the Python
 objects is missing. An argument that defines `__cute_trace_record__()` (a picklable record
 of that state) and `__cute_restore_trace__(record)` gets the record of the build back on
-every call served from memory or disk. warpdrive kernels use this for `describe()`, the TMA
+every call served from memory or disk (`by_static_key` hits excepted: they reuse the compiled
+arguments). warpdrive kernels use this for `describe()`, the TMA
 and alias reports and their warnings. `jit_cache(uncached=predicate)` compiles the calls the
 predicate selects without either cache, for when the trace itself is the point (warpdrive's
 `trace_protocol`).
@@ -68,7 +70,7 @@ predicate selects without either cache, for when the trace itself is the point (
   is a hit. Assert on these in tests rather than disabling the cache.
 - `fn.cache_clear()`: drop this function's in-memory entries; the disk stays.
 - `fn.by_static_key(key, lambda: fn(...))`: a hot path's launch cache keyed by your own
-  hashable value, skipping the full key on a hit.
+  hashable value, skipping the full key on a hit (and the trace-record restore).
 - `compile_many(fn, [(args...), ...], workers=4)`: compile variants in forked workers of a fresh
   compiler process, then load them in the caller. Arguments must pickle.
 

@@ -13,7 +13,7 @@ environment override. Other behavior is expressed through ``jit_cache``
 options. The upstream ``CUTE_DSL_NO_CACHE`` switch is still respected.
 
 Ported from Attention Gym's ``attn_gym/_backends/cute/cache.py`` with the same
-keys, invalidation rules, and artifact format.
+keys and invalidation rules; trace records and ``uncached`` are additions.
 """
 
 from __future__ import annotations
@@ -534,7 +534,8 @@ def jit_cache(
         ``compile_call`` must call this function and is invoked only on a miss, so a warm launch
         skips building and hashing the full argument key. The caller guarantees that
         ``static_key`` determines ``compile_call``'s arguments completely; the compile target is
-        added here. A hit counts in ``cache_info`` like any other hit.
+        added here. A hit counts in ``cache_info`` like any other hit, but restores no trace
+        records: use it where the arguments that were compiled are the ones reused.
         """
         nonlocal hits
         reset_after_fork()

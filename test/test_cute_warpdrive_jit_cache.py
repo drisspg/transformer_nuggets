@@ -45,6 +45,25 @@ class ReorderedGemm(Gemm):
     """Same name and constructor as Gemm: only the class tells the two apart."""
 
 
+class ListGemm(Gemm):
+    """Takes its stage count in a list, which the caller may change after construction."""
+
+    def __init__(self, stages: list):
+        super().__init__(ab_stages=stages[0])
+
+
+class Tagged:
+    """A mixin whose ``__init__`` assigns before the kernel's own."""
+
+    def __init__(self, *args, tag: str = "x", **kwargs):
+        self.tag = tag
+        super().__init__(*args, **kwargs)
+
+
+class TaggedGemm(Tagged, Gemm):
+    pass
+
+
 def test_key_names_each_compile_time_choice():
     """Equal configurations share a key; every knob that changes the kernel or its trace-time
     check gets its own (compile only)."""
@@ -72,10 +91,23 @@ def test_key_names_each_compile_time_choice():
     reassigned = PersistentGemm()
     reassigned.work = PersistentGemm(schedule=AtomicPersistent(stages=3)).work
     assert key_of(reassigned, compile_pgemm) != key_of(pgemms[0], compile_pgemm)
+    stages = [2]
+    listed = ListGemm(stages)
+    stages[0] = 4  # the kernel keeps 2 stages; its key must too
+    assert key_of(listed) != key_of(ListGemm([4])) and listed.ab.n == 2
+    assert key_of(TaggedGemm(tag="a")) != key_of(TaggedGemm(tag="b"))  # mixin init assigns
     retiled = PersistentGemm()
     retiled.tile_n = 224  # the constructor call no longer describes the kernel
     with pytest.raises(TypeError, match=r"\['tile_n'\] assigned after construction"):
         key_of(retiled, compile_pgemm)
+
+
+def test_string_keyed_cache_rejects_kernels():
+    """The in-memory string cache ignores roles, cluster and alias mode: kernels need jit_cache."""
+    from transformer_nuggets.cute.cache import compile_tvm_ffi_and_cache
+
+    with pytest.raises(TypeError, match="through transformer_nuggets.cute.jit_cache"):
+        compile_tvm_ffi_and_cache(Gemm(), "gemm")
 
 
 def test_pickled_kernel_keeps_its_key():
@@ -87,6 +119,12 @@ def test_pickled_kernel_keeps_its_key():
     assert type(copy) is PersistentGemm and copy is not op
     assert (copy.iket, copy.iket_waits, copy.alias_check) == (True, False, "off")
     assert key_of(copy, compile_pgemm) == key_of(op, compile_pgemm)
+    moved = PersistentGemm()
+    moved.cluster = CtaPair()
+    moved.work = PersistentGemm(schedule=AtomicPersistent(stages=3)).work
+    copy = pickle.loads(pickle.dumps(moved))
+    assert copy.work.owner is copy and copy.cluster == CtaPair()
+    assert key_of(copy, compile_pgemm) == key_of(moved, compile_pgemm)
 
 
 # A kernel module outside the package, as a test or user file would define one: its own source
@@ -199,6 +237,19 @@ def test_entry_points_reuse_one_kernel_across_shapes(requires_blackwell, entry, 
         assert (out.float() - ref).abs().max().item() < 0.05 * ref.abs().max().item() + 1e-2
     info = compile_fn.cache_info()  # a disk load counts as a hit, a compile as a miss
     assert info.currsize == 1 and info.hits + info.misses == len(SHAPES)
+
+
+def test_disk_hit_describes_the_traced_kernel(requires_blackwell, isolated_cache):
+    """describe() of a kernel loaded from disk matches the cold build's (TMA, SMEM, alias)."""
+    compile_pgemm.cache_clear()
+    cold = PersistentGemm(cluster=CtaPair(), tile_n=256)
+    compile_pgemm(cold)
+    compile_pgemm.cache_clear()
+    warm = PersistentGemm(cluster=CtaPair(), tile_n=256)
+    compile_pgemm(warm)
+    assert compile_pgemm.cache_info() == CacheInfo(hits=1, misses=0, currsize=1)
+    text = warm.describe()
+    assert text == cold.describe() and "tma       verified CtaGroup.TWO" in text
 
 
 def test_compile_many_builds_kernels_in_a_fresh_process(requires_blackwell, isolated_cache):
