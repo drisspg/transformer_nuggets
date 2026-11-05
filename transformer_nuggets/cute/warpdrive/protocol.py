@@ -272,13 +272,14 @@ class RoleTrace:
                 uses[chan] = 0
         return uses
 
-    def epoch_sequence(self, chan: str) -> list[tuple[str, int]] | str:
-        """``[(op, epochs)]`` of this role's acquires, waits and skips on ``chan``, per work
-        item when they are inside the work-item loop, when none sits in another dynamic loop or
-        branch; otherwise why the sequence is not static."""
+    def epoch_sequence(self, chan: str) -> tuple[bool | None, list[tuple[str, int]]] | str:
+        """``(per_item, [(op, epochs)])`` of this role's acquires, retires, waits and skips on
+        ``chan`` when none sits in a dynamic loop or branch other than the work-item loop:
+        ``per_item`` says whether they run once per work item (inside that loop) or once per
+        launch (None without ops). Otherwise why the sequence is not static."""
         seq, regions = [], set()
         for c, op, blocks, count in self.ops:
-            if c != chan or op not in ("acquire", "wait", "skip"):
+            if c != chan or op not in ("acquire", "retire", "wait", "skip"):
                 continue
             inner = blocks[:-1]  # the enclosing blocks below the role body
             in_item = (
@@ -290,7 +291,7 @@ class RoleTrace:
             seq.append((op, count))
         if len(regions) > 1:
             return f"{self.role_name} uses it both inside and outside the work-item loop"
-        return seq
+        return (regions.pop() if regions else None), seq
 
     def opened(self, handle):
         if active_opt_out("unclosed") is not None:

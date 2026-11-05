@@ -162,11 +162,12 @@ positive Python int (put a conditional skip inside a dynamic branch). Skipping m
 end's outstanding [try tokens](#try-tokens) stale, and skipping past an unconsumed
 [preview](#previews) raises.
 
-When every acquire, wait and skip on the ring is static within the work item (no dynamic loop
-or branch around them except the work-item loop), collection checks ownership: each epoch the
-producer fills has exactly one waiting consumer, no consumer runs past the producer, and
-under a persistent schedule every consumer advances through every epoch of an item. A
-violation raises. `describe()` prints `epochs  verified: ...` or, when any of them is dynamic,
+When every acquire, wait and skip on the ring is static (no dynamic loop or branch around
+them except the work-item loop) and every role uses the ring either once per work item or
+once per launch, collection checks ownership: each epoch the producer publishes has exactly
+one waiting consumer (a final acquire closed with `retire()` has none), no consumer runs past
+the producer, and under a persistent schedule every consumer advances through every epoch of
+an item. A violation raises. `describe()` prints `epochs  verified: ...` or, when any of them is dynamic,
 `unverified (...)` with the reason; then ownership is your obligation.
 
 **A skip can make the next wait inexact.** A wait of epoch e tests parity `(e // n) % 2` on

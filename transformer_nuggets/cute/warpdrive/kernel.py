@@ -1320,12 +1320,20 @@ class WarpSpecialized(metaclass=_KernelType):
                 continue
             producer = ch.producers[0][0].name
             consumers = [ri.name for ri, _ in ch.consumers]
-            seqs = {who: self._ws_epoch_seqs[(name, who)] for who in [producer, *consumers]}
-            dynamic = [seq for seq in seqs.values() if isinstance(seq, str)]
+            traced = {who: self._ws_epoch_seqs[(name, who)] for who in [producer, *consumers]}
+            dynamic = [seq for seq in traced.values() if isinstance(seq, str)]
             if dynamic:
                 self._ws_ownership[name] = f"unverified ({dynamic[0]})"
                 continue
-            epochs = sum(count for _, count in seqs[producer])
+            if len({per_item for per_item, _ in traced.values()} - {None}) > 1:
+                self._ws_ownership[name] = (
+                    "unverified (some roles use it once per work item, others once per launch)"
+                )
+                continue
+            seqs = {who: seq for who, (_, seq) in traced.items()}
+            # A retired acquire (a final unused stage) is an epoch nobody may wait for.
+            total = sum(count for op, count in seqs[producer] if op == "acquire")
+            epochs = total - sum(op == "retire" for op, _ in seqs[producer])
             owners: list[list[str]] = [[] for _ in range(epochs)]
             waited = {who: [] for who in consumers}
             blind = None  # (consumer, epoch) of the first wait that needs a rendezvous
@@ -1349,10 +1357,10 @@ class WarpSpecialized(metaclass=_KernelType):
                 if persistent and mine and mine[0] + epochs - mine[-1] > ch.n:
                     blind = blind or (who, mine[0] + epochs)
                 # A persistent role continues into the next item: it must cover every epoch.
-                if e > epochs or (persistent and e != epochs):
+                if e > total or (persistent and e != total):
                     raise ProtocolError(
                         f"channel {name}: {who} advances {e} epochs per work item (waits and "
-                        f"skips), but {producer} fills {epochs}"
+                        f"skips), but {producer} acquires {total}"
                     )
             bad = next(((e, o) for e, o in enumerate(owners) if len(o) != 1), None)
             if bad is not None:

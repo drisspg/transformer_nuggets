@@ -24,15 +24,19 @@ from transformer_nuggets.cute.warpdrive import (
     Consumer,
     CtaPair,
     NamedBarrier,
+    OneShot,
     Producer,
     ProtocolError,
     Ring,
     Slots,
+    StaticPersistent,
     Threads,
     Tmem,
     TmemPlan,
     Umma,
     WarpSpecialized,
+    WorkCursor,
+    WorkStream,
     role,
 )
 
@@ -337,6 +341,126 @@ class Wide(Static):
 )
 def test_misuse_raises_while_tracing(mode, error):
     _raises_protocol(error, lambda: compile_toy(Static(mode), f"static_{mode}"))
+
+
+class Retired(Static):
+    """Two published epochs (a, b) and a final acquire the producer retires unpublished."""
+
+    def __init__(self):
+        super().__init__("retired")
+
+    @role(warps=0)
+    @cute.jit
+    def prod(self, ctx, *, kv: Producer, join: Producer):
+        for _ in cutlass.range_constexpr(2):
+            with kv.produce():
+                pass
+        kv.acquire().retire()
+        return kv, join
+
+    @role(warps=1)
+    @cute.jit
+    def a(self, ctx, *, kv: Consumer):
+        kv.wait().release()
+        return kv
+
+    @role(warps=2)
+    @cute.jit
+    def b(self, ctx, *, kv: Consumer, join: Consumer):
+        kv.skip(1)
+        kv.wait().release()
+        return kv, join
+
+
+def test_static_ownership_leaves_a_retired_epoch_unowned():
+    op = Retired()
+    compile_toy(op, "static_retired")
+    assert "epochs    verified: 2 epochs per work item (a 1, b 1)\n" in op.describe()
+
+
+class PerItem(WarpSpecialized):
+    """``a`` takes even and ``b`` odd epochs of each work item's two. ``mode``: "ok"; "short"
+    (a does not skip b's trailing epoch, so under a persistent schedule its next item starts on
+    the wrong epoch); "prologue" (the producer fills both epochs once, before its work loop).
+    Compiled only."""
+
+    def __init__(self, schedule, mode: str):
+        self.mode = mode
+        self.kv = exclusive(2)
+        self.work = WorkStream(schedule=schedule)
+
+    @role(warps=0)
+    @cute.jit
+    def prod(self, ctx, *, kv: Producer, work: WorkCursor):
+        if cutlass.const_expr(self.mode == "prologue"):
+            for _ in cutlass.range_constexpr(2):
+                with kv.produce():
+                    pass
+        while work.valid:
+            if cutlass.const_expr(self.mode != "prologue"):
+                for _ in cutlass.range_constexpr(2):
+                    with kv.produce():
+                        pass
+            work.advance()
+        return kv, work
+
+    @role(warps=1)
+    @cute.jit
+    def a(self, ctx, *, kv: Consumer, work: WorkCursor):
+        while work.valid:
+            kv.wait().release()
+            if cutlass.const_expr(self.mode != "short"):
+                kv.skip(1)
+            work.advance()
+        return kv, work
+
+    @role(warps=2)
+    @cute.jit
+    def b(self, ctx, *, kv: Consumer, work: WorkCursor):
+        while work.valid:
+            kv.skip(1)
+            kv.wait().release()
+            work.advance()
+        return kv, work
+
+    @cute.kernel
+    def kernel(self, bound):
+        self.begin_roles(work=bound)
+        self.run_roles(SimpleNamespace())
+
+    @cute.jit
+    def __call__(self, unused: cute.Tensor, n: cutlass.Int32, stream):
+        bound = self.work.bind((n, 1, 1), max_ctas=cutlass.Int32(1))
+        self.kernel.set_name_prefix(f"warpdrive_exclusive_items_{self.mode}")
+        self.kernel(bound).launch(**self.launch_config(bound), stream=stream)
+
+
+@jit_cache
+def compile_items(op):
+    unused = make_fake_compact_tensor(cutlass.Int32, (1,), assumed_align=4)
+    name = f"warpdrive_exclusive_items_{op.mode}_{op.work.get_key()}"
+    return compile_tvm_ffi(op, unused, cutlass.Int32(1), name=name)
+
+
+def test_static_ownership_per_work_item():
+    op = PerItem(StaticPersistent(), "ok")
+    compile_items(op)
+    assert "epochs    verified: 2 epochs per work item (a 1, b 1)\n" in op.describe()
+    # A launch-once prologue does not pair with per-item waits.
+    op = PerItem(OneShot(), "prologue")
+    compile_items(op)
+    assert (
+        "epochs    unverified (some roles use it once per work item, others once per launch)"
+    ) in op.describe()
+    # One item per CTA: b's trailing epoch needs no skip from a. A persistent CTA's next item
+    # would start a one epoch early.
+    op = PerItem(OneShot(), "short")
+    compile_items(op)
+    assert "epochs    verified: 2 epochs per work item (a 1, b 1)\n" in op.describe()
+    _raises_protocol(
+        "a advances 1 epochs per work item .*, but prod acquires 2",
+        lambda: compile_items(PerItem(StaticPersistent(), "short")),
+    )
 
 
 def test_static_check_names_a_wait_that_needs_a_rendezvous():
