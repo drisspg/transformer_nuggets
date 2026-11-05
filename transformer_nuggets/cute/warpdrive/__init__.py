@@ -15,6 +15,7 @@ annotation is a ``ProtocolError``.
 instances of one role take a side's epochs in turn;
 ``Ring(..., consumer_sharing=Sharing.EXCLUSIVE)`` gives each epoch one owner among the consumer
 roles, which ``skip()`` the epochs they do not own;
+``Channel(external="consumer", override=...)`` leaves one side to raw code;
 ``sync="named"`` builds a Threads-to-Threads channel from CTA named barriers (``channels.py``);
 ``end.try_wait()``/``try_acquire()`` probe a stage once and ``wait``/``acquire(token=...)`` skip
 the blocking wait when it was ready; ``end.peek()`` returns a read-only ``Preview`` of the epoch

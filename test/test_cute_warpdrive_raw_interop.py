@@ -1,6 +1,6 @@
-"""The raw-interop example: a managed producer, a consumer that drives the same ring's
-barriers by pointer under an overridden empty count, and a raw role that waits natively on a
-``NamedBarrier``'s ID."""
+"""The raw-interop example: a managed producer, a raw consumer that drives the ring's external
+consumer side by pointer under an overridden empty count, and a raw role that waits natively on
+a ``NamedBarrier``'s ID."""
 
 import pytest
 import torch
@@ -19,7 +19,9 @@ def test_describe_marks_what_the_raw_code_leaves_unverified():
     op = RawInterop()
     compile_raw_interop(op)
     text = op.describe()
-    assert "override  empty_counts 64 x2 -> 1 x2  (differs from derived)" in text, text
+    assert "ring  Ring(2)  producer -> raw code\n" in text, text
+    assert "empty     1 x2\n" in text, text
+    assert "external  consumer side driven by raw code; empty counts are the override's" in text
     row = next(line for line in text.splitlines() if line.strip().startswith("done "))
     assert "arrive by consumer; native id by watcher" in row, row
     assert "unverified: roles calling it have 64 of 96 threads" in row, row

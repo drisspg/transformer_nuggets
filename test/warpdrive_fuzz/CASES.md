@@ -134,7 +134,7 @@ inside a compiled entry point.
 | E116 | `alias_check` other than warn/strict/off; `"strict"` with a potential hazard | ValueError; ProtocolError / kernel.py, alias.py |
 | E117 | `producer_sharing`/`consumer_sharing` that is not a `Sharing`; `Sharing.ROUND_ROBIN` on `Slots`; `sync` other than mbarrier/named; a named channel with a non-Threads side or an `override`; `turnstile=` without a named channel with a round-robin side | ValueError / channels.py |
 | E118 | A round-robin side with fewer than two instances; round-robin instances of different roles or widths; `k` round-robin instances on an mbarrier ring whose stage count is not a multiple of `k` | ProtocolError / kernel.py |
-| E119 | A named or round-robin channel that crosses CTAs (mixed placement or multicast) | ProtocolError / kernel.py |
+| E119 | A named, round-robin or half-external channel that crosses CTAs (mixed placement or multicast) | ProtocolError / kernel.py |
 | E120 | Named channels needing more barrier IDs than 3-15 provide | ProtocolError / kernel.py |
 | E121 | Named round-robin instances sharing stage barriers without an enabled `turnstile` over exactly them; an acquire/wait on that side outside its turn | ProtocolError / kernel.py, channels.py (trace) |
 | E122 | `alias.named_barrier(id, ...)` using a layer or named-channel ID | ProtocolError / kernel.py (trace) |
@@ -147,6 +147,7 @@ inside a compiled entry point.
 | E129 | `producer_sharing=Sharing.EXCLUSIVE`; exclusive consumers on `Slots`, with `sync="named"`, with round-robin producers, or without `consumer_roles` | ValueError / channels.py |
 | E130 | Exclusive consumers with fewer than two consumer instances, unequal contributions (unless `override` sets `empty_counts`), more than one producer instance, a declared consumer role without a Consumer end, or crossing CTAs | ProtocolError / kernel.py |
 | E131 | `skip()` on a join or round-robin end, with a count that is neither a positive Python int nor a dynamic `Int32`, or past an unconsumed preview; a token used across a skip; static exclusive or round-robin ownership with an epoch filled or waited by no or several instances, a consumer past the producers' epochs, or (persistent) a round-robin instance not taking its share of each item | ProtocolError (trace time) / channels.py, kernel.py |
+| E132 | `external` other than producer/consumer, without an `override` of that side's counts, on a named channel, with a non-join side, with that side's role names or fences, or with TMA multicast/fills; a role bound to an external side; managed roles of a half-external channel in different CTAs | ValueError / channels.py; ProtocolError / kernel.py |
 
 ## Runtime labels
 

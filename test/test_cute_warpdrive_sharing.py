@@ -1,11 +1,14 @@
-"""Round-robin epoch ownership (``Sharing.ROUND_ROBIN``).
+"""Round-robin epoch ownership (``Sharing.ROUND_ROBIN``) and external channel sides.
 
 Round-robin instance j of k takes epochs j, j + k, ...: the static ownership check that
 exclusive rings use (``test_cute_warpdrive_exclusive.py``) treats it as an owner skipping the
 other instances' epochs, on either side. Compiled only; the decode toy and example run
-round-robin rings on the GPU."""
+round-robin rings on the GPU. External sides: declaration and collection errors, and
+``describe()``; ``examples/raw_interop.py`` runs one."""
 
 from types import SimpleNamespace
+
+import warnings
 
 import pytest
 
@@ -20,6 +23,7 @@ from transformer_nuggets.cute.jit_cache import jit_cache
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
     Consumer,
+    CtaPair,
     Instance,
     OneShot,
     Producer,
@@ -27,6 +31,7 @@ from transformer_nuggets.cute.warpdrive import (
     Sharing,
     StaticPersistent,
     Threads,
+    Tma,
     WarpSpecialized,
     WorkCursor,
     WorkStream,
@@ -107,6 +112,19 @@ class Producers(Probe):
         return self.drain(ch, work, self.waits[0])
 
 
+class BothSides(Producers):
+    """Round-robin producers and consumers: the check needs a joining side to count against."""
+
+    def __init__(self):
+        super().__init__((2, 2), (2, 2))
+        self.ch = Ring(2, Threads, Threads, producer_sharing=RR, consumer_sharing=RR)
+
+    @role(warps=[range(2, 3), range(3, 4)])
+    @cute.jit
+    def cons(self, ctx, *, stage: Instance, ch: Consumer, work: WorkCursor):
+        return self.drain(ch, work, self.waits[stage])
+
+
 @jit_cache
 def compile_probe(op):
     unused = make_fake_compact_tensor(cutlass.Int32, (1,), assumed_align=4)
@@ -136,6 +154,7 @@ def test_round_robin_ownership_is_verified(op, verdict):
 def test_dynamic_round_robin_trips_leave_ownership_unverified():
     verdict = epochs(Consumers((4,), (2, 2), dynamic=True))
     assert verdict == "epochs    unverified (cons[0]'s wait runs inside a dynamic loop or branch)"
+    assert epochs(BothSides()) == "epochs    unverified (both sides take turns)"
 
 
 @pytest.mark.parametrize(
@@ -170,3 +189,134 @@ def test_dynamic_round_robin_trips_leave_ownership_unverified():
 )
 def test_round_robin_trip_counts_that_do_not_add_up_raise(op, error):
     _raises_protocol(error, lambda: compile_probe(op))
+
+
+# --------------------------------------------------------------------------- #
+# External sides
+# --------------------------------------------------------------------------- #
+
+
+def test_external_side_declaration_errors():
+    with pytest.raises(ValueError, match="external must be 'producer' or 'consumer'"):
+        Ring(2, external="both", override={"empty_counts": 1})
+    with pytest.raises(ValueError, match=r"needs override=\{'empty_counts': \.\.\.\}"):
+        Ring(2, external="consumer")
+    with pytest.raises(ValueError, match=r"needs override=\{'full_counts': \.\.\.\}"):
+        Ring(2, external="producer", override={"empty_counts": 1})
+    with pytest.raises(ValueError, match="needs an mbarrier channel"):
+        Ring(2, sync="named", external="consumer")
+    with pytest.raises(ValueError, match="takes Sharing.JOIN on both sides"):
+        Ring(2, external="consumer", override={"empty_counts": 1}, producer_sharing=RR)
+    # Settings of the external side would never take effect.
+    with pytest.raises(ValueError, match="takes no consumer_roles or release_fence"):
+        Ring(
+            2,
+            external="consumer",
+            override={"empty_counts": 1},
+            consumer_roles=("cons",),
+            release_fence="tmem_store",
+        )
+    with pytest.raises(ValueError, match="takes no commit_fence"):
+        Ring(2, external="producer", override={"full_counts": 1}, commit_fence="smem_async")
+
+
+def _kernel(channels, roles):
+    cls = type("Probe", (WarpSpecialized,), dict(roles))
+
+    def init(self):
+        for name, make in channels.items():
+            setattr(self, name, make())
+
+    cls.__init__ = init
+    return cls()
+
+
+@role(warps=0)
+@cute.jit
+def _prod(self, ctx, *, ch: Producer):
+    return ch
+
+
+@role(warps=1)
+@cute.jit
+def _cons(self, ctx, *, ch: Consumer):
+    return ch
+
+
+def test_external_side_binds_no_role():
+    external = {"ch": lambda: Ring(2, external="consumer", override={"empty_counts": 1})}
+    text = _kernel(external, {"prod": _prod}).describe()
+    assert "ch  Ring(2)  prod -> raw code\n" in text, text
+    assert "empty     1 x2" in text, text
+    assert (
+        "external  consumer side driven by raw code; empty counts are the override's (unverified)"
+    ) in text
+    _raises_protocol(
+        r"channel ch: its consumer side is external \(driven by raw code\), but roles "
+        r"\['cons'\] take a Consumer end",
+        _kernel(external, {"prod": _prod, "cons": _cons}).describe,
+    )
+    # The managed side still needs its role.
+    _raises_protocol(
+        "channel ch: slot 0 has no producer role",
+        _kernel(external, {"other": _cons}).describe,
+    )
+
+
+class ExternalTmaProducer(WarpSpecialized):
+    """Raw code fills ``ch`` by TMA (here: nobody; compiled only); ``cons`` waits once."""
+
+    def __init__(self):
+        self.ch = Ring(1, Tma(128), external="producer", override={"full_counts": 1})
+
+    @role(warps=0)
+    @cute.jit
+    def cons(self, ctx, *, ch: Consumer):
+        ch.wait().release()
+        return ch
+
+    @cute.kernel
+    def kernel(self):
+        self.begin_roles()
+        self.run_roles(SimpleNamespace())
+
+    @cute.jit
+    def __call__(self, unused: cute.Tensor, stream):
+        self.kernel.set_name_prefix("warpdrive_sharing_external_tma")
+        self.kernel().launch(**self.launch_config(grid=(1, 1, 1)), stream=stream)
+
+
+@jit_cache
+def compile_external(op):
+    unused = make_fake_compact_tensor(cutlass.Int32, (1,), assumed_align=4)
+    return compile_tvm_ffi(op, unused, name="warpdrive_sharing_external_tma")
+
+
+def test_an_external_tma_producer_is_not_tma_checked():
+    op = ExternalTmaProducer()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        compile_external(op)
+    assert not [w for w in caught if "TMA check" in str(w.message)]
+    text = op.describe()
+    assert "ch  Ring(1)  raw code -> cons\n" in text, text
+    assert not [line for line in text.splitlines() if line.split()[:1] == ["tma"]], text
+
+
+def test_external_channels_stay_cta_local():
+    with pytest.raises(ValueError, match="its TMA copies take no multicast or fills"):
+        Ring(2, Tma(128, multicast="m"), external="producer", override={"full_counts": 1})
+
+    @role(warps=2, cta="leader")
+    @cute.jit
+    def lead(self, ctx, *, ch: Consumer):
+        return ch
+
+    external = {"ch": lambda: Ring(2, external="producer", override={"full_counts": 1})}
+    op = _kernel(external, {"cons": _cons, "lead": lead})
+    op.cluster = CtaPair()
+    _raises_protocol(
+        "channel ch: its consumer roles run in different CTAs, but its producer side is "
+        "external, driven by raw code in each CTA",
+        op.describe,
+    )

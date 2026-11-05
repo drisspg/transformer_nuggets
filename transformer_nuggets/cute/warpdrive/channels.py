@@ -15,8 +15,9 @@ The layer derives each slot's arrival count from the role instances bound to it,
 with several consumer roles (fan-out) has a join barrier that completes only when all of them
 have released. A ``Tma`` or ``Umma`` side signals once, so it must be bound to one single-warp
 role (the warp that issues the copies or MMAs). ``Channel(override={...})`` replaces any
-derived value; ``Barriers`` reserves mbarriers that user code drives directly. (Round-robin and
-exclusive sides, below, bind several such roles, one signalling per epoch.)
+derived value; ``Barriers`` reserves mbarriers that user code drives directly, and
+``external="consumer"`` (or ``"producer"``) leaves one side of a channel to raw code.
+(Round-robin and exclusive sides, below, bind several such roles, one signalling per epoch.)
 
 Each side shares the channel's epochs among its role instances in one of three ways
 (``producer_sharing=``/``consumer_sharing=``, a ``Sharing``): ``JOIN`` (the default; every
@@ -229,6 +230,13 @@ class Channel:
     ``producer_sharing``/``consumer_sharing`` (a ``Sharing``) and ``sync`` are described in the
     module docstring. A named channel takes no override and must stay CTA-local; once the kernel
     is collected, ``full_barriers``/``empty_barriers`` hold its ``NamedBarrier`` per slot.
+
+    ``external``: ``"producer"`` or ``"consumer"`` when raw code (a raw role, or kernel code)
+    drives that side through ``WarpSpecialized.barrier_ptr``. No role binds that side, so
+    ``override`` must give its counts (``full_counts`` for an external producer,
+    ``empty_counts`` for an external consumer; ``derived_scope`` has 0 there), and that side
+    takes no role names or fences; the layer checks nothing that side does. The channel stays
+    CTA-local: no TMA multicast or fills, and one placement for the managed side's roles.
     """
 
     n: int
@@ -246,6 +254,7 @@ class Channel:
     consumer_sharing: Sharing = Sharing.JOIN
     sync: str = "mbarrier"
     turnstile: str | None = None
+    external: str | None = None
     name: str = field(default="", init=False)
     fixed: bool = field(default=False, init=False)
     producers: list = field(default_factory=list, init=False)  # (RoleInstance, slot | None)
@@ -339,6 +348,41 @@ class Channel:
                     "consumer_sharing=Sharing.EXCLUSIVE needs consumer_roles=(...) naming the "
                     "roles that take the epochs"
                 )
+        if self.external is not None:
+            if self.external not in SIDES:
+                raise ValueError(
+                    f"external must be 'producer' or 'consumer', got {self.external!r}"
+                )
+            if self.named:
+                raise ValueError(
+                    f"external={self.external!r} needs an mbarrier channel: raw code drives the "
+                    "side through barrier pointers, which a named-barrier channel has none of"
+                )
+            if self.owned_epochs:
+                raise ValueError(
+                    f"external={self.external!r} takes Sharing.JOIN on both sides: the layer "
+                    "cannot share epochs with raw code"
+                )
+            if isinstance(self.producer, Tma) and (self.producer.multicast or self.producer.fills):
+                raise ValueError(
+                    f"external={self.external!r} needs a CTA-local channel: raw code drives the "
+                    "external side in each CTA, so its TMA copies take no multicast or fills"
+                )
+            settings = {
+                "producer": ("producer_role", "commit_fence"),
+                "consumer": ("consumer_roles", "release_fence"),
+            }[self.external]
+            unused = [key for key in settings if getattr(self, key)]
+            if unused:
+                raise ValueError(
+                    f"external={self.external!r} takes no {' or '.join(unused)}: no role binds "
+                    "that side, and raw code fences and signals it itself"
+                )
+            if self.external_counts not in (self.override or {}):
+                raise ValueError(
+                    f"external={self.external!r} needs override={{{self.external_counts!r}: "
+                    "...}: no role binds that side, so nothing derives its count"
+                )
         if self.named:
             if self.producer is not Threads or self.consumer is not Threads:
                 raise ValueError(
@@ -367,6 +411,16 @@ class Channel:
     @property
     def named(self) -> bool:
         return self.sync == "named"
+
+    @property
+    def external_counts(self) -> str | None:
+        """The ``override`` key that gives the external side's counts."""
+        return {"producer": "full_counts", "consumer": "empty_counts"}.get(self.external)
+
+    @property
+    def checks_tma(self) -> bool:
+        """A TMA producer the layer runs, whose copies it checks (``tma.py``)."""
+        return isinstance(self.producer, Tma) and not self.internal and self.external != "producer"
 
     def sharing(self, side: str) -> Sharing:
         return self.producer_sharing if side == "producer" else self.consumer_sharing

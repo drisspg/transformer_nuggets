@@ -166,7 +166,11 @@ def _channels(kernel) -> str:
     for name, ch in chans.items():
         kind = f"Slots({ch.n})" if ch.fixed else f"Ring({ch.n})"
         head = f"  {name:<{width}}  {kind:<9}"
-        flow = f"{_bound(ch.producers)} -> {_bound(ch.consumers)}"
+        sides = [
+            "raw code" if side == ch.external else _bound(bound)
+            for side, bound in (("producer", ch.producers), ("consumer", ch.consumers))
+        ]
+        flow = " -> ".join(sides)
         lines += textwrap.wrap(
             flow,
             WIDTH,
@@ -234,6 +238,15 @@ def _channels(kernel) -> str:
                 )
         if ch.owned_epochs:
             details.append(("epochs", kernel._ws_ownership.get(name, "ownership not traced")))
+        if ch.external is not None:
+            counts = ch.external_counts.replace("_", " ")
+            details.append(
+                (
+                    "external",
+                    f"{ch.external} side driven by raw code; {counts} are the override's "
+                    "(unverified)",
+                )
+            )
         if cs > 1:
             scope = ["CTA-local"]
             if sc.pair:
@@ -278,6 +291,8 @@ def _overrides(ch, cluster) -> list[str]:
     out = []
     derived = ch.derived_scope
     for key in ch.override or {}:
+        if key == ch.external_counts:  # no role derives them (the "external" line)
+            continue
         ours, theirs = getattr(derived, key), getattr(ch.scope, key)
         note = "  (differs from derived)" if ours != theirs else ""
         out.append(
@@ -294,7 +309,7 @@ def _tma_status(kernel, name: str, ch) -> str:
     report = kernel._ws_tma.get(name)
     if report is not None:
         return report.status(_sites)
-    if isinstance(ch.producer, Tma) and not ch.internal:
+    if ch.checks_tma:
         return "not checked yet (compile to check the copies)"
     return ""
 

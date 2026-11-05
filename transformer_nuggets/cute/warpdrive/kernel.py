@@ -26,7 +26,6 @@ from transformer_nuggets.cute.warpdrive.channels import (
     Sharing,
     StageBuffer,
     Threads,
-    Tma,
     TurnEnd,
     Turnstile,
     Umma,
@@ -732,6 +731,13 @@ class WarpSpecialized(metaclass=_KernelType):
             ch.cluster = cluster
             ch.derived_scope = derive_scope(ch, cluster, internal=ch.internal)
             ch.scope = apply_overrides(ch, ch.derived_scope, cluster)
+            if ch.scope.pair and ch.external:
+                managed = "consumer" if ch.external == "producer" else "producer"
+                raise ProtocolError(
+                    f"channel {name}: its {managed} roles run in different CTAs, but its "
+                    f"{ch.external} side is external, driven by raw code in each CTA; give the "
+                    f"{managed} roles one placement"
+                )
             if ch.scope.pair and (ch.named or ch.rotates or ch.exclusive):
                 what = (
                     "named barriers are per CTA"
@@ -759,6 +765,13 @@ class WarpSpecialized(metaclass=_KernelType):
             for side in SIDES:
                 mech = chan.producer if side == "producer" else chan.consumer
                 bound = chan.producers if side == "producer" else chan.consumers
+                if side == chan.external:
+                    if bound:
+                        raise ProtocolError(
+                            f"channel {name}: its {side} side is external (driven by raw code), "
+                            f"but roles {[r.name for r, _ in bound]} take a {side.title()} end"
+                        )
+                    continue
                 counts = chan.slot_counts(side)
                 if 0 in counts:
                     raise ProtocolError(
@@ -1306,7 +1319,7 @@ class WarpSpecialized(metaclass=_KernelType):
         if self.alias_check != "off":
             self._ws_alias = alias.check(self, self._ws_alias_roles)
         for name, ch in self._ws_chans.items():
-            if isinstance(ch.producer, Tma) and not ch.internal:
+            if ch.checks_tma:
                 report = self._ws_tma.setdefault(name, TmaReport())
                 if not (report.copies or report.opted_out or report.unverified):
                     report.unverified.append(

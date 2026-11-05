@@ -2,32 +2,30 @@
 
 ``producer`` (warp 0) is fully managed: it fills stage ``s`` of the ``buf`` SMEM buffer with
 epoch ``e``'s words ``e * 64 + t`` and commits each stage on ``ring``.
-``consumer`` (warps 1-2) takes its end of ``ring`` but drives the barriers itself: it waits on
-the full barrier by pointer with the end's live ``PipelineState``, orders its 64 threads'
-reads with the ``read`` named barrier and releases each stage with one arrival from its first
-thread, so ``override={"empty_counts": 1}`` replaces the derived 64. ``watcher`` (warp 3) is
-a raw role: it waits for the consumer's managed ``done.arrive()`` with a native ``bar.sync``
-on ``done.id`` and reduces the consumer's per-thread results into ``out``.
+``consumer`` (warps 1-2) is a raw role on ``ring``'s external consumer side: it waits on the
+full barriers by pointer (``self.barrier_ptr("ring")``) with its own ``PipelineState``, orders
+its 64 threads' reads with the ``read`` named barrier and releases each stage with one arrival
+from its first thread, which ``override={"empty_counts": 1}`` declares. ``watcher`` (warp 3)
+is a raw role too: it waits for the consumer's ``done.arrive()`` with a native ``bar.sync`` on
+``done.id`` and reduces the consumer's per-thread results into ``out``.
 
-``describe()`` shows what this leaves unverified: the overridden empty count next to the
-derived one, and ``done``'s participation (the native waiter supplies 32 of its 96 threads).
+``describe()`` shows what this leaves unverified: the external side's empty count, and
+``done``'s participation (the native waiter supplies 32 of its 96 threads).
 """
 
 from types import SimpleNamespace
 
 import cutlass
 import torch
-from cutlass import cute
+from cutlass import cute, pipeline
 
 from transformer_nuggets.cute.jit_cache import jit_cache
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
-    Consumer,
     NamedBarrier,
     Producer,
     Ring,
     SmemPlan,
-    Threads,
     WarpSpecialized,
     role,
 )
@@ -39,7 +37,7 @@ CONSUMER_FIRST_THREAD = 32  # warp 1's lane 0
 class RawInterop(WarpSpecialized):
     def __init__(self, stages: int = 2):
         self.stages = stages
-        self.ring = Ring(stages, Threads, Threads, override={"empty_counts": 1})
+        self.ring = Ring(stages, external="consumer", override={"empty_counts": 1})
         self.read = NamedBarrier(threads=64)  # the consumer's threads
         self.done = NamedBarrier(threads=96)  # the consumer arrives, the watcher syncs
         self.smem_plan = SmemPlan()
@@ -56,26 +54,26 @@ class RawInterop(WarpSpecialized):
                 ctx.buf[h.index, lane + 32] = e * WORDS + lane + 32
         return ring
 
-    @role(warps=range(1, 3))
+    @role(warps=range(1, 3), raw=True)
     @cute.jit
-    def consumer(self, ctx, *, ring: Consumer):
+    def consumer(self, ctx):
         t = cute.arch.thread_idx()[0] - CONSUMER_FIRST_THREAD
         bad, total = cutlass.Int32(0), cutlass.Int32(0)
-        state = ring.state  # the live PipelineState: this body advances it by hand
+        full = self.barrier_ptr("ring")  # full barriers at [0, n), empty at [n, 2n)
+        empty = full + self.stages
+        state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.stages)
         for e in cutlass.range(ctx.n, unroll=1):
-            cute.arch.mbarrier_wait(ring.full_barrier(state.index), state.phase)
+            cute.arch.mbarrier_wait(full + state.index, state.phase)
             word = ctx.buf[state.index, t]
             bad += word % WORDS != t  # this thread's word; the sum checks the epochs
             total += word
             self.read.sync()  # every thread has read the stage before the one release
             if t == 0:
-                cute.arch.mbarrier_arrive(ring.empty_barrier(state.index))
+                cute.arch.mbarrier_arrive(empty + state.index)
             state.advance()
-        ring.state = state
         ctx.results[0, t] = bad
         ctx.results[1, t] = total
         self.done.arrive()  # publishes the results to the watcher
-        return ring
 
     @role(warps=3, raw=True)
     @cute.jit

@@ -385,7 +385,7 @@ def derive_scope(chan, cluster, *, internal: bool = False) -> Scope:
         self_targets = {c: (c,) for c in ranks}
 
         def local_mask(mech, signalers):
-            if mech is not Umma:
+            if mech is not Umma or not signalers:  # no signaller: an external side
                 return 1
             return _masks({c: (c,) for ri, _ in signalers for c in placed[ri.name]})
 
