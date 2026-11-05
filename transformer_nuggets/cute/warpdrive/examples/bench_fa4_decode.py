@@ -148,6 +148,22 @@ def decode_kernel(kernels, needle):
     return kernels[names[0]]
 
 
+def git_metadata(directory: Path) -> tuple[str | None, bool | None]:
+    """Installed packages and source archives need not have their own Git checkout."""
+    command = ["git", "-C", str(directory)]
+    try:
+        root = subprocess.check_output(
+            [*command, "rev-parse", "--show-toplevel"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+        if Path(root).resolve() != directory.resolve():
+            return None, None
+        commit = subprocess.check_output([*command, "rev-parse", "HEAD"], text=True).strip()
+        dirty = subprocess.check_output([*command, "status", "--porcelain"], text=True).strip()
+        return commit, bool(dirty)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None, None
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--reps", type=int, default=200)
@@ -162,29 +178,34 @@ def main():
     args = parser.parse_args()
     if args.reps < 1 or args.rounds < 1 or args.rounds % 2 == 0:
         parser.error("--reps must be positive and --rounds must be positive and odd")
+    if args.profile and args.output is not None:
+        parser.error("--profile writes profiler reports, not --output replay samples")
     sys.argv = sys.argv[:1]  # CuTeDSL also parses application arguments during compilation.
-    shape_indices = args.shapes if args.shapes is not None else list(range(len(SHAPES)))
+    shape_indices = args.shapes or list(range(len(SHAPES)))
     results = []
-    metadata = {
-        "torch": torch.__version__,
-        "cutlass": cutlass.__version__,
-        "triton": triton.__version__,
-        "gpu": torch.cuda.get_device_name(),
-        "gpu_uuid": os.environ.get("GPU_RUN_GPU_UUID"),
-        "source_sha256": {
-            filename: hashlib.sha256(Path(__file__).with_name(filename).read_bytes()).hexdigest()
-            for filename in ("bench_fa4_decode.py", "fa4_decode_swapab.py")
-        },
-        "warpdrive_commit": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], text=True
-        ).strip(),
-        "fa4_commit": subprocess.check_output(
-            ["git", "-C", str(Path(interface.__file__).parents[2]), "rev-parse", "HEAD"], text=True
-        ).strip(),
-        "reps": args.reps,
-        "rounds": args.rounds,
-        "contract": "fixed-buffer CUDA graph; CUPTI kernel durations; normal DVFS; capture excluded",
-    }
+    metadata = {}
+    if args.output is not None:
+        source_files = (Path(__file__), Path(decode_partials.__code__.co_filename))
+        commit, dirty = git_metadata(source_files[1].parents[4])
+        fa4_commit, fa4_dirty = git_metadata(Path(interface.__file__).parents[2])
+        metadata = {
+            "torch": torch.__version__,
+            "cutlass": cutlass.__version__,
+            "triton": triton.__version__,
+            "gpu": torch.cuda.get_device_name(),
+            "gpu_uuid": os.environ.get("GPU_RUN_GPU_UUID"),
+            "source_sha256": {
+                source.name: hashlib.sha256(source.read_bytes()).hexdigest()
+                for source in source_files
+            },
+            "warpdrive_commit": commit,
+            "warpdrive_dirty": dirty,
+            "fa4_commit": fa4_commit,
+            "fa4_dirty": fa4_dirty,
+            "reps": args.reps,
+            "rounds": args.rounds,
+            "contract": "fixed-buffer CUDA graph; CUPTI kernel durations; normal DVFS; capture excluded",
+        }
     for shape_index in shape_indices:
         b, s, h, hkv, pattern = SHAPES[shape_index]
         torch.manual_seed(0)
