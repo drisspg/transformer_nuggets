@@ -171,12 +171,16 @@ def want_scope(
     *,
     internal: bool = False,
     multicast: tuple[str, ...] = (),
+    fills: str = "",
 ) -> WantScope:
     """R4 (CTA-local) and R11 (cross-CTA) counts, from the participants and the cluster."""
     ranks = tuple(range(geom.size))
     insts = (*producers, *consumers)
     where = {i.name: geom.ctas(i.cta) for i in insts}
-    reach = {r: geom.reach(r, multicast) for r in ranks}
+    # The CTAs each rank's copies land in: its own (or, with fills, every CTA it fills) and
+    # their multicast lines.
+    filled = {r: geom.group(r) if fills == "pair" else ranks if fills else (r,) for r in ranks}
+    reach = {r: set().union(*(geom.reach(d, multicast) for d in filled[r])) for r in ranks}
     copies_cross = any(len(cs) > 1 for cs in reach.values())
     same = len(set(where.values())) == 1
 
@@ -224,7 +228,23 @@ def want_scope(
     }
     tx = tma_bytes
     leaders = geom.ctas("leader")
-    if tma_bytes is not None and not internal and not same:
+    if tma_bytes is not None and fills:
+        # The filler arms the barrier of each CTA it fills, or with leader-only consumers its
+        # pair leaders' (2-CTA copies), for every CTA completing there; a consumer releases each
+        # producer whose copies land in a CTA completing on its barrier or in its unit.
+        two = not set().union(*reach.values()) <= set(full_ctas)
+        home = {d: geom.group(d)[0] if two else d for d in ranks}
+        tx = tma_bytes * (2 if two else 1)
+        full_targets = {p: tuple(sorted({home[d] for d in filled[p]})) for p in empty_ctas}
+        empty_targets = {
+            c: tuple(
+                p
+                for p in empty_ctas
+                if reach[p] & ({d for d in ranks if home[d] == c} | set(unit[c]))
+            )
+            for c in full_ctas
+        }
+    elif tma_bytes is not None and not internal and not same:
         assert geom.pair and empty_ctas == ranks and full_ctas == leaders, "generator bug"
         tx = tma_bytes * 2  # 2-CTA copies of each pair complete on the leader's barrier
         full_targets = {p: (p,) for p in leaders}
@@ -294,6 +314,7 @@ def expected_scopes(spec: gen.KernelSpec) -> dict[str, WantScope]:
             geom,
             tma_bytes if ch.producer == "tma" else None,
             multicast=tuple(ch.multicast),
+            fills=ch.fills,
         )
     s = spec.stream
     if s is not None and s.broadcast:

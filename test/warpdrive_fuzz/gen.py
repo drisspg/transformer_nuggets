@@ -156,6 +156,10 @@ class ChannelSpec:
     tma_pair: bool = False  # pair-scoped: both CTAs copy, CtaGroup.TWO, leader-only consumers
     # Tma(multicast=mode): each CTA copies its part of the tile into every CTA along the mode.
     multicast: str = ""
+    # Tma(fills=...): the producer ("pair": on the pair leaders, "cluster": on rank 0) copies the
+    # tile into every CTA it fills; fill_two: the bytes complete on the pair leaders (CtaGroup.TWO).
+    fills: str = ""
+    fill_two: bool = False
     commit_fence: str | None = None
     release_fence: str | None = None
     remote_scope: str | None = None
@@ -829,7 +833,7 @@ def _extend_channels(ext, channels, roles, geom):
         # Manual signals reach this CTA only: a multicast stage is released in every CTA it
         # was copied into (U7: raw signals must use the effective targets).
         local = len({geom.ctas(by_name[r]["cta"]) for r, _ in parts}) == 1
-        local = local and not ch.get("multicast")
+        local = local and not ch.get("multicast") and not ch.get("fills")
         if local and ext.random() < 0.2:
             sides = [
                 x
@@ -890,6 +894,7 @@ def generate(
     # Knobs added after the first campaigns draw from their own stream, so a seed keeps the
     # kernel it had before them apart from the extensions (findings cite seeds).
     ext = random.Random(f"wdfuzz-ext-{seed}")
+    fill_rng = random.Random(f"wdfuzz-fill-{seed}")  # Tma(fills=...), added after ext
     cluster = tuple(cluster) if cluster is not None else ()
     if cluster:
         pair = cluster[2]
@@ -1022,6 +1027,16 @@ def generate(
                 prod, cons = placed_ctas(ch["producers"]), placed_ctas(ch["consumers"])
                 if pair and prod == {everyone} and cons == {leaders} and rng.random() < 0.7:
                     ch["tma_pair"] = True  # each pair's bytes complete on its leader (R11)
+                    continue
+                # One CTA fills others (R11): the pair leaders fill their pair, rank 0 the
+                # cluster; every CTA it fills has a consumer, or the consumers are the leaders.
+                fills = "pair" if pair and prod == {leaders} else ""
+                fills = "cluster" if not fills and prod == {(0,)} else fills
+                waiting = set().union(*cons)
+                fill_two = pair and waiting == set(leaders)
+                fits = fills and (waiting == set(everyone) or fill_two)
+                if fits and fill_rng.random() < (0.7 if len(prod | cons) > 1 else 0.3):
+                    ch["fills"], ch["fill_two"] = fills, fill_two
                 elif len(prod | cons) > 1:
                     ch["producer"] = "threads"
     spec_roles = {r["name"]: r for r in roles}
@@ -1052,7 +1067,7 @@ def generate(
                 continue
             if any(roles[int(r[1:])]["cta"] == "rank0" for r, _ in side):
                 continue
-            if len(placed_ctas(side)) > 1 and not ch["tma_pair"]:
+            if len(placed_ctas(side)) > 1 and not ch.get("tma_pair") or ch.get("fills"):
                 continue
             if rng.random() < 0.6:
                 ch["multicast"] = rng.choice(modes)
@@ -1526,10 +1541,13 @@ def _emit_body(src: _Src, spec: KernelSpec, r: RoleSpec, extra: bool):
                 dst = f"ctx.ts_{ch}[None, {h}.index]"
                 if c.storage:
                     dst = f'{h}.view("T", write=True, by="tma")'
-                src(
-                    f"cute.copy(ctx.tma_{ch}, ctx.tg_{ch}[None, {e} % {c.tma_tiles}], {dst}, "
-                    f"tma_bar_ptr={bar}{mcast})"
-                )
+                # With fills, the same tile into each filled CTA (same SMEM offset).
+                masks = [f", mcast_mask=ctx.fl_{ch}_{j}" for j in range(fill_count(spec, c))]
+                for mask in masks or [mcast]:
+                    src(
+                        f"cute.copy(ctx.tma_{ch}, ctx.tg_{ch}[None, {e} % {c.tma_tiles}], {dst}, "
+                        f"tma_bar_ptr={bar}{mask})"
+                    )
         else:
             offs = tuple(lay.cons[(ch, r.name, i)] for i in range(r.instances))
             log = f"base + {_by_stage(offs, r)} + 2"
@@ -1990,6 +2008,7 @@ def emit(spec: KernelSpec) -> str:
             prod = f"Tma({nbytes})"
         else:
             mcast = f', multicast="{ch.multicast}"' if ch.multicast else ""
+            mcast += f', fills="{ch.fills}"' if ch.fills else ""
             prod = f"Tma({ch.tma_bytes}{mcast})" if ch.producer == "tma" else _MECH[ch.producer]
         args = [str(ch.n), prod, _MECH[ch.consumer]]
         if ch.mma == "ab":
@@ -2090,6 +2109,13 @@ def emit(spec: KernelSpec) -> str:
             src(f'mc_{c} = self.cluster.multicast("{ch.multicast}")')
             coord, layout = f"mc_{c}.coord", f"mc_{c}.layout"
             ctx.append(f"mc_{c}=mc_{c}.mask")
+        if ch.fills:  # the filler's copy masks, one per CTA it fills
+            first = "0" if ch.fills == "cluster" else f"fr_{c} - fr_{c} % 2"
+            if ch.fills == "pair":
+                src(f"fr_{c} = self.cluster.rank()")
+            for j in range(fill_count(spec, ch)):
+                src(f"fl_{c}_{j} = self.cluster.fill({first} + {j})")
+                ctx.append(f"fl_{c}_{j}=fl_{c}_{j}.mask")
         src(
             f"ts_{c}, tgp_{c} = cpasync.tma_partition(tma_{c}, {coord}, {layout}, "
             f"cute.group_modes(s_{c}, 0, 2), cute.group_modes(tg_{c}, 0, 2))"
@@ -2167,11 +2193,13 @@ def emit(spec: KernelSpec) -> str:
             f"layout_{c} = cute.make_ordered_layout(({ch.tma_rows}, {TMA_COLS}, {ch.n}), "
             "order=(1, 0, 2))"
         )
-        group = "TWO" if ch.tma_pair else "ONE"
+        group = "TWO" if ch.tma_pair or ch.fill_two else "ONE"
         op, sharing = "CopyBulkTensorTileG2SOp", ""
         if ch.multicast:
             op = "CopyBulkTensorTileG2SMulticastOp"
             sharing = f", num_multicast={len(spec.geom.reach(0, (ch.multicast,)))}"
+        if ch.fills:  # copies into other CTAs take a mask
+            op = "CopyBulkTensorTileG2SMulticastOp"
         src(
             f"tma_{c}, tgt_{c} = cpasync.make_tiled_tma_atom(cpasync.{op}("
             f"tcgen05.CtaGroup.{group}), src_{c}, cute.select(layout_{c}, mode=[0, 1]), "
@@ -2235,6 +2263,13 @@ def emit(spec: KernelSpec) -> str:
     src(f"self.kernel({', '.join(launch_args)}).launch({cfg}, stream=stream{pdl})")
     src.end(2)
     return src.text()
+
+
+def fill_count(spec: KernelSpec, ch: ChannelSpec) -> int:
+    """CTAs a ``Tma(fills=...)`` producer copies into (0 without fills)."""
+    if not ch.fills:
+        return 0
+    return spec.geom.size if ch.fills == "cluster" else 2
 
 
 def features(spec: KernelSpec) -> set[str]:
@@ -2317,6 +2352,8 @@ def features(spec: KernelSpec) -> set[str]:
             out.add("payload")
         if ch.tma_pair:
             out.add("tma_pair")
+        if ch.fills:
+            out.add(f"tma_fills_{ch.fills}" + ("_two" if ch.fill_two else ""))
         if ch.multicast:
             out.add("tma_multicast")
         if ch.kind == "slots" and ch.n > 4:
