@@ -941,9 +941,9 @@ and grouping depend on launch count and codegen; new access pairs need a fresh a
 out, lse = fa4_decode(q, k, v, num_splits, seqused_k=lengths, splits_per_seq=counts, shared_kv=True)
 ```
 
-`SwapABDecode(..., shared_kv=True)` (a `SharedKVDecode`) ports the prototype onto the layer:
-one `Ring(sum(kv_stages), Tma(...), Umma, consumer_mode="exclusive")` whose stages hold either
-a K tile or a V^T tile (the V buffer overlaps K), with the QK and PV warps as exclusive
+`SharedKVDecode` (`shared_kv=True` in `fa4_decode`/`decode_partials`) ports the prototype onto
+the layer: one `Ring(sum(kv_stages), Tma(...), Umma, consumer_mode="exclusive")` whose stages
+hold either a K tile or a V^T tile (the V buffer overlaps K), with the QK and PV warps as exclusive
 consumers that `skip()` each other's blocks, and FA4's QKIssued/PVIssued `NamedBarrier`s
 ([recipe](channels.md#rendezvous-recipe-fa4s-qkissuedpvissued)). Both MMA warps probe their
 next stage with a try token after each release, as FA4 does; the loader probes its next stage

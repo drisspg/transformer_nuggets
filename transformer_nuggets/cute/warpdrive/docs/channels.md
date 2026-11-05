@@ -189,7 +189,7 @@ runtime skips").
 
 ### Rendezvous recipe: FA4's QKIssued/PVIssued
 
-The [decode example](../examples/fa4_decode_swapab.py) (`shared_kv=True`) shares one ring
+The [decode example](../examples/fa4_decode_swapab.py) (`SharedKVDecode`) shares one ring
 between its QK and PV MMA warps. The loader fills K(0), K(1), then K(j + 2) and V(j) for each
 block j, then the last two V blocks. With 12 stages of four K and four V stages per block,
 PV's first wait, of V(0), is epoch 12: a full lap after launch. Two

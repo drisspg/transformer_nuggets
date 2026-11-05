@@ -31,8 +31,9 @@ the thread-to-thread mailboxes FA4 builds from ``bar.sync``/``bar.arrive``, and 
     q        Ring(1)  q_store -TMA-> mma_qk
     k, v     Ring     load -TMA-> mma_qk / mma_pv; FA4 shares one ring (K two blocks ahead of V,
                       two MMA cursors); here K and V have their own rings and stages, unless
-                      ``shared_kv=True`` (``SharedKVDecode``: one exclusive-consumer ring ``kv``
-                      and the QKIssued/PVIssued ``NamedBarrier`` pair)
+                      the kernel is a ``SharedKVDecode`` (one exclusive-consumer ring ``kv`` and
+                      the QKIssued/PVIssued ``NamedBarrier`` pair; ``shared_kv=True`` in the
+                      wrappers)
     s        Ring(4)  mma_qk -UMMA-> softmax[0|1], round-robin: softmax[i] takes blocks i, i+2, ...
     p        Ring(4)  softmax[0|1] -> mma_pv, round-robin; P in SMEM, the PV MMA's B operand
                       (``s_stages`` and ``p_stages``)
@@ -50,7 +51,7 @@ would let both softmax warpgroups into the exchange at once, so the turnstile se
 Differences from FA4 (see docs/examples.md for the measured effect):
 
 * By default, separate K and V rings instead of one ring read by two MMA cursors kept within one
-  window by two named barriers (QKIssued/PVIssued); ``shared_kv=True`` selects FA4's protocol.
+  window by two named barriers (QKIssued/PVIssued); ``SharedKVDecode`` is FA4's protocol.
 * The first PV into each O slot overwrites it (``ACCUMULATE = False``) instead of the correction
   warpgroup zero-filling both O slots, and the correction tail reads O and L slot 1 as zero when
   a split has one block, so no TMEM zero-fill must be ordered before the first MMA.
@@ -209,11 +210,9 @@ def gemm_view(mX, order, head_idx=None, qhead_per_kvhead=None, num_heads_kv=None
 
 
 class SwapABDecode(WarpSpecialized):
-    def __new__(cls, *args, shared_kv: bool = False, **kwargs):
-        # The shared ring changes the K/V roles' channel parameters, so it is a subclass.
-        if shared_kv is True and cls is SwapABDecode:
-            cls = SharedKVDecode
-        return super().__new__(cls)
+    # The shared ring changes the K/V roles' channel parameters, so it is a subclass
+    # (``SharedKVDecode``), not an option.
+    shared_kv = False
 
     def __init__(
         self,
@@ -227,18 +226,15 @@ class SwapABDecode(WarpSpecialized):
         p_stages: int = 4,
         head_dim: int = 128,
         head_dim_v: int = 128,
-        shared_kv: bool = False,
         roles: dict[str, RoleConfig] | None = None,
     ):
         """``tile_hq``: query heads per KV head, a power of two up to 32. ``tile_n``: KV tokens
         per block, a power-of-two multiple of 128 (FA4: 256). ``tile_k``: MMA K step, one of
         ``TILE_KS``. ``s_stages``/``p_stages``: S (TMEM) and P (SMEM) ring depths, even (two
         softmax warpgroups). ``head_dim``/``head_dim_v``: Q/K and V/O head dimensions, multiples
-        of ``tile_k`` and 128. ``shared_kv``: FA4's protocol, one K/V ring of
-        ``sum(kv_stages)`` stages read by both MMA warps (``SharedKVDecode``), instead of a K ring
-        and a V ring. ``roles``: placement and register budgets by role name over the defaults
-        (FA4's 64/120/208 split for 32-head tiles, none otherwise). Combinations that do not fit
-        TMEM or SMEM raise at construction or first collection."""
+        of ``tile_k`` and 128. ``roles``: placement and register budgets by role name over the
+        defaults (FA4's 64/120/208 split for 32-head tiles, none otherwise). Combinations that
+        do not fit TMEM or SMEM raise at construction or first collection."""
         if tile_hq not in (1, 2, 4, 8, 16, 32):
             raise ValueError(f"tile_hq must be a power of two up to 32, got {tile_hq}")
         s_subtiles = tile_n // TILE_M
@@ -264,15 +260,7 @@ class SwapABDecode(WarpSpecialized):
                 raise ValueError(
                     f"{name} must be an even number >= 2 (two softmax warpgroups), got {stages}"
                 )
-        if type(shared_kv) is not bool:
-            raise ValueError(f"shared_kv must be a bool, got {shared_kv!r}")
-        shared_kv = shared_kv or isinstance(self, SharedKVDecode)
-        if shared_kv and not isinstance(self, SharedKVDecode):
-            raise ValueError(
-                f"shared_kv=True needs SharedKVDecode's K/V roles; derive {type(self).__name__} "
-                "from SharedKVDecode instead"
-            )
-        self.shared_kv = shared_kv
+        shared_kv = self.shared_kv
         self.tile_hq = tile_hq
         self.tile_hq_mma = max(MMA_N_MIN, tile_hq)
         self.per_sequence = per_sequence
@@ -1142,10 +1130,10 @@ class SwapABDecode(WarpSpecialized):
 
 
 class SharedKVDecode(SwapABDecode):
-    """``SwapABDecode(..., shared_kv=True)``: FA4's K/V protocol. One ring of ``sum(kv_stages)``
-    stages; the loader fills K(0), K(1), then K(j + 2) and V(j) for each block j, then the last
-    two V blocks. Both MMA warps are exclusive consumers: each waits for and releases its own
-    blocks' stages and ``skip()``s the other's.
+    """``SwapABDecode`` with FA4's K/V protocol (``shared_kv=True`` in the wrappers). One ring
+    of ``sum(kv_stages)`` stages; the loader fills K(0), K(1), then K(j + 2) and V(j) for each
+    block j, then the last two V blocks. Both MMA warps are exclusive consumers: each waits for
+    and releases its own blocks' stages and ``skip()``s the other's.
 
     A consumer's parity wait of epoch e is exact once epoch e - n was filled; the waiter
     observed that itself only if its previous wait was at most one ring lap earlier. PV's first
@@ -1160,6 +1148,8 @@ class SharedKVDecode(SwapABDecode):
     in one generation. PV's last ``pv_issued`` arrival is never matched (as in FA4); that is
     sound because a ``OneShot`` CTA runs one work item.
     """
+
+    shared_kv = True
 
     @role(warps=2)
     @cute.jit
@@ -1352,7 +1342,8 @@ def decode_partials(
     <= ``num_splits``) gives per-sequence split counts; partials of splits past a sequence's
     count are left unwritten. Splits without KV blocks write O = 0 and LSE = -inf. ``config``:
     ``SwapABDecode``'s keyword options (``tile_n``, ``tile_k``, ``s_stages``, ``p_stages``,
-    ``shared_kv``, ``roles``); ``head_dim``/``head_dim_v`` follow the tensors."""
+    ``roles``) and ``shared_kv`` (True: ``SharedKVDecode``); ``head_dim``/``head_dim_v`` follow
+    the tensors."""
     if any(t.dtype != torch.bfloat16 for t in (q, k, v)):
         raise TypeError("decode_partials expects bfloat16 q, k, v")
     if (
@@ -1381,11 +1372,21 @@ def decode_partials(
     )
     lse_partial = torch.empty(num_splits, batch, heads, 1, device=dev, dtype=torch.float32)
     options = dict(config, head_dim=head_dim, head_dim_v=head_dim_v)
+    shared_kv = options.pop("shared_kv", False)
+    if type(shared_kv) is not bool:
+        raise ValueError(f"shared_kv must be a bool, got {shared_kv!r}")
+    kernel_class = SharedKVDecode if shared_kv else SwapABDecode
     frozen = {k: _frozen_roles(v) if k == "roles" else v for k, v in options.items()}
-    key = (tile_hq_for(heads, heads_kv), kv_stages, per_sequence, *sorted(frozen.items()))
+    key = (
+        tile_hq_for(heads, heads_kv),
+        kv_stages,
+        per_sequence,
+        shared_kv,
+        *sorted(frozen.items()),
+    )
     op = _OPS.get(key)
     if op is None:
-        op = _OPS[key] = SwapABDecode(key[0], kv_stages, per_sequence, **options)
+        op = _OPS[key] = kernel_class(key[0], kv_stages, per_sequence, **options)
     scale = softmax_scale if softmax_scale is not None else head_dim**-0.5
     compile_decode.by_static_key(key, lambda: compile_decode(op))(
         q[:, 0],

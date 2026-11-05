@@ -84,7 +84,7 @@ and the decode port still matches FA4's partials bit for bit.
 | `s_stages`, `p_stages` (4, 4) | Constructor. Even, one half per softmax warpgroup. |
 | `head_dim`, `head_dim_v` (128, from the tensors) | Constructor. `head_dim` is a multiple of `tile_k` and only sizes Q and the QK K steps; `head_dim_v` is a multiple of 128 and adds O tiles to TMEM (`S + L + O <= 512` columns: 256 fits at every `tile_hq` with the default S ring). |
 | `kv_stages` (FA4's total split 7:5) | Constructor. With `shared_kv`, the shared ring has their sum. |
-| `shared_kv` (False) | Constructor. True selects FA4's shared K/V ring with two exclusive MMA consumers and the QKIssued/PVIssued rendezvous (`SharedKVDecode`, [examples](examples.md#shared-kv-ring)): 2.7-3.8% faster on the ragged 8/1 and the 1x32768 32/1 shapes, 0.1-5.9% slower on the others, so split stays the default. Partials match FA4's either way. |
+| `shared_kv` (False) | `fa4_decode`/`decode_partials`. True selects FA4's shared K/V ring with two exclusive MMA consumers and the QKIssued/PVIssued rendezvous (`SharedKVDecode`, [examples](examples.md#shared-kv-ring)): 2.7-3.8% faster on the ragged 8/1 and the 1x32768 32/1 shapes, 0.1-5.9% slower on the others, so split stays the default. Partials match FA4's either way. |
 | Roles at 64 / 120 / 208 for 32-head tiles, unadjusted otherwise | Defaults computed from `tile_hq`; `roles=` overrides. |
 | `O_STAGES = 2` | Fixed by the algorithm: one O slot per softmax warpgroup (even and odd blocks), merged by the correction tail. |
 | `TILE_M = 128` | Fixed: one lane per KV token row of an S subtile and per head dimension of an O tile. |

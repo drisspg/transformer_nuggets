@@ -21,7 +21,7 @@ from cutlass import cute
 
 from warpdrive_test_helpers import raises_protocol as _raises_protocol
 
-from transformer_nuggets.cute.jit_cache import jit_cache
+from transformer_nuggets.cute.jit_cache import canonical_key, jit_cache
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
     Consumer,
@@ -510,10 +510,10 @@ def test_decode_combines_wider_v(requires_blackwell, decode):
 
 
 def test_decode_shared_kv_describe(decode, requires_blackwell):
-    """shared_kv=True: one exclusive ring read by both MMA warps, FA4's two rendezvous barriers
+    """SharedKVDecode: one exclusive ring read by both MMA warps, FA4's two rendezvous barriers
     declared first (so the stats flags move up), and the default build unchanged."""
-    op = decode.SwapABDecode(8, shared_kv=True)
-    assert isinstance(op, decode.SharedKVDecode) and op.get_name().count("_shared") == 1
+    op = decode.SharedKVDecode(8)
+    assert op.get_name().count("_shared") == 1
     text = op.describe()
     assert "kv       Ring(12) load -> mma_pv, mma_qk" in text, text
     assert "full      1 x12, tx 16384 B" in text and "empty     1 x12" in text
@@ -527,28 +527,24 @@ def test_decode_shared_kv_describe(decode, requires_blackwell):
     assert "V ~ K (smem)  no hazard found" in text, text
     assert "epochs    unverified (load's acquire runs inside a dynamic loop or branch)" in text
     split = decode.SwapABDecode(8)
-    assert type(split) is decode.SwapABDecode and "_shared" not in split.get_name()
+    assert "_shared" not in split.get_name()
     assert "max_done     id 3  160 threads" in split.describe()
-    assert op.__cute_cache_key__() != split.__cute_cache_key__()
-    with pytest.raises(ValueError, match="shared_kv must be a bool"):
-        decode.SwapABDecode(8, shared_kv=1)
+    assert canonical_key(op) != canonical_key(split)  # the class tells the two kernels apart
 
 
-def test_decode_shared_kv_construction(decode):
-    """The knob, the class and pickling agree; a subclass of the split kernel cannot take the
-    shared roles silently."""
-    direct = decode.SharedKVDecode(8)
-    assert direct.shared_kv and "kv       Ring(12)" in direct.describe()
-    op = decode.SwapABDecode(8, shared_kv=True)
+def test_decode_shared_kv_selection(decode):
+    """The wrappers' ``shared_kv`` picks the class; pickling keeps it."""
+    op = decode.SharedKVDecode(8)
+    assert op.shared_kv and "kv       Ring(12)" in op.describe()
     again = pickle.loads(pickle.dumps(op))
     assert type(again) is decode.SharedKVDecode
-    assert again.__cute_cache_key__() == op.__cute_cache_key__()
-
-    class Custom(decode.SwapABDecode):
-        pass
-
-    with pytest.raises(ValueError, match="derive Custom from SharedKVDecode"):
-        Custom(8, shared_kv=True)
+    assert canonical_key(again) == canonical_key(op)
+    q = torch.empty(1, 1, 8, 128, dtype=torch.bfloat16)
+    kv = torch.empty(1, 256, 1, 128, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="shared_kv must be a bool"):
+        decode.decode_partials(q, kv, kv, 1, shared_kv=1)
+    with pytest.raises(TypeError, match="shared_kv"):
+        decode.SwapABDecode(8, shared_kv=True)
 
 
 def test_decode_rejects_unfit_configurations(decode):
