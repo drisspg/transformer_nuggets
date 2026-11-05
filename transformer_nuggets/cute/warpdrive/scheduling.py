@@ -661,6 +661,8 @@ class WorkStream:
     def launch_args(self, device, max_ctas: int | None = None):
         """``(workspace, max_ctas)`` for the compiled entry point. One cached workspace per
         (device, current stream): launches on one stream run in order, so they may share it.
+        A schedule without a workspace (and no ``record``) gets one placeholder per device,
+        which the kernel never reads or writes.
         ``max_ctas`` defaults to the CTAs of every cluster that can be resident at once (the SM
         count for one CTA; fewer for clusters that do not tile the GPCs), so a persistent grid
         runs in one wave. With ``record``, ``max_ctas`` must cover the launch grid in CTAs
@@ -670,6 +672,7 @@ class WorkStream:
 
         device = torch.device(device)
         index = device.index if device.index is not None else torch.cuda.current_device()
+        device = torch.device("cuda", index)  # "cuda" means the current device: cache by index
         sms = resident_ctas(index, self.cluster_size)
         words = 4
         if self.record:
@@ -681,6 +684,16 @@ class WorkStream:
             cs = self.cluster_size
             ctas = -(-(max_ctas or sms) // cs) * cs  # the grid launches whole clusters
             words += len(self.roles) * ctas * self.record * 2
+        if not self.schedule.uses_workspace and not self.record:
+            # The kernel never touches it: one tensor per device serves every stream, and it is
+            # only zeroed outside a capture, so a CUDA graph on a new stream records no fill.
+            ws = self._workspaces.get(device)
+            if ws is None:
+                with torch.cuda.device(index):  # capturing on that device's current stream
+                    capturing = torch.cuda.is_current_stream_capturing()
+                new = torch.empty if capturing else torch.zeros
+                ws = self._workspaces[device] = new(words, dtype=torch.int32, device=device)
+            return ws, max_ctas or sms
         stream = torch.cuda.current_stream(device).cuda_stream
         ws = self._workspaces.get((device, stream))
         if ws is None or ws.numel() < words:

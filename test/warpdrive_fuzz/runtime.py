@@ -356,6 +356,7 @@ def _launch_and_check(spec, op, fn, device, srcs, tag: str):
     if spec.concurrent:
         # Two launches in flight at once on two streams. launch_args() caches one workspace
         # per (device, stream), so each gets its own: the documented way to run concurrently.
+        # Schedules that never touch a workspace share one placeholder per device.
         streams = [torch.cuda.Stream(device) for _ in range(2)]
         pair = []
         for strm in streams:
@@ -363,7 +364,8 @@ def _launch_and_check(spec, op, fn, device, srcs, tag: str):
                 pair.append(_LaunchState(spec, op, device, rows, hits_len))
                 if s is not None and s.record:
                     pair[-1].ws, _ = op.work.launch_args(device, max_ctas=gx)
-        if s is not None and pair[0].ws.data_ptr() == pair[1].ws.data_ptr():
+        shared = s is not None and pair[0].ws.data_ptr() == pair[1].ws.data_ptr()
+        if shared and (op.work.schedule.uses_workspace or s.record):
             raise AssertionError("launch_args() returned one workspace for two streams")
         torch.cuda.synchronize()
         _phase(f"launch {prefix}concurrent")

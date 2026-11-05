@@ -32,6 +32,7 @@ from transformer_nuggets.cute.warpdrive import (
     WorkStream,
     role,
 )
+from transformer_nuggets.cute.warpdrive import scheduling
 from transformer_nuggets.cute.warpdrive.scheduling import tile_grid_dims
 
 SCHEDULES = {
@@ -728,6 +729,68 @@ def test_concurrent_launches_use_one_workspace_per_stream(requires_blackwell, cl
     for ws, count in zip(workspaces, counts, strict=True):
         assert count.tolist() == [4 * want, 4 * want]
         assert ws[:2].tolist() == [0, 0]
+
+
+@pytest.mark.parametrize("case", ["oneshot_tile_grid", "static", "clc"])
+def test_schedules_without_a_workspace_share_an_untouched_placeholder(requires_blackwell, case):
+    """Schedules that never read a workspace get one per device, whichever stream asks; the
+    kernel leaves it alone, and a CUDA graph captured on a new stream records no fill."""
+    op = CountToy(*COUNT_CASES[case], SingleCta())
+    fn = compile_count_toy(op)
+    count = torch.zeros(2, dtype=torch.int32, device="cuda")
+    with torch.cuda.stream(torch.cuda.Stream()):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            ws, sms = op.work.launch_args("cuda")  # first call: inside the capture
+            fn(count, ws, 9, 7, 3, sms)
+    again, _ = op.work.launch_args("cuda")
+    assert again.data_ptr() == ws.data_ptr()
+    ws.fill_(0x5EED)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        graph.replay()
+        torch.cuda.synchronize()
+    names = [e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA]
+    assert not any("memset" in n.lower() for n in names), names
+    assert count.tolist() == [9 * 7 * 3] * 2
+    assert ws.tolist() == [0x5EED] * ws.numel()
+
+
+def test_placeholder_is_per_resolved_device(monkeypatch):
+    """``"cuda"`` resolves to the current device before the cache lookup, so switching devices
+    gets that device's placeholder, ``"cuda"`` and ``"cuda:N"`` share one, and the capture check
+    asks the requested device's current stream (devices and allocations mocked)."""
+    current, capturing = [0], {0: False, 1: False, 2: True}
+
+    class Device:
+        def __init__(self, index):
+            self.index = index
+
+        def __enter__(self):
+            self.saved, current[0] = current[0], self.index
+
+        def __exit__(self, *exc):
+            current[0] = self.saved
+
+    def alloc(kind):
+        return lambda words, dtype, device: SimpleNamespace(kind=kind, device=device)
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: current[0])
+    monkeypatch.setattr(torch.cuda, "device", Device)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing[current[0]])
+    monkeypatch.setattr(torch, "zeros", alloc("zeros"))
+    monkeypatch.setattr(torch, "empty", alloc("empty"))
+    monkeypatch.setattr(scheduling, "resident_ctas", lambda index, cs: 148)
+    stream = WorkStream(schedule=OneShot())
+    on0, _ = stream.launch_args("cuda")
+    current[0] = 1
+    on1, _ = stream.launch_args("cuda")
+    assert (on0.device, on1.device) == (torch.device("cuda", 0), torch.device("cuda", 1))
+    assert stream.launch_args("cuda:1")[0] is on1
+    current[0] = 0
+    assert stream.launch_args("cuda:1")[0] is on1 and stream.launch_args("cuda")[0] is on0
+    on2, _ = stream.launch_args("cuda:2")  # device 2 is capturing; the current device is not
+    assert (on2.kind, on2.device) == ("empty", torch.device("cuda", 2))
+    assert on0.kind == on1.kind == "zeros" and current[0] == 0
 
 
 def test_record_needs_a_bound_stream(requires_blackwell):

@@ -100,6 +100,9 @@ run in order, and launches made with it on different streams get different works
 they can run concurrently. Never pass the same workspace to concurrent launches yourself.
 They would claim from one counter, taking some of each other's items, and the first launch
 to finish could zero it while the other is still claiming.
+Schedules that read no workspace (`OneShot`, `StaticPersistent`, `ClusterLaunchControl`) without
+`record` get one placeholder per device instead, never read or written by the kernel, so a
+CUDA graph captured on a new stream records no fill.
 
 ### The grid and empty work
 
