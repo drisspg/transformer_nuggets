@@ -5,7 +5,7 @@
 A compiled kernel is keyed by its constructor call ([compile keys](roles.md#compile-keys)),
 so every choice a kernel author might tune has to be a constructor argument: a module
 constant would silently share one compiled kernel between two configurations. This page is
-the audit of the layer and the four examples. Each hard-coded choice is either fixed by
+the audit of the layer and the five examples. Each hard-coded choice is either fixed by
 hardware or the algorithm, fixed by the layer's abstraction (with the change that would lift
 it), or a constructor argument.
 
@@ -88,6 +88,19 @@ and the decode port still matches FA4's partials bit for bit.
 | `TILE_M = 128` | Fixed: one lane per KV token row of an S subtile and per head dimension of an O tile. |
 | `MMA_N_MIN = 8` | Hardware: the smallest `tcgen05.mma` N. |
 | `lookahead = 2` (K issued two blocks ahead of V) | Fixed: FA4's issue order. The K ring already bounds the lead, and a larger value with a shallow P ring deadlocks (the load waits for a K stage the QK MMA cannot free until a P stage the PV MMA cannot read without the V the load has not issued), which the layer cannot check. |
+
+### fa4_bwd.py
+
+| Choice | Status |
+|---|---|
+| `causal` | Constructor. Also selects FA4's causal register split. |
+| `dq_stages` (2) | Constructor. 1 or 2 dQ staging buffers for the TMA reduce-adds; more does not fit SMEM. |
+| Roles reduce 0-3 / compute 4-11 / mma 12 / load 13 at 152 / 136 / 88 (136 / 144 / 88 causal) | Defaults computed from `causal` (FA4's `select_sm100_bwd_registers`); `roles=` overrides. |
+| `TILE_M = TILE_N = 128`, `HEAD_DIM = 128` | Fixed by the port's scope: FA4's 1-CTA hdim-128 tiling, whose 512-column TMEM map (S, dV, dP, dK) has no room left. |
+| `Q_STAGE = 2` | Fixed by the schedule: S_{t+1} reads Q_{t+1} before dK_t releases Q_t, so one stage deadlocks; three do not fit SMEM. |
+| dO, K, V, LSE/dPsum stages (1, 1, 1, 2/1) | Fixed: FA4's, and SMEM is full (231 of 232 KB with two dQ staging buffers). |
+| `DQ_COLS = 32`, `EPI_COLS = 64` | Fixed: FA4's dQ reduce width (the postprocess reads its tile order) and the 128-byte TMA store box. |
+| `OneShot()`, `Raster()` | Fixed: the retired last S acquire and the epilogue tiles over Q/dO need one item per CTA. |
 
 A combination that does not fit raises at construction (`ValueError` from the TMEM plan or
 the default K/V stage budget) or at first collection (`ProtocolError`/`ValueError` from the

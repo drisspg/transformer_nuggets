@@ -13,6 +13,9 @@
   ([details](#grouped-gemm)).
 - [fa4_fwd.py](../examples/fa4_fwd.py): two softmax instances, a correction role, slots,
   fan-out/join, turnstiles, S/P aliasing, split-P, persistence and CTA pairs.
+- [fa4_bwd.py](../examples/fa4_bwd.py): FA4's SM100 1-CTA attention backward: 14 warps in
+  four roles, eleven channels (seven with `Warps` sides), five MMAs per tile software-pipelined
+  across overlapping handles, three TMEM aliases and two SMEM epilogue overlaps.
 - [packed_work.py](../examples/packed_work.py): a mapping for a device-built work table with
   a host-visible capacity and device-side length.
 - [fa4_decode_swapab.py](../examples/fa4_decode_swapab.py): FA4's swap-AB single-token decode:
@@ -289,6 +292,141 @@ For NCU, use `--profile` with `--profile-from-start off`: the script warms all v
 then profiles one complete forward per variant between CUDA profiler start/stop. All
 seven standard example configurations keep identical normalized SASS versus `origin/main`
 on SM100 and SM103; only the opt-in hardware-max variant intentionally changes it.
+
+## Attention backward
+
+```python
+from transformer_nuggets.cute.warpdrive.examples.fa4_bwd import fa4_bwd
+
+dq, dk, dv = fa4_bwd(q, k, v, out, dout, lse, causal=False)
+```
+
+A port of the main kernel of FA4's `flash_bwd_sm100.py` at its 1-CTA configuration for head
+dimension 128 (FA4 selects it with `disable_2cta`; its default on SM100 is the 2-CTA kernel).
+FA4's own preprocess (`dPsum = rowsum(dO * O)`, `LSE * log2(e)`, zeroing the fp32 dQ
+accumulator) and dQ postprocess kernels run around it unchanged. Inputs are contiguous,
+16-byte-aligned BF16 `(batch, seqlen, heads, 128)` tensors on one CUDA device, with matching
+batch and head counts (no GQA), and the forward's fp32 `(batch, heads, seqlen_q)` LSE.
+Sequence lengths are arbitrary: TMA zero-fills partial tiles, keys past `seqlen_k` are masked
+and the dK/dV stores are clipped. `causal=True` is FA4's bottom-right-aligned mask. No varlen,
+paging, block sparsity, score mods, softcap or deterministic mode.
+
+A work item is one 128-key tile, in FA4's `SingleTileScheduler` order, which `Raster()` over
+`(n_blocks, heads, batch)` under `OneShot()` reproduces. The roles keep FA4's warp layout:
+dQ reduce on warps 0-3, two compute warpgroups sharing each tile on 4-11, MMA on 12 and load
+on 13. The [module docstring](../examples/fa4_bwd.py) has the channel table, the TMEM map and
+the per-tile MMA order.
+
+### Correctness
+
+On every shape below and in the tests, dK and dV are bit for bit FA4's 1-CTA backward (same
+inputs, same config), non-causal and causal, including ragged lengths. dQ differs only by the
+order in which CTAs' TMA reduce-adds land in the fp32 accumulator (max |diff| up to 9.8e-4
+against values of order 1; FA4 is not bitwise reproducible there either, and some
+runs are bitwise equal). All three are checked against an fp32 autograd reference, within
+FA4's own error. dK/dV are deterministic across launches; dQ is not, as in FA4.
+
+### Timings
+
+Fixed-buffer CUDA-graph replays of one whole backward call (preprocess, main kernel,
+postprocess) per variant, seven interleaved rounds of 30 replays after three seconds of
+warmup; CUPTI gives the main kernel. Minimum round medians in microseconds, lower is better.
+GB300, CuTeDSL 4.8.0, PyTorch `2.15.0.dev20260922+cu132`, FA4 `00807a02`, normal DVFS,
+shared GPUs, November 2026; `fa4_bwd.py` SHA-256 prefix `ceb4035159cd5e55` (this commit's
+kernel, measured before the rebase that only moved its base):
+
+```bash
+gpu-run --timeout 600 auto -- timeout --signal=TERM --kill-after=10s 3000s \
+  .venv/bin/python -m transformer_nuggets.cute.warpdrive.examples.bench_fa4_bwd \
+  --output agent_space/bwd.json  # add --causal for the second table
+```
+
+| batch x heads x seqlen_q x seqlen_k | port | FA4 1-CTA | FA4 default (2-CTA) | port / 1-CTA | port / default | graph port / 1-CTA |
+|---|---:|---:|---:|---:|---:|---:|
+| 2x16x1024x1024 | 42.4 | 41.6 | 40.3 | 1.019 | 1.053 | 1.031 |
+| 4x16x4096x4096 | 972.9 | 967.8 | 893.8 | 1.005 | 1.089 | 1.005 |
+| 1x16x8192x8192 | 953.9 | 943.6 | 853.6 | 1.011 | 1.117 | 1.011 |
+| 4x16x3000x2900 | 536.1 | 531.4 | 524.6 | 1.009 | 1.022 | 1.008 |
+| causal 2x16x1024x1024 | 37.3 | 36.5 | 36.1 | 1.020 | 1.033 | 1.000 |
+| causal 4x16x4096x4096 | 563.5 | 552.2 | 509.6 | 1.020 | 1.106 | 1.018 |
+| causal 1x16x8192x8192 | 550.6 | 536.7 | 479.7 | 1.026 | 1.148 | 1.023 |
+| causal 4x16x3000x2900 | 338.0 | 330.6 | 311.5 | 1.022 | 1.085 | 1.018 |
+
+The port trails the matched FA4 kernel by 0.5-2% non-causal and 2-2.6% causal. Repeated in-process A/Bs of 4x16x4096 put it
+between +0.7% and +3.6% from run to run, while FA4's minimum stayed within 968-975 us. The
+2-CTA default is a different kernel (pair MMAs, a DSMEM dS exchange) and is 3-14% faster
+than either 1-CTA kernel; it is not ported.
+
+What was measured, 4x16x4096 unless noted (NCU 2025.4.1 kernel replay, `--cache-control
+none`, and interleaved in-process CUPTI A/Bs):
+
+| Change | Effect | Kept? |
+|---|---|---|
+| One elected arrival per warp (`Warps`) instead of 256 per-thread arrivals per release | NCU cycles 1.889M -> 1.862M (FA4 1.822M); stall long-scoreboard 6.6 -> 5.8 warps per issue | Yes |
+| dV/dK published right after their last MMA, as FA4 does, instead of after the item's last dQ MMA | -1.7% at 2x16x1024, -2.8% at 4x16x4096 (minimum round medians) | Yes |
+| S_0 waits only for K; V before the first dP (FA4 arms V with dO_0) | -0.9% at 2x16x1024 | Yes |
+| FA4's `gemm_ptx_w_idx` for the SMEM/TMEM MMAs instead of `cute.gemm` | Within noise | Yes (FA4's code) |
+| No peek wait before S_{t+1} (timing-only, incorrect) | Within noise | Peek kept |
+| One release fence for dPsum and dS instead of two | Within noise | No |
+| FA4's two extra compute-wide barriers before the S and dS signals | +0.6% | No |
+| Dropping the second dS-over-dP barrier | +6% | No |
+| In-graph workspace zero fill (`launch_args` before the placeholder fix) | +4 us whole-graph at 2x16x1024 | Fixed in the layer |
+
+With `Warps` the port executes 1.6% more warp instructions than FA4 (285M vs 280M: the
+`bar.warp.sync` and elect per signal; with per-thread arrivals it executed 3% fewer), with
+the same opcode mix otherwise, 128 launch registers and 231 vs 232 KB of SMEM. The remaining
+excess is in mbarrier wait stalls (about +4,000 of 66,700 PC samples, at the barrier-pointer
+lines both kernels' waits are attributed to), not in issued work; which wait carries it is not
+attributed. Swapping `Threads` for `Warps` in the forward, decode and persistent GEMM examples
+moved them by -0.8% to +2.3% (outputs bitwise equal), so `Threads` stays their default.
+
+### What it needed from the layer
+
+- `Warps` channel sides, added for this port (above).
+- `fence_async_shared()` had never run under tracing: the event's `kind` field collided with
+  the recorder's parameter. Fixed.
+- `launch_args()` zeroed a per-stream workspace even for `OneShot`, so graphs captured on a new
+  stream replayed a memset. Fixed: one untouched placeholder per device.
+
+Dropped down, each documented at its site:
+
+- S_{t+1} needs Q_{t+1} while Q_t's handle stays open for dK_t. FA4 rotates
+  `handle_Q = handle_Q_next`; a handle carried into the next loop iteration keeps the
+  pre-loop handle's trace record, so the checker reports it closed twice. The MMA warp waits on
+  the next stage's full barrier itself (`q.full_barrier(q.index)`, `q.phase()`) and reads the
+  stage through `params.sQ`, outside any handle. Proposal: track carried handles per loop
+  iteration, or a non-consuming `end.peek()` that returns a read-only, uncounted handle.
+- The last tile's S acquire has no S_{t+1} to publish and is retired. That, the dK/dV
+  epilogue tiles over Q and dO, and `Q_STAGE = 2` (one Q stage deadlocks: S_{t+1} waits for
+  a load that needs Q_t's release) are protocol facts the layer cannot check; the kernel stays
+  `OneShot`, as FA4's 1-CTA kernel does.
+- dQ reduce and dK/dV epilogues order their SMEM staging with hand-picked named barriers (IDs
+  3-6, recorded with `named_barrier`) and `bulk_commit_group`/`bulk_wait_group`, as in the
+  persistent GEMM epilogue.
+
+Diagnostics that stay noisy:
+
+- The LSE/dPsum bulk copies (`cp.async.bulk`, not tensor TMA) leave their channels' TMA check
+  unverified (`bulk_copy_g2s` is not a recognized atom).
+- The `ds` commit needs both a `tmem_store` fence (dS in TMEM) and an `smem_async` fence (dS in
+  SMEM); a side takes one fence kind, so the `tmem_store` one comes from the `dp` release just
+  before it, which the alias diagnostic does not credit (one `unverified`).
+- The alias diagnostic reports potential hazards on P~S, dS~dP, dQ~dP and dQ~dS that the
+  channel round trips do order. Its graph matches epochs only when the traced per-item counts
+  agree; the MMA role peels its last tile, so its s/dp/dq counts (prologue, two unrolled
+  iterations and the peeled tile) differ from the compute and reduce roles' (two iterations), and ring channels with unequal
+  counts get no reuse edges. Proposal: unroll each role's loops to counts that balance every
+  channel (here three compute iterations for two MMA iterations plus the peeled tile), or
+  accept per-loop trip-count offsets from the author. The compute role's TMEM accesses declare
+  their exact columns, so its cross-warpgroup ordering is checked.
+
+### Size
+
+Counting lines that are neither blank, comments nor docstrings: `fa4_bwd.py` is 924 lines,
+including its tensor wrapper, compile helper and input checks; compiling it executes 864 of
+them. Compiling FA4's 1-CTA causal backward executes 2,679 of `flash_bwd_sm100.py`'s 4,448 code
+lines (the rest are the 2-CTA, varlen, GQA, block-sparse, score-mod, deterministic and folded
+paths), not counting the pipeline, mask and copy helpers both use.
 
 ## Single-token decode
 
