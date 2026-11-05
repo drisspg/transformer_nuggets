@@ -510,18 +510,13 @@ def test_pair_gemm_counter_resets(requires_blackwell):
     assert ws[:2].tolist() == [0, 0]
 
 
-def test_pair_gemm_compiles_once_across_shapes(requires_blackwell, monkeypatch):
-    from transformer_nuggets.cute import cache
+def test_pair_gemm_compiles_once_across_shapes(requires_blackwell):
     from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import (
         PersistentGemm,
         compile_persistent_gemm,
     )
 
-    compiles = []
-    real = cache.compile_tvm_ffi
-    monkeypatch.setattr(
-        cache, "compile_tvm_ffi", lambda *a, **kw: compiles.append(1) or real(*a, **kw)
-    )
+    compile_persistent_gemm.cache_clear()
     op = PersistentGemm(schedule=AtomicPersistent(stages=3), cluster=PAIR, ab_stages=5)
     fns = set()
     for m, n, k, cap in [
@@ -540,7 +535,8 @@ def test_pair_gemm_compiles_once_across_shapes(requires_blackwell, monkeypatch):
         fn(a, b, out, ws, cap)
         ref = torch.nn.functional.linear(a.float(), b.float())
         assert (out.float() - ref).abs().max().item() < 0.05 * ref.abs().max().item() + 1e-2
-    assert len(compiles) <= 1 and len(fns) == 1
+    info = compile_persistent_gemm.cache_info()
+    assert info.currsize == 1 and info.hits + info.misses == 4 and len(fns) == 1
 
 
 # --------------------------------------------------------------------------- #

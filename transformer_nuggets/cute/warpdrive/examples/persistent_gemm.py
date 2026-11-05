@@ -47,8 +47,8 @@ from cutlass.utils.gemm.sm100 import (
     transform_partitioned_tensor_layout,
 )
 
-from transformer_nuggets.cute.cache import compile_tvm_ffi_and_cache
-from transformer_nuggets.cute.utils import make_fake_compact_tensor
+from transformer_nuggets.cute.jit_cache import jit_cache
+from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
     Consumer,
     Producer,
@@ -172,9 +172,6 @@ class PersistentGemm(WarpSpecialized):
             f"acc{self.acc_stages}_"
             f"{self.work.get_key()}{self.iket_key()}{self.trace_key()}"
         )
-
-    def get_key(self) -> str:
-        return self.get_name()
 
     # ------------------------------------------------------------------ roles
 
@@ -423,14 +420,15 @@ class PersistentGemm(WarpSpecialized):
         ).launch(**self.launch_config(bound), stream=stream)
 
 
+@jit_cache(uncached=lambda op: op.trace_protocol)
 def compile_persistent_gemm(op: PersistentGemm):
-    """Compile once with dynamic M, N, K (K and N multiples of 8 for 16-byte TMA strides)."""
+    """Compile once with dynamic M, N, K (K and N multiples of 8 for 16-byte TMA strides).
+    Cached in memory and on disk under ``op.__cute_cache_key__()``."""
     m = cute.sym_int()
     n, k = cute.sym_int(divisibility=8), cute.sym_int(divisibility=8)
     bf16 = cutlass.BFloat16
-    return compile_tvm_ffi_and_cache(
+    return compile_tvm_ffi(
         op,
-        op.get_name(),
         make_fake_compact_tensor(bf16, (m, k)),
         make_fake_compact_tensor(bf16, (n, k)),
         make_fake_compact_tensor(bf16, (m, n)),
@@ -471,7 +469,7 @@ def persistent_gemm(
         op = _OPS[key] = PersistentGemm(
             schedule=schedule, mapping=mapping, cluster=cluster, tile_n=tile_n
         )
-    fn = compile_persistent_gemm(op)
+    fn = compile_persistent_gemm.by_static_key(key, lambda: compile_persistent_gemm(op))
     workspace, sms = op.work.launch_args(a.device)
     fn(a, b, out, workspace, max_ctas or sms)
     return out

@@ -8,7 +8,6 @@ import pytest
 
 pytest.importorskip("cutlass.cute")
 
-from transformer_nuggets.cute import cache
 from transformer_nuggets.cute.profiler.pipeline import (
     analyze_pipeline,
     load_iket_capture,
@@ -44,11 +43,11 @@ class _Recorder:
 
 
 @pytest.fixture
-def iket_recorder(monkeypatch):
+def iket_recorder(monkeypatch, traced_compiles):
     real = tracing.load_iket()
     rec = _Recorder(real)
     monkeypatch.setattr(tracing, "load_iket", lambda: rec)
-    cache._kernel_cache.clear()  # force a trace even if another test compiled the same key
+    compile_persistent_gemm.cache_clear()  # trace even if another test compiled the same key
     return rec
 
 
@@ -57,12 +56,12 @@ def _compile_gemm(op):
     return op
 
 
-def test_disabled_emits_no_iket_ops(monkeypatch):
+def test_disabled_emits_no_iket_ops(monkeypatch, traced_compiles):
     def forbidden():
         raise AssertionError("IKET op emitted with IKET disabled")
 
     monkeypatch.setattr(tracing, "load_iket", forbidden)
-    cache._kernel_cache.clear()
+    compile_persistent_gemm.cache_clear()
     op = _compile_gemm(PersistentGemm(schedule=ClusterLaunchControl(), cluster=CtaPair()))
     assert op.iket_key() == "" and "iket" not in op.get_name()
 

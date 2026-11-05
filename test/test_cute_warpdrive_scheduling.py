@@ -856,19 +856,14 @@ def test_persistent_gemm_mappings(requires_blackwell, mapping):
     _check_gemm(SCHEDULES["atomic"], 1500, 1800, 64, mapping=mapping)
 
 
-def test_persistent_gemm_compiles_once_across_shapes(requires_blackwell, monkeypatch):
+def test_persistent_gemm_compiles_once_across_shapes(requires_blackwell):
     """Tile counts, K, and the grid cap are runtime values: one compile per (schedule, mapping)."""
-    from transformer_nuggets.cute import cache
     from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import (
         PersistentGemm,
         compile_persistent_gemm,
     )
 
-    compiles = []
-    real = cache.compile_tvm_ffi
-    monkeypatch.setattr(
-        cache, "compile_tvm_ffi", lambda *a, **kw: compiles.append(1) or real(*a, **kw)
-    )
+    compile_persistent_gemm.cache_clear()
     op = PersistentGemm(schedule=AtomicPersistent(stages=3), ab_stages=3)
     fns = set()
     # m: 1, multiple of 16, odd, tile edge, multi-wave; n, k: multiples of 8 on both sides of 16.
@@ -888,7 +883,8 @@ def test_persistent_gemm_compiles_once_across_shapes(requires_blackwell, monkeyp
         fn(a, b, out, ws, cap)
         ref = torch.nn.functional.linear(a.float(), b.float())
         assert (out.float() - ref).abs().max().item() < 0.05 * ref.abs().max().item() + 1e-2
-    assert len(compiles) <= 1 and len(fns) == 1
+    info = compile_persistent_gemm.cache_info()
+    assert info.currsize == 1 and info.hits + info.misses == 4 and len(fns) == 1
 
 
 # --------------------------------------------------------------------------- #

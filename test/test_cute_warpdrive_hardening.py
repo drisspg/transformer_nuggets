@@ -644,7 +644,7 @@ _MIXED = MixedGemm()
 
 
 @pytest.mark.parametrize("m, n, k", [(128, 256, 64), (300, 520, 136), (1000, 1000, 1000)])
-def test_mixed_managed_and_raw_gemm(requires_blackwell, m, n, k):
+def test_mixed_managed_and_raw_gemm(requires_blackwell, traced_compiles, m, n, k):
     from transformer_nuggets.cute.warpdrive.examples.gemm import compile_gemm
 
     torch.manual_seed(0)
@@ -665,11 +665,10 @@ def test_mixed_managed_and_raw_gemm(requires_blackwell, m, n, k):
     assert report.groups == {"ONE"} and report.stage_bytes == {49152}
 
 
-def test_raw_role_runs_under_its_budget_branch(monkeypatch):
+def test_raw_role_runs_under_its_budget_branch(monkeypatch, traced_compiles):
     """setmaxnreg is applied once per register budget, in the warpgroup-uniform budget branch; a
     raw role is dispatched inside its branch like any role (it does not adjust registers itself),
     and every IKET role range opens after its budget's adjustment (compile only)."""
-    from transformer_nuggets.cute import cache
     from transformer_nuggets.cute.warpdrive import tracing
     from transformer_nuggets.cute.warpdrive.examples.gemm import compile_gemm
 
@@ -689,11 +688,8 @@ def test_raw_role_runs_under_its_budget_branch(monkeypatch):
         tracing, "load_iket", lambda: SimpleNamespace(range_push=push, range_pop=iket.range_pop)
     )
     op = MixedGemm().enable_iket(waits=False)
-    cache._kernel_cache.clear()  # MixedGemm's name has no IKET suffix: keep this build private
-    try:
-        compile_gemm(op)
-    finally:
-        cache._kernel_cache.clear()
+    compile_gemm.cache_clear()  # trace even if another test compiled the same key
+    compile_gemm(op)
     budgets = [regs for regs, _, _ in op._ws_budget_groups]
     assert [e for e in events if isinstance(e, int)] == budgets  # once per budget, raw included
     regs_of = {r.name: r.regs for r in op._ws_roles}

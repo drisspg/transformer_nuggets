@@ -12,12 +12,8 @@ import cutlass
 from cuda.bindings import driver as cuda
 from cutlass import cute
 
-from transformer_nuggets.cute.cache import (
-    clear_cute_cache,
-    compile_tvm_ffi_and_cache,
-    get_cache_stats,
-)
-from transformer_nuggets.cute.utils import make_fake_compact_tensor
+from transformer_nuggets.cute.jit_cache import CacheInfo, jit_cache
+from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
     Consumer,
     CtaPair,
@@ -59,9 +55,6 @@ class ConfiguredCopy(WarpSpecialized):
         # Deliberately independent of roles: the shared compile cache must distinguish them.
         return "warpdrive_configured_copy"
 
-    def get_key(self) -> str:
-        return self.get_name()
-
     @role(config=load_config)
     @cute.jit
     def load(self, data: Producer, ctx: CopyCtx):
@@ -95,10 +88,10 @@ class ConfiguredCopy(WarpSpecialized):
         )
 
 
-def compile_copy(op: ConfiguredCopy, bound_method: bool = False):
-    return compile_tvm_ffi_and_cache(
-        op.__call__ if bound_method else op,
-        op.get_key(),
+@jit_cache
+def compile_copy(op: ConfiguredCopy):
+    return compile_tvm_ffi(
+        op,
         make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),), assumed_align=4),
         cutlass.Int32(1),
         name=op.get_name(),
@@ -255,19 +248,19 @@ def requires_blackwell():
         pytest.skip("requires a Blackwell GPU")
 
 
-@pytest.mark.parametrize("bound_method", [False, True])
-def test_configured_handoffs_and_cache_isolation(requires_blackwell, bound_method):
-    clear_cute_cache()
+def test_configured_handoffs_and_cache_isolation(requires_blackwell):
+    compile_copy.cache_clear()
     configs = [
         CopyRoles(),
         CopyRoles(RoleConfig(0, regs=48), RoleConfig(range(4, 8), regs=152)),
         CopyRoles(RoleConfig(0, regs=40), RoleConfig(range(8, 12), regs=160)),
     ]
-    compiled = [compile_copy(ConfiguredCopy(config), bound_method) for config in configs]
-    assert get_cache_stats()["misses"] == len(configs)
+    compiled = [compile_copy(ConfiguredCopy(config)) for config in configs]
+    assert compile_copy.cache_info().currsize == len(configs)
     assert len({id(fn) for fn in compiled}) == len(configs)
-    assert compile_copy(ConfiguredCopy(CopyRoles()), bound_method) is compiled[0]
-    assert get_cache_stats()["hits"] == 1
+    assert compile_copy(ConfiguredCopy(CopyRoles())) is compiled[0]
+    info = compile_copy.cache_info()  # disk loads count as hits too
+    assert info.hits + info.misses == len(configs) + 1 and info.currsize == len(configs)
     for config, fn in zip(configs, compiled):
         for n in (1, 7, 19):  # first use and ring wraps, without recompiling
             out = torch.full((384,), -1, device="cuda", dtype=torch.int32)
@@ -277,47 +270,37 @@ def test_configured_handoffs_and_cache_isolation(requires_blackwell, bound_metho
                 lanes = torch.arange(32, device="cuda", dtype=torch.int32)
                 expected[warp * 32 : (warp + 1) * 32] = 32 * n * (n - 1) // 2 + n * lanes
             torch.testing.assert_close(out, expected, rtol=0, atol=0)
-    assert get_cache_stats()["misses"] == len(configs)
+    assert compile_copy.cache_info().currsize == len(configs)
 
 
-def test_omitted_registers_emit_no_adjustment(requires_blackwell, monkeypatch):
+def test_omitted_registers_emit_no_adjustment(requires_blackwell, monkeypatch, traced_compiles):
     def unexpected_adjustment(*args, **kwargs):
         pytest.fail("regs=None must not emit setmaxnreg")
 
     monkeypatch.setattr(cute.arch, "setmaxregister_increase", unexpected_adjustment)
     monkeypatch.setattr(cute.arch, "setmaxregister_decrease", unexpected_adjustment)
     op = ConfiguredCopy(CopyRoles(RoleConfig(0), RoleConfig(1)))
-    clear_cute_cache()
+    compile_copy.cache_clear()
     compile_copy(op)
 
 
-@pytest.mark.parametrize("tvm_ffi", [False, True])
-@pytest.mark.parametrize("bound_method", [False, True])
-def test_both_cache_entrypoints_key_the_resolved_config(monkeypatch, tvm_ffi, bound_method):
-    from transformer_nuggets.cute import cache
-
-    cache.clear_cute_cache()
+def test_cache_key_is_the_resolved_config(tmp_path, monkeypatch):
+    """jit_cache keys the resolved roles, not the selector or the name (compile only)."""
+    monkeypatch.setenv("TRANSFORMER_NUGGETS_CUTE_CACHE_DIR", str(tmp_path))
     built = []
 
-    def compile_marker(op, *args, **kwargs):
-        owner = op.__self__ if bound_method else op
-        built.append(owner.role_config_key())
+    @jit_cache(persistent=False)
+    def compile_marker(op: ConfiguredCopy):
+        built.append(op.role_config_key())
         return object()
 
-    monkeypatch.setattr(cache.cute, "compile", compile_marker)
-    monkeypatch.setattr(cache, "compile_tvm_ffi", compile_marker)
-    compile_fn = cache.compile_tvm_ffi_and_cache if tvm_ffi else cache.compile_and_cache
-
-    def cached(roles=None):
-        op = ConfiguredCopy(roles)
-        return compile_fn(op.__call__ if bound_method else op, "same_key")
-
-    first = cached()
-    changed = CopyRoles(consume=RoleConfig(range(4, 8), regs=152))
-    second = cached(changed)
+    first = compile_marker(ConfiguredCopy())
+    second = compile_marker(ConfiguredCopy(CopyRoles(consume=RoleConfig(range(4, 8), regs=152))))
     assert first is not second
-    assert cached() is first
-    assert len(built) == 2
+    assert compile_marker(ConfiguredCopy()) is first
+    assert compile_marker(FixedCopy()) is not first  # same roles, another class
+    assert len(built) == 3
+    assert compile_marker.cache_info() == CacheInfo(hits=1, misses=3, currsize=3)
 
 
 def test_fa4_register_bucket(requires_blackwell):

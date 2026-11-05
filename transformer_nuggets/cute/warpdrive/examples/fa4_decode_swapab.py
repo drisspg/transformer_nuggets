@@ -69,8 +69,8 @@ from cutlass.utils import get_smem_capacity_in_bytes
 from flash_attn.cute.pack_gqa import pack_gqa_layout, select_modes
 from quack import copy_utils
 
-from transformer_nuggets.cute.cache import compile_tvm_ffi_and_cache
-from transformer_nuggets.cute.utils import make_fake_compact_tensor
+from transformer_nuggets.cute.jit_cache import jit_cache
+from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
     Consumer,
     Instance,
@@ -312,9 +312,6 @@ class SwapABDecode(WarpSpecialized):
             f"warpdrive_fa4_decode_swapab_hq{self.tile_hq}_k{n_k}v{n_v}_{self.work.get_key()}"
             f"{self.iket_key()}{self.trace_key()}"
         )
-
-    def get_key(self) -> str:
-        return self.get_name()
 
     # ------------------------------------------------------------------ helpers
 
@@ -1037,13 +1034,14 @@ class SwapABDecode(WarpSpecialized):
         )
 
 
+@jit_cache(uncached=lambda op: op.trace_protocol)
 def compile_decode(op: SwapABDecode):
-    """Compile once with dynamic batch, heads, KV length and split count."""
+    """Compile once with dynamic batch, heads, KV length and split count. Cached in memory and
+    on disk under ``op.__cute_cache_key__()``."""
     b, h, hkv, s, ns = (cute.sym_int() for _ in range(5))
     bf16, i32 = cutlass.BFloat16, cutlass.Int32
-    return compile_tvm_ffi_and_cache(
+    return compile_tvm_ffi(
         op,
-        op.get_key(),
         make_fake_compact_tensor(bf16, (b, h, HEAD_DIM)),
         make_fake_compact_tensor(bf16, (b, s, hkv, HEAD_DIM)),
         make_fake_compact_tensor(bf16, (b, s, hkv, HEAD_DIM)),
@@ -1101,7 +1099,7 @@ def decode_partials(
     if op is None:
         op = _OPS[key] = SwapABDecode(key[0], kv_stages, per_sequence)
     scale = softmax_scale if softmax_scale is not None else HEAD_DIM**-0.5
-    compile_decode(op)(
+    compile_decode.by_static_key(key, lambda: compile_decode(op))(
         q[:, 0],
         k,
         v,

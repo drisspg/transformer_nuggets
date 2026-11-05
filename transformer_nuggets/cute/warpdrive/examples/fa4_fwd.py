@@ -58,8 +58,8 @@ from cutlass.tensor_utils import LayoutEnum
 from flash_attn.cute.softmax import SoftmaxSm100
 from quack import copy_utils, layout_utils
 
-from transformer_nuggets.cute.cache import compile_tvm_ffi_and_cache
-from transformer_nuggets.cute.utils import make_fake_compact_tensor
+from transformer_nuggets.cute.jit_cache import jit_cache
+from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
     Consumer,
     Instance,
@@ -238,9 +238,6 @@ class FlashAttentionForward(WarpSpecialized):
             f"warpdrive_fa4_fwd_{self.cluster.get_key()}_kv{self.kv_stages}{ts}_"
             f"{self.work.get_key()}{self.iket_key()}{self.trace_key()}"
         )
-
-    def get_key(self) -> str:
-        return self.get_name()
 
     # ------------------------------------------------------------------ roles
 
@@ -826,16 +823,17 @@ class FlashAttentionForward(WarpSpecialized):
         ).launch(**self.launch_config(bound), stream=stream, min_blocks_per_mp=1)
 
 
+@jit_cache(uncached=lambda op: op.trace_protocol)
 def compile_fa4_fwd(op: FlashAttentionForward):
-    """Compile once with dynamic batch, heads, and sequence lengths."""
+    """Compile once with dynamic batch, heads, and sequence lengths. Cached in memory and on
+    disk under ``op.__cute_cache_key__()``."""
     b, h = cute.sym_int(), cute.sym_int()
     sq, sk = cute.sym_int(), cute.sym_int(divisibility=N_BLOCK)
     bf16 = cutlass.BFloat16
     qo = (b, sq, h, HEAD_DIM)
     kv = (b, sk, h, HEAD_DIM)
-    return compile_tvm_ffi_and_cache(
+    return compile_tvm_ffi(
         op,
-        op.get_key(),
         make_fake_compact_tensor(bf16, qo),
         make_fake_compact_tensor(bf16, kv),
         make_fake_compact_tensor(bf16, kv),
@@ -903,7 +901,7 @@ def fa4_fwd(
             mapping=mapping,
             use_ldred_rowmax=use_ldred_rowmax,
         )
-    fn = compile_fa4_fwd(op)
+    fn = compile_fa4_fwd.by_static_key(key, lambda: compile_fa4_fwd(op))
     workspace, sms = op.work.launch_args(q.device)
     fn(q, k, v, out, lse, scale * LOG2_E, workspace, max_ctas or sms)
     return out, lse

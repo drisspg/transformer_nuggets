@@ -53,8 +53,14 @@ def requires_blackwell() -> None:
         pytest.skip("warpdrive tests require SM100-family GPUs")
 
 
+# The diagnostic runs while tracing; a kernel loaded from the disk cache reports nothing.
+pytestmark = pytest.mark.usefixtures("traced_compiles")
+
+
 def compile_quietly(op, compile_fn=compile_fa4_fwd):
-    """Compile, returning the alias diagnostic's warnings (other warnings pass through)."""
+    """Compile (tracing, even if this process compiled the key before), returning the alias
+    diagnostic's warnings (other warnings pass through)."""
+    compile_fn.cache_clear()
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         fn = compile_fn(op)

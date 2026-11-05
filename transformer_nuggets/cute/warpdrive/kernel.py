@@ -14,6 +14,7 @@ import cutlass
 from cutlass import Int32, cute, memory, pipeline
 from cutlass._mlir.dialects import nvvm
 
+from transformer_nuggets.cute.jit_cache import module_source_digest
 from transformer_nuggets.cute.warpdrive import alias
 from transformer_nuggets.cute.warpdrive.channels import (
     Barriers,
@@ -301,6 +302,16 @@ def role(
 # --------------------------------------------------------------------------- #
 
 
+_HOST_SETTINGS = ("alias_check", "trace_protocol", "iket", "iket_waits")
+
+
+def _rebuild(cls, args, kwargs, settings):
+    kernel = cls(*args, **kwargs)
+    for name, value in settings.items():
+        setattr(kernel, name, value)
+    return kernel
+
+
 class WarpSpecialized:
     """Base for warp-specialized kernels.
 
@@ -325,6 +336,18 @@ class WarpSpecialized:
     iket: bool = False  # emit IKET ranges named after roles and channels (tracing.py)
     iket_waits: bool = True  # with iket: also a range around every blocking channel wait
     cluster: Cluster = SingleCta()  # or CtaPair(): one line switches to 2-CTA MMAs
+
+    def __new__(cls, *args, **kwargs):
+        self = super().__new__(cls)
+        # The constructor call, for pickling: a fresh compiler process rebuilds the kernel.
+        object.__setattr__(self, "_ws_init", (args, kwargs))
+        return self
+
+    def __reduce__(self):
+        """Pickle as the constructor call plus the host settings set after it (``alias_check``,
+        IKET, ``trace_protocol``); other attributes assigned after construction are not kept."""
+        settings = {k: vars(self)[k] for k in _HOST_SETTINGS if k in vars(self)}
+        return _rebuild, (type(self), *self._ws_init, settings)
 
     def __setattr__(self, name, value):
         if isinstance(value, WorkStream):
@@ -770,37 +793,54 @@ class WarpSpecialized:
 
     def role_config_key(self) -> tuple:
         """Resolved placement/budgets, independent of selector identity. First use collects and
-        freezes the role configuration. Include this value in custom compilation caches."""
+        freezes the role configuration. ``__cute_cache_key__`` includes it."""
         self._collect()
         return tuple(
             (r.role, r.index, r.first_warp, r.num_warps, r.regs, r.cta, r.raw)
             for r in self._ws_roles
         )
 
-    def __cute_compile_key__(self) -> tuple:
-        """Extra key consumed automatically by transformer_nuggets.cute.cache. This supplements
-        the author's algorithm key; it does not replace keys for tiles, dtypes or other flags."""
+    def get_key(self) -> str:
+        """The author's algorithm key: every compile-time choice the kernel reads (tiles,
+        stages, dtypes, flags). The default is ``get_name()``, which the examples build from
+        those choices; override it when the name leaves one out."""
+        return self.get_name()
+
+    def __cute_cache_key__(self) -> tuple:
+        """This kernel's key as a ``jit_cache`` compile argument (the examples' ``compile_*``).
+
+        ``jit_cache`` adds the class's module and name. On top of ``get_key()`` the layer keys
+        the resolved role placement and budgets, the cluster, each work stream, the IKET and
+        tracing settings, ``alias_check`` (a cached kernel skips the trace-time diagnostic, so a
+        "warn" build must not satisfy a "strict" one), and the source of every module defining
+        the kernel's, cluster's, and streams' classes: editing a kernel the compile function does
+        not import (a test's subclass) recompiles it instead of loading a stale entry."""
+        streams = [v for v in vars(self).values() if isinstance(v, WorkStream)]
+        parts = [self, self.cluster]
+        parts += [part for s in streams for part in (s.schedule, s.mapping, s.ready)]
+        modules = sorted({c.__module__ for part in parts for c in type(part).__mro__})
         return (
-            type(self).__module__,
-            type(self).__qualname__,
+            self.get_key(),
             self.role_config_key(),
             self.cluster.get_key(),
-            self.iket_key(),
-            self.trace_key(),
-            self.alias_check,  # a cached kernel skips the trace-time diagnostic (strict too)
+            tuple(s.get_key() for s in streams),
+            tuple(getattr(self, k) for k in _HOST_SETTINGS),
+            tuple((m, module_source_digest(m)) for m in modules),
         )
 
     def enable_iket(self, enabled: bool = True, *, waits: bool = True):
         """Emit IKET ranges in the next compile (``tracing.py`` lists the names). Off: no IR.
         ``waits=False`` keeps only the role/work-item ranges (fine-grained wait ranges cost
-        ~35% on FA4 under ``run-iket``; role ranges alone cost about nothing). Include
-        ``iket_key()`` in the compile-cache key (the examples' ``get_name`` does)."""
+        ~35% on FA4 under ``run-iket``; role ranges alone cost about nothing).
+        ``__cute_cache_key__`` keys both settings; ``iket_key()`` names them (the examples'
+        ``get_name`` uses it)."""
         self.iket, self.iket_waits = enabled, waits
         return self
 
     def trace_key(self) -> str:
-        """Compile-key suffix of ``trace_protocol``: a cached kernel was never traced, so a
-        traced instance needs its own entry to fill the protocol log."""
+        """Kernel-name suffix of ``trace_protocol``. A cached kernel was never traced, so the
+        examples compile a traced instance uncached (``jit_cache(uncached=...)``) to fill its
+        protocol log."""
         return "_trace" if self.trace_protocol else ""
 
     def iket_key(self) -> str:

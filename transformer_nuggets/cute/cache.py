@@ -99,13 +99,7 @@ def _cache_name(func: Callable) -> str:
 
 
 def _compile_cache_key(func: Callable, cache_key: str) -> str:
-    """An optional __cute_compile_key__ hook supplements the caller's algorithm key with
-    instance specialization state (for example warpdrive's resolved role configuration)."""
-    key = f"{_cache_name(func)}_{cache_key}"
-    extra = getattr(func, "__cute_compile_key__", None)
-    if extra is None:
-        extra = getattr(getattr(func, "__self__", None), "__cute_compile_key__", None)
-    return key if extra is None else f"{key}_instance={extra()!r}"
+    return f"{_cache_name(func)}_{cache_key}"
 
 
 def compile_and_cache(func: Callable, cache_key: str, *args, **kwargs):
@@ -142,8 +136,8 @@ def compile_tvm_ffi_and_cache(
     *args,
     name: str | None = None,
 ):
-    """Cache one canonical fake-tensor TVM-FFI compilation, including an optional instance key
-    returned by func.__cute_compile_key__()."""
+    """Cache one canonical fake-tensor TVM-FFI compilation in memory under ``cache_key``.
+    ``transformer_nuggets.cute.jit_cache`` adds a disk cache keyed by source and versions."""
     func_name = _cache_name(func)
     full_cache_key = _compile_cache_key(func, cache_key)
 

@@ -14,8 +14,8 @@ from cuda.bindings import driver as cuda
 from cutlass import cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from transformer_nuggets.cute.cache import compile_tvm_ffi_and_cache
-from transformer_nuggets.cute.utils import make_fake_compact_tensor
+from transformer_nuggets.cute.jit_cache import jit_cache
+from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
     Consumer,
     OneShot,
@@ -79,9 +79,6 @@ class Gemm(WarpSpecialized):
         return (
             f"warpdrive_gemm_ab{self.ab.n}_acc{self.acc_stages}{self.iket_key()}{self.trace_key()}"
         )
-
-    def get_key(self) -> str:
-        return self.get_name()
 
     # ------------------------------------------------------------------ roles
 
@@ -252,14 +249,15 @@ class Gemm(WarpSpecialized):
         )
 
 
+@jit_cache(uncached=lambda op: op.trace_protocol)
 def compile_gemm(op: Gemm):
-    """Compile once with dynamic M, N, K (K and N multiples of 8 for 16-byte TMA strides)."""
+    """Compile once with dynamic M, N, K (K and N multiples of 8 for 16-byte TMA strides).
+    Cached in memory and on disk under ``op.__cute_cache_key__()``."""
     m = cute.sym_int()
     n, k = cute.sym_int(divisibility=8), cute.sym_int(divisibility=8)
     bf16 = cutlass.BFloat16
-    return compile_tvm_ffi_and_cache(
+    return compile_tvm_ffi(
         op,
-        op.get_name(),
         make_fake_compact_tensor(bf16, (m, k)),
         make_fake_compact_tensor(bf16, (n, k)),
         make_fake_compact_tensor(bf16, (m, n)),
@@ -319,7 +317,7 @@ def gemm(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor | None = None) -> t
         return out
     if a.shape[1] == 0:  # no K tiles: the MMA would publish an unwritten accumulator
         return out.zero_()
-    compile_gemm(Gemm())(a, b, out)
+    compile_gemm.by_static_key("default", lambda: compile_gemm(Gemm()))(a, b, out)
     return out
 
 

@@ -493,7 +493,7 @@ def test_multicast_copy_needs_a_multicast_channel(requires_blackwell):
     assert isinstance(info.value, ProtocolError) or "ProtocolError" in repr(info.value)
 
 
-def test_2x2_gemm_tma_check_verifies_multicast(requires_blackwell):
+def test_2x2_gemm_tma_check_verifies_multicast(requires_blackwell, traced_compiles):
     op = PersistentGemm(cluster=PAIRS_2X2, tile_n=224)
     compile_persistent_gemm(op)
     assert "tma       verified CtaGroup.TWO, 30720 B/stage per CTA" in op.describe()
