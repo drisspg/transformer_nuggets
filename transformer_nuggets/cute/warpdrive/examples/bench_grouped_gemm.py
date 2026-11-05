@@ -15,7 +15,12 @@ from pathlib import Path
 
 import torch
 
-from transformer_nuggets.cute.warpdrive import AtomicPersistent, ClusterLaunchControl, CtaPair
+from transformer_nuggets.cute.warpdrive import (
+    AtomicPersistent,
+    ClusterLaunchControl,
+    CtaPair,
+    StaticPersistent,
+)
 from transformer_nuggets.cute.warpdrive.examples.grouped_gemm import (
     GroupedGemm,
     compile_grouped_gemm,
@@ -65,7 +70,11 @@ def variants_for(a, b, offsets, sizes, labels: list[str]) -> dict:
             calls[label] = loop
         else:
             cluster, *options = label.split("_")
-            schedules = {"atomic": AtomicPersistent(), "clc": ClusterLaunchControl()}
+            schedules = {
+                "atomic": AtomicPersistent(),
+                "clc": ClusterLaunchControl(),
+                "static": StaticPersistent(),
+            }
             op = GroupedGemm(
                 cluster=CtaPair() if cluster == "pair" else None,
                 schedule=next((schedules[o] for o in options if o in schedules), None),
@@ -147,7 +156,7 @@ def main() -> None:
         "--variants",
         nargs="+",
         default=["grouped_mm", "mm_loop", "single", "pair"],
-        help="grouped_mm, mm_loop, or single/pair with optional _atomic/_clc and _n<tile_n>",
+        help="grouped_mm, mm_loop, or single/pair with optional _atomic/_clc/_static and _n<tile_n>",
     )
     parser.add_argument("--samples", type=int, default=10)
     parser.add_argument("--rounds", type=int, default=5)
