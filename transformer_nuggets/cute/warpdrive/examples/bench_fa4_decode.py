@@ -11,15 +11,27 @@ runs with the same split count and table. Reported per shape:
   replay time.
 
 Run under ``gpu-run``:
-``python -m transformer_nuggets.cute.warpdrive.examples.bench_fa4_decode [--reps 200]``.
+``python -m transformer_nuggets.cute.warpdrive.examples.bench_fa4_decode --output results.json``.
+Timing uses fixed buffers and the median of seven interleaved round medians. ``--profile`` warms
+both variants, then brackets one complete call each with CUDA profiler start/stop for NCU.
 """
 
 import argparse
+import hashlib
+import json
 import math
 import os
 import statistics
+import subprocess
+import sys
+import time
+from dataclasses import asdict, dataclass
+from functools import partial
+from pathlib import Path
 
+import cutlass
 import torch
+import triton
 
 os.environ.setdefault("FLASH_ATTENTION_SM100_BACKEND", "swapab")
 
@@ -93,8 +105,24 @@ def graph_of(fn):
     return graph
 
 
-def replay_times(graph, reps):
-    """(median graph replay us, {kernel name: median us})."""
+@dataclass(frozen=True)
+class ReplayRound:
+    graph_samples_us: list[float]
+    kernel_samples_us: dict[str, list[float]]
+
+    @property
+    def graph_us(self) -> float:
+        return statistics.median(self.graph_samples_us)
+
+    @property
+    def kernels_us(self) -> dict[str, float]:
+        return {
+            name: statistics.median(samples) for name, samples in self.kernel_samples_us.items()
+        }
+
+
+def replay_times(graph, reps) -> ReplayRound:
+    """CUDA-event whole-graph times and CUPTI kernel times, in microseconds."""
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(reps)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(reps)]
     for _ in range(10):
@@ -105,26 +133,60 @@ def replay_times(graph, reps):
             graph.replay()
             e.record()
         torch.cuda.synchronize()
-    replay = statistics.median(s.elapsed_time(e) * 1e3 for s, e in zip(starts, ends))
+    replay = [s.elapsed_time(e) * 1e3 for s, e in zip(starts, ends)]
     kernels = {}
     for ev in prof.events():
         if ev.device_type == torch.autograd.DeviceType.CUDA and ev.device_time > 0:
             kernels.setdefault(ev.name, []).append(ev.device_time)
-    return replay, {name: statistics.median(t) for name, t in kernels.items()}
+    return ReplayRound(replay, kernels)
 
 
 def decode_kernel(kernels, needle):
     names = [n for n in kernels if needle in n]
-    return kernels[names[0]] if names else float("nan")
+    if len(names) != 1:
+        raise RuntimeError(f"expected one {needle!r} decode kernel, found {names}")
+    return kernels[names[0]]
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--reps", type=int, default=200)
+    parser.add_argument("--rounds", type=int, default=7, help="interleaved A/B rounds")
     parser.add_argument("--shapes", type=int, nargs="*", help="indices into SHAPES")
+    parser.add_argument(
+        "--output", type=Path, help="save provenance and all replay samples as JSON"
+    )
+    parser.add_argument(
+        "--profile", action="store_true", help="warm, then profile one call per variant"
+    )
     args = parser.parse_args()
-    shapes = [SHAPES[i] for i in args.shapes] if args.shapes else SHAPES
-    for b, s, h, hkv, pattern in shapes:
+    if args.reps < 1 or args.rounds < 1 or args.rounds % 2 == 0:
+        parser.error("--reps must be positive and --rounds must be positive and odd")
+    sys.argv = sys.argv[:1]  # CuTeDSL also parses application arguments during compilation.
+    shape_indices = args.shapes if args.shapes is not None else list(range(len(SHAPES)))
+    results = []
+    metadata = {
+        "torch": torch.__version__,
+        "cutlass": cutlass.__version__,
+        "triton": triton.__version__,
+        "gpu": torch.cuda.get_device_name(),
+        "gpu_uuid": os.environ.get("GPU_RUN_GPU_UUID"),
+        "source_sha256": {
+            filename: hashlib.sha256(Path(__file__).with_name(filename).read_bytes()).hexdigest()
+            for filename in ("bench_fa4_decode.py", "fa4_decode_swapab.py")
+        },
+        "warpdrive_commit": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True
+        ).strip(),
+        "fa4_commit": subprocess.check_output(
+            ["git", "-C", str(Path(interface.__file__).parents[2]), "rev-parse", "HEAD"], text=True
+        ).strip(),
+        "reps": args.reps,
+        "rounds": args.rounds,
+        "contract": "fixed-buffer CUDA graph; CUPTI kernel durations; normal DVFS; capture excluded",
+    }
+    for shape_index in shape_indices:
+        b, s, h, hkv, pattern = SHAPES[shape_index]
         torch.manual_seed(0)
         q = torch.randn(b, 1, h, 128, device="cuda", dtype=torch.bfloat16)
         k = torch.randn(b, s, hkv, 128, device="cuda", dtype=torch.bfloat16)
@@ -145,34 +207,91 @@ def main():
         lse = lse[..., 0]
         do = (o - o_fa4)[owned].abs().max().item()
         same = torch.equal(o[owned], o_fa4[owned])
+        same_lse = torch.equal(lse[owned], lse_fa4[owned])
+        if not same or not same_lse:
+            raise RuntimeError(f"shape {shape_index}: port partials are not bitwise equal to FA4")
         fin = owned[..., None] & torch.isfinite(lse_fa4)
         dl = (lse - lse_fa4)[fin].abs().max().item() if fin.any() else 0.0
         ref = reference(q, k, v, used)
         err_port = (out.float() - ref).abs().max().item()
         err_fa4 = (out_fa4.float() - ref).abs().max().item()
-        g_fa4 = graph_of(lambda: interface._flash_attn_fwd(
-            q, k, v, seqused_k=used, max_seqlen_k=s, num_splits=0, return_lse=True
-        ))  # fmt: skip
+        g_fa4 = graph_of(
+            partial(
+                interface._flash_attn_fwd,
+                q,
+                k,
+                v,
+                seqused_k=used,
+                max_seqlen_k=s,
+                num_splits=0,
+                return_lse=True,
+            )
+        )
         # The port's wrapper fills seqused_k when it is None; build it outside the graph.
         used_port = used if used is not None else torch.full((b,), s, device="cuda").int()
         g_port = graph_of(
-            lambda: fa4_decode(q, k, v, splits, seqused_k=used_port, splits_per_seq=table)
+            partial(fa4_decode, q, k, v, splits, seqused_k=used_port, splits_per_seq=table)
         )
-        t_fa4, k_fa4 = replay_times(g_fa4, args.reps)
-        t_port, k_port = replay_times(g_port, args.reps)
-        # Interleave a second round so drift affects both.
-        t_fa4b, k_fa4b = replay_times(g_fa4, args.reps)
-        t_portb, k_portb = replay_times(g_port, args.reps)
-        dec_fa4 = min(decode_kernel(k_fa4, "attn_kernel"), decode_kernel(k_fa4b, "attn_kernel"))
-        dec_port = min(decode_kernel(k_port, "warpdrive"), decode_kernel(k_portb, "warpdrive"))
+        if args.profile:
+            torch.cuda.cudart().cudaProfilerStart()
+            interface._flash_attn_fwd(
+                q, k, v, seqused_k=used, max_seqlen_k=s, num_splits=0, return_lse=True
+            )
+            fa4_decode(q, k, v, splits, seqused_k=used_port, splits_per_seq=table)
+            torch.cuda.synchronize()
+            torch.cuda.cudart().cudaProfilerStop()
+            print(
+                f"shape {shape_index}: warmed and profiled matched {splits}-split decodes",
+                flush=True,
+            )
+            continue
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            g_fa4.replay()
+            g_port.replay()
+            torch.cuda.synchronize()
+        rounds = {"fa4": [], "port": []}
+        graphs = {"fa4": g_fa4, "port": g_port}
+        for round_index in range(args.rounds):
+            order = ("fa4", "port") if round_index % 2 == 0 else ("port", "fa4")
+            for variant in order:
+                rounds[variant].append(replay_times(graphs[variant], args.reps))
+        dec_fa4 = statistics.median(
+            decode_kernel(r.kernels_us, "attn_kernel") for r in rounds["fa4"]
+        )
+        dec_port = statistics.median(
+            decode_kernel(r.kernels_us, "warpdrive") for r in rounds["port"]
+        )
+        graph_fa4 = statistics.median(r.graph_us for r in rounds["fa4"])
+        graph_port = statistics.median(r.graph_us for r in rounds["port"])
+        results.append(
+            {
+                "shape_index": shape_index,
+                "shape": SHAPES[shape_index],
+                "splits": splits,
+                "counts": counts,
+                "partials_bitwise_equal": same and same_lse,
+                "partial_o_max_error": do,
+                "partial_lse_max_error": dl,
+                "final_o_max_error": {"fa4": err_fa4, "port": err_port},
+                "decode_us": {"fa4": dec_fa4, "port": dec_port},
+                "graph_us": {"fa4": graph_fa4, "port": graph_port},
+                "rounds": {name: [asdict(r) for r in samples] for name, samples in rounds.items()},
+            }
+        )
+        if args.output is not None:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(
+                json.dumps({"metadata": metadata, "results": results}, indent=2)
+            )
         print(
             f"b{b} s{s} h{h}/{hkv} {pattern} splits {splits} "
             f"{'per-seq ' + str(counts) if table is not None else 'static'}\n"
             f"  partials: max|dO| {do:.1e} bitwise {same}, max|dLSE| {dl:.1e}; "
             f"final vs fp32: port {err_port:.1e}, FA4 {err_fa4:.1e}\n"
             f"  decode kernel us: FA4 {dec_fa4:.2f}, port {dec_port:.2f} "
-            f"({dec_port / dec_fa4:.3f}x); graph us: FA4 {min(t_fa4, t_fa4b):.2f}, "
-            f"port {min(t_port, t_portb):.2f}",
+            f"({dec_port / dec_fa4:.3f}x); graph us: FA4 {graph_fa4:.2f}, "
+            f"port {graph_port:.2f}",
             flush=True,
         )
 
