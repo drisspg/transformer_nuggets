@@ -20,6 +20,8 @@ Then read the closest complete example, including its host wrapper, launch and c
 
 - [GEMM](examples/gemm.py): single-CTA TMA → MMA → epilogue.
 - [Persistent GEMM](examples/persistent_gemm.py): repeated work, schedules and clusters.
+- [Grouped GEMM](examples/grouped_gemm.py): a custom `WorkMap` decoding device-side group
+  sizes, per-item TMA addressing and a ragged TMA store.
 - [FA4 forward](examples/fa4_fwd.py): slots, fan-out and overlapping lifetimes.
 - [Swap-AB decode](examples/fa4_decode_swapab.py): round-robin and named channels; not a
   persistent template.

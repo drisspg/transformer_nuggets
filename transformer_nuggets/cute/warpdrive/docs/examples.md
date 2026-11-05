@@ -7,6 +7,10 @@
 - [persistent_gemm.py](../examples/persistent_gemm.py): all four schedules, double-buffered
   accumulators, TMA stores, CTA pairs, larger clusters with TMA multicast and configurable
   `tile_n`.
+- [grouped_gemm.py](../examples/grouped_gemm.py): MoE grouped GEMM with group sizes read on
+  the device: a `WorkMap` that decodes `(group, rows, n_tile)` from the offsets, one TMA
+  descriptor per operand across all groups and a ragged TMA store
+  ([details](#grouped-gemm)).
 - [fa4_fwd.py](../examples/fa4_fwd.py): two softmax instances, a correction role, slots,
   fan-out/join, turnstiles, S/P aliasing, split-P, persistence and CTA pairs.
 - [packed_work.py](../examples/packed_work.py): a mapping for a device-built work table with
@@ -89,6 +93,55 @@ The harness is a CUDA-graph A/B: one graph per configuration, captured once, rep
 round-robin rounds (`torch.mm` first, then the widths in order) with default clocks and warm
 L2, reporting each configuration's best round median. Rerun it at your shapes before trusting
 a difference under 5%.
+
+## Grouped GEMM
+
+```python
+from transformer_nuggets.cute.warpdrive.examples.grouped_gemm import grouped_gemm
+
+a = torch.randn(4096, 7168, device="cuda", dtype=torch.bfloat16)  # the experts' rows, concatenated
+b = torch.randn(8, 2048, 7168, device="cuda", dtype=torch.bfloat16)  # one (N, K) weight per expert
+offsets = torch.tensor([700, 700, 1500, 2100, 2100, 3000, 4000, 4096], device="cuda", dtype=torch.int32)
+out = grouped_gemm(a, b, offsets)  # out[s_g:e_g] = a[s_g:e_g] @ b[g].T
+```
+
+`offsets` holds each group's end row (`torch._grouped_mm`'s `offs`) and is read only on the
+device, so one compiled kernel serves every `G`, `total_M`, `N`, `K` and routing; groups may be
+empty or any size. Rows past `offsets[-1]` are left untouched. Operand limits are those of
+the GEMMs above. Keyword options: `schedule` (default `AtomicPersistent()`), `cluster`
+(`SingleCta()` or `CtaPair()`), `max_ctas`, `tile_n`, `ab_stages`, `acc_stages`, `c_stages`,
+`epi_tile_n` and `roles`.
+
+The host cannot count the groups' tiles, so `GroupedTiles` declares
+`ceil(total_M / tile_m) + G` m-tiles (each group's ragged tail adds at most one) and the
+device decode drops the unused slot per group: a binary search over the offsets finds the
+group of an m-tile in `log2(G)` loads. Under a local schedule (`StaticPersistent`, `OneShot`)
+every role repeats that search between tiles, which measured 10-27% slower than the broadcast
+schedules (`AtomicPersistent`, `ClusterLaunchControl`) on the shapes below; hence the default.
+
+A and `out` use one TMA descriptor each, addressed at the item's row with
+`cute.domain_offset`; B is a 3-D `(N, K, G)` view so the group is a TMA coordinate. The output
+is stored through a ragged TMA view (a `(2^30, N, 2^31 - 1)` tensor whose row mode ends where
+TMA clips and whose third mode selects the group's end row), so a tile that ends inside a
+group is clipped by the TMA store like a tile at the tensor's edge.
+
+CUDA-graph replay on a shared GB300 (`bench_grouped_gemm.py`, 20 calls per graph, min of
+five interleaved rounds' medians), skewed routing with 1/8 of the experts idle; microseconds
+per call and TFLOP/s on the real rows. `grouped_mm` is `torch._grouped_mm`, `mm loop` a
+`torch.mm` per group, `pair` is `CtaPair()`:
+
+| G, tokens, N x K | `grouped_mm` | `mm loop` | 1 CTA atomic | 1 CTA CLC | pair atomic |
+|---|---:|---:|---:|---:|---:|
+| 8, 4096, 2048 x 7168 | 117 (1024) | 119 | 105 (1146) | 90 (1339) | 121 |
+| 8, 16384, 7168 x 2048 | 316 (1521) | 333 | 335 (1438) | 336 | 329 |
+| 64, 8192, 4096 x 4096 | 410 (670) | 521 | 366 (751) | 373 | 422 |
+| 64, 32768, 2048 x 7168 | 809 (1189) | 914 | 799 (1205) | 823 | 832 |
+| 128, 16384, 7168 x 2048 | 726 (663) | 826 | 612 (786) | 627 | 725 |
+| 128, 32768, 4096 x 4096 | 1090 (1009) | 1230 | 1116 (986) | 1108 | 1163 |
+
+Small skewed groups waste rows in 128-row tiles (1.5x the real rows at G=64 and G=128 here)
+for every kernel; a pair's 256-row tiles waste twice that, so `CtaPair()` only ties on the
+G=8 shapes.
 
 ## Attention forward
 
