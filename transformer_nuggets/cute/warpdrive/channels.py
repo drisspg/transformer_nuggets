@@ -856,6 +856,11 @@ class _End:
             state = Int32(values[0])
         else:
             state = self._state.__new_from_mlir_values__(values)
+        return self._rebuilt(state, self._views)
+
+    def _rebuilt(self, state, views):
+        """A new copy of this end (registered in the shared record's lineage) with ``state``
+        and ``views``."""
         return type(self)(
             self._chan,
             self._bars,
@@ -865,7 +870,7 @@ class _End:
             state,
             self._cta,
             self._rec,
-            self._views,
+            views,
             self._stride,
         )
 
@@ -895,18 +900,7 @@ class _End:
                     f"{self._trace.role_name}: {chan.name}.views({name}=...): the view's stage "
                     f"mode {part.axis} has {extent} stages, but {chan.name} has {chan.n}"
                 )
-        return type(self)(
-            chan,
-            self._bars,
-            self._buffers,
-            self._trace,
-            self._bound,
-            self._state,
-            self._cta,
-            self._rec,
-            {**self._views, **named},
-            self._stride,
-        )
+        return self._rebuilt(self._state, {**self._views, **named})
 
     def _mbarriers(self, what: str):
         if self._chan.named:
@@ -997,13 +991,15 @@ class _End:
         it hands out the live state, which raw code may advance in place, so it invalidates
         the end's outstanding try tokens and unadopted previews, as assigning it does."""
         self._check_current()
-        self._rec.resets += 1
-        self._rec.lineage.advanced(self._copy)
+        self._raw_state_access()
         return self._state
 
     @state.setter
     def state(self, value):
         self._state = value
+        self._raw_state_access()
+
+    def _raw_state_access(self):
         self._rec.resets += 1  # outstanding tokens no longer name the end's epoch
         self._rec.lineage.advanced(self._copy)
 
@@ -1101,9 +1097,13 @@ class _End:
             self._rec.slots.add(slot)
         else:
             self._state.advance(self._stride)
-        self._rec.advances[slot] = self._rec.advances.get(slot, 0) + 1
-        self._rec.lineage.advanced(self._copy)
+        self._advanced(slot)
         return index, phase, label
+
+    def _advanced(self, key):
+        """Count this copy's move to the next epoch of ``key`` (a slot, None for a ring)."""
+        self._rec.advances[key] = self._rec.advances.get(key, 0) + 1
+        self._rec.lineage.advanced(self._copy)
 
     def _current(self, slot, op):
         """(index, phase, label) of the next use, without advancing."""
@@ -1329,8 +1329,7 @@ class ConsumerEnd(_End):
         self._check_current()
         self._trace.record(chan.name, "skip", None, count=n)
         self._state.advance(n)
-        self._rec.advances[None] = self._rec.advances.get(None, 0) + 1
-        self._rec.lineage.advanced(self._copy)
+        self._advanced(None)
 
     def peek(self, slot=None) -> Preview:
         """Wait until the stage the next ``wait`` takes is full and return a read-only
