@@ -517,7 +517,7 @@ correction warpgroup. What it needed from the layer:
 
 - Work items `(split, kv_head, batch)` from a `SplitKV` mapping. With per-sequence counts it
   reads the table after `PdlWait()` and drops the splits past each count.
-- `round_robin` rings for S, P and the row-max/row-sum mailboxes, so softmax[i] takes blocks
+- Round-robin sides (`Sharing.ROUND_ROBIN`) on S, P and the row-max/row-sum mailboxes, so softmax[i] takes blocks
   i, i+2, ... with one warpgroup's counts. The schedule stays `OneShot`: with an odd block
   count a second item would start on softmax[1]'s epochs.
 - Named-barrier channels for the thread mailboxes, with a turnstile around the shared row-max
@@ -945,7 +945,7 @@ out, lse = fa4_decode(q, k, v, num_splits, seqused_k=lengths, splits_per_seq=cou
 ```
 
 `SharedKVDecode` (`shared_kv=True` in `fa4_decode`/`decode_partials`) ports the prototype onto
-the layer: one `Ring(sum(kv_stages), Tma(...), Umma, consumer_mode="exclusive")` whose stages
+the layer: one `Ring(sum(kv_stages), Tma(...), Umma, consumer_sharing=Sharing.EXCLUSIVE)` whose stages
 hold either a K tile or a V^T tile (the V buffer overlaps K), with the QK and PV warps as exclusive
 consumers that `skip()` each other's blocks, and FA4's QKIssued/PVIssued `NamedBarrier`s
 ([recipe](channels.md#rendezvous-recipe-fa4s-qkissuedpvissued)). Both MMA warps probe their

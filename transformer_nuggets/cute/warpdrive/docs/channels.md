@@ -100,10 +100,27 @@ An unbound end can visit any slot. This is useful for one MMA warp producing two
 two softmax instances consume independently. The [FA4 example](../examples/fa4_fwd.py) uses
 this pattern.
 
+## Sharing epochs
+
+Each side of a channel shares its epochs among the role instances bound to it in one of three
+ways, a `Sharing` passed as `producer_sharing=` or `consumer_sharing=`:
+
+- `Sharing.JOIN` (the default): every instance takes every epoch it is bound to, and an
+  epoch's count is the sum of their contributions, the join of
+  [counts](#counts-come-from-the-roles). Either side, `Ring` or `Slots`.
+- `Sharing.ROUND_ROBIN`: the instances take the epochs in turn ([below](#round-robin-instances)).
+  Either side, `Ring` only.
+- `Sharing.EXCLUSIVE`: one of the declared consumer roles owns each epoch and the others skip it
+  ([exclusive consumers](#exclusive-consumers)). Consumers of an mbarrier `Ring` only.
+
+A non-join side gives each epoch one owner, so its count is one instance's. When every
+acquire, wait and skip on such a channel is static, collection checks the
+[ownership](#static-ownership-check).
+
 ## Round-robin instances
 
 ```python
-self.s = Ring(4, Umma, Threads, round_robin=True)
+self.s = Ring(4, Umma, Threads, consumer_sharing=Sharing.ROUND_ROBIN)
 
 
 @role(warps=[range(4, 8), range(8, 12)], regs=120)
@@ -115,15 +132,17 @@ def softmax(self, params, *, stage: Instance, s: Consumer):
     return s
 ```
 
-With `round_robin=True`, the instances on a side take the epochs in turn. Instance j of k
+With `Sharing.ROUND_ROBIN` on a side, its instances take the epochs in turn. Instance j of k
 handles epochs j, j + k, j + 2k, ..., in instance-binding order. Its zero-based operation m
 uses stage `(j + m*k) % n` and that epoch's [phase](#stages-and-phases), so softmax[1] above
-starts at the second stage and skips softmax[0]'s. Either or both sides can rotate; a side
-with one instance is unchanged. Each epoch's count is one instance's arrivals: 128 here,
-not the 256 of a join.
+starts at the second stage and skips softmax[0]'s. Either or both sides can rotate, each
+declared separately; a round-robin side needs at least two instances. Each epoch's count is
+one instance's arrivals: 128 here, not the 256 of a join.
 `describe()` prints the rotation and the per-epoch count. The instances must be one role with
-the same width, and their loops must visit their own epochs; nothing checks that the trip counts
-add up. Epochs continue across work items; entering a new work iteration does not reset an
+the same width, and their loops must visit their own epochs: an instance is an
+[owner](#static-ownership-check) that skips the other instances' epochs after each of its own,
+so static trip counts that do not add up raise, and dynamic ones stay `unverified`. Epochs
+continue across work items; entering a new work iteration does not reset an
 end's rotation. Round-robin rings are CTA-local and cannot multicast. On an mbarrier ring the
 stage count must be a multiple of k, and the layer adds no turn-taking. A parity wait is exact only
 when the waiter saw the stage's previous epoch itself; with 3 instances on 2 stages, instance 2's
@@ -138,7 +157,7 @@ self.kv = Ring(
     Tma(stage_bytes),
     Umma,
     consumer_roles=("mma_qk", "mma_pv"),
-    consumer_mode="exclusive",
+    consumer_sharing=Sharing.EXCLUSIVE,
     buffer={"K": k_buf, "V": v_buf},
 )
 
@@ -149,15 +168,15 @@ for _ in cutlass.range_constexpr(k_stages):
         ...
 ```
 
-With `consumer_mode="exclusive"` each epoch of the ring has exactly one owner among the
-consumers. The owner waits for it and releases it as usual; every other consumer calls
+With `consumer_sharing=Sharing.EXCLUSIVE` each epoch of the ring has exactly one owner among
+the consumers. The owner waits for it and releases it as usual; every other consumer calls
 `skip(n)`, which advances its end's stage, phase and count by n epochs without waiting or
 arriving. The counts are one consumer's contribution (1 for `Umma`), not a join's, and the
-producer still fills every epoch in order. The default, `"join"`, keeps the fan-out join
-described in [counts](#counts-come-from-the-roles). Selecting neither mode changes nothing in
-other channels; `skip()` emits only the index arithmetic.
+producer still fills every epoch in order. The default, `Sharing.JOIN`, keeps the fan-out join
+described in [counts](#counts-come-from-the-roles). The sharing of one channel changes nothing
+in others; `skip()` emits only the index arithmetic.
 
-The layer checks the topology: a `Ring` with mbarriers, without `round_robin` or
+The layer checks the topology: a `Ring` with mbarriers, a joining producer side, and not
 `sync="named"`; `consumer_roles` declared, each bound to a consumer end; at least two consumer
 instances with equal contributions (single-warp roles for `Umma`); one producer instance; and
 CTA-local placement. [`override=`](dropping_down.md) applies as on any mbarrier ring. Full-side
@@ -170,14 +189,20 @@ supply them. `skip()` exists only on an exclusive ring's consumer ends and is
 end's `state` (raw code may advance it), leaves the ownership check `unverified`. Skipping makes the end's outstanding [try tokens](#try-tokens) stale, and
 skipping past an unconsumed [preview](#previews) raises.
 
-When every acquire, wait and skip on the ring is static (no dynamic loop or branch around
-them except the work-item loop) and every role uses the ring either once per work item or
-once per launch, collection checks ownership: each epoch the producer publishes has exactly
-one waiting consumer (a final acquire closed with `retire()` has none), no consumer runs past
-the producer, and under a persistent schedule every consumer advances through every epoch of
-an item. A violation raises. `describe()` prints `epochs  verified: ...` or, when any of them
-(or a skip count) is dynamic, `unverified (...)` with the reason; then ownership is your
-obligation.
+### Static ownership check
+
+When every acquire, wait and skip on an exclusive or round-robin channel is static (no dynamic
+loop or branch around them except the work-item loop) and every role uses it either once per
+work item or once per launch, collection checks ownership: each epoch is filled by exactly one
+producer instance, each epoch the producers publish has exactly one waiting consumer (a final
+acquire closed with `retire()` has none), no consumer runs past the producers, and under a
+persistent schedule every instance advances through every epoch of an item (a round-robin
+instance j of k must take an item's epochs j, j + k, ... and resume at j in the next, so k
+divides each item's epochs). A violation raises. `describe()` prints `epochs  verified: ...`
+or, when any of them (or a skip count) is dynamic, `unverified (...)` with the reason; then
+ownership is your obligation. The check needs one joining instance opposite the shared side
+(exclusive consumers have one producer by construction); round-robin instances on both sides,
+or several joining instances, stay `unverified`.
 
 **A skip can make the next wait inexact.** A wait of epoch e tests parity `(e // n) % 2` on
 stage `e % n`, which is exact once epoch e - n was filled: before that, the stage is one
@@ -232,8 +257,9 @@ effect, not only correctness.
 ## Named-barrier channels
 
 ```python
-self.row_sum = Ring(2, Threads, Threads, sync="named", round_robin=True)
-self.row_max = Ring(1, Threads, Threads, sync="named", round_robin=True, turnstile="mufu")
+rr = Sharing.ROUND_ROBIN  # two softmax warpgroups produce in turn
+self.row_sum = Ring(2, Threads, Threads, sync="named", producer_sharing=rr)
+self.row_max = Ring(1, Threads, Threads, sync="named", producer_sharing=rr, turnstile="mufu")
 self.mufu = Turnstile()
 
 with mufu.turn():

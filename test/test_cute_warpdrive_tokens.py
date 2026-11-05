@@ -24,6 +24,7 @@ from transformer_nuggets.cute.warpdrive import (
     Consumer,
     Producer,
     Ring,
+    Sharing,
     Slots,
     SmemPlan,
     Threads,
@@ -265,7 +266,7 @@ class Accepted(Toy):
         self.mode = mode
         self.ch = Ring(2, Threads, Threads, payload=(cutlass.Int32, (N,)))
         self.slots = Slots(2, Threads, Threads)
-        self.rr = Ring(2, Threads, Threads, round_robin=True)
+        self.rr = Ring(2, Threads, Threads, consumer_sharing=Sharing.ROUND_ROBIN)
 
     @role(warps=0)
     @cute.jit

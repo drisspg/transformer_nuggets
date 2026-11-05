@@ -502,7 +502,7 @@ def _handoff_handles(acc: Access) -> list:
     return [
         h
         for h in acc.handles
-        if not h.chan.internal and not h.chan.round_robin and (h.chan.fixed or h.chan.n == 1)
+        if not h.chan.internal and not h.chan.rotates and (h.chan.fixed or h.chan.n == 1)
     ]
 
 
@@ -678,7 +678,7 @@ class _Graph:
                     if not waits:
                         continue
                     label = name if slot is None else f"{name}[{slot}]"
-                    if chan.exclusive or chan.round_robin:
+                    if chan.exclusive or chan.rotates:
                         # Which consumer owns which epoch follows its runtime skips, and a
                         # round-robin instance's epochs interleave with the others' (j, j + k,
                         # ...), which the traced counts do not match: every pairing is a guess.

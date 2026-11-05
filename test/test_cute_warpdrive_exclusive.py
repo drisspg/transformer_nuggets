@@ -1,5 +1,5 @@
-"""Exclusive consumers (``Ring(..., consumer_mode="exclusive")``): each epoch is owned by one of
-several consumer roles, which waits and releases it, while the others ``skip()`` it.
+"""Exclusive consumers (``Ring(..., consumer_sharing=Sharing.EXCLUSIVE)``): each epoch is owned
+by one of several consumer roles, which waits and releases it, while the others ``skip()`` it.
 
 Declaration, collection and trace-time errors; the static ownership check and ``describe()``;
 the alias diagnostic's treatment of exclusive epochs; runtime toys with interleaved and grouped
@@ -29,6 +29,7 @@ from transformer_nuggets.cute.warpdrive import (
     OneShot,
     Producer,
     Ring,
+    Sharing,
     Slots,
     StaticPersistent,
     Threads,
@@ -58,7 +59,7 @@ def exclusive(n=4, consumer=Threads, **kw):
         Threads,
         consumer,
         consumer_roles=("a", "b"),
-        consumer_mode="exclusive",
+        consumer_sharing=Sharing.EXCLUSIVE,
         payload=(cutlass.Int32, (N,)),
         **kw,
     )
@@ -123,16 +124,19 @@ def take(ctx, kv, e, who: int, delay):
 
 
 def test_declaration_errors():
-    with pytest.raises(ValueError, match="consumer_mode must be one of"):
-        Ring(2, Threads, Threads, consumer_mode="fanout")
+    excl = Sharing.EXCLUSIVE
+    with pytest.raises(ValueError, match="consumer_sharing must be a Sharing"):
+        Ring(2, Threads, Threads, consumer_sharing="exclusive")
     with pytest.raises(ValueError, match="needs a Ring"):
-        Slots(2, Threads, Threads, consumer_roles=("a", "b"), consumer_mode="exclusive")
-    with pytest.raises(ValueError, match="cannot be combined with sync='named'"):
+        Slots(2, Threads, Threads, consumer_roles=("a", "b"), consumer_sharing=excl)
+    with pytest.raises(ValueError, match="needs an mbarrier ring: exclusive consumers skip"):
         exclusive(sync="named")
-    with pytest.raises(ValueError, match="cannot be combined with round_robin=True"):
-        exclusive(round_robin=True)
+    with pytest.raises(ValueError, match="producer_sharing must be Sharing.JOIN"):
+        exclusive(producer_sharing=Sharing.ROUND_ROBIN)
+    with pytest.raises(ValueError, match="producer_sharing=Sharing.EXCLUSIVE is not supported"):
+        Ring(2, Threads, Threads, producer_sharing=excl)
     with pytest.raises(ValueError, match="needs consumer_roles"):
-        Ring(2, Threads, Threads, consumer_mode="exclusive")
+        Ring(2, Threads, Threads, consumer_sharing=excl)
 
 
 def _kernel(channels, roles, cluster=None):
@@ -210,7 +214,7 @@ def test_declared_role_must_consume():
     _raises_protocol(r"exclusive consumer role\(s\) \['b'\] take no Consumer end", op.describe)
 
 
-_EXCL = {"consumer_mode": "exclusive"}
+_EXCL = {"consumer_sharing": Sharing.EXCLUSIVE}
 
 
 def test_umma_consumers_and_cross_cta_placement():
@@ -747,7 +751,7 @@ class AliasModel(WarpSpecialized):
             Threads,
             Threads,
             consumer_roles=roles,
-            consumer_mode=mode,
+            consumer_sharing=Sharing(mode),
             commit_fence="tmem_store",
         )
         self.back = Ring(1, Threads, Threads)

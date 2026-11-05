@@ -89,6 +89,7 @@ from transformer_nuggets.cute.warpdrive import (
     Producer,
     Ring,
     RoleConfig,
+    Sharing,
     SmemPlan,
     StageView,
     Threads,
@@ -315,7 +316,7 @@ class SwapABDecode(WarpSpecialized):
                 Tma(self.kv_stage_bytes),
                 Umma,
                 consumer_roles=("mma_qk", "mma_pv"),
-                consumer_mode="exclusive",
+                consumer_sharing=Sharing.EXCLUSIVE,
                 buffer={"K": k_buf, "V": v_buf},
             )
             # FA4's QKIssued/PVIssued: each MMA warp arrives on one after issuing a block and
@@ -325,14 +326,22 @@ class SwapABDecode(WarpSpecialized):
         else:
             self.k = Ring(n_k, Tma(self.kv_stage_bytes), Umma, buffer=k_buf)
             self.v = Ring(n_v, Tma(self.kv_stage_bytes), Umma, buffer=v_buf)
-        self.s = Ring(s_stages, Umma, Threads, round_robin=True)
+        rr = Sharing.ROUND_ROBIN  # softmax[0|1] take alternate KV blocks
+        self.s = Ring(s_stages, Umma, Threads, consumer_sharing=rr)
         self.p = Ring(
-            p_stages, Threads, Umma, round_robin=True, commit_fence="smem_async", buffer=p_buf
+            p_stages, Threads, Umma, producer_sharing=rr, commit_fence="smem_async", buffer=p_buf
         )
         self.o = Ring(O_STAGES, Umma, Threads, release_fence="tmem_store")
-        self.row_max = Ring(1, Threads, Threads, sync="named", round_robin=True, turnstile="mufu")
+        self.row_max = Ring(
+            1, Threads, Threads, sync="named", producer_sharing=rr, turnstile="mufu"
+        )
         self.row_sum = Ring(
-            O_STAGES, Threads, Threads, sync="named", round_robin=True, commit_fence="tmem_store"
+            O_STAGES,
+            Threads,
+            Threads,
+            sync="named",
+            producer_sharing=rr,
+            commit_fence="tmem_store",
         )
         # One-shot flags between the correction warpgroup and the load warp: the signalling
         # side arrives, the other syncs. Each completes once per work item and a OneShot CTA

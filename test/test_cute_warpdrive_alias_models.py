@@ -20,6 +20,7 @@ from transformer_nuggets.cute.warpdrive import (
     Consumer,
     Producer,
     Ring,
+    Sharing,
     Slots,
     SmemPlan,
     Threads,
@@ -730,8 +731,9 @@ class RoundRobinRoundTrip(Model):
 
     def __init__(self, early: bool):
         self.early = early
-        self.s = Ring(2, Threads, Threads, round_robin=True, commit_fence="tmem_store")
-        self.back = Ring(2, Threads, Threads, round_robin=True)
+        rr = Sharing.ROUND_ROBIN
+        self.s = Ring(2, Threads, Threads, consumer_sharing=rr, commit_fence="tmem_store")
+        self.back = Ring(2, Threads, Threads, producer_sharing=rr)
         self.tmem_plan = TmemPlan().region("S", 128).alias("P", of="S", offset=64, cols=64)
 
     @role(warps=0)

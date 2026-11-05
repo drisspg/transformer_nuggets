@@ -27,7 +27,7 @@ declared by the kernel: channels and their stage counts, signal mechanisms and f
 | TMEM allocation | The plan's columns rounded up to a power of two, at least 32 | Hardware (`tcgen05.alloc` granularity). |
 | Scheduler warp | The first warp no role owns, with its warpgroup's budget, or `WorkStream(scheduler_warp=)` | Constructor-level. |
 | Round-robin depth | A round-robin ring needs a multiple of its instance count in stages | Correctness: an instance's parity wait is only exact when it saw the stage's previous epoch itself. |
-| Exclusive consumers | `consumer_mode="exclusive"` on a CTA-local mbarrier `Ring` with one producer and equal consumer contributions | Declared per channel. The skew between owners (a rendezvous where a wait follows more than a ring lap of skips) is the author's ([channels](channels.md#exclusive-consumers)). |
+| Exclusive consumers | `consumer_sharing=Sharing.EXCLUSIVE` on a CTA-local mbarrier `Ring` with one producer and equal consumer contributions | Declared per channel. The skew between owners (a rendezvous where a wait follows more than a ring lap of skips) is the author's ([channels](channels.md#exclusive-consumers)). |
 | TMA, MMA and fences | `Tma(bytes, multicast=, fills=)`, `Umma`, `Threads`, `Warps`, `commit_fence=`, `release_fence=` | Declared per channel by the kernel. |
 
 ## The examples

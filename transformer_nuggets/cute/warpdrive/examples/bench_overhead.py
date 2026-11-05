@@ -50,6 +50,7 @@ from transformer_nuggets.cute.warpdrive import (
     OneShot,
     Producer,
     Ring,
+    Sharing,
     SmemPlan,
     Threads,
     Tma,
@@ -183,8 +184,8 @@ class RoundRobinPingPong(ProbeBase):
 
     def __init__(self, kind: str = "round_robin", stages: int = 2):
         self.kind, self.stages = kind, stages
-        self.fwd = Ring(stages, Threads, Threads, round_robin=True)
-        self.back = Ring(stages, Threads, Threads, round_robin=True)
+        self.fwd = Ring(stages, Threads, Threads, consumer_sharing=Sharing.ROUND_ROBIN)
+        self.back = Ring(stages, Threads, Threads, producer_sharing=Sharing.ROUND_ROBIN)
 
     @role(warps=0)
     @cute.jit

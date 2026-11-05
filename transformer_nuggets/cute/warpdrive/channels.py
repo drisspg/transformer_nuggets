@@ -18,14 +18,17 @@ role (the warp that issues the copies or MMAs). ``Channel(override={...})`` repl
 derived value; ``Barriers`` reserves mbarriers that user code drives directly. (Round-robin and
 exclusive sides, below, bind several such roles, one signalling per epoch.)
 
-Three declaration options change how a channel synchronizes:
+Each side shares the channel's epochs among its role instances in one of three ways
+(``producer_sharing=``/``consumer_sharing=``, a ``Sharing``): ``JOIN`` (the default; every
+instance takes every epoch it is bound to, and the counts sum), ``ROUND_ROBIN`` or
+``EXCLUSIVE``. Three declaration options change how a channel synchronizes:
 
-* ``round_robin=True`` (``Ring`` only): the role instances on a side take the epochs in turn.
-  With ``k`` instances, instance ``j`` handles epochs ``j, j + k, j + 2k, ...``, and each epoch's
-  arrival count is one instance's contribution, not the join of all of them. FA4's decode
-  kernel uses it for two softmax warpgroups that alternate KV blocks. On an mbarrier ring ``k``
-  must divide the stage count: a parity wait is only exact when the waiter itself saw the
-  stage's previous epoch, and with ``n % k != 0`` another instance did.
+* ``Sharing.ROUND_ROBIN`` (``Ring`` only, either side): the role instances on that side take the
+  epochs in turn. With ``k`` instances, instance ``j`` handles epochs ``j, j + k, j + 2k, ...``,
+  and each epoch's arrival count is one instance's contribution, not the join of all of them.
+  FA4's decode kernel uses it for two softmax warpgroups that alternate KV blocks. On an
+  mbarrier ring ``k`` must divide the stage count: a parity wait is only exact when the waiter
+  itself saw the stage's previous epoch, and with ``n % k != 0`` another instance did.
 * ``sync="named"`` (``Threads`` on both sides): each slot is a pair of CTA named barriers
   (``bar.sync``/``bar.arrive``, unaligned) instead of mbarriers. A named barrier has no phase:
   it completes when the producer's and the consumer's threads have all arrived, so its count is
@@ -33,15 +36,17 @@ Three declaration options change how a channel synchronizes:
   equivalent of an mbarrier ring starting empty. IDs are allocated from 15 downward; see
   ``WarpSpecialized.named_barrier_ids``.
 
-* ``consumer_mode="exclusive"`` (``Ring`` only): each epoch belongs to exactly one of the
-  declared ``consumer_roles``, which waits and releases it; the other consumers ``skip()`` it
+* ``consumer_sharing=Sharing.EXCLUSIVE`` (``Ring`` only): each epoch belongs to exactly one of
+  the declared ``consumer_roles``, which waits and releases it; the other consumers ``skip()`` it
   (advance their end without waiting or arriving). Each epoch's count is one consumer's
   contribution. Which consumer owns which epoch is the author's protocol: the layer checks the
   topology (CTA-local, one producer, equal contributions unless ``override`` sets
   ``empty_counts``, which then are the author's) and, when every wait and skip is
   static, that each epoch has one owner. A wait is exact only if the waiter's previous wait
   was at most one ring lap earlier; otherwise the author orders it after the stage's previous
-  epoch (FA4's decode uses two named barriers; see ``docs/channels.md``).
+  epoch (FA4's decode uses two named barriers; see ``docs/channels.md``). Round-robin sides
+  share this ownership check: instance ``j`` of ``k`` is an owner that skips ``k - 1`` epochs
+  after each of its own.
 
 A named barrier cannot tell two instances apart: if round-robin instances share a stage's barrier
 (``n % k != 0``, e.g. a one-stage mailbox written by two warpgroups in turn), their threads could
@@ -53,6 +58,7 @@ tracing).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 
 import cutlass
 from cutlass import Int32, cute
@@ -169,8 +175,22 @@ def _fences(side: str, value) -> tuple[str, ...]:
     return kinds
 
 
+class Sharing(Enum):
+    """How the role instances on one side of a ``Ring`` share its epochs.
+
+    ``JOIN``: every instance takes every epoch it is bound to; an epoch's count is the sum of
+    their contributions (a fan-out join). ``ROUND_ROBIN``: instance ``j`` of ``k`` (in binding
+    order) takes epochs ``j, j + k, ...``; the count is one instance's. ``EXCLUSIVE`` (consumers
+    only): one of ``consumer_roles`` owns each epoch and the others ``skip()`` it; the count is
+    one consumer's."""
+
+    JOIN = "join"
+    ROUND_ROBIN = "round_robin"
+    EXCLUSIVE = "exclusive"
+
+
 SYNC_KINDS = ("mbarrier", "named")
-CONSUMER_MODES = ("join", "exclusive")
+SIDES = ("producer", "consumer")
 
 
 @dataclass
@@ -206,9 +226,9 @@ class Channel:
     ``empty_counts=1``, with the role closing via ``handle.release(signal=False)`` (per-warp
     elected releases are the ``Warps`` mechanism; ``docs/dropping_down.md``).
 
-    ``round_robin``, ``sync`` and ``consumer_mode`` are described in the module docstring. A
-    named channel takes no override and must stay CTA-local; ``named_ids`` holds its ``(full,
-    empty)`` barrier IDs per slot once the kernel is collected.
+    ``producer_sharing``/``consumer_sharing`` (a ``Sharing``) and ``sync`` are described in the
+    module docstring. A named channel takes no override and must stay CTA-local; ``named_ids``
+    holds its ``(full, empty)`` barrier IDs per slot once the kernel is collected.
     """
 
     n: int
@@ -222,10 +242,10 @@ class Channel:
     release_fence: str | tuple[str, ...] | None = None
     remote_scope: str | None = None
     override: dict | None = None
-    round_robin: bool = False
+    producer_sharing: Sharing = Sharing.JOIN
+    consumer_sharing: Sharing = Sharing.JOIN
     sync: str = "mbarrier"
     turnstile: str | None = None
-    consumer_mode: str = "join"
     name: str = field(default="", init=False)
     fixed: bool = field(default=False, init=False)
     producers: list = field(default_factory=list, init=False)  # (RoleInstance, slot | None)
@@ -284,27 +304,39 @@ class Channel:
                     f"got {self.buffer!r}"
                 )
             self.buffers = dict(named)
-        if type(self.round_robin) is not bool:
-            raise ValueError(f"round_robin must be a bool, got {self.round_robin!r}")
+        for side in SIDES:
+            if not isinstance(self.sharing(side), Sharing):
+                raise ValueError(
+                    f"{side}_sharing must be a Sharing (JOIN, ROUND_ROBIN, EXCLUSIVE), got "
+                    f"{self.sharing(side)!r}"
+                )
         if self.sync not in SYNC_KINDS:
             raise ValueError(f"channel sync must be one of {SYNC_KINDS}, got {self.sync!r}")
-        if self.turnstile is not None and not (self.named and self.round_robin):
-            raise ValueError("turnstile= serializes round-robin instances of a named channel")
-        if self.consumer_mode not in CONSUMER_MODES:
+        if self.turnstile is not None and not (self.named and self.rotates):
             raise ValueError(
-                f"consumer_mode must be one of {CONSUMER_MODES}, got {self.consumer_mode!r}"
+                "turnstile= serializes round-robin instances of a named channel: it needs "
+                "sync='named' and a Sharing.ROUND_ROBIN side"
+            )
+        if self.producer_sharing is Sharing.EXCLUSIVE:
+            raise ValueError(
+                "producer_sharing=Sharing.EXCLUSIVE is not supported: only consumer ends skip() "
+                "epochs; producer instances taking turns use Sharing.ROUND_ROBIN"
             )
         if self.exclusive:
-            if self.named or self.round_robin:
-                what = "sync='named'" if self.named else "round_robin=True"
+            if self.named:
                 raise ValueError(
-                    f"consumer_mode='exclusive' cannot be combined with {what}: exclusive "
-                    "consumers own whole epochs of an mbarrier ring through explicit skips"
+                    "consumer_sharing=Sharing.EXCLUSIVE needs an mbarrier ring: exclusive "
+                    "consumers skip epochs by phase, and a named barrier has no phase"
+                )
+            if self.producer_sharing is not Sharing.JOIN:
+                raise ValueError(
+                    "consumer_sharing=Sharing.EXCLUSIVE needs one producer filling every epoch "
+                    "in order; producer_sharing must be Sharing.JOIN"
                 )
             if not self.consumer_roles:
                 raise ValueError(
-                    "consumer_mode='exclusive' needs consumer_roles=(...) naming the roles that "
-                    "take the epochs"
+                    "consumer_sharing=Sharing.EXCLUSIVE needs consumer_roles=(...) naming the "
+                    "roles that take the epochs"
                 )
         if self.named:
             if self.producer is not Threads or self.consumer is not Threads:
@@ -335,9 +367,23 @@ class Channel:
     def named(self) -> bool:
         return self.sync == "named"
 
+    def sharing(self, side: str) -> Sharing:
+        return self.producer_sharing if side == "producer" else self.consumer_sharing
+
     @property
     def exclusive(self) -> bool:
-        return self.consumer_mode == "exclusive"
+        return self.consumer_sharing is Sharing.EXCLUSIVE
+
+    @property
+    def rotates(self) -> bool:
+        """Some side is ``Sharing.ROUND_ROBIN``."""
+        return Sharing.ROUND_ROBIN in (self.producer_sharing, self.consumer_sharing)
+
+    @property
+    def owned_epochs(self) -> bool:
+        """Some side gives each epoch one owner (round-robin or exclusive) instead of joining:
+        the kernel checks the traced epoch ownership (``WarpSpecialized._check_ownership``)."""
+        return (self.producer_sharing, self.consumer_sharing) != (Sharing.JOIN, Sharing.JOIN)
 
     @property
     def empty_counts_overridden(self) -> bool:
@@ -348,12 +394,12 @@ class Channel:
     def turns(self, side: str) -> int:
         """Instances taking turns on ``side``: ``k`` for a round-robin side, else 1."""
         bound = self.producers if side == "producer" else self.consumers
-        return len(bound) if self.round_robin and len(bound) > 1 else 1
+        return len(bound) if self.sharing(side) is Sharing.ROUND_ROBIN and bound else 1
 
     def slot_counts(self, side: str) -> list[int]:
         mech = self.producer if side == "producer" else self.consumer
         bound = self.producers if side == "producer" else self.consumers
-        if self.turns(side) > 1 or (side == "consumer" and self.exclusive and bound):
+        if self.sharing(side) is not Sharing.JOIN and bound:
             # One instance signals each epoch (the layer checks that they contribute equally).
             return [arrivals(mech, bound[0][0].num_threads)] * self.n
         return [
@@ -377,12 +423,12 @@ class Slots(Channel):
 
     def __post_init__(self):
         super().__post_init__()
-        if self.round_robin:
-            raise ValueError("round_robin needs a Ring: a Slots caller names the slot itself")
-        if self.exclusive:
-            raise ValueError(
-                "consumer_mode='exclusive' needs a Ring: a Slots consumer names its slots instead"
-            )
+        for side in SIDES:
+            if self.sharing(side) is not Sharing.JOIN:
+                raise ValueError(
+                    f"{side}_sharing={self.sharing(side)} needs a Ring: a Slots caller names the "
+                    "slot itself"
+                )
         self.fixed = True
         if self.n > 31:
             raise ValueError("Slots supports at most 31 slots (phase bits share one Int32)")
@@ -1064,7 +1110,7 @@ class _End:
     def _raw_state_access(self):
         self._rec.resets += 1  # outstanding tokens no longer name the end's epoch
         self._rec.lineage.advanced(self._copy)
-        if self._chan.exclusive:  # raw code may advance it: the epoch sequence is unknown
+        if self._chan.owned_epochs:  # raw code may advance it: the epoch sequence is unknown
             self._trace.record(self._chan.name, "state", None)
 
     @property
@@ -1397,11 +1443,11 @@ class ConsumerEnd(_End):
         least 0), which leaves the ring's ownership check unverified."""
         chan, who, site = self._chan, self._trace.role_name, user_site()
         if not chan.exclusive:
-            mode = "round-robin" if chan.round_robin else "joining"
+            mode = "round-robin" if chan.turns("consumer") > 1 else "joining"
             raise ProtocolError(
                 f"{who}: {chan.name}.skip() at {site}: only consumers of an exclusive ring "
-                f"(consumer_mode='exclusive') skip epochs; {mode} consumers take every epoch "
-                "they are bound to"
+                f"(consumer_sharing=Sharing.EXCLUSIVE) skip epochs; {mode} consumers take every "
+                "epoch they are bound to"
             )
         dynamic = isinstance(n, Int32)
         if not dynamic and (type(n) is not int or n < 1):

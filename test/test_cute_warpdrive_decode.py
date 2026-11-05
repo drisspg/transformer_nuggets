@@ -31,6 +31,7 @@ from transformer_nuggets.cute.warpdrive import (
     ProtocolError,
     Ring,
     RoleConfig,
+    Sharing,
     Slots,
     Threads,
     Turn,
@@ -56,15 +57,16 @@ class RoundRobinToy(WarpSpecialized):
         self.mode = mode
         payload = (cutlass.Int32, (32,))
         rr_stages = 2 if mode == "short_ring" else K_MID
-        self.rr = Ring(rr_stages, Threads, Threads, round_robin=True, payload=payload)
-        self.nr = Ring(K_MID, Threads, Threads, sync="named", round_robin=True, payload=payload)
+        rr = Sharing.ROUND_ROBIN
+        self.rr = Ring(rr_stages, Threads, Threads, consumer_sharing=rr, payload=payload)
+        self.nr = Ring(K_MID, Threads, Threads, sync="named", producer_sharing=rr, payload=payload)
         turnstile = None if mode == "no_turnstile" else "turn"
         self.mail = Ring(
             1,
             Threads,
             Threads,
             sync="named",
-            round_robin=True,
+            producer_sharing=rr,
             turnstile=turnstile,
             payload=payload,
         )
@@ -209,8 +211,10 @@ def _consumer_pair(width2=1):
 
 
 def test_round_robin_declaration_errors():
-    with pytest.raises(ValueError, match="round_robin needs a Ring"):
-        Slots(2, Threads, Threads, round_robin=True)
+    with pytest.raises(ValueError, match="consumer_sharing=Sharing.ROUND_ROBIN needs a Ring"):
+        Slots(2, Threads, Threads, consumer_sharing=Sharing.ROUND_ROBIN)
+    with pytest.raises(ValueError, match="producer_sharing must be a Sharing"):
+        Ring(2, Threads, Threads, producer_sharing="round_robin")
     with pytest.raises(ValueError, match="both sides must be Threads"):
         Ring(2, Umma, Threads, sync="named")
     with pytest.raises(ValueError, match="takes no override"):
@@ -230,13 +234,19 @@ def test_round_robin_declaration_errors():
     def cons(self, ctx, *, ch: Consumer):
         return ch
 
-    # No side has several instances: nothing to take turns.
+    # A round-robin side with one instance: nothing to take turns.
+    rr = Sharing.ROUND_ROBIN
     op = _kernel(
-        {"ch": lambda: Ring(2, Threads, Threads, round_robin=True)}, {"prod": prod, "cons": cons}
+        {"ch": lambda: Ring(2, Threads, Threads, consumer_sharing=rr)},
+        {"prod": prod, "cons": cons},
     )
-    _raises_protocol("round_robin needs several instances of one role", op.describe)
+    _raises_protocol(
+        r"consumer_sharing=Sharing.ROUND_ROBIN needs at least two instances of one role on the "
+        r"consumer side, got \['cons'\]",
+        op.describe,
+    )
     # Two different roles, or instances of different widths, cannot alternate one count.
-    op = _kernel({"ch": lambda: Ring(2, Threads, Threads, round_robin=True)}, _consumer_pair())
+    op = _kernel({"ch": lambda: Ring(2, Threads, Threads, consumer_sharing=rr)}, _consumer_pair())
     _raises_protocol("must be instances of one role with the same width", op.describe)
 
 
@@ -281,11 +291,11 @@ def test_named_channels_need_free_ids_and_one_cta():
         return a
 
     op = _kernel(
-        {"a": lambda: Ring(2, Threads, Threads, round_robin=True)},
+        {"a": lambda: Ring(2, Threads, Threads, consumer_sharing=Sharing.ROUND_ROBIN)},
         {"lead": lead, "pair_cons": pair_cons},
     )
     op.cluster = CtaPair()
-    _raises_protocol("round_robin is CTA-local", op.describe)
+    _raises_protocol("round-robin sides are CTA-local", op.describe)
 
 
 def test_named_turnstile_must_seat_the_round_robin_instances():
@@ -305,7 +315,9 @@ def test_named_turnstile_must_seat_the_round_robin_instances():
         return a
 
     channels = {
-        "a": lambda: Ring(1, Threads, Threads, sync="named", round_robin=True, turnstile="t"),
+        "a": lambda: Ring(
+            1, Threads, Threads, sync="named", producer_sharing=Sharing.ROUND_ROBIN, turnstile="t"
+        ),
         "t": Turnstile,
     }
     op = _kernel(channels, {"prod": prod, "other": other, "cons": cons})

@@ -220,7 +220,6 @@ def _channels(kernel) -> str:
                     "bootstrap and skew are the author's",
                 )
             )
-            details.append(("epochs", kernel._ws_ownership.get(name, "ownership not traced")))
         for side in ("producer", "consumer"):
             if ch.turns(side) > 1:
                 details.append(
@@ -230,6 +229,8 @@ def _channels(kernel) -> str:
                         f"j, j+{ch.turns(side)}, ...; counts are one instance's",
                     )
                 )
+        if ch.owned_epochs:
+            details.append(("epochs", kernel._ws_ownership.get(name, "ownership not traced")))
         if cs > 1:
             scope = ["CTA-local"]
             if sc.pair:
