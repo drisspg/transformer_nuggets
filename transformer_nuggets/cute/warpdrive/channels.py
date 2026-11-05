@@ -1190,6 +1190,23 @@ class _End:
                 "probe in the region that consumes it"
             )
 
+    def _take(self, slot, token, op: str):
+        """Take the next stage for ``acquire``/``wait``: check ``token`` before advancing, then
+        wait for empty (producer) or full (consumer). Only an mbarrier wait may be skipped when
+        the token's probe found it ready. Returns (index, phase, label)."""
+        if token is not None:
+            self._take_token(token, slot, op)
+        index, phase, label = self._next(slot, op)
+        chan, producer = self._chan, isinstance(self, ProducerEnd)
+        self._trace.record(chan.name, op, label)
+        if chan.named:
+            self._check_turn("producer" if producer else "consumer", op)
+            self._named_wait(chan.named_ids[1 if producer else 0], index, op)
+        else:
+            with wait_range(self._trace, f"{chan.name}.{op}"):
+                _wait(self._empty(index) if producer else self._full(index), phase, token)
+        return index, phase, label
+
 
 class ProducerEnd(_End):
     def try_acquire(self, slot=None) -> Token:
@@ -1202,17 +1219,8 @@ class ProducerEnd(_End):
         """Wait until the stage is empty; returns a handle to commit or retire. ``token``: this
         end's ``try_acquire()`` of the same stage; the wait runs only if that probe failed. A
         ``Tma`` producer arms the stage's bytes here either way, once."""
-        if token is not None:
-            self._take_token(token, slot, "acquire")
-        index, phase, label = self._next(slot, "acquire")
-        self._trace.record(self._chan.name, "acquire", label)
-        if self._chan.named:
-            self._check_turn("producer", "acquire")
-            self._named_wait(self._chan.named_ids[1], index, "acquire")
-            return Handle(self, index, phase, label, True)
-        with wait_range(self._trace, f"{self._chan.name}.acquire"):
-            _wait(self._empty(index), phase, token)
-        if isinstance(self._chan.producer, Tma):
+        index, phase, label = self._take(slot, token, "acquire")
+        if isinstance(self._chan.producer, Tma):  # never a named channel (Threads only)
             self._arm(self._full(index))
         return Handle(self, index, phase, label, True)
 
@@ -1286,18 +1294,9 @@ class ConsumerEnd(_End):
     def wait(self, slot=None, *, token=None) -> Handle:
         """Wait until the stage is full; returns a handle to release. ``token``: this end's
         ``try_wait()`` of the same stage; the wait runs only if that probe failed."""
-        if token is not None:
-            self._take_token(token, slot, "wait")
-        index, phase, label = self._next(slot, "wait")
-        self._trace.record(self._chan.name, "wait", label)
-        if self._chan.named:
-            self._check_turn("consumer", "wait")
-            self._named_wait(self._chan.named_ids[0], index, "wait")
-            return Handle(self, index, phase, label, False)
-        with wait_range(self._trace, f"{self._chan.name}.wait"):
-            _wait(self._full(index), phase, token)
+        index, phase, label = self._take(slot, token, "wait")
         handle = Handle(self, index, phase, label, False)
-        if self._rec.previews:
+        if self._rec.previews:  # never on a named channel, which cannot peek
             self._adopt(slot, handle.rec)
         return handle
 
