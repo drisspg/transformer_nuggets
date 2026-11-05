@@ -7,6 +7,7 @@ and through a one-stage named mailbox that a turnstile serializes. The decode te
 """
 
 import math
+import pickle
 import warnings
 from types import SimpleNamespace
 
@@ -505,6 +506,23 @@ def test_decode_shared_kv_describe(decode, requires_blackwell):
     assert op.__cute_cache_key__() != split.__cute_cache_key__()
     with pytest.raises(ValueError, match="shared_kv must be a bool"):
         decode.SwapABDecode(8, shared_kv=1)
+
+
+def test_decode_shared_kv_construction(decode):
+    """The knob, the class and pickling agree; a subclass of the split kernel cannot take the
+    shared roles silently."""
+    direct = decode.SharedKVDecode(8)
+    assert direct.shared_kv and "kv       Ring(12)" in direct.describe()
+    op = decode.SwapABDecode(8, shared_kv=True)
+    again = pickle.loads(pickle.dumps(op))
+    assert type(again) is decode.SharedKVDecode
+    assert again.__cute_cache_key__() == op.__cute_cache_key__()
+
+    class Custom(decode.SwapABDecode):
+        pass
+
+    with pytest.raises(ValueError, match="derive Custom from SharedKVDecode"):
+        Custom(8, shared_kv=True)
 
 
 def test_decode_rejects_unfit_configurations(decode):

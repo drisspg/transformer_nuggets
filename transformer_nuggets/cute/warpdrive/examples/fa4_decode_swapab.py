@@ -210,7 +210,7 @@ def gemm_view(mX, order, head_idx=None, qhead_per_kvhead=None, num_heads_kv=None
 class SwapABDecode(WarpSpecialized):
     def __new__(cls, *args, shared_kv: bool = False, **kwargs):
         # The shared ring changes the K/V roles' channel parameters, so it is a subclass.
-        if shared_kv and not issubclass(cls, SharedKVDecode):
+        if shared_kv is True and cls is SwapABDecode:
             cls = SharedKVDecode
         return super().__new__(cls)
 
@@ -265,6 +265,12 @@ class SwapABDecode(WarpSpecialized):
                 )
         if type(shared_kv) is not bool:
             raise ValueError(f"shared_kv must be a bool, got {shared_kv!r}")
+        shared_kv = shared_kv or isinstance(self, SharedKVDecode)
+        if shared_kv and not isinstance(self, SharedKVDecode):
+            raise ValueError(
+                f"shared_kv=True needs SharedKVDecode's K/V roles; derive {type(self).__name__} "
+                "from SharedKVDecode instead"
+            )
         self.shared_kv = shared_kv
         self.tile_hq = tile_hq
         self.tile_hq_mma = max(MMA_N_MIN, tile_hq)
