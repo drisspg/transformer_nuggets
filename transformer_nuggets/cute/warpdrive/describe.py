@@ -208,11 +208,16 @@ def _channels(kernel) -> str:
             details.append(("empty", empty))
         if ch.exclusive:
             owners = ", ".join(r.name for r, _ in ch.consumers)
+            counts = (
+                "empty counts overridden: each owner's release must supply them (unverified)"
+                if "empty_counts" in (ch.override or {})
+                else "counts are one consumer's"
+            )
             details.append(
                 (
                     "owners",
-                    f"exclusive: one of {owners} owns each epoch, the others skip it; counts "
-                    "are one consumer's; bootstrap and skew are the author's",
+                    f"exclusive: one of {owners} owns each epoch, the others skip it; {counts}; "
+                    "bootstrap and skew are the author's",
                 )
             )
             details.append(("epochs", kernel._ws_ownership.get(name, "ownership not traced")))

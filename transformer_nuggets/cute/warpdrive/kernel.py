@@ -1752,7 +1752,8 @@ def _check_turns(name: str, side: str, bound):
 
 def _check_exclusive(name: str, chan):
     """An exclusive ring: one producer instance and at least two consumer instances of the
-    declared roles, each contributing the same arrivals (each epoch counts one of them)."""
+    declared roles, each contributing the same arrivals (each epoch counts one of them) unless
+    ``override`` sets the empty counts, which the owners' releases must then supply."""
     producers = [r.name for r, _ in chan.producers]
     consumers = [r for r, _ in chan.consumers]
     if len(producers) != 1:
@@ -1771,7 +1772,7 @@ def _check_exclusive(name: str, chan):
             f"channel {name}: exclusive consumer role(s) {missing} take no Consumer end"
         )
     contributions = {r.name: arrivals(chan.consumer, r.num_threads) for r in consumers}
-    if len(set(contributions.values())) > 1:
+    if "empty_counts" not in (chan.override or {}) and len(set(contributions.values())) > 1:
         raise ProtocolError(
             f"channel {name}: exclusive consumers must contribute equal arrivals (each epoch "
             f"counts one of them), got {contributions}"

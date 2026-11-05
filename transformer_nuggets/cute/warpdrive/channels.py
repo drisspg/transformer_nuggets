@@ -37,7 +37,8 @@ Three declaration options change how a channel synchronizes:
   declared ``consumer_roles``, which waits and releases it; the other consumers ``skip()`` it
   (advance their end without waiting or arriving). Each epoch's count is one consumer's
   contribution. Which consumer owns which epoch is the author's protocol: the layer checks the
-  topology (CTA-local, one producer, equal contributions) and, when every wait and skip is
+  topology (CTA-local, one producer, equal contributions unless ``override`` sets
+  ``empty_counts``, which then are the author's) and, when every wait and skip is
   static, that each epoch has one owner. A wait is exact only if the waiter's previous wait
   was at most one ring lap earlier; otherwise the author orders it after the stage's previous
   epoch (FA4's decode uses two named barriers; see ``docs/channels.md``).
@@ -293,18 +294,11 @@ class Channel:
                 f"consumer_mode must be one of {CONSUMER_MODES}, got {self.consumer_mode!r}"
             )
         if self.exclusive:
-            if self.named or self.round_robin or self.override:
-                what = (
-                    "sync='named'"
-                    if self.named
-                    else "round_robin=True"
-                    if self.round_robin
-                    else "override="
-                )
+            if self.named or self.round_robin:
+                what = "sync='named'" if self.named else "round_robin=True"
                 raise ValueError(
                     f"consumer_mode='exclusive' cannot be combined with {what}: exclusive "
-                    "consumers own whole epochs of an mbarrier ring through explicit skips, with "
-                    "one consumer's derived count"
+                    "consumers own whole epochs of an mbarrier ring through explicit skips"
                 )
             if not self.consumer_roles:
                 raise ValueError(
@@ -1302,10 +1296,11 @@ class ConsumerEnd(_End):
 
     consume = wait
 
-    def skip(self, n: int = 1):
+    def skip(self, n: int | Int32 = 1):
         """Exclusive ring: advance past ``n`` epochs that other consumers own, without waiting
-        or arriving. Outstanding try tokens of this end go stale; an unadopted preview raises.
-        ``n`` is a positive Python int (put a dynamic skip under a dynamic branch)."""
+        or arriving (``state.advance(n)``). Outstanding try tokens of this end go stale; an
+        unadopted preview raises. ``n`` is a positive Python int, or a dynamic ``Int32`` (at
+        least 0), which leaves the ring's ownership check unverified."""
         chan, who, site = self._chan, self._trace.role_name, user_site()
         if not chan.exclusive:
             mode = "round-robin" if chan.round_robin else "joining"
@@ -1314,10 +1309,11 @@ class ConsumerEnd(_End):
                 f"(consumer_mode='exclusive') skip epochs; {mode} consumers take every epoch "
                 "they are bound to"
             )
-        if type(n) is not int or n < 1:
+        dynamic = isinstance(n, Int32)
+        if not dynamic and (type(n) is not int or n < 1):
             raise ProtocolError(
                 f"{who}: {chan.name}.skip({n!r}) at {site}: the skip count must be a positive "
-                "Python int"
+                "Python int or a dynamic Int32"
             )
         if self._rec.previews:
             raise ProtocolError(
@@ -1326,7 +1322,7 @@ class ConsumerEnd(_End):
                 "next wait would take another epoch than the one previewed"
             )
         self._check_current()
-        self._trace.record(chan.name, "skip", None, count=n)
+        self._trace.record(chan.name, "skip", None, count=None if dynamic else n)
         self._state.advance(n)
         self._advanced(None)
 

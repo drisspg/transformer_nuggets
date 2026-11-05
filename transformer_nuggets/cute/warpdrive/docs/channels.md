@@ -154,21 +154,27 @@ producer still fills every epoch in order. The default, `"join"`, keeps the fan-
 described in [counts](#counts-come-from-the-roles). Selecting neither mode changes nothing in
 other channels; `skip()` emits only the index arithmetic.
 
-The layer checks the topology: a `Ring` with mbarriers, without `round_robin`, `sync="named"`
-or `override`; `consumer_roles` declared, each bound to a consumer end; at least two consumer
+The layer checks the topology: a `Ring` with mbarriers, without `round_robin` or
+`sync="named"`; `consumer_roles` declared, each bound to a consumer end; at least two consumer
 instances with equal contributions (single-warp roles for `Umma`); one producer instance; and
-CTA-local placement. `skip()` exists only on an exclusive ring's consumer ends and takes a
-positive Python int (put a conditional skip inside a dynamic branch). Skipping makes the
-end's outstanding [try tokens](#try-tokens) stale, and skipping past an unconsumed
-[preview](#previews) raises.
+CTA-local placement. [`override=`](dropping_down.md) applies as on any mbarrier ring. Full-side
+keys (`tx`, `full_counts`, `full_mask`) leave ownership untouched; `empty_counts` replaces the
+per-epoch owner count, lifts the equal-contribution check, and `describe()` marks the counts
+unverified: each owner's release (typically `release(signal=False)` plus a raw arrive) must
+supply them. `skip()` exists only on an exclusive ring's consumer ends and is
+`end.state.advance(n)` plus bookkeeping. It takes a positive Python int or a dynamic `Int32`
+(n >= 0, as `PipelineState.advance` takes); a dynamic count leaves the ownership check
+`unverified`. Skipping makes the end's outstanding [try tokens](#try-tokens) stale, and
+skipping past an unconsumed [preview](#previews) raises.
 
 When every acquire, wait and skip on the ring is static (no dynamic loop or branch around
 them except the work-item loop) and every role uses the ring either once per work item or
 once per launch, collection checks ownership: each epoch the producer publishes has exactly
 one waiting consumer (a final acquire closed with `retire()` has none), no consumer runs past
 the producer, and under a persistent schedule every consumer advances through every epoch of
-an item. A violation raises. `describe()` prints `epochs  verified: ...` or, when any of them is dynamic,
-`unverified (...)` with the reason; then ownership is your obligation.
+an item. A violation raises. `describe()` prints `epochs  verified: ...` or, when any of them
+(or a skip count) is dynamic, `unverified (...)` with the reason; then ownership is your
+obligation.
 
 **A skip can make the next wait inexact.** A wait of epoch e tests parity `(e // n) % 2` on
 stage `e % n`, which is exact once epoch e - n was filled: before that, the stage is one

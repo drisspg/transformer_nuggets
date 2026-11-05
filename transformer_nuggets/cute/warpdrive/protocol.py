@@ -303,7 +303,8 @@ class RoleTrace:
         self.iket = iket  # emit IKET work-item/role ranges (tracing.py)
         self.iket_waits = iket and iket_waits  # and ranges around blocking waits
         # (channel, op, enclosing blocks innermost first, epochs, order) per recorded op:
-        # epochs is a skip's count, else 1; order is a close's handle order (HandleRecord).
+        # epochs is a skip's count (None if dynamic), else 1; order is a close's handle order
+        # (HandleRecord).
         self.ops: list = []
         self.item_block = None  # the work-item loop body (set by the WorkCursor's advance())
         self.open: list = []
@@ -351,12 +352,12 @@ class RoleTrace:
         d = _block_depth(current_block(), self.root)
         return 0 if d is None else d
 
-    def record(self, chan, op, slot, count: int = 1, order: int | None = None):
+    def record(self, chan, op, slot, count: int | None = 1, order: int | None = None):
         # Blocks are captured while live: a region the tracer later discards must not be
         # walked afterwards (dereferencing an erased block crashes).
         self.ops.append((chan, op, _ancestors(current_block(), self.root), count, order))
         if self.log is not None:
-            logged = op if count == 1 else f"{op} {count}"
+            logged = op if count == 1 else f"{op} {'n' if count is None else count}"
             self.log.record(self.role_name, chan, logged, slot, self.depth(), user_site())
 
     def uses_per_item(self) -> dict:
@@ -390,6 +391,8 @@ class RoleTrace:
             )
             if inner and not in_item:
                 return f"{self.role_name}'s {op} runs inside a dynamic loop or branch"
+            if count is None:
+                return f"{self.role_name}'s skip count is dynamic"
             regions.add(bool(inner))
             seq.append((op, order if op == "retire" else count))
         if len(regions) > 1:

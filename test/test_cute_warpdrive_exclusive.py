@@ -131,8 +131,6 @@ def test_declaration_errors():
         exclusive(sync="named")
     with pytest.raises(ValueError, match="cannot be combined with round_robin=True"):
         exclusive(round_robin=True)
-    with pytest.raises(ValueError, match="cannot be combined with override="):
-        exclusive(override={"empty_counts": 2})
     with pytest.raises(ValueError, match="needs consumer_roles"):
         Ring(2, Threads, Threads, consumer_mode="exclusive")
 
@@ -186,6 +184,21 @@ def _role(warps, side, cta="all"):
 def test_collection_errors(roles, message):
     op = _kernel({"kv": lambda: exclusive(2)}, roles)
     _raises_protocol(message, op.describe)
+
+
+def test_overrides_apply_to_exclusive_rings():
+    """Full-side overrides leave ownership alone; overridden empty counts are the author's, so
+    unequal consumers are accepted and the counts are marked unverified."""
+    roles = {"p": _role(0, Producer), "a": _role(1, Consumer), "b": _role(range(2, 4), Consumer)}
+    op = _kernel({"kv": lambda: exclusive(2, override={"empty_counts": 1})}, roles)
+    text = op.describe()
+    assert "empty     1 x2" in text
+    assert "empty counts overridden: each owner's release must supply them (unverified)" in text
+    roles = {"p": _role(0, Producer), "a": _role(1, Consumer), "b": _role(2, Consumer)}
+    op = _kernel({"kv": lambda: exclusive(2, override={"full_counts": 1})}, roles)
+    text = op.describe()
+    assert "override  full_counts 32 x2 -> 1 x2  (differs from derived)" in text
+    assert "counts are one consumer's" in text
 
 
 def test_declared_role_must_consume():
@@ -318,7 +331,6 @@ class Wide(Static):
         ("join_skip", r"join\.skip\(\) at .*only consumers of an exclusive ring"),
         ("bad_count", r"kv\.skip\(0\) at .*must be a positive Python int"),
         ("bool_count", r"kv\.skip\(True\) at .*must be a positive Python int"),
-        ("dynamic_count", r"kv\.skip\(.*\) at .*must be a positive Python int"),
         ("token", r"stale token probed at test_cute_warpdrive_exclusive\.py:\d+"),
         ("preview", r"kv\.skip\(\) at .* with an unconsumed preview \(kv\[i\] peek"),
         ("double", r"epoch 0 of 6 per launch is waited by a and b"),
@@ -483,6 +495,12 @@ def test_static_ownership_per_work_item():
     assert "epochs    verified: 2 epochs per launch (a 1, b 1)\n" in op.describe()
 
 
+def test_dynamic_skip_count_leaves_ownership_unverified():
+    op = Static("dynamic_count")
+    compile_toy(op, "static_dynamic_count")
+    assert "epochs    unverified (a's skip count is dynamic)" in op.describe()
+
+
 def test_static_check_names_a_wait_that_needs_a_rendezvous():
     op = Wide()
     compile_toy(op, "static_wide")
@@ -595,6 +613,65 @@ class Grouped(Toy):
         return kv
 
 
+@cute.jit
+def own(ctx, kv, e, who: int, delay):
+    """``take()`` whose release leaves the arrival to the caller; returns (kv, stage)."""
+    lane = cute.arch.lane_idx()
+    spin(delay)
+    h = kv.wait()
+    if h.data[lane] != e * N + lane:
+        cute.arch.atomic_add(ctx.out.iterator + (ctx.out.shape[0] - 1), cutlass.Int32(1))
+    if lane == 0:
+        ctx.out[e] = who
+    stage = h.index
+    h.release(signal=False)
+    return kv, stage
+
+
+class Halves(Toy):
+    """``a`` (one warp) owns epochs [0, n // 2), ``b`` (two warps) the rest, after a dynamic
+    ``skip(n // 2)``. The consumers contribute unequal arrivals, so ``empty_counts=1``
+    overrides the count: each releases with ``signal=False``, then one thread arrives once the
+    role's threads have read the stage. b waits only after ``a_done``, so every earlier epoch
+    is filled and its first wait is exact."""
+
+    label = "halves"
+
+    def __init__(self):
+        self.kv = exclusive(4, override={"empty_counts": 1})
+        self.a_done = NamedBarrier(threads=96)
+        self.b_read = NamedBarrier(threads=64)
+
+    @role(warps=0)
+    @cute.jit
+    def prod(self, ctx, *, kv: Producer):
+        return fill(ctx, kv, ctx.n)
+
+    @role(warps=1)
+    @cute.jit
+    def a(self, ctx, *, kv: Consumer):
+        for e in cutlass.range(ctx.n // 2, unroll=1):
+            kv, stage = own(ctx, kv, e, 1, ctx.delay_a)
+            cute.arch.sync_warp()
+            if cute.arch.lane_idx() == 0:
+                cute.arch.mbarrier_arrive(kv.empty_barrier(stage))
+        self.a_done.arrive()
+        return kv
+
+    @role(warps=range(2, 4))
+    @cute.jit
+    def b(self, ctx, *, kv: Consumer):
+        half = ctx.n // 2
+        kv.skip(half)
+        self.a_done.sync()
+        for e in cutlass.range(half, ctx.n, unroll=1):
+            kv, stage = own(ctx, kv, e, 2, ctx.delay_b)
+            self.b_read.sync()
+            if cute.arch.thread_idx()[0] == 64:
+                cute.arch.mbarrier_arrive(kv.empty_barrier(stage))
+        return kv
+
+
 def _run(fn, epochs, n, delay_a=0, delay_b=0):
     out = torch.full((epochs + 1,), -1, device="cuda", dtype=torch.int32)
     out[-1] = 0
@@ -615,6 +692,16 @@ def test_interleaved_owners(requires_blackwell, n, late):
     for _ in range(2):  # repeated launches start from fresh barriers
         owners, bad = _run(fn, n, n, DELAY * (late == "a"), DELAY * (late == "b"))
         assert bad == 0 and owners == [1 + e % 2 for e in range(n)]
+
+
+@pytest.mark.parametrize("n", [0, 1, 9, 24])
+@pytest.mark.parametrize("late", ["none", "a", "b"])
+def test_unequal_owners_with_overridden_counts_and_dynamic_skip(requires_blackwell, n, late):
+    op = Halves()
+    fn = compile_toy(op, "halves")
+    for _ in range(2):
+        owners, bad = _run(fn, n, n, DELAY * (late == "a"), DELAY * (late == "b"))
+        assert bad == 0 and owners == [1 if e < n // 2 else 2 for e in range(n)]
 
 
 @pytest.mark.parametrize("stages, group", [(3, 2), (4, 2), (3, 4)])
