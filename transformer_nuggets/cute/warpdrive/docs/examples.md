@@ -23,6 +23,9 @@
   named-barrier mailboxes and P staged through SMEM.
 - [bench_overhead.py](../examples/bench_overhead.py): handoff and fixed-cost microbenchmarks
   against hand-written twins ([results](#warpdrive-fixed-costs)).
+- [bench_persistent_gemm.py](../examples/bench_persistent_gemm.py): the persistent GEMM's
+  schedules, clusters, tile widths and accumulator handoff against `torch.mm`
+  ([results](#tile-boundaries)).
 
 ## GEMM
 
@@ -96,6 +99,58 @@ The harness is a CUDA-graph A/B: one graph per configuration, captured once, rep
 round-robin rounds (`torch.mm` first, then the widths in order) with default clocks and warm
 L2, reporting each configuration's best round median. Rerun it at your shapes before trusting
 a difference under 5%.
+
+### Tile boundaries
+
+Three things decide how much of a tile's epilogue hides behind the next tile's mainloop: the
+MMA warp's `tcgen05.commit` publishes the accumulator asynchronously (the layer's `Umma`
+side), two TMEM stages let it start the next tile in the other buffer, and the epilogue hands
+a stage back as soon as its last subtile's `tcgen05.ld` has completed (`tcgen05.wait::ld`,
+`early_release=True`, the default) rather than after that subtile's SMEM staging and TMA store
+(`early_release=False`). In SASS the early release only moves the accumulator's arrive up to
+the last `LDTM`; a single CTA's epilogue (`cp.async.bulk.wait_group` pacing included) is well
+shorter than its mainloop at every shape below, so it mostly matters for CTA pairs at short K.
+
+`bench_persistent_gemm.py --variants mm single single_late single_clc single_acc1 pair
+pair_late pair_clc pair_clc_late pair_atomic pair_acc1 pair_n256 pair_n256_late pair_n256_clc`,
+GB300, CuTeDSL 4.8.0, November 2026, min of five interleaved rounds' medians of 10 replays of
+20 calls, microseconds (`clc` is `ClusterLaunchControl()`, `atomic` `AtomicPersistent()`,
+`late` is `early_release=False`, `acc1` is `acc_stages=1`; the pair is `tile_n=224` unless
+`256`). The shared GPU ran about 10% slower than for the table above (`torch.mm` 82.4 vs 75.2
+at 4096^3), so compare within a table:
+
+| M x N x K | `torch.mm` | 1 CTA | 1 CTA late | 1 CTA clc | 1 CTA acc1 | pair | pair late | pair clc | pair clc late | pair atomic | pair acc1 | pair 256 | pair 256 late | pair 256 clc |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1024 x 12800 x 1152 | 18.6 | 21.5 | 21.5 | 21.6 | 22.5 | 23.3 | 23.5 | 23.2 | 23.1 | 23.1 | 26.2 | 21.0 | 20.9 | 21.2 |
+| 2048 x 8192 x 1024 | 20.2 | 25.8 | 25.2 | 25.0 | 27.9 | 22.3 | 22.5 | 22.3 | 22.7 | 22.9 | 25.7 | 24.9 | 24.9 | 24.7 |
+| 4096 x 4096 x 512 | 11.8 | 15.7 | 15.7 | 15.4 | 16.7 | 13.0 | 13.3 | 13.0 | 13.3 | 13.0 | 15.8 | 14.0 | 14.4 | 14.0 |
+| 4096 x 4096 x 4096 | 82.4 | 94.3 | 94.6 | 96.9 | 96.7 | 81.2 | 81.5 | 86.2 | 86.3 | 82.1 | 85.6 | 90.8 | 90.4 | 90.3 |
+| 3000 x 5000 x 4096 | 78.5 | 90.3 | 90.2 | 93.5 | 91.2 | 77.9 | 77.8 | 81.9 | 79.1 | 79.1 | 82.1 | 88.0 | 86.9 | 85.8 |
+
+The second accumulator stage is worth 1-22% (most at 4096 x 4096 x 512 on a pair, where the
+epilogue is as long as the 8-k-tile mainloop; least at K = 4096 on one CTA). Early release is worth 0-3% on pairs at short K
+(repeatable at 4096 x 4096 x 512 in two sweeps for both pair widths) and within noise elsewhere,
+including by NCU duration at 1024 x 12800 x 1152 (`--clock-control none`, five launches each:
+single 22.0 vs 21.6, pair 256 20.8 vs 21.1, pair 224 22.8 vs 23.1, pair clc 24.4 vs 24.2 early
+vs late, against cuBLAS's 128x256 2-CTA kernel at 19.4). The short-K shapes trail `torch.mm`
+by 10-25% for wave quantization (1024 x 12800: 400 single tiles or 200 pair tiles over 148 SMs
+are 2.7 waves) and the store-bound 4096 x 4096 x 512 (32 MB out), not for tile-boundary gaps.
+
+Before this measurement `ClusterLaunchControl` and `AtomicPersistent` pairs ran 8-20% behind
+`StaticPersistent` at short K (24.2-24.4 vs 22.4-22.6, 23.1 vs 21.2, 15.2-15.4 vs 12.7-12.8 us
+on the first three shapes), and deeper work rings did not help. Per-role `%globaltimer` probes
+at 4096 x 4096 x 512 (pair, CLC) found every role waiting 0.7-1.2 us per item not for the
+scheduler (its ring slot was already full) but inside its own ring *release*: the pair ring
+derived a cluster-scope `mbarrier.arrive`, a `MEMBAR.ALL.GPU` per receiving thread, while the
+scheduler's claim took 0.26-0.29 us (CLC) or 0.32 us (atomic) and decode plus `st.async`
+publication 0.32 us. The ring's payload is completed by bytes and its releases publish
+nothing, so the layer now derives `remote_scope="cta"` for it ([scheduling](scheduling.md));
+the probes then show releases of 0.03-0.13 us and the MMA's item period equal to static's.
+With that, CLC ties static on the three short-K shapes and trails it by 0-6% at K = 4096 across
+runs (the table's 86.2 vs 81.2 was the largest; earlier sweeps had 82.8 vs 81.8), which is
+unexplained: neither the first-item path (the roles start within 0.1 us of static's) nor the
+claim chain is on the critical path there. The CLC path's remaining per-item cost is the
+0.6 us scheduler chain above, one work ring slot ahead of the slowest role.
 
 ## Grouped GEMM
 
