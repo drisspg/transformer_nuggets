@@ -7,6 +7,7 @@ and through a one-stage named mailbox that a turnstile serializes. The decode te
 """
 
 import math
+import warnings
 from types import SimpleNamespace
 
 import pytest
@@ -386,6 +387,13 @@ DECODE_CONFIGS = [
     ((2, 1500, 32, 1, 8, [300, 1500], [8, 3]), {"head_dim_v": 256}),
     ((3, 2048, 8, 1, 4, [1, 700, 2048], [1, 2, 4]), {"s_stages": 2, "p_stages": 6}),
     ((2, 1000, 10, 2, 3, None, None), {"s_stages": 6, "p_stages": 2, "kv_stages": (4, 4)}),
+    # The shared K/V ring: a 4-stage ring is one K block, so every V wait needs the rendezvous.
+    ((3, 2048, 8, 1, 4, [1, 700, 2048], [1, 2, 4]), {"shared_kv": True, "kv_stages": (2, 2)}),
+    ((2, 1000, 10, 2, 3, None, None), {"shared_kv": True, "kv_stages": (1, 2)}),
+    ((2, 1000, 10, 2, 3, None, None), {"shared_kv": True, "tile_k": 32}),
+    ((3, 2048, 8, 1, 4, [1, 700, 2048], [1, 2, 4]), {"shared_kv": True, "tile_n": 512}),
+    ((2, 1500, 32, 1, 8, [300, 1500], [8, 3]), {"shared_kv": True, "head_dim_v": 256}),
+    ((2, 1000, 10, 2, 3, None, None), {"shared_kv": True, "head_dim": 256}),
 ]
 
 
@@ -421,9 +429,10 @@ def check_against_reference(decode, case, **config):
     assert torch.count_nonzero(o[empty]) == 0, "an empty split must write O = 0"
 
 
+@pytest.mark.parametrize("shared_kv", [False, True])
 @pytest.mark.parametrize("case", DECODE_CASES)
-def test_decode_matches_fp32_reference(requires_blackwell, decode, case):
-    check_against_reference(decode, case)
+def test_decode_matches_fp32_reference(requires_blackwell, decode, case, shared_kv):
+    check_against_reference(decode, case, shared_kv=shared_kv)
 
 
 @pytest.mark.parametrize(
@@ -473,6 +482,31 @@ def test_decode_combines_wider_v(requires_blackwell, decode):
     )
 
 
+def test_decode_shared_kv_describe(decode, requires_blackwell):
+    """shared_kv=True: one exclusive ring read by both MMA warps, FA4's two rendezvous barriers
+    declared first (so the stats flags move up), and the default build unchanged."""
+    op = decode.SwapABDecode(8, shared_kv=True)
+    assert isinstance(op, decode.SharedKVDecode) and op.get_name().count("_shared") == 1
+    text = op.describe()
+    assert "kv       Ring(12) load -> mma_pv, mma_qk" in text, text
+    assert "full      1 x12, tx 16384 B" in text and "empty     1 x12" in text
+    assert "owners    exclusive: one of mma_pv, mma_qk owns each epoch" in text
+    assert "qk_issued    id 3  64 threads" in text and "pv_issued    id 4  64 threads" in text
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        decode.compile_decode(op)
+    text = op.describe()
+    # The MMAs' K/V reads and the loads are annotated: the stage handoff orders them.
+    assert "V ~ K (smem)  no hazard found" in text, text
+    assert "epochs    unverified (load's acquire runs inside a dynamic loop or branch)" in text
+    split = decode.SwapABDecode(8)
+    assert type(split) is decode.SwapABDecode and "_shared" not in split.get_name()
+    assert "max_done     id 3  160 threads" in split.describe()
+    assert op.__cute_cache_key__() != split.__cute_cache_key__()
+    with pytest.raises(ValueError, match="shared_kv must be a bool"):
+        decode.SwapABDecode(8, shared_kv=1)
+
+
 def test_decode_rejects_unfit_configurations(decode):
     with pytest.raises(ValueError, match="TMEM plan needs"):
         decode.SwapABDecode(32, tile_n=512)
@@ -493,6 +527,7 @@ def test_decode_rejects_unfit_configurations(decode):
         decode.SwapABDecode(8, roles={"load": RoleConfig(range(16, 18))})
 
 
+@pytest.mark.parametrize("shared_kv", [False, True])
 @pytest.mark.parametrize(
     "b, s, used",
     [
@@ -502,7 +537,9 @@ def test_decode_rejects_unfit_configurations(decode):
         (1, 8192, None),
     ],
 )
-def test_decode_matches_fa4_partials_bitwise(requires_blackwell, decode, monkeypatch, b, s, used):
+def test_decode_matches_fa4_partials_bitwise(
+    requires_blackwell, decode, monkeypatch, b, s, used, shared_kv
+):
     """Same split partials as FA4's swap-AB decode (with per-sequence lengths, the split counts
     from FA4's prepare kernel; then FA4's combine) bit for bit, and the same combined output."""
     interface = pytest.importorskip("flash_attn.cute.interface")
@@ -532,11 +569,12 @@ def test_decode_matches_fa4_partials_bitwise(requires_blackwell, decode, monkeyp
     table = captured["table"]
     assert (table is None) == (used is None), "FA4 took unexpected per-sequence split counts"
     splits = captured["o"].shape[0]
-    o, lse = decode.decode_partials(q, k, v, splits, seqused_k=used, splits_per_seq=table)
+    kw = {"seqused_k": used, "splits_per_seq": table, "shared_kv": shared_kv}
+    o, lse = decode.decode_partials(q, k, v, splits, **kw)
     counts = table if table is not None else torch.full((b,), splits, device="cuda")
     owned = torch.arange(splits, device="cuda")[:, None] < counts[None, :]
     assert torch.equal(o[owned], captured["o"][owned])
     assert torch.equal(lse[..., 0][owned], captured["lse"][:, :, 0][owned])
-    out, lse_out = decode.fa4_decode(q, k, v, splits, seqused_k=used, splits_per_seq=table)
+    out, lse_out = decode.fa4_decode(q, k, v, splits, **kw)
     assert torch.equal(out, out_fa4)
     assert torch.equal(lse_out, lse_fa4)

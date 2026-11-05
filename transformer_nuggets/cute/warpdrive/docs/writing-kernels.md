@@ -194,7 +194,8 @@ performance result by themselves.
 - [Persistent GEMM](../examples/persistent_gemm.py): multiple work items, pairs and multicast.
 - [FA4 forward](../examples/fa4_fwd.py): multi-consumer handoffs, slots and overlapping storage.
 - [Swap-AB decode](../examples/fa4_decode_swapab.py): round-robin instances and named channels;
-  currently OneShot-only, not a persistent template.
+  `shared_kv=True` adds exclusive consumers with FA4's rendezvous. Currently OneShot-only, not a
+  persistent template.
 - [Packed work](../examples/packed_work.py): a device-built list and readiness before decoding.
 - [Dropping down](dropping_down.md): raw barriers and targeted opt-outs when a managed pattern
   does not express the algorithm. Explain the replacement ordering; don't suppress a check

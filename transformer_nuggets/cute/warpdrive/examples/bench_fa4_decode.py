@@ -15,6 +15,8 @@ Run under ``gpu-run``:
 Timing uses fixed buffers and the median of seven interleaved round medians. ``--profile`` warms
 both variants, then brackets matched complete calls with CUDA profiler start/stop for NCU.
 ``--profile-reps`` repeats alternating pairs; ``--output`` also saves profiling provenance.
+``--shared-kv`` runs the port with ``shared_kv=True`` (FA4's shared K/V ring) instead of the
+default split K and V rings; compare the two in separate, interleaved processes.
 """
 
 import argparse
@@ -185,6 +187,9 @@ def main():
     parser.add_argument(
         "--profile-reps", type=int, default=1, help="alternating FA4/port pairs under NCU"
     )
+    parser.add_argument(
+        "--shared-kv", action="store_true", help="run the port with one shared K/V ring"
+    )
     args = parser.parse_args()
     if args.reps < 1 or args.rounds < 1 or args.rounds % 2 == 0:
         parser.error("--reps must be positive and --rounds must be positive and odd")
@@ -217,6 +222,7 @@ def main():
             "reps": args.reps,
             "rounds": args.rounds,
             "profile_reps": args.profile_reps if args.profile else None,
+            "shared_kv": args.shared_kv,
             "contract": (
                 "fixed-buffer complete calls; replay, caches and clocks controlled by external profiler"
                 if args.profile
@@ -235,8 +241,9 @@ def main():
             print(f"b{b} s{s} h{h}/{hkv} {pattern}: FA4 chose one split; skipped")
             continue
         splits, table = cap["o"].shape[0], cap["table"]
-        o, lse = decode_partials(q, k, v, splits, seqused_k=used, splits_per_seq=table)
-        out, _ = fa4_decode(q, k, v, splits, seqused_k=used, splits_per_seq=table)
+        port = {"splits_per_seq": table, "shared_kv": args.shared_kv}
+        o, lse = decode_partials(q, k, v, splits, seqused_k=used, **port)
+        out, _ = fa4_decode(q, k, v, splits, seqused_k=used, **port)
         counts = table.tolist() if table is not None else [splits] * b
         owned = torch.tensor(
             [[i < counts[j] for j in range(b)] for i in range(splits)], device="cuda"
@@ -267,9 +274,7 @@ def main():
         )
         # The port's wrapper fills seqused_k when it is None; build it outside the graph.
         used_port = used if used is not None else torch.full((b,), s, device="cuda").int()
-        g_port = graph_of(
-            partial(fa4_decode, q, k, v, splits, seqused_k=used_port, splits_per_seq=table)
-        )
+        g_port = graph_of(partial(fa4_decode, q, k, v, splits, seqused_k=used_port, **port))
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
             g_fa4.replay()
@@ -287,9 +292,7 @@ def main():
                     num_splits=0,
                     return_lse=True,
                 ),
-                "port": partial(
-                    fa4_decode, q, k, v, splits, seqused_k=used_port, splits_per_seq=table
-                ),
+                "port": partial(fa4_decode, q, k, v, splits, seqused_k=used_port, **port),
             }
             launch_order = []
             torch.cuda.cudart().cudaProfilerStart()

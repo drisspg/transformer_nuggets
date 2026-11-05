@@ -23,8 +23,9 @@ Then read the closest complete example, including its host wrapper, launch and c
 - [Grouped GEMM](examples/grouped_gemm.py): a custom `WorkMap` decoding device-side group
   sizes, per-item TMA addressing and a ragged TMA store.
 - [FA4 forward](examples/fa4_fwd.py): slots, fan-out and overlapping lifetimes.
-- [Swap-AB decode](examples/fa4_decode_swapab.py): round-robin and named channels; not a
-  persistent template.
+- [Swap-AB decode](examples/fa4_decode_swapab.py): round-robin and named channels, and with
+  `shared_kv=True` exclusive consumers plus a named-barrier rendezvous; not a persistent
+  template.
 - [Packed work](examples/packed_work.py): mapping a device-built list, not a complete kernel.
 
 Read the linked topic guide when using that feature. If investigating a fuzz report, resolve

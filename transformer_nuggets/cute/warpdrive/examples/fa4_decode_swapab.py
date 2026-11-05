@@ -30,7 +30,9 @@ the thread-to-thread mailboxes FA4 builds from ``bar.sync``/``bar.arrive``, and 
 
     q        Ring(1)  q_store -TMA-> mma_qk
     k, v     Ring     load -TMA-> mma_qk / mma_pv; FA4 shares one ring (K two blocks ahead of V,
-                      two MMA cursors); here K and V have their own rings and stages
+                      two MMA cursors); here K and V have their own rings and stages, unless
+                      ``shared_kv=True`` (``SharedKVDecode``: one exclusive-consumer ring ``kv``
+                      and the QKIssued/PVIssued ``NamedBarrier`` pair)
     s        Ring(4)  mma_qk -UMMA-> softmax[0|1], round-robin: softmax[i] takes blocks i, i+2, ...
     p        Ring(4)  softmax[0|1] -> mma_pv, round-robin; P in SMEM, the PV MMA's B operand
                       (``s_stages`` and ``p_stages``)
@@ -47,8 +49,8 @@ would let both softmax warpgroups into the exchange at once, so the turnstile se
 
 Differences from FA4 (see docs/examples.md for the measured effect):
 
-* Separate K and V rings instead of one ring read by two MMA cursors kept within one window by
-  two named barriers (QKIssued/PVIssued).
+* By default, separate K and V rings instead of one ring read by two MMA cursors kept within one
+  window by two named barriers (QKIssued/PVIssued); ``shared_kv=True`` selects FA4's protocol.
 * The first PV into each O slot overwrites it (``ACCUMULATE = False``) instead of the correction
   warpgroup zero-filling both O slots, and the correction tail reads O and L slot 1 as zero when
   a split has one block, so no TMEM zero-fill must be ordered before the first MMA.
@@ -206,6 +208,12 @@ def gemm_view(mX, order, head_idx=None, qhead_per_kvhead=None, num_heads_kv=None
 
 
 class SwapABDecode(WarpSpecialized):
+    def __new__(cls, *args, shared_kv: bool = False, **kwargs):
+        # The shared ring changes the K/V roles' channel parameters, so it is a subclass.
+        if shared_kv and not issubclass(cls, SharedKVDecode):
+            cls = SharedKVDecode
+        return super().__new__(cls)
+
     def __init__(
         self,
         tile_hq: int,
@@ -218,15 +226,18 @@ class SwapABDecode(WarpSpecialized):
         p_stages: int = 4,
         head_dim: int = 128,
         head_dim_v: int = 128,
+        shared_kv: bool = False,
         roles: dict[str, RoleConfig] | None = None,
     ):
         """``tile_hq``: query heads per KV head, a power of two up to 32. ``tile_n``: KV tokens
         per block, a power-of-two multiple of 128 (FA4: 256). ``tile_k``: MMA K step, one of
         ``TILE_KS``. ``s_stages``/``p_stages``: S (TMEM) and P (SMEM) ring depths, even (two
         softmax warpgroups). ``head_dim``/``head_dim_v``: Q/K and V/O head dimensions, multiples
-        of ``tile_k`` and 128. ``roles``: placement and register budgets by role name over the
-        defaults (FA4's 64/120/208 split for 32-head tiles, none otherwise). Combinations that do
-        not fit TMEM or SMEM raise at construction or first collection."""
+        of ``tile_k`` and 128. ``shared_kv``: FA4's protocol, one K/V ring of
+        ``sum(kv_stages)`` stages read by both MMA warps (``SharedKVDecode``), instead of a K ring
+        and a V ring. ``roles``: placement and register budgets by role name over the defaults
+        (FA4's 64/120/208 split for 32-head tiles, none otherwise). Combinations that do not fit
+        TMEM or SMEM raise at construction or first collection."""
         if tile_hq not in (1, 2, 4, 8, 16, 32):
             raise ValueError(f"tile_hq must be a power of two up to 32, got {tile_hq}")
         s_subtiles = tile_n // TILE_M
@@ -252,6 +263,9 @@ class SwapABDecode(WarpSpecialized):
                 raise ValueError(
                     f"{name} must be an even number >= 2 (two softmax warpgroups), got {stages}"
                 )
+        if type(shared_kv) is not bool:
+            raise ValueError(f"shared_kv must be a bool, got {shared_kv!r}")
+        self.shared_kv = shared_kv
         self.tile_hq = tile_hq
         self.tile_hq_mma = max(MMA_N_MIN, tile_hq)
         self.per_sequence = per_sequence
@@ -293,14 +307,29 @@ class SwapABDecode(WarpSpecialized):
         p_buf = self.smem_plan.buffer("P", bf16, align=1024)
         self.smem_plan.buffer("Q", bf16, align=1024)
         k_buf = self.smem_plan.buffer("K", bf16, align=1024)
-        v_buf = self.smem_plan.buffer("V", bf16, align=1024)
+        # Shared: each stage holds a K tile or a V^T tile, read with its own MMA layout.
+        v_buf = self.smem_plan.buffer("V", bf16, align=1024, overlaps=k_buf if shared_kv else None)
         # The O staging tile reuses K's bytes: it is written after the final O commit, which
-        # follows every QK MMA (S full -> P -> PV -> O full).
+        # follows every QK MMA (S full -> P -> PV -> O full) and, shared, every PV MMA.
         o_buf = self.smem_plan.buffer("O", Float32, align=1024, overlaps=k_buf)
 
         self.q = Ring(1, Tma(n * head_dim * 2), Umma)
-        self.k = Ring(n_k, Tma(self.kv_stage_bytes), Umma, buffer=k_buf)
-        self.v = Ring(n_v, Tma(self.kv_stage_bytes), Umma, buffer=v_buf)
+        if shared_kv:
+            self.kv = Ring(
+                n_k + n_v,
+                Tma(self.kv_stage_bytes),
+                Umma,
+                consumer_roles=("mma_qk", "mma_pv"),
+                consumer_mode="exclusive",
+                buffer={"K": k_buf, "V": v_buf},
+            )
+            # FA4's QKIssued/PVIssued: each MMA warp arrives on one after issuing a block and
+            # syncs on the other before waiting for its next, so both parity waits are exact.
+            self.qk_issued = NamedBarrier(threads=64)
+            self.pv_issued = NamedBarrier(threads=64)
+        else:
+            self.k = Ring(n_k, Tma(self.kv_stage_bytes), Umma, buffer=k_buf)
+            self.v = Ring(n_v, Tma(self.kv_stage_bytes), Umma, buffer=v_buf)
         self.s = Ring(s_stages, Umma, Threads, round_robin=True)
         self.p = Ring(
             p_stages, Threads, Umma, round_robin=True, commit_fence="smem_async", buffer=p_buf
@@ -354,6 +383,8 @@ class SwapABDecode(WarpSpecialized):
             shape = f"_n{self.tile_n}k{self.tile_k}d{self.head_dim}dv{self.head_dim_v}"
         if (self.s_stages, self.p_stages) != (4, 4):
             shape += f"_s{self.s_stages}p{self.p_stages}"
+        if self.shared_kv:
+            shape += "_shared"
         return (
             f"warpdrive_fa4_decode_swapab_hq{self.tile_hq}_k{n_k}v{n_v}{shape}_"
             f"{self.work.get_key()}{self.iket_key()}{self.trace_key()}"
@@ -459,11 +490,29 @@ class SwapABDecode(WarpSpecialized):
         v: Producer,
         work: WorkCursor,
     ):
+        thr_qk, thr_pv, tKsK, tVsV = self.load_setup(params)
+        k = k.views(K=StageView(tKsK, axis=1))
+        v = v.views(V=StageView(tVsV, axis=1))
+        lookahead = 2  # FA4's issue order: K(s) with V(s - 2)
+        while work.valid:
+            r = self.split_range(params, work.item)
+            for s in cutlass.range(lookahead + r.n_blocks, unroll=1):
+                if s < r.n_blocks:
+                    k = self.fill(k, "K", params.tma_k, self.k_sources(params, thr_qk, r, s))
+                if s >= lookahead:
+                    j = s - lookahead
+                    v = self.fill(v, "V", params.tma_v, self.v_sources(params, thr_pv, r, j))
+            self.split_stats(params, r)
+            work.advance()
+        return k, v, work
+
+    def load_setup(self, params: DecodeParams):
+        """Prefetch the TMA descriptors; the two MMAs' thread slices and the SMEM sides (tKsK,
+        tVsV) of the K/V partitions, which do not depend on the global tile."""
         for atom in (params.tma_q, params.tma_k, params.tma_v, params.tma_o):
             cpasync.prefetch_descriptor(atom)
         thr_qk, thr_pv = params.mma_qk.get_slice(0), params.mma_pv.get_slice(0)
         tiler = (TILE_M, self.tile_k)
-        # The SMEM side of a TMA partition does not depend on the global tile.
         gK0 = cute.zipped_divide(
             cute.local_tile(params.mK, (TILE_M, self.head_dim), (0, 0, 0)), tiler
         )[(None, None), (0, None)]
@@ -484,59 +533,60 @@ class SwapABDecode(WarpSpecialized):
             cute.group_modes(params.sV, 0, 3),
             cute.group_modes(thr_pv.partition_A(gV0), 0, 3),
         )
-        k = k.views(K=StageView(tKsK, axis=1))
-        v = v.views(V=StageView(tVsV, axis=1))
-        lookahead = 2  # FA4's issue order: K(s) with V(s - 2)
-        while work.valid:
-            r = self.split_range(params, work.item)
-            for s in cutlass.range(lookahead + r.n_blocks, unroll=1):
-                if s < r.n_blocks:
-                    for sm in cutlass.range_constexpr(self.s_subtiles):
-                        unit = (s + r.n_block_min) * self.s_subtiles + sm
-                        gK = cute.local_tile(params.mK, (TILE_M, self.head_dim), (unit, 0, r.bh))
-                        gK_sub = cute.zipped_divide(gK, tiler)[(None, None), (0, None)]
-                        _, tKgK = cpasync.tma_partition(
-                            params.tma_k,
-                            0,
-                            cute.make_layout(1),
-                            cute.group_modes(params.sK, 0, 3),
-                            cute.group_modes(thr_qk.partition_A(gK_sub), 0, 3),
-                        )
-                        for dk in cutlass.range_constexpr(self.k_tiles):
-                            with k.produce() as h:
-                                cute.copy(
-                                    params.tma_k,
-                                    tKgK[None, dk],
-                                    h.view("K"),
-                                    tma_bar_ptr=h.barrier,
-                                )
-                if s >= lookahead:
-                    block = s - lookahead + r.n_block_min
-                    for sk in cutlass.range_constexpr(self.pv_k_tiles):
-                        unit = block * self.s_subtiles + sk // (TILE_M // self.tile_k)
-                        gVt = cute.zipped_divide(
-                            cute.local_tile(params.mV, (self.head_dim_v, TILE_M), (0, unit, r.bh)),
-                            tiler,
-                        )
-                        gVt_sub = gVt[(None, None), (None, sk % (TILE_M // self.tile_k))]
-                        _, tVgV = cpasync.tma_partition(
-                            params.tma_v,
-                            0,
-                            cute.make_layout(1),
-                            cute.group_modes(params.sV, 0, 3),
-                            cute.group_modes(thr_pv.partition_A(gVt_sub), 0, 3),
-                        )
-                        for dm in cutlass.range_constexpr(self.d_tiles):
-                            with v.produce() as h:
-                                cute.copy(
-                                    params.tma_v,
-                                    tVgV[None, dm],
-                                    h.view("V"),
-                                    tma_bar_ptr=h.barrier,
-                                )
-            self.split_stats(params, r)
-            work.advance()
-        return k, v, work
+        return thr_qk, thr_pv, tKsK, tVsV
+
+    def k_sources(self, params: DecodeParams, thr_qk, r: SplitRange, s):
+        """Block s's K tiles, one per stage: subtile-major, then K step."""
+        tiler = (TILE_M, self.tile_k)
+        for sm in range(self.s_subtiles):
+            unit = (s + r.n_block_min) * self.s_subtiles + sm
+            gK = cute.local_tile(params.mK, (TILE_M, self.head_dim), (unit, 0, r.bh))
+            gK_sub = cute.zipped_divide(gK, tiler)[(None, None), (0, None)]
+            _, tKgK = cpasync.tma_partition(
+                params.tma_k,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(params.sK, 0, 3),
+                cute.group_modes(thr_qk.partition_A(gK_sub), 0, 3),
+            )
+            for dk in range(self.k_tiles):
+                yield tKgK[None, dk]
+
+    def v_sources(self, params: DecodeParams, thr_pv, r: SplitRange, j):
+        """Block j's V^T tiles, one per stage: PV K step-major, then head-dim tile."""
+        tiler = (TILE_M, self.tile_k)
+        block = j + r.n_block_min
+        for sk in range(self.pv_k_tiles):
+            unit = block * self.s_subtiles + sk // (TILE_M // self.tile_k)
+            gVt = cute.zipped_divide(
+                cute.local_tile(params.mV, (self.head_dim_v, TILE_M), (0, unit, r.bh)),
+                tiler,
+            )
+            gVt_sub = gVt[(None, None), (None, sk % (TILE_M // self.tile_k))]
+            _, tVgV = cpasync.tma_partition(
+                params.tma_v,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(params.sV, 0, 3),
+                cute.group_modes(thr_pv.partition_A(gVt_sub), 0, 3),
+            )
+            for dm in range(self.d_tiles):
+                yield tVgV[None, dm]
+
+    def fill(self, end, name: str, atom, sources, probe: bool = False):
+        """One TMA copy of each source into the next stage of ``end``'s buffer ``name``. With
+        ``probe``, each acquire after the first takes a try token probed after the previous
+        commit (tokens cannot cross the dynamic regions between groups). The shared ring's K
+        and V alias each other, so its copies are annotated for the alias diagnostic."""
+        access = {"write": True, "by": "tma"} if self.shared_kv else {}
+        token, sources = None, iter(sources)
+        src = next(sources, None)
+        while src is not None:
+            with end.produce(token=token) as h:
+                cute.copy(atom, src, h.view(name, **access), tma_bar_ptr=h.barrier)
+            src = next(sources, None)
+            token = end.try_acquire() if probe and src is not None else None
+        return end
 
     @cute.jit
     def split_stats(self, params: DecodeParams, r: SplitRange):
@@ -1051,6 +1101,8 @@ class SwapABDecode(WarpSpecialized):
             bf16, major.MN, major.MN, Float32, one, (TILE_M, n)
         )
         n_k, n_v = self.kv_stages
+        if cutlass.const_expr(self.shared_kv):  # both views of the shared ring: every stage
+            n_k = n_v = n_k + n_v
         sQ_layout = sm100_utils.make_smem_layout_b(mma_qk, tiler, bf16, self.k_tiles)
         sP_layout = sm100_utils.make_smem_layout_b(
             mma_pv, (None, n, self.tile_n), bf16, self.p_stages
@@ -1106,6 +1158,170 @@ class SwapABDecode(WarpSpecialized):
         )
 
 
+class SharedKVDecode(SwapABDecode):
+    """``SwapABDecode(..., shared_kv=True)``: FA4's K/V protocol. One ring of ``sum(kv_stages)``
+    stages; the loader fills K(0), K(1), then K(j + 2) and V(j) for each block j, then the last
+    two V blocks. Both MMA warps are exclusive consumers: each waits for and releases its own
+    blocks' stages and ``skip()``s the other's.
+
+    A consumer's parity wait of epoch e is exact once epoch e - n was filled; the waiter
+    observed that itself only if its previous wait was at most one ring lap earlier. PV's first
+    V wait (epoch 3 * K-block stages) and, on short rings, later waits are not, so FA4's two
+    named barriers order them: QK arrives on ``qk_issued`` after issuing block j and syncs on
+    ``pv_issued`` before waiting for block j's K; PV arrives on ``pv_issued`` once before its
+    first block, after each of K(0) and K(1) is issued, and after issuing each V block, and
+    syncs on ``qk_issued`` before each V block. When PV waits for V(j), QK has issued K(j + 2),
+    the group filled just before V(j); when QK waits for K(j) (j >= 3), PV has issued V(j - 3),
+    the group just before K(j). Every earlier epoch is then filled, so both waits are exact.
+    Each side syncs on one barrier between two arrivals on the other, so neither arrives twice
+    in one generation. PV's last ``pv_issued`` arrival is never matched (as in FA4); that is
+    sound because a ``OneShot`` CTA runs one work item.
+    """
+
+    @role(warps=2)
+    @cute.jit
+    def load(self, params: DecodeParams, *, kv: Producer, work: WorkCursor):
+        thr_qk, thr_pv, tKsK, tVsV = self.load_setup(params)
+        kv = kv.views(K=StageView(tKsK, axis=1), V=StageView(tVsV, axis=1))
+        lookahead = 2
+        while work.valid:
+            r = self.split_range(params, work.item)
+            for s in cutlass.range(lookahead + r.n_blocks, unroll=1):
+                if s < r.n_blocks:
+                    sources = self.k_sources(params, thr_qk, r, s)
+                    kv = self.fill(kv, "K", params.tma_k, sources, probe=True)
+                if s >= lookahead:
+                    sources = self.v_sources(params, thr_pv, r, s - lookahead)
+                    kv = self.fill(kv, "V", params.tma_v, sources, probe=True)
+            self.split_stats(params, r)
+            work.advance()
+        return kv, work
+
+    @role(warps=0)
+    @cute.jit
+    def mma_qk(
+        self,
+        params: DecodeParams,
+        *,
+        q: Consumer,
+        kv: Consumer,
+        s: Producer,
+        work: WorkCursor,
+        tmem: Tmem,
+    ):
+        mma = params.mma_qk
+        atom = cute.make_mma_atom(mma.op)
+        tCrQ = mma.make_fragment_B(params.sQ)
+        kv = kv.views(K=StageView(mma.make_fragment_A(params.sK), axis=3))
+        tStS, _, _ = self.tmem_tensors(params, tmem)
+        qk_k_blocks = self.tile_k // cute.size(mma.shape_mnk, mode=[2])
+        k_stages = self.s_subtiles * self.k_tiles
+        while work.valid:
+            r = self.split_range(params, work.item)
+            if r.n_blocks > 0:
+                qh = q.wait()
+                for block in cutlass.range(r.n_blocks, unroll=1):
+                    if block >= 3:  # V(block - 3) was filled between K(block - 1) and K(block)
+                        kv.skip(self.d_tiles * self.pv_k_tiles)
+                    self.pv_issued.sync()
+                    token = kv.try_wait()
+                    sh = s.acquire()
+                    for sm in cutlass.range_constexpr(self.s_subtiles):
+                        atom.set(tcgen05.Field.ACCUMULATE, False)
+                        acc = tStS[None, None, None, sm, sh.index]
+                        for dk in cutlass.range_constexpr(self.k_tiles):
+                            with kv.consume(token=token) as kh:
+                                for i in cutlass.range_constexpr(qk_k_blocks):
+                                    cute.gemm(
+                                        atom,
+                                        acc,
+                                        kh.view("K", None, None, i, read=True, by="umma"),
+                                        tCrQ[None, None, i, dk],
+                                        acc,
+                                    )
+                                    atom.set(tcgen05.Field.ACCUMULATE, True)
+                            if cutlass.const_expr(sm * self.k_tiles + dk == k_stages - 1):
+                                self.qk_issued.arrive()
+                            else:
+                                token = kv.try_wait()
+                    sh.commit()
+                # PV's waits for V(n - 2) and V(n - 1) follow two more rendezvous.
+                for _ in cutlass.range_constexpr(2):
+                    self.pv_issued.sync()
+                    self.qk_issued.arrive()
+                qh.release()
+            work.advance()
+        return q, kv, s, work
+
+    @role(warps=1)
+    @cute.jit
+    def mma_pv(
+        self,
+        params: DecodeParams,
+        *,
+        kv: Consumer,
+        p: Consumer,
+        o: Producer,
+        work: WorkCursor,
+        tmem: Tmem,
+    ):
+        mma = params.mma_pv
+        atom = cute.make_mma_atom(mma.op)
+        kv = kv.views(V=StageView(mma.make_fragment_A(params.sV), axis=3))
+        p = p.views(P=StageView(mma.make_fragment_B(params.sP), axis=3))
+        _, _, tOtO = self.tmem_tensors(params, tmem)
+        pv_k_blocks = self.tile_k // cute.size(mma.shape_mnk, mode=[2])
+        k_stages = self.s_subtiles * self.k_tiles
+        v_stages = self.pv_k_tiles * self.d_tiles
+        while work.valid:
+            r = self.split_range(params, work.item)
+            if r.n_blocks > 0:
+                self.pv_issued.arrive()
+                for ahead in cutlass.range_constexpr(2):  # K(0) and K(1) come before V(0)
+                    if ahead < r.n_blocks:
+                        kv.skip(k_stages)
+                    self.qk_issued.sync()
+                    self.pv_issued.arrive()
+                for j in cutlass.range(r.n_blocks, unroll=1):
+                    if j + 2 < r.n_blocks:  # K(j + 2) was filled just before V(j)
+                        kv.skip(k_stages)
+                    self.qk_issued.sync()
+                    token = kv.try_wait()
+                    ph = p.wait()
+                    # Free once the correction has rescaled what PV(j - 2) left there.
+                    oh = o.acquire()
+                    for dk in cutlass.range_constexpr(self.pv_k_tiles):
+                        for dm in cutlass.range_constexpr(self.d_tiles):
+                            last = dk * self.d_tiles + dm == v_stages - 1
+                            acc = tOtO[None, None, None, dm, oh.index]
+                            with kv.consume(token=token) as vh:
+                                for i in cutlass.range_constexpr(pv_k_blocks):
+                                    # Blocks 0 and 1 start their slot: no zero-fill first.
+                                    if cutlass.const_expr(dk == 0 and i == 0):
+                                        atom.set(tcgen05.Field.ACCUMULATE, j >= O_STAGES)
+                                    cute.gemm(
+                                        atom,
+                                        acc,
+                                        vh.view("V", None, None, i, read=True, by="umma"),
+                                        ph.view("P", None, None, dk * pv_k_blocks + i),
+                                        acc,
+                                    )
+                                    atom.set(tcgen05.Field.ACCUMULATE, True)
+                                if cutlass.const_expr(last):
+                                    self.pv_issued.arrive()
+                            if cutlass.const_expr(not last):
+                                token = kv.try_wait()
+                    ph.release()
+                    oh.commit()
+            # The correction tail always merges two slots; a one-block split commits an empty
+            # second one, which the tail reads as zero.
+            if r.n_blocks == 1:
+                with o.produce():
+                    pass
+            work.advance()
+        return kv, p, o, work
+
+
 @jit_cache(uncached=lambda op: op.trace_protocol)
 def compile_decode(op: SwapABDecode):
     """Compile once with dynamic batch, heads, KV length and split count. Cached in memory and
@@ -1153,7 +1369,7 @@ def decode_partials(
     <= ``num_splits``) gives per-sequence split counts; partials of splits past a sequence's
     count are left unwritten. Splits without KV blocks write O = 0 and LSE = -inf. ``config``:
     ``SwapABDecode``'s keyword options (``tile_n``, ``tile_k``, ``s_stages``, ``p_stages``,
-    ``roles``); ``head_dim``/``head_dim_v`` follow the tensors."""
+    ``shared_kv``, ``roles``); ``head_dim``/``head_dim_v`` follow the tensors."""
     if any(t.dtype != torch.bfloat16 for t in (q, k, v)):
         raise TypeError("decode_partials expects bfloat16 q, k, v")
     if (

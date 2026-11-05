@@ -472,7 +472,8 @@ dimensions and the roles' register budgets are constructor arguments of `SwapABD
 defaults, which match FA4; see [configuration](configuration.md) for the valid ranges.
 
 FA4 reads one K/V ring with two MMA cursors, keeping K two blocks ahead of V with two extra named
-barriers. Here K and V have their own rings, 7 and 5 stages at FA4's total of 12 (8-head tiles).
+barriers. By default K and V have their own rings here, 7 and 5 stages at FA4's total of 12 (8-head
+tiles); `shared_kv=True` selects FA4's shared ring (see [below](#shared-kv-ring)).
 The other changes: the first PV into each O slot overwrites it instead of the correction
 warpgroup zero-filling TMEM first, and an empty split runs the normal tail with zero sums.
 
@@ -797,14 +798,68 @@ to 9 of 13. With the committed benchmark in A/B/A/B processes on one GB300 (seve
 (mean of two processes per side; ragged 8x65536: 27.392 -> 27.361 us). Partials stayed
 bitwise equal to FA4's in every process.
 
-The missing layer capability is a shared TMA ring with multiple independent, exclusive MMA
-cursors, including explicit skipped epochs and a bootstrap/skew contract preventing parity
-aliasing. `Slots` requires Python-int slot IDs and only advances a reader's visited slots;
-it does not supply that dynamic ownership protocol. This is a capability requirement, not
-a shipped API or a recommendation to replace every split ring. The raw prototype, source
-phase tables, matched Perfetto tracks, failed ablations and reproduction scripts are retained
-in `agent_space/decode_sass/`; the example's split-ring default and the seven-config SASS gate
-remain unchanged.
+The missing layer capability was a shared TMA ring with several independent, exclusive MMA
+cursors, explicit skipped epochs and a bootstrap/skew contract preventing parity aliasing.
+`Slots` requires Python-int slot IDs and only advances a reader's visited slots; it does not
+supply that dynamic ownership protocol. [Exclusive consumers](channels.md#exclusive-consumers)
+now provide the ring and the skips; the skew contract stays the author's, as the rendezvous
+recipe there shows. The raw prototype, source phase tables, matched Perfetto tracks, failed
+ablations and reproduction scripts are retained in `agent_space/decode_sass/`.
+
+### Shared KV ring
+
+```python
+out, lse = fa4_decode(q, k, v, num_splits, seqused_k=lengths, splits_per_seq=counts, shared_kv=True)
+```
+
+`SwapABDecode(..., shared_kv=True)` (a `SharedKVDecode`) ports the prototype onto the layer:
+one `Ring(sum(kv_stages), Tma(...), Umma, consumer_mode="exclusive")` whose stages hold either
+a K tile or a V^T tile (the V buffer overlaps K), with the QK and PV warps as exclusive
+consumers that `skip()` each other's blocks, and FA4's QKIssued/PVIssued `NamedBarrier`s
+([recipe](channels.md#rendezvous-recipe-fa4s-qkissuedpvissued)). Both MMA warps probe their
+next stage with a try token after each release, as FA4 does; the loader probes its next stage
+after each commit within a block's K or V group (a token cannot cross the dynamic regions
+between groups, where FA4's loader carries its own). The default remains the split rings:
+the shared ring wins on ragged lengths and the 32-head single-sequence case and loses on the
+others. Partials stay bitwise equal to FA4's with either.
+
+Decode-kernel CUPTI medians in microseconds of the committed benchmark
+(`bench_fa4_decode.py`, FA4 prepare/decode/combine, port decode/combine; only the decode
+kernel timed), `--shared-kv` against the default in three process pairs (A/B, B/A, A/B)
+under one reservation, seven alternating FA4/port rounds of 200 replays after three seconds
+of warmup, median of the three process medians. GB300, CuTeDSL 4.8.0, PyTorch
+`2.15.0.dev20260922+cu132`, Triton 3.8.0, FA4 `00807a02`, November 5, 2026, normal DVFS;
+lower is better:
+
+| batch x kv_len, heads/kv_heads | FA4 | split (default) | shared_kv | shared vs split |
+|---|---:|---:|---:|---:|
+| 1x8192, 8/1 | 4.320 | 4.256 | 4.288 | +0.75% |
+| 4x16384, 32/8 | 39.872 | 40.224 | 40.257 | +0.08% |
+| 8x32768, 32/8 | 152.097 | 148.162 | 150.432 | +1.53% |
+| 8x65536 ragged, 8/1 | 26.945 | 28.162 | 27.104 | -3.76% |
+| 16x32768 ragged, 64/8 | 179.906 | 179.842 | 180.019 | +0.10% |
+| 1x32768, 32/1 | 7.088 | 7.168 | 6.976 | -2.68% |
+| 2x131072 ragged, 16/1 | 9.281 | 8.736 | 9.248 | +5.86% |
+
+The ragged case gains 1.06 us (the raw prototype's wrapper confirmation: 0.895 us, 27.487 to
+26.592 us), leaving 0.16 us to FA4. Each variant's three process medians agreed within
+0.16 us (0.1%). Levels move more than that between reservations: an earlier
+reservation on the same GPU measured the ragged case at 27.36 (split) and 26.37-26.40 us
+(shared) with FA4 at 26.18 us, so compare columns of one run only. Pick the protocol per
+shape: shared for ragged lengths with a single KV head and for long single sequences with
+many heads per KV head; split elsewhere, notably for the 2x131072 ragged case (+5.9%) and the
+8x32768 full case (+1.5%).
+
+The try tokens are worth keeping on the shared ring, unlike on the split rings: removing them
+(blocking waits throughout), interleaved in three process pairs on shapes 1x8192, 8x65536
+ragged, 1x32768 and 2x131072 ragged, measured 4.352/26.432/7.040/9.248 us against
+4.288/26.431/6.944/9.248 us with them.
+
+```bash
+gpu-run --timeout 1800 auto -- timeout --signal=TERM --kill-after=5s 900s \
+  .venv/bin/python -m transformer_nuggets.cute.warpdrive.examples.bench_fa4_decode --shared-kv \
+  --output agent_space/decode_shared.json
+```
 
 ## warpdrive fixed costs
 
