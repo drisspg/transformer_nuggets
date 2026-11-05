@@ -93,6 +93,7 @@ from transformer_nuggets.cute.warpdrive.tracing import pop, push_if
 
 AXES = ("m", "n", "l")
 INT32_MAX = 2**31 - 1
+MAX_GRID_YZ = 65535  # gridDim.y and gridDim.z limit
 
 
 def _field_key(obj, skip: tuple[str, ...] = ()) -> str:
@@ -105,12 +106,6 @@ def _field_key(obj, skip: tuple[str, ...] = ()) -> str:
         for f in fields(obj)
         if f.name not in skip
     )
-
-
-def _min(a, b):
-    if isinstance(a, int) and isinstance(b, int):
-        return min(a, b)
-    return cutlass.min(a, b)
 
 
 # --------------------------------------------------------------------------- #
@@ -189,6 +184,9 @@ class WorkMap:
     def get_key(self) -> str:
         raise NotImplementedError
 
+    def describe(self) -> str:
+        return type(self).__name__
+
 
 @dataclass(frozen=True)
 class Raster(WorkMap):
@@ -259,9 +257,9 @@ class Raster(WorkMap):
             a = r - b * e_along
         else:
             # A band never holds more than the whole layer, so this stays within the count.
-            band_tiles = _min(self.swizzle, e_band) * e_along
+            band_tiles = cutlass.min(self.swizzle, e_band) * e_along
             start = (r // band_tiles) * self.swizzle
-            width = _min(self.swizzle, e_band - start)
+            width = cutlass.min(self.swizzle, e_band - start)
             local = r - start * e_along
             a = local // width
             b = start + (local - a * width)
@@ -431,9 +429,6 @@ class OneShot(IndexSchedule):
     persistent = False
     uses_max_ctas = False
 
-    def launch_units(self, total, max_units):
-        return cutlass.max(total, 1)
-
     def index_limit(self, total, units, cs: int):
         return total * cs  # the 1-D grid; the terminal index is ``total``
 
@@ -498,14 +493,13 @@ class ClusterLaunchControl(IndexSchedule):
     launched CTA with ``clusterlaunchcontrol.try_cancel`` and runs its item instead. The hardware
     balances load and yields SMs to other kernels, with no counter to manage. ``stages``: decoded
     items buffered ahead of the slowest role. In a cluster rank 0 cancels whole clusters (the
-    response is not multicast; the decoded item is published to every CTA)."""
+    response is not multicast; the decoded item is published to every CTA). Nothing is in
+    flight when the scheduler warp exits: every query was waited, and none follows a failed one
+    (PTX forbids that), so ``close_claims`` has nothing to do."""
 
     stages: int = 2
     broadcast = True
     uses_max_ctas = False
-
-    def launch_units(self, total, max_units):
-        return cutlass.max(total, 1)
 
     def index_limit(self, total, units, cs: int):
         return total * cs  # the grid; a failed cancel returns the terminal index ``total``
@@ -530,11 +524,6 @@ class ClusterLaunchControl(IndexSchedule):
         if cutlass.const_expr(problem.cs > 1):
             x = x // problem.cs  # first CTA of the canceled cluster -> cluster index
         return x * ok + problem.total * (1 - ok)
-
-    def close_claims(self, fetch, problem):
-        # Every query was waited, and none follows a failed one (PTX forbids that), so nothing
-        # is in flight when the scheduler warp exits.
-        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -566,13 +555,12 @@ class WorkStream:
     _workspaces: dict = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self):
-        for value, protocol, arg in (
-            (self.mapping, WorkMap, "mapping"),
-            (self.schedule, IndexSchedule, "schedule"),
-            (self.ready, (Readiness, type(None)), "ready"),
+        for arg, value, protocol, names in (
+            ("mapping", self.mapping, WorkMap, "WorkMap"),
+            ("schedule", self.schedule, IndexSchedule, "IndexSchedule"),
+            ("ready", self.ready, (Readiness, type(None)), "Readiness or None"),
         ):
             if not isinstance(value, protocol):
-                names = getattr(protocol, "__name__", "Readiness or None")
                 raise TypeError(
                     f"WorkStream.{arg}: expected an instance of {names} (subclass the public "
                     f"protocol), got {type(value).__name__}"
@@ -621,8 +609,7 @@ class WorkStream:
 
     def describe(self) -> str:
         ready = f", ready={type(self.ready).__name__}" if self.ready else ""
-        desc = getattr(self.mapping, "describe", lambda: type(self.mapping).__name__)()
-        return f"{self.schedule.describe()}, {desc}{ready}"
+        return f"{self.schedule.describe()}, {self.mapping.describe()}{ready}"
 
     def get_key(self) -> str:
         """Compile-key fragment: only compile-time choices (never extents or SM counts)."""
@@ -658,7 +645,7 @@ class WorkStream:
                 f"schedule (OneShot), not {self.schedule.describe()}; a role that runs several "
                 f"items takes `{self.name or 'work'}: WorkCursor` and loops"
             )
-        problems = getattr(self.owner, "_ws_problems", None) or {}
+        problems = getattr(self.owner, "_ws_problems", {})
         if self.name not in problems:
             raise ProtocolError(
                 f"WorkStream {self.name or '?'}: call single_item() inside a role, after "
@@ -749,16 +736,19 @@ class BoundWork:
         self.total = total
         self.cs = stream.cluster_size  # CTAs per work unit
 
+    def _in_units(self, ctas):
+        """A CTA count or index along x in work units (clusters of ``cs`` CTAs)."""
+        return ctas if self.cs == 1 else ctas // self.cs
+
     def units(self):
         """Device-side: launched work units along x (CTAs, or clusters); the
         persistent schedules' stride. A ``OneShot`` tile grid has more units along y and z."""
-        grid = cute.arch.grid_dim()[0]
-        return grid if self.cs == 1 else grid // self.cs
+        return self._in_units(cute.arch.grid_dim()[0])
 
     def first_unit(self):
         """Device-side: this CTA's work unit (its cluster's index), as a linear index."""
         bidx, bidy, bidz = cute.arch.block_idx()
-        unit = bidx if self.cs == 1 else bidx // self.cs
+        unit = self._in_units(bidx)
         if _tile_grid(self.stream):
             em, en, _ = self.space
             unit = unit + em * (bidy + en * bidz)
@@ -768,23 +758,18 @@ class BoundWork:
         """Device-side, in the kernel prologue (``begin_roles``): the first item's words of a
         ``_tile_grid`` stream, shared by every role so the fallback branch stays off their
         paths."""
-        self.first_words = self.grid_item_words() if _tile_grid(self.stream) else None
-
-    def grid_item_words(self):
-        """Device-side: this CTA's item words for a ``_tile_grid`` stream, from ``blockIdx``
-        when the launch is the tile grid, decoded from the 1-D index when it fell back."""
-        bidx, bidy, bidz = cute.arch.block_idx()
-        unit = bidx if self.cs == 1 else bidx // self.cs
-        return list(
-            _grid_item(self.stream.mapping, self.space, Int32(unit), Int32(bidy), Int32(bidz))
-        )
+        self.first_words = None
+        if _tile_grid(self.stream):
+            bidx, bidy, bidz = cute.arch.block_idx()
+            unit = Int32(self._in_units(bidx))
+            item = _grid_item(self.stream.mapping, self.space, unit, Int32(bidy), Int32(bidz))
+            self.first_words = list(item)
 
     def _uses_workspace(self) -> bool:
         return self.stream.schedule.uses_workspace or bool(self.stream.record)
 
     def __extract_mlir_values__(self):
         values = cutlass.extract_mlir_values(self.space)
-        self._n_space = len(values)
         if not isinstance(self.total, int):  # a static total stays a constant
             values += cutlass.extract_mlir_values(self.total)
         if self._uses_workspace():
@@ -792,7 +777,7 @@ class BoundWork:
         return values
 
     def __new_from_mlir_values__(self, values):
-        n = getattr(self, "_n_space", len(cutlass.extract_mlir_values(self.space)))
+        n = len(cutlass.extract_mlir_values(self.space))
         space = cutlass.new_from_mlir_values(self.space, values[:n])
         total = self.total
         if not isinstance(total, int):
@@ -868,15 +853,7 @@ def _decode(stream, index, problem):
     mapping = stream.mapping
     if mapping.decodes_any_index:
         return _keep_words(mapping, index, problem.space)[1]
-    return list(_decode_valid(mapping, index, problem.total, problem.space))
-
-
-@cute.jit
-def _decode_valid(mapping, index, total, space):
-    words = tuple(Int32(0) for _ in range(mapping.words))
-    if index < total:
-        words = tuple(_keep_words(mapping, index, space)[1])
-    return words
+    return list(_decode_kept(mapping, index, problem.total, problem.space)[1])
 
 
 @cute.jit
@@ -964,9 +941,6 @@ def _is_while_body(block, cond_block) -> bool:
         and block == op.regions[1].blocks[0]
         and cond_block == op.regions[0].blocks[0]
     )
-
-
-MAX_GRID_YZ = 65535  # gridDim.y and gridDim.z limit
 
 
 @functools.cache
