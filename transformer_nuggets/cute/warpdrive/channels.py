@@ -227,8 +227,8 @@ class Channel:
     elected releases are the ``Warps`` mechanism; ``docs/dropping_down.md``).
 
     ``producer_sharing``/``consumer_sharing`` (a ``Sharing``) and ``sync`` are described in the
-    module docstring. A named channel takes no override and must stay CTA-local; ``named_ids``
-    holds its ``(full, empty)`` barrier IDs per slot once the kernel is collected.
+    module docstring. A named channel takes no override and must stay CTA-local; once the kernel
+    is collected, ``full_barriers``/``empty_barriers`` hold its ``NamedBarrier`` per slot.
     """
 
     n: int
@@ -261,8 +261,9 @@ class Channel:
     internal: bool = field(default=False, init=False, repr=False)
     # ``buffer`` normalized to {name: SmemBuffer}; a single buffer is keyed by its plan name.
     buffers: dict = field(default_factory=dict, init=False, repr=False)
-    # sync="named": ([full id per slot], [empty id per slot]), assigned by the kernel.
-    named_ids: tuple | None = field(default=None, init=False, repr=False)
+    # sync="named": a NamedBarrier per slot for each side, allocated by the kernel.
+    full_barriers: tuple = field(default=(), init=False, repr=False)
+    empty_barriers: tuple = field(default=(), init=False, repr=False)
 
     def __post_init__(self):
         if type(self.n) is not int:
@@ -685,7 +686,7 @@ class Handle(_Stage):
         self._close(True, "commit" if signal else "commit(raw signal)")
         if wait:
             _fence(self._end._chan.commit_fence)
-            self._end._named_wait(self._end._chan.named_ids[0], self.index, "commit")
+            self._end._named_wait(self._end._chan.full_barriers, self.index, "commit")
         elif signal:
             self._end._signal(self.index)
 
@@ -1014,24 +1015,24 @@ class _End:
         if self._chan.named:
             raise ProtocolError(
                 f"{self._trace.role_name}: {self._chan.name} is a named-barrier channel and has no "
-                f"mbarriers ({what}); its barrier IDs are channel.named_ids"
+                f"mbarriers ({what}); its barriers are channel.full_barriers/empty_barriers"
             )
 
-    def _named_id(self, ids, index):
+    @staticmethod
+    def _named(barriers, index):
+        """(barrier ID, thread count) of a named channel's slot ``index`` on one side."""
         if isinstance(index, int):
-            return ids[index]
-        return Int32(ids[0]) + index  # ring stages have consecutive IDs
+            nb = barriers[index]
+            return nb._allocated_id(), nb.threads
+        # Ring stages have consecutive IDs and one count.
+        return Int32(barriers[0]._allocated_id()) + index, barriers[0].threads
 
-    def _named_count(self, index):
-        counts = self._chan.named_counts()
-        return counts[index] if isinstance(index, int) else counts[0]
-
-    def _named_wait(self, ids, index, op):
+    def _named_wait(self, barriers, index, op):
         with wait_range(self._trace, f"{self._chan.name}.{op}"):
-            _named_sync(self._named_id(ids, index), self._named_count(index))
+            _named_sync(*self._named(barriers, index))
 
-    def _named_arrive(self, ids, index):
-        _named_arrive(self._named_id(ids, index), self._named_count(index))
+    def _named_arrive(self, barriers, index):
+        _named_arrive(*self._named(barriers, index))
 
     def _check_turn(self, side: str, op: str):
         chan = self._chan
@@ -1048,7 +1049,7 @@ class _End:
         """Named channel, consumer: arrive once on the empty barriers of ``slots`` (layer-emitted
         at role start; the equivalent of mbarriers starting empty)."""
         for j in slots:
-            _named_arrive(self._chan.named_ids[1][j], self._chan.named_counts()[j])
+            self._named_arrive(self._chan.empty_barriers, j)
 
     def _full(self, index):
         return self._bars + index
@@ -1335,7 +1336,7 @@ class _End:
         self._trace.record(chan.name, op, label)
         if chan.named:
             self._check_turn("producer" if producer else "consumer", op)
-            self._named_wait(chan.named_ids[1 if producer else 0], index, op)
+            self._named_wait(chan.empty_barriers if producer else chan.full_barriers, index, op)
         else:
             with wait_range(self._trace, f"{chan.name}.{op}"):
                 _wait(self._empty(index) if producer else self._full(index), phase, ready)
@@ -1396,7 +1397,7 @@ class ProducerEnd(_End):
         chan = self._chan
         if chan.named:
             _fence(chan.commit_fence)
-            self._named_arrive(chan.named_ids[0], index)
+            self._named_arrive(chan.full_barriers, index)
             return
         self._arrive(chan.producer, self._full(index), chan.commit_fence, chan.scope.full_mask)
 
@@ -1507,7 +1508,7 @@ class ConsumerEnd(_End):
         chan = self._chan
         if chan.named:
             _fence(chan.release_fence)
-            self._named_arrive(chan.named_ids[1], index)
+            self._named_arrive(chan.empty_barriers, index)
             return
         self._arrive(chan.consumer, self._empty(index), chan.release_fence, chan.scope.empty_mask)
 

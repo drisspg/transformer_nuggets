@@ -196,7 +196,10 @@ def _channels(kernel) -> str:
         details.append(("signal", f"{_mech(ch.producer)} -> {_mech(ch.consumer)}"))
         if ch.named:
             # One hardware barrier per slot and side; producers and consumers both arrive.
-            full_ids, empty_ids = ch.named_ids
+            full_ids, empty_ids = (
+                [nb._allocated_id() for nb in bars]
+                for bars in (ch.full_barriers, ch.empty_barriers)
+            )
             count = fmt_counts(ch.named_counts())
             named = f"full ids {full_ids}, empty ids {empty_ids}, {count} threads"
             if ch.turnstile is not None:

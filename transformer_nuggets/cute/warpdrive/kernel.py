@@ -1033,10 +1033,11 @@ class WarpSpecialized(metaclass=_KernelType):
 
     @property
     def named_barrier_ids(self) -> dict:
-        """``{channel: ([full id per slot], [empty id per slot])}`` of the named-barrier channels.
-        They are allocated from 15 downward, after the layer's IDs 1 and 2; declared
-        ``NamedBarrier``s take IDs from 3 upward (each has its own ``.id``). Hand-picked IDs in
-        user code must avoid both (``alias.named_barrier`` calls are checked while tracing)."""
+        """``{channel: ([full id per slot], [empty id per slot])}`` of the named-barrier channels
+        (the IDs of their ``full_barriers``/``empty_barriers``). They are allocated from 15
+        downward, after the layer's IDs 1 and 2; declared ``NamedBarrier``s take IDs from 3
+        upward (each has its own ``.id``). Hand-picked IDs in user code must avoid both
+        (``alias.named_barrier`` calls are checked while tracing)."""
         self._collect()
         return dict(self._ws_named)
 
@@ -1485,6 +1486,11 @@ class WarpSpecialized(metaclass=_KernelType):
             name: {"sync": [], "arrive": [], "native": [], "unverified": []}
             for name in self._ws_named_bars
         }
+        channel_bars = {
+            nb.name: nb
+            for ch in self._ws_chans.values()
+            for nb in (*ch.full_barriers, *ch.empty_barriers)
+        }
         ops = {"barrier": "sync", "barrier_arrive": "arrive", "barrier_native": "native"}
         for role_events in self._ws_alias_roles:
             for ev in role_events.events:
@@ -1492,6 +1498,8 @@ class WarpSpecialized(metaclass=_KernelType):
                     continue
                 if "barrier" in ev.data:  # a NamedBarrier operation or ID read
                     name = ev.data["barrier"].name
+                    if channel_bars.get(name) is ev.data["barrier"]:
+                        continue  # a named channel's slot: participation is the channel's
                     if self._ws_named_bars.get(name) is not ev.data["barrier"]:
                         raise ProtocolError(
                             f"{role_events.name}: NamedBarrier {name} at {ev.site} belongs to "
@@ -1884,8 +1892,9 @@ def _role_overrides(roles, declared: dict) -> dict:
 def _allocate_named(chans: dict, named_bars: dict) -> dict:
     """Assign named barrier IDs: named channels from ``MAX_NAMED_BARRIER_ID`` down (per channel,
     ``n`` consecutive full IDs then ``n`` empty IDs, which ring stages index), then each
-    ``NamedBarrier`` one ID from ``FIRST_FREE_BARRIER_ID`` up, in declaration order. Returns the
-    channels' IDs."""
+    ``NamedBarrier`` one ID from ``FIRST_FREE_BARRIER_ID`` up, in declaration order. A named
+    channel's slots become ``NamedBarrier``s (``full_barriers``/``empty_barriers``) counting
+    the slot's producer and consumer threads. Returns the channels' IDs."""
     named_chans = {name: ch for name, ch in chans.items() if ch.named}
     need = sum(2 * ch.n for ch in named_chans.values()) + len(named_bars)
     free = MAX_NAMED_BARRIER_ID - FIRST_FREE_BARRIER_ID + 1
@@ -1898,12 +1907,26 @@ def _allocate_named(chans: dict, named_bars: dict) -> dict:
     out, top = {}, MAX_NAMED_BARRIER_ID
     for name, ch in named_chans.items():
         base = top - 2 * ch.n + 1
-        ch.named_ids = (list(range(base, base + ch.n)), list(range(base + ch.n, top + 1)))
-        out[name] = ch.named_ids
+        ch.full_barriers, ch.empty_barriers = (
+            tuple(
+                _channel_barrier(f"{name}.{kind}[{s}]", first + s, count)
+                for s, count in enumerate(ch.named_counts())
+            )
+            for kind, first in (("full", base), ("empty", base + ch.n))
+        )
+        out[name] = tuple(
+            [nb._id for nb in bars] for bars in (ch.full_barriers, ch.empty_barriers)
+        )
         top = base - 1
     for barrier_id, nb in enumerate(named_bars.values(), FIRST_FREE_BARRIER_ID):
         nb._id = barrier_id
     return out
+
+
+def _channel_barrier(name: str, barrier_id: int, threads: int) -> NamedBarrier:
+    nb = NamedBarrier(threads)
+    nb.name, nb._id = name, barrier_id
+    return nb
 
 
 def _runs(warps: list[int]) -> list[range]:

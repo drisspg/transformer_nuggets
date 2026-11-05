@@ -113,7 +113,7 @@ class RoundRobinToy(WarpSpecialized):
             with mail.consume() as h:
                 ctx.out[e * 32 + lane, 2] = h.data[lane]
         if cutlass.const_expr(self.mode == "id_collision"):
-            named_barrier(self.named_barrier_ids["mail"][0][0], 32)
+            named_barrier(self.mail.full_barriers[0].id, 32)
         return nr, mail
 
     @cute.kernel

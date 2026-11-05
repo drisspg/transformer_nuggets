@@ -291,9 +291,10 @@ turnstile over exactly those instances; their acquires (or waits) must run insid
 which is checked while tracing.
 
 IDs are allocated per channel in declaration order from 15 downward, in consecutive blocks
-of n full IDs followed by n empty IDs. `channel.named_ids[0][s]` and
-`channel.named_ids[1][s]` name slot s's full and empty barriers; `op.named_barrier_ids` and
-`describe()` list them. ID 0 is for CTA synchronization, and 1 and 2 belong to the layer,
+of n full IDs followed by n empty IDs. Each slot's barriers are
+[`NamedBarrier`s](#named-barriers): `channel.full_barriers[s]` and `channel.empty_barriers[s]`,
+named `<channel>.full[s]`/`<channel>.empty[s]`, with the slot's ID (`.id`) and its producer
+plus consumer thread count (`.threads`). `op.named_barrier_ids` and `describe()` list the IDs. ID 0 is for CTA synchronization, and 1 and 2 belong to the layer,
 leaving 13 IDs for channels and [named barriers](#named-barriers). Hand-picked IDs must avoid
 the allocated IDs even if they are small. Calls through `alias.named_barrier` are checked
 against them; raw `cute.arch.barrier` and `barrier_arrive` calls are not. Named channels have

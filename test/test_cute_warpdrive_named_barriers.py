@@ -225,6 +225,12 @@ def test_named_barriers_allocate_upward_and_leave_channel_ids():
     assert op.named_barrier_ids == plain.named_barrier_ids == {"a": ([12, 13], [14, 15])}
     op.describe()
     assert (op.x.id, op.y.id) == (3, 4)
+    # The channel's slots are NamedBarriers too, counting both sides' threads.
+    slots = [(nb.name, nb.id, nb.threads) for nb in (*op.a.full_barriers, *op.a.empty_barriers)]
+    assert slots == [("a.full[0]", 12, 64), ("a.full[1]", 13, 64)] + [
+        ("a.empty[0]", 14, 64),
+        ("a.empty[1]", 15, 64),
+    ]
 
 
 def test_named_barrier_ids_are_exhaustible():
