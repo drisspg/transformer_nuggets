@@ -1037,6 +1037,8 @@ def generate(
                 fits = fills and (waiting == set(everyone) or fill_two)
                 if fits and fill_rng.random() < (0.7 if len(prod | cons) > 1 else 0.3):
                     ch["fills"], ch["fill_two"] = fills, fill_two
+                elif prod == {everyone} and waiting == set(everyone) and fill_rng.random() < 0.5:
+                    pass  # each CTA loads its own stage; extra leader or rank0 consumers join
                 elif len(prod | cons) > 1:
                     ch["producer"] = "threads"
     spec_roles = {r["name"]: r for r in roles}
@@ -1059,15 +1061,22 @@ def generate(
             )
             if width > 512:
                 ch["payload"] = False
-    if cluster:  # multicast TMA along a mode with more than one CTA (never with rank0 roles)
+    if cluster:  # multicast TMA along a mode with more than one CTA
         modes = [m for m in "mn" if len(geom.reach(0, (m,))) > 1]
         for ch in channels:
             side = (*ch["producers"], *ch["consumers"])
             if ch["producer"] != "tma" or not modes:
                 continue
-            if any(roles[int(r[1:])]["cta"] == "rank0" for r, _ in side):
-                continue
-            if len(placed_ctas(side)) > 1 and not ch.get("tma_pair") or ch.get("fills"):
+            # Every CTA a copy lands in needs a waiting consumer: producers and consumers in
+            # every CTA (extra leader or rank0 consumers may join), 2-CTA channels, pair fills,
+            # or one placement without rank0 roles.
+            prod, cons = placed_ctas(ch["producers"]), placed_ctas(ch["consumers"])
+            everywhere = prod == {everyone} and set().union(*cons) == set(everyone)
+            single = len(placed_ctas(side)) == 1 and not any(
+                roles[int(r[1:])]["cta"] == "rank0" for r, _ in side
+            )
+            pair_fill = ch.get("fills") == "pair"
+            if not (everywhere or single or ch.get("tma_pair") or pair_fill):
                 continue
             if rng.random() < 0.6:
                 ch["multicast"] = rng.choice(modes)
@@ -2105,7 +2114,7 @@ def emit(spec: KernelSpec) -> str:
                 f"{TMA_COLS}, {ch.n}), order=(1, 0, 2)), 128)"
             )
         coord, layout = "0", "cute.make_layout(1)"
-        if ch.multicast:
+        if ch.multicast and not ch.fills:
             src(f'mc_{c} = self.cluster.multicast("{ch.multicast}")')
             coord, layout = f"mc_{c}.coord", f"mc_{c}.layout"
             ctx.append(f"mc_{c}=mc_{c}.mask")
@@ -2113,9 +2122,12 @@ def emit(spec: KernelSpec) -> str:
             first = "0" if ch.fills == "cluster" else f"fr_{c} - fr_{c} % 2"
             if ch.fills == "pair":
                 src(f"fr_{c} = self.cluster.rank()")
+            mode = f', "{ch.multicast}"' if ch.multicast else ""
             for j in range(fill_count(spec, ch)):
-                src(f"fl_{c}_{j} = self.cluster.fill({first} + {j})")
+                src(f"fl_{c}_{j} = self.cluster.fill({first} + {j}{mode})")
                 ctx.append(f"fl_{c}_{j}=fl_{c}_{j}.mask")
+            if ch.multicast:  # both CTAs of a pair sit at one position along each mode
+                coord, layout = f"fl_{c}_0.coord", f"fl_{c}_0.layout"
         src(
             f"ts_{c}, tgp_{c} = cpasync.tma_partition(tma_{c}, {coord}, {layout}, "
             f"cute.group_modes(s_{c}, 0, 2), cute.group_modes(tg_{c}, 0, 2))"
@@ -2354,6 +2366,8 @@ def features(spec: KernelSpec) -> set[str]:
             out.add("tma_pair")
         if ch.fills:
             out.add(f"tma_fills_{ch.fills}" + ("_two" if ch.fill_two else ""))
+            if ch.multicast:
+                out.add("tma_fills_multicast")
         if ch.multicast:
             out.add("tma_multicast")
         if ch.kind == "slots" and ch.n > 4:

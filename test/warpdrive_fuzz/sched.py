@@ -228,14 +228,20 @@ def want_scope(
     }
     tx = tma_bytes
     leaders = geom.ctas("leader")
-    if tma_bytes is not None and fills:
-        # The filler arms the barrier of each CTA it fills, or with leader-only consumers its
-        # pair leaders' (2-CTA copies), for every CTA completing there; a consumer releases each
+    if tma_bytes is not None and not internal:
+        # Copies landing in CTA d complete on d's barrier, or with leader-only consumers on its
+        # pair leader's (2-CTA copies). That barrier is armed once, for every CTA completing
+        # there, by its own CTA or (fills) by the CTA filling it. A consumer releases each
         # producer whose copies land in a CTA completing on its barrier or in its unit.
-        two = not set().union(*reach.values()) <= set(full_ctas)
+        two = not set().union(*(reach[p] for p in empty_ctas)) <= set(full_ctas)
+        assert not two or (geom.pair and set(full_ctas) <= set(leaders)), "generator bug"
         home = {d: geom.group(d)[0] if two else d for d in ranks}
         tx = tma_bytes * (2 if two else 1)
-        full_targets = {p: tuple(sorted({home[d] for d in filled[p]})) for p in empty_ctas}
+        if fills:
+            full_targets = {p: tuple(sorted({home[d] for d in filled[p]})) for p in empty_ctas}
+        else:
+            bars = {home[d] for p in empty_ctas for d in reach[p]}
+            full_targets = {p: (p,) for p in empty_ctas if p in bars}
         empty_targets = {
             c: tuple(
                 p
@@ -244,10 +250,6 @@ def want_scope(
             )
             for c in full_ctas
         }
-    elif tma_bytes is not None and not internal and not same:
-        assert geom.pair and empty_ctas == ranks and full_ctas == leaders, "generator bug"
-        tx = tma_bytes * 2  # 2-CTA copies of each pair complete on the leader's barrier
-        full_targets = {p: (p,) for p in leaders}
 
     def counts(mech, side, targets):
         out = {}
