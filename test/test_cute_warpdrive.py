@@ -818,6 +818,7 @@ PGEMM_CONFIGS = [
     {"epi_tile_n": 16, "c_stages": 4},
     {"tile_n": 224, "epi_tile_n": 16},
     {"acc_stages": 1},
+    {"early_release": False},
     {"ab_stages": 2},
     {"roles": {"epilogue": RoleConfig(range(4), regs=152)}},
 ]
@@ -863,6 +864,9 @@ def test_persistent_gemm_rejects_unfit_configurations():
     assert "0-3    epilogue    152" in tuned.describe()
     assert tuned.__cute_cache_key__() != PersistentGemm().__cute_cache_key__()
     assert PersistentGemm(c_stages=3).get_name() != PersistentGemm().get_name()
+    assert "_late_" in PersistentGemm(early_release=False).get_name()
+    with pytest.raises(ValueError, match="early_release must be a bool"):
+        PersistentGemm(early_release=1)
 
 
 GEMMS = pytest.mark.parametrize("fn", [gemm, persistent_gemm], ids=lambda f: f.__name__)

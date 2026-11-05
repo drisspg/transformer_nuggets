@@ -121,12 +121,17 @@ class PersistentGemm(WarpSpecialized):
         c_stages: int = 2,
         epi_tile_n: int = 32,
         roles: dict[str, RoleConfig] | None = None,
+        early_release: bool = True,
     ):
         """``ab_stages``: A/B ring depth (default: what fills ~192 KB). ``acc_stages``: TMEM
         accumulators (2 overlaps a tile's epilogue with the next mainloop). ``tile_n``: output
         tile width (``default_tile_n``). ``c_stages`` SMEM buffers of ``128 x epi_tile_n`` stage
         the TMA-store epilogue. ``roles``: placement and register budgets by role name over the
-        ``@role`` defaults (40/40/160)."""
+        ``@role`` defaults (40/40/160). ``early_release``: the epilogue hands an accumulator
+        back to the MMA once its last subtile is in registers, before that subtile's SMEM
+        staging and TMA store (False: after the last subtile is staged and its store issued)."""
+        if type(early_release) is not bool:
+            raise ValueError(f"early_release must be a bool, got {early_release!r}")
         self.cluster = cluster or SingleCta()
         cs = self.cluster.pair_size  # CTAs per MMA
         if tile_n is None:
@@ -142,6 +147,7 @@ class PersistentGemm(WarpSpecialized):
         self.tile_n = tile_n
         self.epi_tile = (CTA_TILE_M, epi_tile_n)
         self.c_stages = c_stages
+        self.early_release = early_release
         self.roles = roles
         cta_tile = (CTA_TILE_M, tile_n, TILE_K)
         # The MMA tile spans the cluster along M; each CTA holds 128 rows of A and N / cs rows
@@ -188,9 +194,10 @@ class PersistentGemm(WarpSpecialized):
     def get_name(self) -> str:
         epi = (self.c_stages, self.epi_tile[1])
         epi = "" if epi == (2, 32) else f"c{epi[0]}x{epi[1]}_"
+        release = "" if self.early_release else "late_"
         return (
             f"warpdrive_pgemm_{self.cluster.get_key()}_n{self.tile_n}_ab{self.ab.n}_"
-            f"acc{self.acc_stages}_{epi}"
+            f"acc{self.acc_stages}_{epi}{release}"
             f"{self.work.get_key()}{self.iket_key()}{self.trace_key()}"
         )
 
@@ -252,7 +259,9 @@ class PersistentGemm(WarpSpecialized):
     ):
         """TMEM -> registers -> swizzled SMEM -> TMA store, one ``epi_tile`` subtile at a time
         through ``c_stages`` SMEM buffers. TMA clips the ragged edges, so partial tiles cost the
-        same."""
+        same. With ``early_release`` the accumulator goes back to the MMA as soon as its last
+        subtile's ``tcgen05.ld`` has completed (``tcgen05.wait::ld``), so the next tile's
+        mainloop is not held up by this tile's last SMEM staging round and TMA store."""
         tidx, _, _ = cute.arch.thread_idx()
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         # This CTA's rows of the tile.
@@ -290,22 +299,30 @@ class PersistentGemm(WarpSpecialized):
         while work.valid:
             m, n = self.mma_tile_mn(params, work.item)
             dst = cute.group_modes(bSG_gC[None, None, None, m, n], 1, 3)  # (TMA, SUB)
-            with acc.consume() as a:
-                for i in cutlass.range_constexpr(subtiles):
-                    buf = (first + i) % self.c_stages if rotate else i % self.c_stages
-                    cute.copy(t2r, tTR_tAcc[None, None, None, i, a.index], tTR_rAcc)
-                    tRS_rC.store(r2s.retile(tTR_rAcc).load().to(self.dtype))
-                    cute.copy(r2s, tRS_rC, tRS_sC[None, None, None, buf])
-                    cute.arch.fence_view_async_shared()  # st.shared -> TMA store
-                    # Every epilogue thread reaches both syncs convergently: the aligned form.
-                    self.epi_sync.sync(aligned=True)
-                    if warp == 0:
-                        cute.copy(params.tma_c, bSG_sC[None, buf], dst[None, i])
-                        cute.arch.cp_async_bulk_commit_group()
-                        # Buffer `buf` is rewritten c_stages subtiles later; keep at most
-                        # c_stages - 1 stores still reading SMEM.
-                        cute.arch.cp_async_bulk_wait_group(self.c_stages - 1, read=True)
-                    self.epi_sync.sync(aligned=True)
+            a = acc.wait()
+            for i in cutlass.range_constexpr(subtiles):
+                buf = (first + i) % self.c_stages if rotate else i % self.c_stages
+                cute.copy(t2r, tTR_tAcc[None, None, None, i, a.index], tTR_rAcc)
+                if cutlass.const_expr(self.early_release and i == subtiles - 1):
+                    # Every thread waits for its own loads before arriving, so the MMA that
+                    # the epilogue threads' arrivals unblock overwrites TMEM no tcgen05.ld
+                    # still reads.
+                    cute.arch.fence_view_async_tmem_load()
+                    a.release()
+                tRS_rC.store(r2s.retile(tTR_rAcc).load().to(self.dtype))
+                cute.copy(r2s, tRS_rC, tRS_sC[None, None, None, buf])
+                cute.arch.fence_view_async_shared()  # st.shared -> TMA store
+                # Every epilogue thread reaches both syncs convergently: the aligned form.
+                self.epi_sync.sync(aligned=True)
+                if warp == 0:
+                    cute.copy(params.tma_c, bSG_sC[None, buf], dst[None, i])
+                    cute.arch.cp_async_bulk_commit_group()
+                    # Buffer `buf` is rewritten c_stages subtiles later; keep at most
+                    # c_stages - 1 stores still reading SMEM.
+                    cute.arch.cp_async_bulk_wait_group(self.c_stages - 1, read=True)
+                self.epi_sync.sync(aligned=True)
+            if cutlass.const_expr(not self.early_release):
+                a.release()
             if cutlass.const_expr(rotate):
                 first = (first + subtiles) % self.c_stages
             work.advance()
@@ -496,7 +513,7 @@ def persistent_gemm(
     runs 2-CTA 256 x ``tile_n`` tiles, ``Cluster(2, 2, pair=True)`` two such pairs sharing A.
     ``tile_n`` defaults to ``default_tile_n(cluster)``: 224 for a pair, 256 otherwise.
     ``config``: ``PersistentGemm``'s other keyword options (``ab_stages``, ``acc_stages``,
-    ``c_stages``, ``epi_tile_n``, ``roles``)."""
+    ``c_stages``, ``epi_tile_n``, ``roles``, ``early_release``)."""
     out = check_gemm_args(a, b, out)
     if out.numel() == 0:
         return out
