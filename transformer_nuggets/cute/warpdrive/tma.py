@@ -42,20 +42,26 @@ KINDS = {
 }
 
 
-# Multicast masks handed out by ``Cluster.multicast`` in the kernel being traced: {hash of the
-# mask's ir.Value, or ("const", bits) for a mask the same in every CTA: (mode, CTAs reached)}.
-# Tracing is single-threaded; cleared at ``begin_roles``.
+# Multicast masks handed out by ``Cluster.multicast``/``Cluster.fill`` in the kernel being
+# traced: {hash of the mask's ir.Value, or ("const", bits) for a mask the same in every CTA:
+# (mode, CTAs reached, the CTAs ``Cluster.fill`` built it for)}. Tracing is single-threaded;
+# cleared at ``begin_roles``.
 _MASKS: dict = {}
 
 
-def record_multicast_mask(mask, mode: str, ctas: int) -> None:
+def record_multicast_mask(mask, mode: str, ctas: int, target=None) -> None:
+    """Record a mask; ``target``: the rank (a Python int or a device value) of the CTA a
+    ``Cluster.fill`` copy is for. Fills of different CTAs can share a constant mask (two CTAs on
+    one multicast line), so a mask keeps every target it was built for."""
     value = mask.ir_value()
     owner = value.owner
+    key = hash(value)
     if getattr(owner, "name", None) == "arith.constant":
         # A constant mask is rematerialized at each use, so it is known by its bits.
-        _MASKS[("const", _constant_bits(owner))] = (mode, ctas)
-    else:
-        _MASKS[hash(value)] = (mode, ctas)
+        key = ("const", _constant_bits(owner))
+    _, _, targets = _MASKS.setdefault(key, (mode, ctas, set()))
+    if target is not None:
+        targets.add(target if isinstance(target, int) else ("rank", hash(target.ir_value())))
 
 
 def _constant_bits(op) -> int | None:
@@ -111,9 +117,11 @@ class _Copy:
     group: str
     nbytes: int | None  # None: not countable (dynamic layout or unparsed type)
     in_stage_region: bool  # issued in the region that acquired the stage (runs once per stage)
-    # The cluster mode of a multicast copy's mask ("?": a mask not from Cluster.multicast);
-    # None when not multicast.
+    # The cluster mode of a multicast copy's mask ("fill": a single-CTA Cluster.fill mask, "?": a
+    # mask the layer did not hand out); None when not multicast.
     multicast: str | None = None
+    # The copy's key in _MASKS; None when not multicast (it lands in the issuing CTA).
+    mask_key: object = None
 
 
 @dataclass
@@ -226,6 +234,10 @@ def check_role(trace, cluster, reports: dict) -> None:
             why.append(untracked)
         if any(cp.nbytes is None or not cp.in_stage_region for cp in stage.copies):
             why.append("a copy sits in a nested loop/branch or has a dynamic layout")
+        filled = _fill_count(use.chan)
+        if filled > 1 and _fill_targets(stage.copies) < filled:
+            # Copies that land twice in one CTA can total the right bytes yet starve another.
+            why.append(f"its copies take fewer distinct masks than the {filled} CTAs it fills")
         if why:
             report.unverified.append(f"bytes of {rec.what} at {rec.site}: {why[0]}")
         if why or stage.opted_out or use.chan.name in opted_out_chans:
@@ -254,11 +266,29 @@ def _copies(use: TmaUse) -> tuple[list[_Copy], list, str | None]:
             for copy_op in _copy_ops(op):
                 nbytes = _copy_bytes(copy_op, copy_bits)
                 in_stage = use.handle is not None and copy_op.block == use.handle.block
-                mode = _mask_mode(copy_op) if multicast else None
-                copies.append(_Copy(use.site, group, nbytes, in_stage, mode))
+                mode, key = _mask_mode(copy_op) if multicast else (None, None)
+                copies.append(_Copy(use.site, group, nbytes, in_stage, mode, key))
     except (AttributeError, KeyError, IndexError, ValueError, RuntimeError) as e:
         return [], ops, f"cannot inspect the IR at {use.site}: {type(e).__name__}: {e}"
     return copies, ops, None
+
+
+def _fill_targets(copies) -> int:
+    """How many CTAs a stage's copies can be for, at most: the CTAs ``Cluster.fill`` built their
+    masks for (each mask used at most once per such CTA), plus one per other mask and one for
+    unmasked copies (the issuing CTA)."""
+    uses = {}
+    for cp in copies:
+        uses[cp.mask_key] = uses.get(cp.mask_key, 0) + 1
+    filled, uses_of_filled, other = set(), 0, 0
+    for key, n in uses.items():
+        targets = _MASKS.get(key, (None, 0, set()))[2] if key is not None else ()
+        if targets:
+            filled |= targets
+            uses_of_filled += min(n, len(targets))
+        else:
+            other += 1
+    return min(uses_of_filled, len(filled)) + other
 
 
 def _is_tma_bar(op) -> bool:
@@ -299,9 +329,9 @@ def _kind(set_value) -> tuple[str, bool] | None:
     return KINDS.get(kind.group(1)) if kind else None
 
 
-def _mask_mode(copy_op) -> str:
-    """The cluster mode of the multicast mask set on a copy's atom, or "?" when the mask is not
-    one ``Cluster.multicast`` handed out."""
+def _mask_mode(copy_op) -> tuple[str, object]:
+    """``(mode, key)`` of the multicast mask set on a copy's atom: its cluster mode, or "?" when
+    the layer did not hand it out, and its key in ``_MASKS``."""
     op = copy_op.operands[0].owner.operation
     while op.name == SET_VALUE:
         if "<mcast_mask>" in str(op.attributes["field"]):
@@ -310,10 +340,9 @@ def _mask_mode(copy_op) -> str:
             key = hash(mask)
             if getattr(owner, "name", None) == "arith.constant":
                 key = ("const", _constant_bits(owner))
-            mode, _ = _MASKS.get(key, ("?", 0))
-            return mode
+            return _MASKS.get(key, ("?",))[0], key
         op = op.operands[0].owner.operation
-    return "?"
+    return "?", None
 
 
 def _copy_ops(set_value) -> list:

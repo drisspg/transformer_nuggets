@@ -279,10 +279,20 @@ def load(self, ld: Producer, ctx):
     own, peer = self.cluster.fill(rank), self.cluster.fill(rank + 1)
     for i in cutlass.range(ctx.n, unroll=1):
         with ld.produce() as s:
-            cute.copy(ctx.tma, ctx.g_own[None, i], ctx.s[None, s.index], tma_bar_ptr=s.barrier,
-                      mcast_mask=own.mask)
-            cute.copy(ctx.tma, ctx.g_peer[None, i], ctx.s[None, s.index], tma_bar_ptr=s.barrier,
-                      mcast_mask=peer.mask)
+            cute.copy(
+                ctx.tma,
+                ctx.g_own[None, i],
+                ctx.s[None, s.index],
+                tma_bar_ptr=s.barrier,
+                mcast_mask=own.mask,
+            )
+            cute.copy(
+                ctx.tma,
+                ctx.g_peer[None, i],
+                ctx.s[None, s.index],
+                tma_bar_ptr=s.barrier,
+                mcast_mask=peer.mask,
+            )
     return ld
 ```
 
@@ -319,7 +329,8 @@ Fills are for CTAs that can't issue their own loads, not a speedup. A persistent
 pair leaders load the A/B ring for both CTAs (`LeaderLoadGemm` in
 [`test_cute_warpdrive_fills.py`](../../../../test/test_cute_warpdrive_fills.py)) was 6-13%
 slower than loading from both CTAs for a pair on a GB300, and within noise for the 2x2 cluster
-(CUDA-graph replay, warm L2, 2048 x 2048 x 8192 to 8192^3).
+(November 2026, while adding fills; CUDA-graph replay, warm L2, default clocks, best of five
+interleaved rounds at 4096^3, 8192^3, 8192 x 11008 x 4096 and 2048 x 2048 x 8192).
 
 ### A rank0 consumer on a multicast channel
 

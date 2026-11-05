@@ -355,14 +355,14 @@ class PersistentGemm(WarpSpecialized):
             cute.group_modes(sB, 0, 3),
             cute.group_modes(thr_mma.partition_B(gB), 0, 3),
         )
-        return dict(
-            mcast_a=share_a.mask,
-            mcast_b=share_b.mask,
-            tAsA=StageView(tAsA, axis=1),
-            tAgA=tAgA,
-            tBsB=StageView(tBsB, axis=1),
-            tBgB=tBgB,
-        )
+        return {
+            "mcast_a": share_a.mask,
+            "mcast_b": share_b.mask,
+            "tAsA": StageView(tAsA, axis=1),
+            "tAgA": tAgA,
+            "tBsB": StageView(tBsB, axis=1),
+            "tBgB": tBgB,
+        }
 
     # ------------------------------------------------------------------- host
 

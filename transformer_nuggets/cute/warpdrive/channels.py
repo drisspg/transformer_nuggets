@@ -71,7 +71,8 @@ class Tma:
 
     ``fills``: ``"pair"`` or ``"cluster"`` when one CTA issues the copies of others: a producer
     on each pair leader fills both CTAs of its MMA pair, or a ``rank0`` producer every CTA of the
-    cluster (``Cluster.fill``). The producing CTA arms the full barrier of every CTA it fills,
+    cluster (``Cluster.fill``). The producing CTA arms the full barriers its copies complete on
+    (each filled CTA's, or with pair-leader consumers the leader's, for both CTAs of the pair),
     and the consumers there release it. ``tx_bytes`` stays what lands in each CTA."""
 
     tx_bytes: int

@@ -214,14 +214,15 @@ class Cluster:
         if mode is not None:
             _check_mode(mode)
             if len(self.line(0, mode)) > 1:
-                return self._line_copy(self.layout_vmnk().get_flat_coord(rank), mode)
+                return self._line_copy(self.layout_vmnk().get_flat_coord(rank), mode, rank)
         bit = 1 << rank if isinstance(rank, int) else Int32(1) << rank
         mask = cutlass.Int16(bit)
-        record_multicast_mask(mask, "fill", 1)
+        record_multicast_mask(mask, "fill", 1, target=rank)
         return TmaMulticast(0, cute.make_layout(1), mask, 1)
 
-    def _line_copy(self, coord, mode: str) -> TmaMulticast:
-        """The multicast partition and mask of the CTA at ``coord`` along ``mode``."""
+    def _line_copy(self, coord, mode: str, target=None) -> TmaMulticast:
+        """The multicast partition and mask of the CTA at ``coord`` along ``mode`` (``target``:
+        its rank, when a filling CTA issues the copy)."""
         from transformer_nuggets.cute.warpdrive.tma import record_multicast_mask
 
         axis = 1 if mode == "m" else 2
@@ -231,7 +232,7 @@ class Cluster:
             cute.slice_(vmnk, (0, None, 0, 0) if axis == 1 else (0, 0, None, 0)).shape
         )
         mask = cpasync.create_tma_multicast_mask(vmnk, coord, mcast_mode=axis)
-        record_multicast_mask(mask, mode, ctas)
+        record_multicast_mask(mask, mode, ctas, target)
         return TmaMulticast(coord[axis], layout, mask, ctas)
 
     def filled(self, rank: int, fills: str | None) -> tuple[int, ...]:
@@ -522,12 +523,15 @@ def _tma_targets(chan, cluster, consumers: tuple, producers: tuple, unit: dict):
         )
     starved = sorted(set(consumers) - set(bar.values()))
     if starved:
-        fix = "fills='pair'" if set(producers) <= set(leaders) and cluster.pair else "fills"
-        fix = "fills='cluster'" if producers == (0,) and not cluster.pair else fix
+        if cluster.pair and producers == leaders:
+            fix = "declare Tma(..., fills='pair') so each leader issues and arms its pair's copies"
+        elif producers == (0,):
+            fix = "declare Tma(..., fills='cluster') so rank 0 issues and arms every CTA's copies"
+        else:
+            fix = "run the producer in those CTAs"
         raise ProtocolError(
             f"channel {name}: consumers in CTAs {starved} wait on stages no TMA copy fills "
-            f"(producers run in CTAs {list(producers)}); declare Tma(..., {fix}) so the "
-            "producing CTA issues and arms their copies, or run the producer there"
+            f"(producers run in CTAs {list(producers)}); {fix}"
         )
     arm = {}
     for b in sorted(set(bar.values())):

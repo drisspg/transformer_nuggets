@@ -130,15 +130,19 @@ class FillToy(WarpSpecialized):
         for i in cutlass.range(ctx.n, unroll=1):
             with ld.consume() as h:
                 if cutlass.const_expr(self.slow):
-                    # The filled CTAs lag far behind their filler, which finishes first.
-                    if rank != 0:
-                        start = cute.arch.clock64()
-                        while cute.arch.clock64() - start < 20000:
-                            pass
+                    self.lag(rank)
                 row = ((unit * self.cluster.size + rank) * ctx.n + i) * ROWS + lane
                 for c in cutlass.range(64, unroll_full=True):
                     out[row, c] = ctx.stage[lane, c, h.index]
         return ld
+
+    @cute.jit
+    def lag(self, rank):
+        """The filled CTAs lag far behind their filler, which finishes first."""
+        if rank != 0:
+            start = cute.arch.clock64()
+            while cute.arch.clock64() - start < 20000:
+                pass
 
     @role(config=lambda k: k.use_config)
     @cute.jit
@@ -386,6 +390,24 @@ def test_fill_copy_bytes_mismatch_rejects(requires_blackwell):
     op.ld = Ring(2, Tma(2 * TILE_BYTES, fills="pair"), Threads)
     with pytest.raises(Exception, match="for the 2 CTAs it fills.*declare Tma\\(4096\\)"):
         compile_toy(op)
+
+
+def test_duplicate_fill_copies_are_unverified(requires_blackwell):
+    """Two copies into the leader's own stage total the bytes of both CTAs, but the peer's stage
+    never fills: the check cannot count bytes per destination, so it reports the channel
+    unverified instead of verified."""
+
+    class Duplicate(FillToy):
+        def __init__(self):
+            super().__init__(CtaPair(), fills="pair")
+
+        def copies(self, rank):
+            return [rank, rank]
+
+    op = Duplicate()
+    with pytest.warns(UserWarning, match="could not verify"):
+        compile_toy(op)
+    assert "fewer distinct masks than the 2 CTAs it fills" in op.describe()
 
 
 def test_fill_mask_needs_a_fills_channel(requires_blackwell):
