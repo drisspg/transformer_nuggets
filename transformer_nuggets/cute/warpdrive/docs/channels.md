@@ -287,8 +287,10 @@ use it: there it reproduces the hand-picked barrier it replaced, SASS included.
 Named barriers take IDs from 3 upward in declaration order, named channels from 15 downward,
 so declaring one moves no channel's IDs. Collection raises when they don't fit in 13 IDs.
 `describe()` lists each barrier's ID and count and, after a compile, the roles that arrived or
-synced. `.id` is the ID for exceptional native calls, such as a library function that takes
-one; the layer neither records nor checks those calls. With IKET waits enabled, `sync()` is a
+synced. `.id` is the ID for native calls (`cute.arch.barrier(barrier_id=nb.id, ...)`, a
+library function that takes one), which may be mixed freely with `sync()`/`arrive()` on the
+same barrier. The layer does not see the native calls themselves, but it records which roles
+read `.id` while tracing (`native id by ...` in `describe()`). With IKET waits enabled, `sync()` is a
 `<name>.sync` range; [pipeline plans](tracing.md) model channels only and leave named barriers
 out.
 
@@ -296,7 +298,10 @@ What the layer checks: the count is a multiple of 32, at most 1024 and at most t
 threads. While tracing, an `alias.named_barrier` call raises if its ID is outside 0-15 or
 owned by the layer, a named channel or a `NamedBarrier`. A barrier also raises if the roles
 using it in some CTA have fewer threads in total than its count, since it could never
-complete there. More threads than the count is not an error, because a role may take part
+complete there. When a role running in that CTA (or kernel code outside the roles) read
+`.id`, native calls may supply the missing arrivals: `describe()` reports the participation as
+unverified instead, and the barrier raises only if its count exceeds every thread that runs
+a role there. More threads than the count is not an error, because a role may take part
 with some of its warps (FA4 backward's per-warpgroup epilogue barriers). The layer doesn't
 check which threads arrive in each generation, that participation is balanced, or that the
 protocol makes progress.

@@ -317,10 +317,14 @@ def _named_barriers(kernel) -> str:
     rows = []
     for name, nb in kernel._ws_named_bars.items():
         users = kernel._ws_named_users.get(name, {})
-        ops = [f"{op} by {', '.join(users[op])}" for op in ("arrive", "sync") if users.get(op)]
+        labels = {"arrive": "arrive", "sync": "sync", "native": "native id"}
+        ops = [f"{labels[op]} by {', '.join(users[op])}" for op in labels if users.get(op)]
+        ops += [f"unverified: {note}" for note in users.get("unverified", ())]
         if not traced:
             ops = ["users known after a compile"]
-        rows.append([name, f"id {nb.id}", f"{nb.threads} threads", "; ".join(ops) or "unused"])
+        rows.append(
+            [name, f"id {nb._allocated_id()}", f"{nb.threads} threads", "; ".join(ops) or "unused"]
+        )
     return "\n".join(["Named barriers", *_table(rows)])
 
 

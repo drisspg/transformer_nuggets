@@ -1398,8 +1398,11 @@ class WarpSpecialized(metaclass=_KernelType):
 
     def _check_named_barriers(self):
         """Reject hand-picked ``alias.named_barrier`` IDs that are out of range or owned by the
-        layer, a named channel, or a ``NamedBarrier``; record each ``NamedBarrier``'s users and
-        reject one whose users cannot supply its count in some CTA."""
+        layer, a named channel, or a ``NamedBarrier``; record each ``NamedBarrier``'s users
+        (``{"sync"/"arrive"/"native": role names, "unverified": notes}``) and reject one whose
+        users cannot supply its count in some CTA. Native code that read ``.id`` may supply the
+        rest: incomplete observed participation in a CTA where it runs is unverified, but more
+        threads than that CTA's roles have is still impossible."""
         taken = {
             i: f"channel {name}"
             for name, ids in self._ws_named.items()
@@ -1408,23 +1411,27 @@ class WarpSpecialized(metaclass=_KernelType):
         taken.update({TMEM_PTR_BARRIER_ID: "the layer", TMEM_TEARDOWN_BARRIER_ID: "the layer"})
         taken.update(
             {
-                nb.id: f"NamedBarrier {name} (call {name}.sync() or {name}.arrive())"
+                nb._allocated_id(): f"NamedBarrier {name} (call {name}.sync() or {name}.arrive())"
                 for name, nb in self._ws_named_bars.items()
             }
         )
-        users = {name: {"sync": [], "arrive": []} for name in self._ws_named_bars}
+        users = {
+            name: {"sync": [], "arrive": [], "native": [], "unverified": []}
+            for name in self._ws_named_bars
+        }
+        ops = {"barrier": "sync", "barrier_arrive": "arrive", "barrier_native": "native"}
         for role_events in self._ws_alias_roles:
             for ev in role_events.events:
-                if ev.kind not in ("barrier", "barrier_arrive"):
+                if ev.kind not in ops:
                     continue
-                if "barrier" in ev.data:  # a NamedBarrier operation
+                if "barrier" in ev.data:  # a NamedBarrier operation or ID read
                     name = ev.data["barrier"].name
                     if self._ws_named_bars.get(name) is not ev.data["barrier"]:
                         raise ProtocolError(
                             f"{role_events.name}: NamedBarrier {name} at {ev.site} belongs to "
                             "another kernel; declare one on this kernel"
                         )
-                    op = "sync" if ev.kind == "barrier" else "arrive"
+                    op = ops[ev.kind]
                     if role_events.name not in users[name][op]:
                         users[name][op].append(role_events.name)
                     continue
@@ -1443,18 +1450,39 @@ class WarpSpecialized(metaclass=_KernelType):
                     )
         roles = {r.name: r for r in self._ws_roles}
         for name, nb in self._ws_named_bars.items():
-            used_by = [
-                roles[r] for r in dict.fromkeys(users[name]["sync"] + users[name]["arrive"])
-            ]
+            used = users[name]
+            outside = nb._native_outside_roles  # kernel code every role's threads may run
+            nb._native_outside_roles = False
+            if outside:
+                used["native"].append("kernel code")
+            used_by = [roles[r] for r in dict.fromkeys(used["sync"] + used["arrive"])]
+            native = [roles[r] for r in used["native"] if r in roles]
             for rank in range(self.cluster.size):
-                here = [r for r in used_by if rank in self.cluster.ctas(r.cta)]
+                in_rank = [r for r in self._ws_roles if rank in self.cluster.ctas(r.cta)]
+                here = [r for r in used_by if r in in_rank]
                 total = sum(r.num_threads for r in here)
-                if 0 < total < nb.threads:
-                    where = f" in CTA rank {rank}" if self.cluster.size > 1 else ""
+                where = f" in CTA rank {rank}" if self.cluster.size > 1 else ""
+                if not (outside or any(r in in_rank for r in native)):
+                    if 0 < total < nb.threads:
+                        raise ProtocolError(
+                            f"NamedBarrier {name} counts {nb.threads} threads, but the roles "
+                            f"using it{where} ({', '.join(r.name for r in here)}) have only "
+                            f"{total}; it can never complete"
+                        )
+                    continue
+                # Native callers can be any thread that runs here (a role, or kernel code).
+                runs = (
+                    self.num_warps * WARP_SIZE if outside else sum(r.num_threads for r in in_rank)
+                )
+                if runs < nb.threads:
                     raise ProtocolError(
-                        f"NamedBarrier {name} counts {nb.threads} threads, but the roles using "
-                        f"it{where} ({', '.join(r.name for r in here)}) have only {total}; it "
-                        "can never complete"
+                        f"NamedBarrier {name} counts {nb.threads} threads, but only {runs} run "
+                        f"the roles{where}; it can never complete"
+                    )
+                if total < nb.threads:
+                    used["unverified"].append(
+                        f"roles calling it{where} have {total} of {nb.threads} threads; native "
+                        f"code reading .id ({', '.join(used['native'])}) must supply the rest"
                     )
         self._ws_named_users = users
 

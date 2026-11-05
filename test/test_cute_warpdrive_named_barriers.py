@@ -34,7 +34,9 @@ class FlagToy(WarpSpecialized):
     The publisher stalls for ``delay`` cycles, writes ``value + lane`` to SMEM and arrives on
     the one-shot ``done`` flag; the waiters sync on it, so they read the value rather than the
     sentinel. Waiter warp 0 then stalls and doubles the value into a second SMEM row before the
-    waiters' ``pair_sync``; waiter warp 1 reads that row after it. ``mode`` injects errors."""
+    waiters' ``pair_sync``; waiter warp 1 reads that row after it. ``mode="native"`` makes the
+    waiters sync on ``done`` with a native ``bar.sync`` on ``done.id``; other modes inject
+    errors."""
 
     def __init__(self, mode: str = "ok"):
         self.mode = mode
@@ -66,7 +68,10 @@ class FlagToy(WarpSpecialized):
     def waiters(self, ctx):
         lane = cute.arch.lane_idx()
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) - 1
-        self.done.sync()
+        if cutlass.const_expr(self.mode == "native"):
+            cute.arch.barrier(barrier_id=self.done.id, number_of_threads=self.done.threads)
+        else:
+            self.done.sync()
         value = ctx.smem[0, lane]
         if warp == 0:
             start = cute.arch.clock64()
@@ -103,12 +108,14 @@ def compile_flag_toy(op):
     )
 
 
+@pytest.mark.parametrize("mode", ["ok", "native"])
 @pytest.mark.parametrize("value, delay", [(7, 0), (1000, 20000)])
-def test_one_shot_flag_and_intra_role_sync(requires_blackwell, value, delay):
+def test_one_shot_flag_and_intra_role_sync(requires_blackwell, mode, value, delay):
     """The waiters see the publisher's write through the one-shot flag, and waiter warp 1 sees
-    warp 0's write through the intra-role sync, even when the writers stall."""
+    warp 0's write through the intra-role sync, even when the writers stall; also when the
+    waiters join the managed publisher's flag with a native sync on its ID."""
     out = torch.full((32, 2), -5, device="cuda", dtype=torch.int32)
-    compile_flag_toy(FlagToy())(out, value, delay)
+    compile_flag_toy(FlagToy(mode))(out, value, delay)
     expected = torch.arange(32, device="cuda", dtype=torch.int32) + value
     torch.testing.assert_close(out[:, 0], expected)
     torch.testing.assert_close(out[:, 1], expected * 2)
@@ -139,6 +146,16 @@ def test_describe_lists_named_barriers_and_their_users():
         rows = [line.split() for line in op.describe().splitlines()]
         assert all(row in rows for row in expected)
     assert compile_flag_toy.cache_info().hits >= 1
+
+
+def test_native_id_users_leave_the_count_unverified():
+    """Waiters that sync natively on ``done.id`` complete the publisher's managed arrive: the
+    observed 32 of 96 threads is reported as unverified rather than rejected."""
+    op = FlagToy("native")
+    compile_flag_toy(op)
+    row = next(line for line in op.describe().splitlines() if line.strip().startswith("done "))
+    assert "arrive by publisher; native id by waiters" in row
+    assert "unverified: roles calling it have 32 of 96 threads" in row
 
 
 @pytest.mark.parametrize(
@@ -242,7 +259,8 @@ class PairProbe(WarpSpecialized):
 
     cluster = CtaPair()
 
-    def __init__(self, threads: int):
+    def __init__(self, threads: int, native: bool = False):
+        self.native = native
         self.x = NamedBarrier(threads=threads)
 
     @role(warps=0, cta="leader")
@@ -253,7 +271,10 @@ class PairProbe(WarpSpecialized):
     @role(warps=1)
     @cute.jit
     def both(self, ctx):
-        self.x.sync()
+        if cutlass.const_expr(self.native):
+            cute.arch.barrier(barrier_id=self.x.id, number_of_threads=self.x.threads)
+        else:
+            self.x.sync()
 
     @cute.kernel
     def kernel(self, out):
@@ -262,14 +283,16 @@ class PairProbe(WarpSpecialized):
 
     @cute.jit
     def __call__(self, out: cute.Tensor, stream):
-        self.kernel.set_name_prefix(f"warpdrive_named_barrier_pair_{self.x.threads}")
+        self.kernel.set_name_prefix(
+            f"warpdrive_named_barrier_pair_{self.x.threads}_{int(self.native)}"
+        )
         self.kernel(out).launch(**self.launch_config(grid=(2, 1, 1)), stream=stream)
 
 
 @jit_cache
 def compile_pair_probe(op):
     out = make_fake_compact_tensor(cutlass.Int32, (1,), assumed_align=4)
-    return compile_tvm_ffi(op, out, name=f"named_barrier_pair_{op.x.threads}")
+    return compile_tvm_ffi(op, out, name=f"named_barrier_pair_{op.x.threads}_{int(op.native)}")
 
 
 def test_named_barrier_users_are_counted_per_cta():
@@ -281,3 +304,13 @@ def test_named_barrier_users_are_counted_per_cta():
         lambda: compile_pair_probe(PairProbe(64)),
     )
     compile_pair_probe(PairProbe(32))
+
+
+def test_native_users_cannot_exceed_the_threads_in_a_cta():
+    """A native ID user leaves missing arrivals unverified, but in CTA rank 1 only ``both``'s
+    32 threads run any role, so no native call can complete a 64-thread barrier there."""
+    _raises_protocol(
+        r"NamedBarrier x counts 64 threads, but only 32 run the roles in CTA rank 1; it can "
+        r"never complete",
+        lambda: compile_pair_probe(PairProbe(64, native=True)),
+    )

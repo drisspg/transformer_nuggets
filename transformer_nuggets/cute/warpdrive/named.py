@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from cutlass import cute
+from cutlass._mlir import ir
 
 from transformer_nuggets.cute.warpdrive.channels import _named_arrive, _named_sync
 from transformer_nuggets.cute.warpdrive.protocol import ProtocolError, current_trace
@@ -36,13 +37,18 @@ class NamedBarrier:
     forms (``bar.sync``/``bar.arrive``), which require every thread of each participating warp
     to execute the same instruction convergently; use it only where that holds and it matters.
 
-    ``id`` is the allocated barrier ID for exceptional native calls (a library that takes an
-    ID). Such calls are invisible to the layer: no diagnostic event and no collision check.
+    ``id`` is the allocated barrier ID for native calls (``cute.arch.barrier(barrier_id=...)``,
+    a library that takes an ID). The calls themselves are invisible to the layer, but reading
+    ``id`` while a kernel is traced records that native code may join the barrier: the count
+    check then reports incomplete observed participation as unverified instead of raising.
     """
 
     threads: int
     name: str = field(default="", init=False)
     _id: int | None = field(default=None, init=False, repr=False)
+    # ``id`` read by kernel code outside the role bodies in the current trace (the kernel's
+    # named-barrier check takes and clears it).
+    _native_outside_roles: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self):
         if (
@@ -57,6 +63,15 @@ class NamedBarrier:
 
     @property
     def id(self) -> int:
+        barrier_id = self._allocated_id()
+        trace = current_trace()
+        if trace is not None:
+            trace.event("barrier_native", barrier=self)
+        elif _tracing_device_code():  # kernel code outside the roles: every thread may join
+            self._native_outside_roles = True
+        return barrier_id
+
+    def _allocated_id(self) -> int:
         if self._id is None:
             raise ProtocolError(
                 f"NamedBarrier {self.name or '(unnamed)'} has no ID yet: declare it as a kernel "
@@ -70,17 +85,19 @@ class NamedBarrier:
         waits enabled, the wait is a ``<name>.sync`` range."""
         with wait_range(current_trace(), f"{self.name}.sync"):
             if aligned:
-                cute.arch.barrier(barrier_id=self.id, number_of_threads=self.threads)
+                cute.arch.barrier(barrier_id=self._allocated_id(), number_of_threads=self.threads)
             else:
-                _named_sync(self.id, self.threads)
+                _named_sync(self._allocated_id(), self.threads)
         self._record("barrier")
 
     def arrive(self, *, aligned: bool = False):
         """Arrive without waiting; the generation completes when ``threads`` have arrived."""
         if aligned:
-            cute.arch.barrier_arrive(barrier_id=self.id, number_of_threads=self.threads)
+            cute.arch.barrier_arrive(
+                barrier_id=self._allocated_id(), number_of_threads=self.threads
+            )
         else:
-            _named_arrive(self.id, self.threads)
+            _named_arrive(self._allocated_id(), self.threads)
         self._record("barrier_arrive")
 
     def _record(self, kind: str):
@@ -88,4 +105,12 @@ class NamedBarrier:
         # arriving thread, so it gets its own kind the alias diagnostic ignores.
         trace = current_trace()
         if trace is not None:
-            trace.event(kind, threads=self.threads, id=self.id, barrier=self)
+            trace.event(kind, threads=self.threads, id=self._allocated_id(), barrier=self)
+
+
+def _tracing_device_code() -> bool:
+    try:
+        ir.InsertionPoint.current  # noqa: B018
+    except ValueError:
+        return False
+    return True
