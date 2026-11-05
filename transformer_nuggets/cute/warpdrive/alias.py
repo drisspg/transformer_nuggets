@@ -13,7 +13,8 @@ PTX citations; raw ordering instructions are legal but invisible.
 Reports distinguish ``potential hazard`` (a conflicting pair with an established missing
 edge), ``unverified`` (an invisible access/edge, an unmodeled cluster, or a channel whose
 epochs the trace does not match: unequal per-item counts from prologues or peeled iterations
-leave the correspondence unknown, as do an exclusive ring's skipped epochs) and ``no hazard
+leave the correspondence unknown, as do an exclusive ring's skipped epochs and a round-robin
+ring's alternating instances) and ``no hazard
 found`` (only among annotated accesses, not a proof). Default ``alias_check="warn"`` puts the
 report in ``describe()`` and warns once about findings; ``"strict"`` raises on potential hazards;
 ``"off"`` skips analysis. ``unchecked("alias", reason=...)`` excludes enclosed annotations.
@@ -496,8 +497,8 @@ def _handoff_handles(acc: Access) -> list:
     e and e + n, not consecutive ones, so it hands over only storage indexed by its stage."""
     if acc.handle is not None:
         return [acc.handle]
-    # A round-robin ring's epochs do not follow one role's program order, which the model's
-    # epoch matching assumes: it adds no edges (accesses ordered only through it are flagged).
+    # A round-robin ring's epochs do not follow one role's program order, which the handoff
+    # assumes; the graph gives its epochs guessed edges instead (_Graph._link).
     return [
         h
         for h in acc.handles
@@ -651,7 +652,7 @@ class _Graph:
             rec = ev.data["handle"]
             if ev.data.get("retire"):  # a retired stage publishes nothing
                 continue
-            if rec.chan.internal or rec.chan.round_robin:  # see _handoff_handles
+            if rec.chan.internal:
                 continue
             key = (rec.chan.name, rec.slot, rec.producer)
             out.setdefault(key, {}).setdefault(item, []).append(p)
@@ -677,10 +678,15 @@ class _Graph:
                     if not waits:
                         continue
                     label = name if slot is None else f"{name}[{slot}]"
-                    if chan.exclusive:
-                        # Which consumer owns which epoch follows its runtime skips, which the
-                        # traced counts do not give: every pairing is a guess.
-                        why = f"{label}: exclusive ring, epoch owners follow runtime skips"
+                    if chan.exclusive or chan.round_robin:
+                        # Which consumer owns which epoch follows its runtime skips, and a
+                        # round-robin instance's epochs interleave with the others' (j, j + k,
+                        # ...), which the traced counts do not match: every pairing is a guess.
+                        why = (
+                            f"{label}: exclusive ring, epoch owners follow runtime skips"
+                            if chan.exclusive
+                            else f"{label}: round-robin ring, epochs alternate between instances"
+                        )
                         for item in span:
                             self._guess(src, by_item.get(item, []), dst, waits, item, why)
                     elif producer:  # publication: commit k -> wait k of the same item
@@ -987,8 +993,8 @@ def _graph_order(graph: _Graph, x: Access, px: int, y: Access, py: int) -> tuple
             UNVERIFIED,
             f"{x.describe()} before {y.describe()}: ordered only through channel epochs the "
             f"trace does not match ({'; '.join(reasons)}): unknown epoch correspondence "
-            "(prologues, peeled iterations or exclusive-ring skips change the traced counts), "
-            "not an established missing edge",
+            "(prologues, peeled iterations, exclusive-ring skips or round-robin turns change the "
+            "traced counts), not an established missing edge",
             EPOCHS,
         )
     ]

@@ -713,3 +713,64 @@ def test_raw_release_is_unverified_not_a_hazard(raw, expected):
     assert status(op, "Q ~ P") == expected, alias_section(op)
     if raw:
         assert "only a raw signal (signal=False) would order them" in alias_section(op)
+
+
+# --------------------------------------------------------------------------- #
+# A round-robin ring: its epochs alternate between the instances, which the model's epoch
+# matching does not follow, so an ordering through it is unverified, as through an exclusive
+# ring, never a potential hazard.
+# --------------------------------------------------------------------------- #
+
+
+class RoundRobinRoundTrip(Model):
+    """``prod`` writes S and publishes it on round-robin ``s``; instance j of ``soft`` reads its
+    warp's lanes of P (an alias in S) in epochs j, j + 2, ..., then hands the epoch back on
+    round-robin ``back``, which prod waits for before its next write: a valid ordering.
+    ``early``: soft reads P before waiting for it, which no path orders after the write."""
+
+    def __init__(self, early: bool):
+        self.early = early
+        self.s = Ring(2, Threads, Threads, round_robin=True, commit_fence="tmem_store")
+        self.back = Ring(2, Threads, Threads, round_robin=True)
+        self.tmem_plan = TmemPlan().region("S", 128).alias("P", of="S", offset=64, cols=64)
+
+    @role(warps=0)
+    @cute.jit
+    def prod(self, ctx, *, s: Producer, back: Consumer, tmem: Tmem):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            tmem.access("S", write=True, lanes=range(32, 96))
+            with s.produce():
+                pass
+            with back.consume():
+                pass
+        return s, back
+
+    @role(warps=[range(1, 2), range(2, 3)])
+    @cute.jit
+    def soft(self, ctx, *, s: Consumer, back: Producer, tmem: Tmem):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            if cutlass.const_expr(self.early):
+                tmem.access("P", read=True)
+            with s.consume():
+                if cutlass.const_expr(not self.early):
+                    tmem.access("P", read=True)
+            with back.produce():
+                pass
+        return s, back
+
+
+def test_round_robin_ordering_is_unverified_not_a_hazard():
+    """Once reported ``no channel path orders them`` (and raised under ``strict``): the
+    round-robin rings' edges were dropped from the graph."""
+    op = RoundRobinRoundTrip(early=False)
+    op.alias_check = "strict"
+    compile_quietly(op, "round_robin_round_trip")
+    assert status(op, "P ~ S") == "unverified", alias_section(op)
+    assert "s: round-robin ring, epochs alternate between instances" in alias_section(op)
+
+
+def test_read_before_a_round_robin_wait_is_a_potential_hazard():
+    op = RoundRobinRoundTrip(early=True)
+    compile_quietly(op, "round_robin_early_read")
+    assert status(op, "P ~ S") == "potential hazard", alias_section(op)
+    assert "no channel path orders them [channel]" in alias_section(op)

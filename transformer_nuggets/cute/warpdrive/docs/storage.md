@@ -209,11 +209,14 @@ all memory accesses or prove cross-role convergence. `h.data`, `tmem.ptr`, `tmem
 A deeper ring orders epoch e before e + n, not the next epoch. Its stage handoff only orders
 storage indexed by that ring's own stage, with static, disjoint stage spans. Ring-stage SMEM
 shared by different channels is unverified. Consumers of one fan-out epoch, and producers of
-one fan-in epoch, are not ordered with respect to each other. Round-robin channels, and ring
-reuse whose ops sit in a loop inside the work item, add no ordering edges to the model, so
-accesses ordered only through them can be reported as hazards. An exclusive ring's stage
-handoff is checked like any ring's (its consumers never share an epoch), but its epochs follow
-runtime skips, so a path through it and another channel is a guess: `unverified`.
+one fan-in epoch, are not ordered with respect to each other. Ring reuse whose ops sit in a
+loop inside the work item adds no ordering edges to the model, so accesses ordered only
+through it can be reported as hazards. An exclusive ring's stage handoff is checked like any
+ring's (its consumers never share an epoch), but its epochs follow runtime skips, so a path
+through it and another channel is a guess: `unverified`. A round-robin channel's epochs
+alternate between its instances, which the epoch matching does not follow: every path through
+it is a guess, so an ordering it provides is `unverified`, while a pair no pairing of its epochs
+could order stays a `potential hazard`.
 
 The model matches epochs across roles by traced per-item counts. When two roles' counts on a
 channel differ (a prologue, a peeled last tile or a differently shaped loop on one side), the
