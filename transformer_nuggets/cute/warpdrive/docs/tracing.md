@@ -17,8 +17,8 @@ compile_persistent_gemm(op)
 print(op.describe())
 ```
 
-For the 2-CTA persistent GEMM with CLC, after the compile (output at `2491252`; print yours for the
-current version):
+For the 2-CTA persistent GEMM with CLC (its default `tile_n=224`), after the compile (print yours
+for the current version):
 
 ```
 PersistentGemm: 8 warps, 256 threads
@@ -35,12 +35,12 @@ Roles
 
 Channels
   ab         Ring(6)  load -> mma
-             signal    Tma(32768 B) -> Umma
-             full      leader 1 x6, tx 65536 B (leader-armed)
+             signal    Tma(30720 B) -> Umma
+             full      leader 1 x6, tx 61440 B (leader-armed)
              empty     leader 1 x6, peer 1 x6
              scope     pair-scoped, release_mask 0b11, tail
              storage   buffer A, B
-             tma       verified CtaGroup.TWO, 32768 B/stage per CTA @ persistent_gemm.py:156,157
+             tma       verified CtaGroup.TWO, 30720 B/stage per CTA @ persistent_gemm.py:194,195
   acc        Ring(2)  mma -> epilogue
              signal    Umma -> Threads
              full      leader 1 x2, peer 1 x2
@@ -64,16 +64,16 @@ Streams
         scheduler warp 6 broadcasts over work_ring
         roles: epilogue, load, mma
 
-TMEM: 512 columns used, 512 allocated
-  tmem acc [0, 256), [256, 512)
+TMEM: 448 columns used, 512 allocated
+  tmem acc [0, 224), [224, 448)
 
-SMEM plan: 212992 B per CTA in 3 buffer(s), plus alignment padding
+SMEM plan: 200704 B per CTA in 3 buffer(s), plus alignment padding
   A  BFloat16  98304 B  6 stages (mode -1)  align 1024  -> ab
-  B  BFloat16  98304 B  6 stages (mode -1)  align 1024  -> ab
+  B  BFloat16  86016 B  6 stages (mode -1)  align 1024  -> ab
   C  BFloat16  16384 B                      align 128
 ```
 
-Reading it: `ab` is pair-scoped, so the leader arms 64 KiB for both CTAs' TMA halves and the
+Reading it: `ab` is pair-scoped, so the leader arms 60 KiB for both CTAs' TMA halves and the
 MMA's release multicasts to both (`release_mask 0b11`). `acc`'s empty barrier lives on the
 leader and expects 256 epilogue threads from the two CTAs. The scheduler warp sits in the padding
 warpgroup and broadcasts each CLC claim through `work_ring` to every role in both CTAs.

@@ -45,17 +45,48 @@ the next tile's mainloop. Changing stage counts still has to fit SMEM and TMEM.
 
 `cluster=Cluster(2, 2, pair=True)` runs two pairs side by side along N that multicast A
 ([clusters](clusters.md#larger-clusters)). With `tile_n=224` that is cuBLAS's 256x224 2x2
-configuration for 3000x5000x4096. CUDA-graph replay, GB300, CuTeDSL 4.8.0, November 2026, best
-of three interleaved rounds of 60 replays (microseconds, lower is better):
+configuration for 3000x5000x4096.
 
-| M x N x K | `torch.mm` | pair 256 static | pair 224 static | 2x2 224 static | 2x2 224 CLC |
-|---|---:|---:|---:|---:|---:|
-| 3000 x 5000 x 4096 | 74.3 | 82.1 | 73.2 | 72.8 | 75.3 |
-| 4096 x 4096 x 4096 | 76.2 | 82.3 | 73.4 | 87.5 | 90.8 |
+`tile_n` defaults to 224 for `CtaPair()` and 256 otherwise. The width that wins is mostly
+wave quantization: how the tile count divides into the resident CTAs (152 CTAs, 76 pairs or 36
+2x2 clusters on a GB300) and how full the last wave is, against the better per-FLOP efficiency
+of the full 256-wide tile once there are many waves. So no single width wins everywhere; the
+defaults are a compromise over the shapes below. CUDA-graph replay, GB300, CuTeDSL 4.8.0,
+November 2026, `StaticPersistent`, min of five interleaved rounds' medians of 60 replays
+(microseconds, lower is better):
 
-At 4096 a 448-wide cluster tile leaves a partly empty last column and a fifth wave; the
-256-wide 2x2 runs 80.8 us there. 8192 x 8192 x 8192 replays varied by up to 15% between rounds
-on the shared GPU, so they are not listed.
+| M x N x K | `torch.mm` | 1 CTA 224 | 1 CTA 256 | pair 192 | pair 224 | pair 256 | 2x2 192 | 2x2 224 | 2x2 256 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4096 x 4096 x 4096 | 75.2 | 83.2 | 87.9 | 77.9 | 72.4 | 81.2 | 77.5 | 87.1 | 79.4 |
+| 3000 x 5000 x 4096 | 72.9 | 83.4 | 85.6 | 77.3 | 72.8 | 81.1 | 77.4 | 71.8 | 79.6 |
+| 2048 x 8192 x 4096 | 79.2 | 83.3 | 86.0 | 77.9 | 72.9 | 81.2 | 78.8 | 87.5 | 81.2 |
+| 8192 x 2048 x 4096 | 76.0 | 100.8 | 88.7 | 80.1 | 89.4 | 81.2 | 90.0 | 86.2 | 79.5 |
+| 4096 x 4096 x 14336 | 264.2 | 292.9 | 306.9 | 282.3 | 269.0 | 290.2 | 277.5 | 309.4 | 277.3 |
+| 4096 x 14336 x 4096 | 244.7 | 282.3 | 265.9 | 258.3 | 262.3 | 253.6 | 263.8 | 264.2 | 260.8 |
+| 8192 x 11008 x 4096 | 393.1 | 454.3 | 442.4 | 416.3 | 441.3 | 410.5 | 438.0 | 448.6 | 410.5 |
+| 6000 x 3000 x 2048 | 43.1 | 50.7 | 47.5 | 48.4 | 47.8 | 44.4 | 48.9 | 47.3 | 44.7 |
+| 1234 x 4096 x 4096 | 30.1 | 38.7 | 42.7 | 34.3 | 39.3 | 42.8 | 34.9 | 39.9 | 43.2 |
+| 1024 x 1024 x 8192 | 18.4 | 38.0 | 42.0 | 33.9 | 38.0 | 42.0 | 34.0 | 38.1 | 42.2 |
+
+Two sweeps (3 and 5 rounds, also with `tile_n=128` and `ClusterLaunchControl`) agree within
+5% on most table shapes (8% on the two smallest) and rank the widths the same way under CLC; the shapes with
+400 us and more (8192 x 11008 and the two left out of the table, 8192^3 and
+16384 x 4096 x 14336) moved up to 10% between sweeps and up to 19% between rounds on the shared
+GPU, so their single-digit differences mean little. Over the twelve shapes the pair at 224 is
+1-3% faster than at 256 in geomean in each of the four sweep x schedule combinations (2.2%
+pooled) and a repeatable 7-11% at the 4096-class shapes; 192 is 0.5-3.5% faster than 256
+(1.7% pooled), with its gains on the noisy large shapes. One CTA ties between 224 and 256
+(within 0.6%), so it keeps 256. For the 2x2 cluster 224 is the worst default (a 448-wide
+cluster tile gives a 4096-wide N a fifth wave) and 192 beats 256 by only 1-3%, within that
+noise, so it keeps 256. 128 only wins the 32-tile 1024 x 1024 x 8192 shape, by 24% over 192.
+A rule on the tile count picks the winner for one- and two-wave problems but is 10-15% off at
+many-wave ones, where the full tile's efficiency wins, so there is no shape-based selector:
+pass `tile_n` for a shape you care about.
+
+The harness is a CUDA-graph A/B: one graph per configuration, captured once, replayed in
+round-robin rounds (`torch.mm` first, then the widths in order) with default clocks and warm
+L2, reporting each configuration's best round median. Rerun it at your shapes before trusting
+a difference under 5%.
 
 ## Attention forward
 

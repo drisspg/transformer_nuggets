@@ -166,7 +166,7 @@ Channels
              empty     rank 0 2 x6, rank 1 2 x6, rank 2 2 x6, rank 3 2 x6
              scope     cross-CTA, multicast n, release_mask 0b1111, tail
              storage   buffer A, B
-             tma       verified CtaGroup.TWO, 30720 B/stage per CTA @ persistent_gemm.py:174,175
+             tma       verified CtaGroup.TWO, 30720 B/stage per CTA @ persistent_gemm.py:194,195
   acc        Ring(2)  mma -> epilogue
              signal    Umma -> Threads
              full      rank 0 1 x2, rank 1 1 x2, rank 2 1 x2, rank 3 1 x2
