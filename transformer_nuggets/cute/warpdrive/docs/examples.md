@@ -126,22 +126,39 @@ TMA clips and whose third mode selects the group's end row), so a tile that ends
 group is clipped by the TMA store like a tile at the tensor's edge.
 
 CUDA-graph replay on a shared GB300 (`bench_grouped_gemm.py`, 20 calls per graph, min of
-five interleaved rounds' medians), skewed routing with 1/8 of the experts idle; microseconds
-per call and TFLOP/s on the real rows. `grouped_mm` is `torch._grouped_mm`, `mm loop` a
-`torch.mm` per group, `pair` is `CtaPair()`:
+five interleaved rounds' medians, PyTorch 2.15 nightly cu132), skewed routing with 1/8 of the
+experts idle; microseconds per call and TFLOP/s on the real rows. `grouped_mm` is
+`torch._grouped_mm` (`F.grouped_mm` is the same aten op and measured within 1%), `mm loop` a
+`torch.mm` per group, `Triton` Inductor's persistent TMA grouped GEMM template
+(`max_autotune` with Triton as the only GEMM backend), `QUACK` FlexGEMM's QUACK backend with
+an identity epilogue (its untuned pick, a 128 x 128 tile on a 2-CTA MMA with a dynamic
+persistent scheduler) and `QUACK tuned` the same with Inductor's `tuned=True` shortlist;
+`pair` is `CtaPair()`:
 
-| G, tokens, N x K | `grouped_mm` | `mm loop` | 1 CTA atomic | 1 CTA CLC | pair atomic |
-|---|---:|---:|---:|---:|---:|
-| 8, 4096, 2048 x 7168 | 117 (1024) | 119 | 105 (1146) | 90 (1339) | 121 |
-| 8, 16384, 7168 x 2048 | 316 (1521) | 333 | 335 (1438) | 336 | 329 |
-| 64, 8192, 4096 x 4096 | 410 (670) | 521 | 366 (751) | 373 | 422 |
-| 64, 32768, 2048 x 7168 | 809 (1189) | 914 | 799 (1205) | 823 | 832 |
-| 128, 16384, 7168 x 2048 | 726 (663) | 826 | 612 (786) | 627 | 725 |
-| 128, 32768, 4096 x 4096 | 1090 (1009) | 1230 | 1116 (986) | 1108 | 1163 |
+| G, tokens, N x K | `grouped_mm` | `mm loop` | `Triton` | `QUACK` | `QUACK tuned` | 1 CTA atomic | 1 CTA CLC | pair atomic |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8, 4096, 2048 x 7168 | 116 (1038) | 123 | 102 | 104 (1151) | 120 | 111 (1085) | 94 (1286) | 119 |
+| 8, 16384, 7168 x 2048 | 324 (1486) | 319 | 361 | 383 (1258) | 325 | 334 (1440) | 337 | 327 |
+| 64, 8192, 4096 x 4096 | 407 (676) | 530 | 384 | 376 (730) | 392 | 377 (728) | 379 | 412 |
+| 64, 32768, 2048 x 7168 | 810 (1188) | 935 | 798 | 887 (1085) | 820 | 791 (1216) | 805 | 809 |
+| 128, 16384, 7168 x 2048 | 701 (686) | 855 | 658 | 675 (713) | 658 | 631 (763) | 629 | 699 |
+| 128, 32768, 4096 x 4096 | 1067 (1031) | 1244 | 1117 | 1195 (920) | 1122 | 1093 (1006) | 1098 | 1137 |
 
 Small skewed groups waste rows in 128-row tiles for every kernel (1.5x the real rows at
 G=64 with 8192 tokens and G=128 with 16384, 1.13-1.25x at 32768); a pair's 256-row tiles
 waste about twice that, so `CtaPair()` only ties on the G=8 shapes.
+
+The untuned QUACK kernel beats 1 CTA atomic only on the smallest shape (and not 1 CTA CLC),
+ties at G=64 with 8192 tokens, where its 64-row-per-CTA tiles waste the fewest rows, and
+trails the 1 CTA kernels by 7-15% on the other four. Tuning helps QUACK on the G=8 shape with N=7168 (a 256 x 256 tile on a 2-CTA MMA with a
+2 x 2 cluster, so A is multicast across the two n-neighbours; it ties `pair` there) but hurts
+on the smallest: Inductor benchmarks the shortlist with evenly spaced offsets, so the winner
+is picked for balanced routing. FlexGEMM's TRITON backend without `max_autotune` lowers to
+the extern `_grouped_mm`, and its NVGEMM backend has no grouped GEMM choice
+(`NoValidChoicesError`). Besides tile choice, QUACK's varlen scheduler counts the groups'
+tiles exactly (a warp prefix sum over the offsets, cached per group) where ours walks an
+upper bound and drops one empty slot per group, and it rasters a group's tiles in swizzled
+bands for L2 reuse; neither shows up as a gap in these timings.
 
 `offsets` must be nonnegative, nondecreasing and at most `total_M`, and must not change while
 the kernel runs; the kernel clamps them to `A`, so other values compute wrong rows but stay in
