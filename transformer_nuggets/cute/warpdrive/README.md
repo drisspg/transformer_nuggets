@@ -126,6 +126,7 @@ budgets, every channel's per-CTA arrival counts, masks and TMA bytes, the schedu
   handoffs.
 - [Dropping down](docs/dropping_down.md): raw barriers, count overrides and unchecked sites.
 - [Tracing](docs/tracing.md): inspect the kernel, capture IKET ranges and use the profiler.
+- [Compile cache](../jit_cache/README.md): compiled kernels kept on disk, keys, and clearing it.
 - [Examples](docs/examples.md): persistent GEMM, FA4 forward and swap-AB decode, input limits,
   SM103 hardware row max and timings.
 

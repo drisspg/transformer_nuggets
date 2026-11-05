@@ -74,7 +74,7 @@ These are conditional guarantees relative to that program, not a theorem about a
 | R13 | Raster is a bijection over positive `(m,n,l)` extents, l slowest, with selected raster, bands and reversals; decode intermediates stay within max(index, item count), so it is exact for every index R18 admits. Plain OneShot Raster uses `(m*cs,n,l)` when n/l <=65535, otherwise a 1-D grid. Device decoding follows the actual grid, so the supported hand-built `(total*cs,1,1)` grid preserves item identity too. |
 | R14 | `decode` runs only for valid indices `[0,total)`, after the readiness hook, for every mapping without `decodes_any_index` (local cursors, the scheduler warp, skip loops and `single_item()` alike); a mapping with `decodes_any_index` may also be evaluated speculatively (at terminal indices, or before readiness in the tile-grid prologue) and the words are discarded; a skipping mapping's `keep` is only used for valid indices. A subclass that overrides `decode` does not inherit `decodes_any_index`. Only a mapping with `skips` may return a runtime `keep` (trace-time check), and a skipping mapping is decoded once per visited index. Broadcast schedulers acquire a free work slot before claiming, bounding lookahead by stages. CLC waits every response and issues none after failure. `AtomicPersistent` reports once in `close_claims`; the last report fences and zeros `[claims,finished]` for sequential launches/graph replay. |
 | R15 | Generated synchronization must implement the finite, live abstract protocol without extra waits, premature reuse, lost publications or added deadlock. Compilation alone does not establish that precondition; a timeout is a candidate failure requiring attribution, not proof of a layer bug. |
-| R16 | `describe()` reports derived/effective structure (including the SMEM plan and the alias diagnostic's findings), not runtime correctness. Protocol logs are static traced sites, not execution histories. IKET off emits no IKET ops; cache keys must include IKET/protocol trace choices. Exported plans are per-CTA, work-item-granular approximations, not deadlock proofs. |
+| R16 | `describe()` reports derived/effective structure (including the SMEM plan and the alias diagnostic's findings), not runtime correctness. Protocol logs are static traced sites, not execution histories. IKET off emits no IKET ops; `__cute_cache_key__()` includes IKET/protocol trace choices, and a kernel loaded from `jit_cache` restores its traced reports (the protocol log excepted: traced kernels compile uncached). Exported plans are per-CTA, work-item-granular approximations, not deadlock proofs. |
 | R17 | A space with any Raster extent <= 0 is empty: `bind` stores `(1,1,0)` (what the kernel's `bound.space` reads), `count64` is 0, `bound.grid()` launches one work unit under every schedule, single CTA or pair, every role's first `valid` is false, no mapping without `decodes_any_index` is decoded (Raster and the adapters may evaluate and discard index 0), no decode divides by zero (host or device), and the atomic workspace is left zeroed for the next launch. The check is host code in the jit entry point; kernels pay nothing. |
 | R18 | The mapping's `count64` (Int64, saturating at 2^31; Raster's never wraps) is evaluated once on the host and narrowed to the Int32 `total` the kernel receives. `bound.grid()` admits a space only when `schedule.index_limit` of that count fits Int32: `total*cs` for OneShot/ClusterLaunchControl (the 1-D grid; terminal index `total`), `total + units - 1` for Static/Atomic (the last unit's terminal index). Within it, no grid extent, index, claim or CLC result wraps, and the narrowing never truncates a launched count. |
 | R19 | For any `IndexSchedule`/`WorkMap`/`Readiness` subclass meeting U15, the layer calls the protocol exactly as documented (below) and keeps owning distribution. Built-in schedules go through the same protocol. Normalized SASS of seven example configurations (gemm OneShot; persistent GEMM static single/pair and 2-CTA CLC; FA4 single, 2-CTA CLC, 2-CTA CLC split-P; CuTeDSL 4.8.0, GB300) was unchanged by making the protocol public and by the `(keep, words)` decode; host-side counting changed it only by reading `total` from a kernel parameter instead of recomputing the extent product, with neutral CUDA-graph timings. |
@@ -103,11 +103,14 @@ checks apply as for decorator shorthand. The configuration is snapshotted for th
 not polled on subsequent calls. Construct a new instance for another configuration (U12).
 Selectors are never GPU operations. They must not depend on runtime tensor contents.
 
-The standard `cute.cache` compile helpers add `op.__cute_compile_key__()` to the author's
-algorithm key. It includes resolved roles (including an inserted scheduler), CTA topology and
-tracing flags. Equivalent configurations reuse a cache entry; changed role budgets/placement
-cannot collide just because the author's key omitted them. Custom caches must include the hook
-explicitly, and other static algorithm choices remain the author's responsibility.
+A `jit_cache` compile of a kernel keys on `op.__cute_cache_key__()`: the bound constructor
+call, cluster, work streams, IKET/protocol-trace/alias settings, resolved roles (including an
+inserted scheduler), and the source digest of the modules defining the kernel's classes.
+Equivalent configurations reuse a cache entry; changed role budgets/placement cannot collide.
+A public attribute assigned after construction (other than the cluster, streams and those
+settings) makes the key raise `TypeError` instead of serving a kernel the constructor call no
+longer describes. Static choices made elsewhere (module globals changed at runtime) remain the
+author's responsibility.
 
 - A non-callable `config` raises `TypeError` at decoration.
 - Mixing `config` with explicit non-default placement arguments raises `ValueError`.
@@ -134,8 +137,8 @@ configurations is identical with `alias_check` "warn" and "off", sm_100a target 
 GB300 host, November 2026); it reads only the traced
 annotations and managed channel operations; `"strict"` raises only on a potential hazard; and
 `unchecked("alias", reason=...)` removes exactly the accesses annotated inside the block.
-`__cute_compile_key__()` includes `alias_check`, so the standard cache helpers never serve a
-strict build from a warn/off one (custom caches must include the hook, U12).
+`__cute_cache_key__()` includes `alias_check`, so `jit_cache` never serves a strict build
+from a warn/off one, and a cached build restores the traced report and its warning (U12).
 
 Known blind spots (phase 1): cluster kernels (reported unverified), unannotated or raw accesses,
 raw ordering instructions, raw roles, raw signals (`signal=False`), ring-stage SMEM shared by two
@@ -460,7 +463,7 @@ Python-int slot accessor behavior; this is not a blanket bounds/ownership check 
 | U9 | Raw roles get placement/regs/init/annotated TMEM teardown, not managed end/cursor/turnstile checks or the persistent-drain requirement. |
 | U10 | State return/reassignment, coherent `keep`/maps, workspace ABI/zeros, and avoiding concurrent workspace reuse. A custom mapping's `count64` must be exact up to 2^31 and never wrap (saturate instead), and its `decode` must be safe for every valid index of a bound space; with `decodes_any_index` it must also be safe past the end and on empty spaces. A device-built list must not change after readiness. `record` log offsets and launch resources other than the grid extent must fit Int32 and CUDA limits. The strict work-loop checks do not recognize stale state restoration or prove all per-item work is correct. |
 | U11 | Frozen contexts are shallow: referenced tensors/lists/objects remain mutable. Namespaces are not made immutable. |
-| U12 | No declaration mutation/recollection promise after first collection. Fresh compile keys must include all static choices, IKET and protocol tracing. |
+| U12 | No declaration mutation/recollection promise after first collection. A custom compile cache must key every static choice, IKET and protocol tracing; `__cute_cache_key__()` covers them for constructor-set kernels. |
 | U13 | No post-close payload/pointer ownership check; raw barrier accessors and Slots phase range/binding are not bounds-checked. |
 | U14 | No performance threshold, inter-unit deterministic order, race-freedom proof or profiler-plan proof of liveness. |
 | U15 | Custom schedules: every returned index is in `[0,total)` or terminal `>= total` (never negative); `first_index` depends only on launch values and `problem`, and `first_index`/`next_index` are identical pure functions in every role; claims across units cover each kept index once (R12 then holds); the schedule terminates; `uses_max_ctas`/`uses_workspace`/`index_limit`/`get_key` are truthful (`index_limit` bounds every index and grid extent; the key names every compile-time field, in lowercase identifier characters); `close_claims` only closes claim state. Custom mappings: U10; each kept index is a distinct work item (repeated outputs such as split-K partials are distinct `(tile, split)` items reduced elsewhere), and every needed item must be reachable as a kept index in `[0,count)`. |

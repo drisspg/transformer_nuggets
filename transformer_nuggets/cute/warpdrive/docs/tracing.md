@@ -104,9 +104,9 @@ This adds the traced acquire/commit/wait/release sites and source lines. A loop 
 site, not one record per runtime iteration. Use it to check which handle closes where, not
 to determine when a warp stalled.
 
-Include `trace_key()` in custom compile-cache keys so an untraced kernel cannot satisfy a
-traced request. The standard CuTe cache helpers include the kernel's
-`__cute_compile_key__()` hook, which covers these tracing choices.
+A cached kernel was never traced, so the examples' `compile_*` functions compile a
+`trace_protocol` kernel without the cache (`jit_cache(uncached=...)`). Other trace results
+come back with a cached kernel ([compile keys](roles.md#compile-keys)).
 
 ### TMA checks
 
@@ -143,8 +143,8 @@ with self.trace_region("exp"):
     ...  # exp2 work
 ```
 
-Disabled tracing emits no IKET operations. Include `iket_key()` in custom compile-cache keys,
-or use the standard hook as above.
+Disabled tracing emits no IKET operations. `iket` and `iket_waits` are part of the kernel's
+cache key; `iket_key()` names them in the examples' kernel names.
 
 The following needs NVIDIA's `run-iket` tooling and a script that launches the compiled kernel
 once. `profile_kernel.py` is your script, not a file supplied by warpdrive:
@@ -176,8 +176,8 @@ Open the resulting trace in [Perfetto](https://ui.perfetto.dev/).
 The plan is per CTA. `cta=1` excludes leader-only roles in a pair; any rank excludes the roles
 that don't run there. Its regions are work-item
 granular, so ring occupancy and reuse estimates for an inner K loop are coarse, not
-measurements of individual stages. Traced reuse counts require a compile on this object;
-a cache hit need not populate its trace data.
+measurements of individual stages. Traced reuse counts come from the compile that built the
+kernel; a cached kernel restores them.
 
 See the [pipeline profiler README](../../profiler/README.md#declarative-pipeline-analysis)
 for critical-path analysis, measured timelines and capture tooling.

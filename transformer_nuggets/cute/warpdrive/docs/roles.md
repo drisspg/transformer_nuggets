@@ -154,10 +154,28 @@ out, lse = fa4_fwd(q, k, v, roles=roles)
 
 ## Compile keys
 
-The [CuTe cache helpers](../../cache.py) include `op.__cute_compile_key__()` in addition to
-your algorithm key. It records the resolved roles, CTA topology, tracing choices and
-`alias_check` mode, so changing placement or budgets cannot reuse an incompatible entry. Include the hook yourself
-if you use another cache. Tile shapes, dtypes and other static algorithm choices still need to be
-in your key.
+The examples compile through [`jit_cache`](../../jit_cache/README.md), which keeps compiled
+kernels on disk across processes. Make your compile helper a module-level `@jit_cache`
+function of the kernel:
+
+```python
+@jit_cache(uncached=lambda op: op.trace_protocol)  # a protocol trace needs a real trace
+def compile_kernel(op: MyKernel):
+    return compile_tvm_ffi(op, *fake_args, name=op.get_name())
+```
+
+The kernel's key is `op.__cute_cache_key__()`: its constructor call (defaults filled in), the
+cluster, each work stream, `iket`/`iket_waits`/`trace_protocol`/`alias_check`, the resolved
+roles, and the source of the modules defining the kernel's classes. So `Gemm()` and
+`Gemm(ab_stages=3)` share an entry, a changed budget or placement does not, and editing a
+kernel subclass in your own file recompiles it. Pass static choices to the constructor:
+assigning another public attribute after construction (`op.tile_n = 128`) makes the key raise
+`TypeError`, because the constructor call no longer describes the kernel. The cluster, work
+streams and those four settings may be reassigned.
+
+A cached kernel was not traced, but `describe()` still shows the trace's findings: `jit_cache`
+restores the TMA, SMEM and alias reports and the opt-outs saved with the build, and repeats
+their warnings. Kernels pickle as their constructor call, so `compile_many` can build several
+in parallel.
 
 Define kernels in source files: CuTeDSL reads the source again for AST preprocessing.

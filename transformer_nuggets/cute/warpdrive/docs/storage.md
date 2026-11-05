@@ -114,11 +114,10 @@ print(op.describe())
 The diagnostic checks declared SMEM overlaps and `TmemPlan.alias` regions. It only knows
 about accesses you annotate. Set `"strict"` to raise `ProtocolError` on a potential hazard,
 or `"off"` to skip the analysis. Strict mode does not turn an unverified case into an error.
-The analysis runs while tracing the kernel. The standard cache helpers key on `alias_check`
-through `op.__cute_compile_key__()`, so a warn/off build cannot satisfy a strict request.
-Custom caches must include that hook too; it also records role placement and tracing choices. Reusing an
-executable does not by itself populate a new object's report; inspect the object that was
-traced or arrange a fresh trace.
+The analysis runs while tracing the kernel. A `jit_cache` compile keys on `alias_check`
+through `op.__cute_cache_key__()`, so a warn/off build cannot satisfy a strict request, and a
+kernel loaded from the cache gets the traced report back, warning included
+([compile keys](roles.md#compile-keys)).
 
 For SMEM, annotate the view where the access happens:
 
