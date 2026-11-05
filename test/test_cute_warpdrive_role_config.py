@@ -1,4 +1,5 @@
-"""Constructor-selected roles: binding, validation, specialization reuse, and real handoffs."""
+"""Constructor-configured roles (``roles=`` overrides and ``config=`` selectors): binding,
+validation, specialization reuse, and real handoffs."""
 
 from dataclasses import FrozenInstanceError, dataclass, field, replace
 from operator import attrgetter
@@ -29,10 +30,7 @@ from transformer_nuggets.cute.warpdrive import (
 )
 
 
-@dataclass(frozen=True)
-class CopyRoles:
-    load: RoleConfig = field(default_factory=lambda: RoleConfig(0, regs=40))
-    consume: RoleConfig = field(default_factory=lambda: RoleConfig(range(4, 8), regs=160))
+LOAD, CONSUME = RoleConfig(0, regs=40), RoleConfig(range(4, 8), regs=160)  # the defaults
 
 
 @dataclass(frozen=True)
@@ -41,21 +39,18 @@ class CopyCtx:
     iterations: cutlass.Int32
 
 
-def load_config(kernel: "ConfiguredCopy") -> RoleConfig:
-    # Named functions and lambdas have the same host-only selector contract.
-    return kernel.roles.load
-
-
 class ConfiguredCopy(WarpSpecialized):
-    def __init__(self, roles: CopyRoles | None = None):
-        self.roles = roles if roles is not None else CopyRoles()
+    """Declared defaults, overridden per instance through ``roles=``."""
+
+    def __init__(self, roles: dict | None = None):
+        self.roles = roles
         self.data = Ring(2, Threads, Threads, payload=(cutlass.Int32, (32,)))
 
     def get_name(self) -> str:
         # Deliberately independent of roles: the shared compile cache must distinguish them.
         return "warpdrive_configured_copy"
 
-    @role(config=load_config)
+    @role(warps=0, regs=40)
     @cute.jit
     def load(self, data: Producer, ctx: CopyCtx):
         lane = cute.arch.lane_idx()
@@ -64,7 +59,7 @@ class ConfiguredCopy(WarpSpecialized):
                 h.data[lane] = i * 32 + lane
         return data
 
-    @role(config=lambda kernel: kernel.roles.consume)
+    @role(warps=range(4, 8), regs=160)
     @cute.jit
     def consume(self, data: Consumer, ctx: CopyCtx):
         lane = cute.arch.lane_idx()
@@ -98,13 +93,30 @@ def compile_copy(op: ConfiguredCopy):
     )
 
 
-class FixedCopy(ConfiguredCopy):
-    @role(warps=0, regs=40)
+@dataclass(frozen=True)
+class CopyRoles:
+    load: RoleConfig = field(default_factory=lambda: LOAD)
+    consume: RoleConfig = field(default_factory=lambda: CONSUME)
+
+
+def load_config(kernel: "SelectedCopy") -> RoleConfig:
+    # Named functions and lambdas have the same host-only selector contract.
+    return kernel.placement.load
+
+
+class SelectedCopy(ConfiguredCopy):
+    """The same kernel with ``config=`` selectors reading a constructor-built dataclass."""
+
+    def __init__(self, placement: CopyRoles | None = None):
+        super().__init__()
+        self.placement = placement if placement is not None else CopyRoles()
+
+    @role(config=load_config)
     @cute.jit
     def load(self, data: Producer, ctx: CopyCtx):
         return data
 
-    @role(warps=range(4, 8), regs=160)
+    @role(config=lambda kernel: kernel.placement.consume)
     @cute.jit
     def consume(self, data: Consumer, ctx: CopyCtx):
         return data
@@ -118,11 +130,30 @@ def test_config_matches_shorthand_and_normalizes_warps():
     assert RoleConfig(0) == RoleConfig(range(1)) == RoleConfig([range(1)])
     with pytest.raises(FrozenInstanceError):
         config.regs = 184
-    assert ConfiguredCopy().role_config_key() == FixedCopy().role_config_key()
+    assert ConfiguredCopy().role_config_key() == SelectedCopy().role_config_key()
     assert (
-        ConfiguredCopy().describe().replace("ConfiguredCopy", "FixedCopy")
-        == FixedCopy().describe()
+        ConfiguredCopy().describe().replace("ConfiguredCopy", "SelectedCopy")
+        == SelectedCopy().describe()
     )
+    tuned = {"consume": replace(CONSUME, regs=152)}
+    assert (
+        ConfiguredCopy(tuned).role_config_key()
+        == SelectedCopy(CopyRoles(consume=tuned["consume"])).role_config_key()
+    )
+    assert "4-7    consume     152" in ConfiguredCopy(tuned).describe()
+
+
+def test_roles_override_diagnostics():
+    with pytest.raises(ProtocolError, match="roles names \\['consumer'\\], which are not roles"):
+        ConfiguredCopy({"consumer": CONSUME}).describe()
+    with pytest.raises(ProtocolError, match="roles\\['load'\\] must be a RoleConfig"):
+        ConfiguredCopy({"load": 40}).describe()
+    with pytest.raises(ProtocolError, match="roles must be a mapping"):
+        ConfiguredCopy(CopyRoles()).describe()
+    op = ConfiguredCopy()
+    op.roles = {"load": LOAD}  # after construction: not part of the constructor call
+    with pytest.raises(TypeError, match="assigned after construction"):
+        op.__cute_cache_key__()
 
 
 def test_resolution_is_per_instance_and_frozen_after_collection():
@@ -175,9 +206,7 @@ def test_callable_object_and_lambda_instances(selector):
 
 
 def test_resolved_placement_drives_pair_scope():
-    op = ConfiguredCopy(
-        CopyRoles(RoleConfig(0, regs=40, cta="leader"), RoleConfig(range(4, 8), regs=160))
-    )
+    op = ConfiguredCopy({"load": replace(LOAD, cta="leader")})
     op.cluster = CtaPair()
     # Pair payloads aren't yet supported: use the same graph as a pure handoff.
     op.data = Ring(2, Threads, Threads)
@@ -188,10 +217,10 @@ def test_resolved_placement_drives_pair_scope():
 
 def test_resolved_graph_validation_and_no_implicit_budget():
     with pytest.raises(ValueError, match="claimed by"):
-        ConfiguredCopy(CopyRoles(consume=RoleConfig(0, regs=40))).describe()
+        ConfiguredCopy({"consume": RoleConfig(0, regs=40)}).describe()
     with pytest.raises(ValueError, match="mixed register budgets"):
-        ConfiguredCopy(CopyRoles(RoleConfig(0), RoleConfig(1, regs=40))).describe()
-    op = ConfiguredCopy(CopyRoles(RoleConfig(0), RoleConfig(1)))
+        ConfiguredCopy({"load": RoleConfig(0), "consume": RoleConfig(1, regs=40)}).describe()
+    op = ConfiguredCopy({"load": RoleConfig(0), "consume": RoleConfig(1)})
     assert op.num_threads == 64  # no setmaxnreg-driven warpgroup padding
     assert all(entry[4] is None for entry in op.role_config_key())
 
@@ -251,26 +280,29 @@ def requires_blackwell():
 def test_configured_handoffs_and_cache_isolation(requires_blackwell):
     compile_copy.cache_clear()
     configs = [
-        CopyRoles(),
-        CopyRoles(RoleConfig(0, regs=48), RoleConfig(range(4, 8), regs=152)),
-        CopyRoles(RoleConfig(0, regs=40), RoleConfig(range(8, 12), regs=160)),
+        None,
+        {"load": RoleConfig(0, regs=48), "consume": RoleConfig(range(4, 8), regs=152)},
+        {"consume": RoleConfig(range(8, 12), regs=160)},
     ]
     compiled = [compile_copy(ConfiguredCopy(config)) for config in configs]
     assert compile_copy.cache_info().currsize == len(configs)
     assert len({id(fn) for fn in compiled}) == len(configs)
-    assert compile_copy(ConfiguredCopy(CopyRoles())) is compiled[0]
+    assert compile_copy(ConfiguredCopy(None)) is compiled[0]
+    # The key is the constructor call: spelling the defaults out is another kernel.
+    assert compile_copy(ConfiguredCopy({"load": LOAD, "consume": CONSUME})) is not compiled[0]
+    assert compile_copy.cache_info().currsize == len(configs) + 1
     info = compile_copy.cache_info()  # disk loads count as hits too
-    assert info.hits + info.misses == len(configs) + 1 and info.currsize == len(configs)
+    assert info.hits + info.misses == len(configs) + 2 and info.currsize == len(configs) + 1
     for config, fn in zip(configs, compiled):
         for n in (1, 7, 19):  # first use and ring wraps, without recompiling
             out = torch.full((384,), -1, device="cuda", dtype=torch.int32)
             fn(out, n)
             expected = torch.full_like(out, -1)
-            for warp in config.consume.warps[0]:
+            for warp in (config or {}).get("consume", CONSUME).warps[0]:
                 lanes = torch.arange(32, device="cuda", dtype=torch.int32)
                 expected[warp * 32 : (warp + 1) * 32] = 32 * n * (n - 1) // 2 + n * lanes
             torch.testing.assert_close(out, expected, rtol=0, atol=0)
-    assert compile_copy.cache_info().currsize == len(configs)
+    assert compile_copy.cache_info().currsize == len(configs) + 1
 
 
 def test_omitted_registers_emit_no_adjustment(requires_blackwell, monkeypatch, traced_compiles):
@@ -279,7 +311,7 @@ def test_omitted_registers_emit_no_adjustment(requires_blackwell, monkeypatch, t
 
     monkeypatch.setattr(cute.arch, "setmaxregister_increase", unexpected_adjustment)
     monkeypatch.setattr(cute.arch, "setmaxregister_decrease", unexpected_adjustment)
-    op = ConfiguredCopy(CopyRoles(RoleConfig(0), RoleConfig(1)))
+    op = ConfiguredCopy({"load": RoleConfig(0), "consume": RoleConfig(1)})
     compile_copy.cache_clear()
     compile_copy(op)
 
@@ -295,28 +327,26 @@ def test_cache_key_is_the_resolved_config(tmp_path, monkeypatch):
         return object()
 
     first = compile_marker(ConfiguredCopy())
-    second = compile_marker(ConfiguredCopy(CopyRoles(consume=RoleConfig(range(4, 8), regs=152))))
+    second = compile_marker(ConfiguredCopy({"consume": RoleConfig(range(4, 8), regs=152)}))
     assert first is not second
     assert compile_marker(ConfiguredCopy()) is first
-    assert compile_marker(FixedCopy()) is not first  # same roles, another class
+    assert compile_marker(SelectedCopy()) is not first  # same roles, another class
     assert len(built) == 3
     assert compile_marker.cache_info() == CacheInfo(hits=1, misses=3, currsize=3)
 
 
 def test_fa4_register_bucket(requires_blackwell):
     pytest.importorskip("flash_attn.cute")
-    from transformer_nuggets.cute.warpdrive.examples.fa4_fwd import Fa4Roles, fa4_fwd
+    from transformer_nuggets.cute.warpdrive.examples.fa4_fwd import fa4_fwd
 
     torch.manual_seed(0)
     q = torch.randn(1, 512, 2, 128, device="cuda", dtype=torch.bfloat16)
     k, v = torch.randn_like(q), torch.randn_like(q)
-    base = Fa4Roles()
-    tuned = replace(
-        base,
-        softmax=replace(base.softmax, regs=184),
-        correction=replace(base.correction, regs=96),
-    )
-    expected, expected_lse = fa4_fwd(q, k, v, roles=base)
+    tuned = {
+        "softmax": RoleConfig((range(4), range(4, 8)), regs=184),
+        "correction": RoleConfig(range(8, 12), regs=96),
+    }
+    expected, expected_lse = fa4_fwd(q, k, v)
     actual, actual_lse = fa4_fwd(q, k, v, roles=tuned)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     torch.testing.assert_close(actual_lse, expected_lse, rtol=0, atol=0)

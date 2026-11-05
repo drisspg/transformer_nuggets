@@ -6,7 +6,7 @@ import functools
 import inspect
 import pickle
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, is_dataclass, replace
 from types import SimpleNamespace
@@ -274,11 +274,14 @@ def role(
 ):
     """Mark a method as a warp role, using fixed placement or a per-instance config selector.
 
-    ``@role(warps=4, regs=40)`` supplies a fixed RoleConfig. Alternatively,
-    ``@role(config=lambda kernel: kernel.roles.load)`` selects one after construction, on first
-    collection (describe, compile-cache lookup, or tracing). A named function or callable object
-    works too. The selector is host code, never a device call; its result is snapshotted for
-    that kernel instance. Construct a new instance to change a collected configuration.
+    ``@role(warps=4, regs=40)`` supplies a fixed RoleConfig: the default placement. A kernel
+    instance replaces it per role through ``self.roles``, a ``{method name: RoleConfig}``
+    mapping set in ``__init__`` (typically from a constructor argument merged over the kernel's
+    computed defaults). Alternatively, ``@role(config=lambda kernel: kernel.setting)`` selects
+    one after construction, on first collection (describe, compile-cache lookup, or tracing). A
+    named function or callable object works too. The selector is host code, never a device call.
+    Either way the result is snapshotted for that kernel instance on first collection. Construct
+    a new instance to change a collected configuration.
 
     A list of warp ranges instantiates the method once per range; an Instance parameter receives
     its index. ``cta="leader"`` restricts execution to the leader of each MMA pair (a no-op without
@@ -358,6 +361,10 @@ class WarpSpecialized(metaclass=_KernelType):
 
     tmem_plan: TmemPlan | None = None
     smem_plan: SmemPlan | None = None  # SMEM buffers channels bind with buffer= (storage.py)
+    # Per-instance role placement and budgets: ``{method name: RoleConfig}`` replaces the
+    # ``@role`` declaration of each named role. Set it in ``__init__`` from a constructor
+    # argument so the compile key sees it; unknown names raise at collection.
+    roles: Mapping[str, RoleConfig] | None = None
     # Alias diagnostic (alias.py): "warn" (describe() plus one warning on findings), "strict"
     # (raise on a potential hazard), or "off". Host-only; it never changes the generated code.
     alias_check: str = "warn"
@@ -443,12 +450,18 @@ class WarpSpecialized(metaclass=_KernelType):
                     )
         roles = []
         ctx_types = {}  # annotated context type -> first "role.param" using it
-        for name in dir(type(self)):
+        declared = {
+            name: meta
+            for name in dir(type(self))
+            if (meta := getattr(getattr(type(self), name), "_warpdrive", None)) is not None
+        }
+        overrides = _role_overrides(self.roles, declared)
+        for name, meta in declared.items():
             fn = getattr(type(self), name)
-            meta = getattr(fn, "_warpdrive", None)
-            if meta is None:
-                continue
-            resolved = meta if isinstance(meta, RoleConfig) else meta(self)
+            if name in overrides:
+                resolved = overrides[name]
+            else:
+                resolved = meta if isinstance(meta, RoleConfig) else meta(self)
             if not isinstance(resolved, RoleConfig):
                 raise ProtocolError(
                     f"role {name}: config selector must return RoleConfig, "
@@ -1501,6 +1514,25 @@ def _check_named_turns(name: str, chan, turns: dict):
                 f"without the other side; declare an enabled Turnstile over {sorted(bound)} and "
                 "pass its name as turnstile=, or use a multiple of the instance count as stages"
             )
+
+
+def _role_overrides(roles, declared: dict) -> dict:
+    """Check a kernel's ``roles`` mapping against its declared role names."""
+    if roles is None:
+        return {}
+    if not isinstance(roles, Mapping):
+        raise ProtocolError(
+            f"roles must be a mapping from role name to RoleConfig, got {type(roles).__name__}"
+        )
+    unknown = sorted(set(roles) - set(declared))
+    if unknown:
+        raise ProtocolError(f"roles names {unknown}, which are not roles; have {sorted(declared)}")
+    for name, config in roles.items():
+        if not isinstance(config, RoleConfig):
+            raise ProtocolError(
+                f"roles[{name!r}] must be a RoleConfig, got {type(config).__name__}"
+            )
+    return dict(roles)
 
 
 def _allocate_named(chans: dict) -> dict:
