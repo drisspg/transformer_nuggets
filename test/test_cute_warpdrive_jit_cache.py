@@ -125,6 +125,11 @@ def test_pickled_kernel_keeps_its_key():
     copy = pickle.loads(pickle.dumps(moved))
     assert copy.work.owner is copy and copy.cluster == CtaPair()
     assert key_of(copy, compile_pgemm) == key_of(moved, compile_pgemm)
+    stages = [2]
+    listed = ListGemm(stages)
+    stages[0] = 4  # the key froze the call as made; the rebuilt kernel must be that call too
+    copy = pickle.loads(pickle.dumps(listed))
+    assert copy.ab.n == 2 and key_of(copy) == key_of(listed)
 
 
 # A kernel module outside the package, as a test or user file would define one: its own source

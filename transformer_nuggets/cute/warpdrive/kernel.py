@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import functools
 import inspect
 import pickle
@@ -336,19 +337,30 @@ def _rebuild(cls, args, kwargs, settings):
 
 class _KernelType(type):
     """Brackets construction. What any ``__init__`` of the call assigns belongs to the
-    constructor; when the call returns, its bound arguments are frozen as the kernel's cache key
-    (so later in-place changes to an argument cannot alter it) and kept for pickling."""
+    constructor. The call's arguments are copied before it runs; that one copy is frozen as the
+    kernel's cache key and replayed when the kernel is unpickled, so a later in-place change to
+    an argument alters neither."""
 
     def __call__(cls, *args, **kwargs):
-        kernel = super().__call__(*args, **kwargs)
-        call = _init_signature(cls).bind(kernel, *args, **kwargs)
-        call.apply_defaults()
         try:
-            frozen = canonical_key(tuple(call.arguments.items())[1:])  # without self
-        except TypeError as error:  # raised by __cute_cache_key__, only if the kernel is cached
-            frozen = error
+            init = copy.deepcopy((args, kwargs))
+        except Exception as error:  # raised by __cute_cache_key__ and pickling, if ever used
+            init = TypeError(
+                f"{cls.__name__}: the constructor arguments cannot be copied, so the kernel has "
+                f"no cache key and cannot be pickled ({error})"
+            )
+        kernel = super().__call__(*args, **kwargs)
+        if isinstance(init, TypeError):
+            frozen = init
+        else:
+            call = _init_signature(cls).bind(kernel, *init[0], **init[1])
+            call.apply_defaults()
+            try:
+                frozen = canonical_key(tuple(call.arguments.items())[1:])  # without self
+            except TypeError as error:
+                frozen = error
         object.__setattr__(kernel, "_ws_init_key", frozen)
-        object.__setattr__(kernel, "_ws_init", (args, kwargs))
+        object.__setattr__(kernel, "_ws_init", init)
         return kernel
 
 
@@ -386,6 +398,8 @@ class WarpSpecialized(metaclass=_KernelType):
         """Pickle as the constructor call (a fresh compiler process rebuilds the kernel) plus
         what the cache key allows after it: the host settings, the cluster, and work streams.
         Other attributes assigned after construction make the key raise, so none are kept."""
+        if isinstance(self._ws_init, TypeError):
+            raise self._ws_init
         state = vars(self)
         settings = {k: state[k] for k in (*_HOST_SETTINGS, "cluster") if k in state}
         # A stream refers back to its owner; ship its declaration and let setattr re-own it.
@@ -882,15 +896,15 @@ class WarpSpecialized(metaclass=_KernelType):
         """This kernel's key as a ``jit_cache`` compile argument (the examples' ``compile_*``).
 
         ``jit_cache`` adds the class's module and name. The key is the constructor call (its
-        bound arguments, defaults filled in, frozen when construction returns, so changing a
+        bound arguments, defaults filled in, copied before ``__init__`` runs, so changing a
         list argument in place later does not change it) plus what may change after it: the
         cluster, each work stream, and the host settings (IKET, ``trace_protocol``,
-        ``alias_check``: a "warn" build must not satisfy a "strict" one). The resolved role placement and budgets
-        and the source of every module defining the kernel's, cluster's, and streams' classes
-        complete it, so editing a kernel the compile function does not import (a test's
-        subclass) recompiles it. Other public attributes assigned after construction raise a
-        ``TypeError`` here: set them in ``__init__``. In-place changes to objects the
-        constructor built (``op.ab.n = 4``) are not keyed: don't make them."""
+        ``alias_check``: a "warn" build must not satisfy a "strict" one). The resolved role
+        placement and budgets and the source of every module defining the kernel's, cluster's,
+        and streams' classes complete it, so editing a kernel the compile function does not
+        import (a test's subclass) recompiles it. Other public attributes assigned after
+        construction raise a ``TypeError`` here: set them in ``__init__``. In-place changes to
+        objects the constructor built (``op.ab.n = 4``) are not keyed: don't make them."""
         late = vars(self).get("_ws_late")
         if late:
             raise TypeError(
