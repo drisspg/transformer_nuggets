@@ -115,54 +115,61 @@ tails; returned cursors also let tracing close any remaining work range.
 
 ## Choose placement in the constructor
 
+The decorator declares the default. A kernel instance replaces any role's placement or
+budget through `self.roles`, a mapping from the method name to a `RoleConfig`, set in
+`__init__` from a constructor argument:
+
 ```python
-from dataclasses import dataclass
-from transformer_nuggets.cute.warpdrive import Instance, RoleConfig
-
-
-@dataclass(frozen=True)
-class AttentionRoles:
-    softmax: RoleConfig
-    mma: RoleConfig
+from collections.abc import Mapping
+from transformer_nuggets.cute.warpdrive import RoleConfig
 
 
 class Attention(WarpSpecialized):
-    def __init__(self, registers):
-        self.roles = AttentionRoles(
-            softmax=RoleConfig([range(4), range(4, 8)], regs=registers.softmax),
-            mma=RoleConfig(12, regs=registers.other, cta="leader"),
-        )
+    def __init__(self, tile_hq: int, roles: Mapping[str, RoleConfig] | None = None):
+        defaults = {}  # computed from the other arguments
+        if tile_hq > 16:
+            defaults["softmax"] = RoleConfig([range(4), range(4, 8)], regs=120)
+        self.roles = {**defaults, **(roles or {})}
         ...  # channels and storage
 
-    @role(config=lambda kernel: kernel.roles.softmax)
+    @role(warps=[range(4), range(4, 8)], regs=192)
     @cute.jit
     def softmax(self, params, *, stage: Instance): ...
 ```
 
-The selector is a host callable returning a `RoleConfig`. A named function works too.
-`describe()`, tracing or a compile-cache lookup can trigger the first collection; the result
-is then fixed for that kernel instance. Construct another instance to change it; mutating
-or recollecting declarations after the first collection is unsupported. Selectors are host
-code and must not depend on runtime tensor contents.
+A name that is not a role, or a value that is not a `RoleConfig`, raises `ProtocolError` at
+collection. The merged configuration then goes through the same checks as the declarations:
+claimed warps, contiguous instances, one budget per warpgroup and the register pool. Set
+`self.roles` only in `__init__`: assigning it later makes the compile key raise, because the
+constructor call no longer describes the kernel ([compile keys](#compile-keys)).
+`describe()` shows the resolved budgets.
 
 `RoleConfig` is frozen and copies lists of ranges into tuples. It has the same `warps`,
-`regs`, `cta` and `raw` fields as the decorator. Don't mix `config=` with explicit placement
-arguments. Changing placement does not change your tensor partitions; update those yourself.
+`regs`, `cta` and `raw` fields as the decorator. Changing placement does not change your
+tensor partitions; update those yourself. `dataclasses.replace` derives a variant of a
+declared configuration.
 
-The FA4 example accepts a `Fa4Roles` configuration:
+The examples take `roles=` this way: the decode kernel computes FA4's 32-head register split
+as its defaults, and `fa4_fwd` passes the mapping through:
 
 ```python
-from dataclasses import replace
-from transformer_nuggets.cute.warpdrive.examples.fa4_fwd import Fa4Roles, fa4_fwd
+from transformer_nuggets.cute.warpdrive import RoleConfig
+from transformer_nuggets.cute.warpdrive.examples.fa4_fwd import fa4_fwd
 
-roles = Fa4Roles()
-roles = replace(
-    roles,
-    softmax=replace(roles.softmax, regs=184),
-    correction=replace(roles.correction, regs=96),
-)
+roles = {
+    "softmax": RoleConfig([range(4), range(4, 8)], regs=184),
+    "correction": RoleConfig(range(8, 12), regs=96),
+}
 out, lse = fa4_fwd(q, k, v, roles=roles)
 ```
+
+When the placement itself is computed and no decorator default makes sense,
+`@role(config=selector)` takes a host callable returning a `RoleConfig`; a named function
+works too. `describe()`, tracing or a compile-cache lookup can trigger the first collection;
+the result is then fixed for that kernel instance. Construct another instance to change it;
+mutating or recollecting declarations after the first collection is unsupported. Selectors
+are host code and must not depend on runtime tensor contents. Don't mix `config=` with
+explicit placement arguments. An entry in `self.roles` overrides a selector too.
 
 ## Compile keys
 

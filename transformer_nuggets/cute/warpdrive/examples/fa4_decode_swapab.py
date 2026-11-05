@@ -3,12 +3,15 @@ with ``warpdrive``.
 
 The kernel computes ``S^T = K Q^T`` and ``O^T = V^T P^T``: the 128 KV tokens of an MMA tile fill
 the M dimension, and the query heads of one KV head (GQA) fill the small N dimension. A work item
-is ``(split, kv_head, batch)``; it reduces a contiguous range of 256-token KV blocks to a
-normalized fp32 O partial and a natural-log LSE partial. ``fa4_decode`` combines the splits with
-FA4's combine kernel.
+is ``(split, kv_head, batch)``; it reduces a contiguous range of ``tile_n``-token KV blocks (256
+by default) to a normalized fp32 O partial and a natural-log LSE partial. ``fa4_decode`` combines
+the splits with FA4's combine kernel.
 
-Scope: bf16 Q/K/V, head dim 128, ``tile_hq = next_pow2(heads / kv_heads)`` up to 32, dense
-contiguous KV with optional per-sequence lengths (``seqused_k``) and per-sequence split counts.
+Scope: bf16 Q/K/V, head dims 128 by default (``head_dim``, ``head_dim_v`` constructor arguments),
+``tile_hq = next_pow2(heads / kv_heads)`` up to 32, dense contiguous KV with optional per-sequence
+lengths (``seqused_k``) and per-sequence split counts. The KV block, K step, S/P ring depths and
+the roles' register budgets are constructor arguments too (docs/configuration.md); the defaults
+below are FA4's.
 KV rows past a sequence's length must be finite: FA4 zero-fills them with a per-CTA bounded V
 descriptor, this port relies on P being zero there. No paging, varlen Q, masks or score mods.
 
@@ -29,6 +32,7 @@ the thread-to-thread mailboxes FA4 builds from ``bar.sync``/``bar.arrive``:
                       two MMA cursors); here K and V have their own rings and stages
     s        Ring(4)  mma_qk -UMMA-> softmax[0|1], round-robin: softmax[i] takes blocks i, i+2, ...
     p        Ring(4)  softmax[0|1] -> mma_pv, round-robin; P in SMEM, the PV MMA's B operand
+                      (``s_stages`` and ``p_stages``)
     o        Ring(2)  mma_pv -UMMA-> correction; slot j % 2 accumulates blocks j, j+2, ...
     row_max  named    softmax[0|1] -> correction, round-robin; the running max M(j) in sRowMax
     row_sum  named    softmax[0|1] -> correction, round-robin; per-thread sums in TMEM L

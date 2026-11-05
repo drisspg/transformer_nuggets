@@ -1,14 +1,16 @@
 """Cut-down FlashAttention-4 forward (SM100) written with ``warpdrive``.
 
-Scope: bf16 in/out, fp32 accumulation, head_dim 128, non-causal, no masking, work items of
-(256 query rows, head, batch) scheduled by a ``WorkStream`` (``OneShot`` by default, or a
-persistent schedule), 1-CTA MMAs. ``seqlen_k`` must be a multiple
-of 128 (no key masking); ``seqlen_q`` may be any length because TMA zero-fills the loads of
+Scope: bf16 in/out, fp32 accumulation, head_dim 64 or 128, non-causal, no masking, work items
+of (256 query rows, head, batch) scheduled by a ``WorkStream`` (``OneShot`` by default, or a
+persistent schedule), 1-CTA MMAs. ``seqlen_k`` must be a multiple of the K/V tile (``tile_n``,
+128 or 64; no key masking); ``seqlen_q`` may be any length because TMA zero-fills the loads of
 the last Q tile and clips its O store. Returns O and the log-sum-exp (natural log).
 
 The schedule mirrors FA4's non-ping-pong path (``flash_attn/cute/flash_fwd_sm100.py``):
-two 128-row Q tiles per CTA (``q_stage=2``), 128-column K/V tiles, warps 0-3 softmax for
-tile 0, 4-7 softmax for tile 1, 8-11 correction, 12 MMA, 13 epilogue, 14 load, 15 idle.
+two 128-row Q tiles per CTA (``q_stage=2``), ``tile_n``-column K/V tiles, warps 0-3 softmax for
+tile 0, 4-7 softmax for tile 1, 8-11 correction, 12 MMA, 13 epilogue, 14 load, 15 idle. The
+tiles, head dimension, stage count, rescale threshold and the roles' placement and register
+budgets are constructor arguments (docs/configuration.md).
 
 Dependency graph (channels, all mbarriers; slot j = Q tile j):
 
@@ -23,8 +25,9 @@ Dependency graph (channels, all mbarriers; slot j = Q tile j):
     softmax[0] <-> softmax[1] turnstile around exp2 (FA4's s0_s1_sequence; off by default,
                                         as in FA4)
 
-TMEM (512 columns): S0 [0,128), S1 [128,256), O0 [256,384), O1 [384,512); P_j is bf16 packed
-two per column into the upper half of S_j ([64,128) of each S slot).
+TMEM (512 columns at the defaults): S0 [0,128), S1 [128,256), O0 [256,384), O1 [384,512);
+P_j is bf16 packed two per column into the upper half of S_j ([64,128) of each S slot). S slots
+are ``tile_n`` columns and O slots ``head_dim``.
 
 SMEM is an ``SmemPlan``: sO, sQ and sK, with V reusing K's stages (``overlaps=``), bound to the
 epi, q and kv channels so each handle selects its own stage. ``overlap_o_q=True`` also places sO
@@ -715,7 +718,8 @@ class FlashAttentionForward(WarpSpecialized):
         sO_layout,
         bound,
     ):
-        # K and V stages share one buffer (same stage size at head_dim 128).
+        # K and V stages share one buffer: a tile_n x head_dim K tile and a head_dim x tile_n
+        # V tile have the same bytes.
         layouts = {"O": sO_layout, "Q": sQ_layout, "K": sK_layout, "V": sV_layout}
         self.begin_roles(work=bound, layouts=layouts)
         sO, sQ, sK, sV = self.buffer("O"), self.buffer("Q"), self.buffer("K"), self.buffer("V")

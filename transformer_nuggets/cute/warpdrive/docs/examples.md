@@ -97,10 +97,12 @@ out, lse = fa4_fwd(q, k, v)
 ```
 
 This is a teaching kernel for unmasked attention, not a replacement for the full FA4 API.
-Inputs are contiguous, 16-byte-aligned BF16 `(batch, seqlen, heads, 128)` tensors on one CUDA
-device. K and V have matching shapes; all inputs have matching batch and head counts. Key
-length must be a positive multiple of 128. Query length can be ragged. There is no varlen,
-GQA or other head dimension. The example imports `flash_attn.cute` and `quack` helpers.
+Inputs are contiguous, 16-byte-aligned BF16 `(batch, seqlen, heads, head_dim)` tensors on one
+CUDA device, head dimension 64 or 128 (the default tiling; 2 x (`tile_n` + `head_dim`) TMEM
+columns must fit in 512). K and V have matching shapes; all inputs have matching batch and
+head counts. Key length must be a positive multiple of `tile_n` (128, or 64). Query length can
+be ragged. There is no varlen or GQA. The example imports `flash_attn.cute` and `quack`
+helpers.
 
 O has Q's shape. LSE is fp32 `(batch, heads, seqlen_q)` in natural-log units. The input checks
 are not a complete validator of all these requirements. A wrapper accepting an input does not
@@ -108,8 +110,11 @@ establish the advertised rank, head-dimension or device contract; enforce those 
 when building another wrapper around this teaching kernel.
 
 `fa4_fwd(..., schedule=..., mapping=...)` lets you change index assignment and work order.
-See [scheduling](scheduling.md) for `Raster` and the FA4 mappings. `roles=Fa4Roles(...)`
-changes placement and register budgets; see [roles](roles.md#choose-placement-in-the-constructor).
+See [scheduling](scheduling.md) for `Raster` and the FA4 mappings. `roles={...}` changes
+placement and register budgets by role name; see
+[roles](roles.md#choose-placement-in-the-constructor). `tile_n=64` halves the K/V tile,
+`rescale_threshold` sets FA4's lazy-rescale threshold, and head dimension 64 or 128 follows
+the tensors; [configuration](configuration.md) lists every knob and what stays fixed.
 
 K and V share channel-bound SMEM. The `FlashAttentionForward` constructor also accepts
 `overlap_o_q=True` to reuse Q's bytes for epilogue SMEM; the `fa4_fwd` wrapper does not expose
@@ -213,9 +218,11 @@ out, lse = fa4_decode(q, k, v, num_splits=8, seqused_k=lengths, splits_per_seq=c
 ```
 
 A port of FA4's `flash_fwd_decode_sm100.py`: S^T = K Q^T and O^T = V^T P^T, so 128 KV tokens
-fill the MMA's M and the query heads of one KV head fill N. Q is `(batch, 1, heads, 128)`, K and
-V `(batch, kv_len, kv_heads, 128)`, all BF16 and contiguous, with up to 32 query heads per KV
-head. `seqused_k` (int32 per sequence) shortens sequences; KV rows past it must be finite, since
+fill the MMA's M and the query heads of one KV head fill N. Q is `(batch, 1, heads, d)`, K
+`(batch, kv_len, kv_heads, d)` and V `(batch, kv_len, kv_heads, d_v)`, all BF16 and contiguous,
+with up to 32 query heads per KV head; `d` is a multiple of the K step (64 by default) and
+`d_v` of 128, within TMEM (128/128 by default, 256 for either with 8-head tiles).
+`seqused_k` (int32 per sequence) shortens sequences; KV rows past it must be finite, since
 FA4's bounded V descriptor isn't ported. `splits_per_seq` caps each sequence's splits, as FA4's
 prepare kernel does. `decode_partials` returns the fp32 split partials in FA4's combine layout;
 `fa4_decode` combines them with FA4's combine kernel. No paging, varlen Q, masks or score mods.
@@ -232,6 +239,11 @@ correction warpgroup. What it needed from the layer:
 - Named-barrier channels for the thread mailboxes and done flags, with a turnstile around the
   shared row-max exchange.
 - P in a 4-stage SMEM ring read as the PV MMA's B operand; no TMEM alias.
+
+The KV block (`tile_n`, 256), K step (`tile_k`, 64), S and P ring depths (4 and 4), head
+dimensions and the roles' register budgets are constructor arguments of `SwapABDecode`;
+`decode_partials` and `fa4_decode` forward them as keywords. The measurements below are at the
+defaults, which match FA4; see [configuration](configuration.md) for the valid ranges.
 
 FA4 reads one K/V ring with two MMA cursors, keeping K two blocks ahead of V with two extra named
 barriers. Here K and V have their own rings, 7 and 5 stages at FA4's total of 12 (8-head tiles).
