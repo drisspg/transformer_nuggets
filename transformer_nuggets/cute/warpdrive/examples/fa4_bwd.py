@@ -83,6 +83,7 @@ from transformer_nuggets.cute.jit_cache import jit_cache
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
     Consumer,
+    NamedBarrier,
     OneShot,
     Producer,
     Raster,
@@ -102,7 +103,6 @@ from transformer_nuggets.cute.warpdrive import (
     bulk_commit_group,
     bulk_wait_group,
     fence_async_shared,
-    named_barrier,
     role,
 )
 
@@ -114,10 +114,6 @@ Q_STAGE = 2
 DQ_COLS = 32  # dQ columns per TMA reduce-add (FA4's dQ_reduce_ncol at 1-CTA)
 EPI_COLS = 64  # dK/dV columns per compute warpgroup (one 128-byte-row TMA store box)
 LOG2_E = math.log2(math.e)
-# Named barriers inside roles (the layer owns 1 and 2; this kernel declares no named channels).
-COMPUTE_BAR = 3  # the 8 compute warps: P over S, dS over dP
-REDUCE_BAR = 4  # the 4 reduce warps: dQ staging buffer
-EPI_BAR = 5  # 5 and 6: one per compute warpgroup's dK/dV epilogue tile
 
 
 @dataclass(frozen=True)
@@ -241,6 +237,12 @@ class FlashAttentionBackward(WarpSpecialized):
         self.ds = Ring(1, Warps, Umma, buffer=ds_buf, commit_fence="smem_async")
         self.dq = Ring(1, Umma, Warps)
         self.dkv = Slots(2, Umma, Warps)  # slot 0: dV, slot 1: dK
+        # Syncs inside a role: the 8 compute warps (P over S, dS over dP), the 4 reduce warps
+        # (the dQ staging buffer), and each compute warpgroup's dK/dV epilogue tile.
+        self.compute_sync = NamedBarrier(threads=256)
+        self.reduce_sync = NamedBarrier(threads=128)
+        self.epi_sync_wg0 = NamedBarrier(threads=128)
+        self.epi_sync_wg1 = NamedBarrier(threads=128)
         self.tmem_plan = (
             TmemPlan()
             .region("S", TILE_M)
@@ -610,7 +612,7 @@ class FlashAttentionBackward(WarpSpecialized):
                     if cutlass.const_expr(st == 0):
                         # P overwrites S columns that the other warpgroup may still be loading.
                         cute.arch.fence_view_async_tmem_load()
-                        named_barrier(COMPUTE_BAR, 256)
+                        self.compute_sync.sync(aligned=True)
                     tmem.access("P", write=True, cols=lambda w, st=st: cols(w, st, 16))
                     cute.copy(thr_st, rP32[None, st, None, None], tStP_r2t[None, st, None, None])
                 sh.release()  # layer fences the tcgen05.st of P
@@ -624,7 +626,7 @@ class FlashAttentionBackward(WarpSpecialized):
                     cute.copy(thr_ld, tdPtdP_t2r[None, st, None, None], rdP)
                     cute.arch.fence_view_async_tmem_load()
                     # dS overwrites dP columns the other warpgroup may still be loading.
-                    named_barrier(COMPUTE_BAR, 256)
+                    self.compute_sync.sync(aligned=True)
                     rdP_st, rS_st = rdP[None, 0, 0], rS[None, st, 0, 0]
                     rdPsum = cute.make_rmem_tensor(tScS_t2r[None, 0, 0, 0].shape, Float32)
                     cute.autovec_copy(dh.view(None, None, st, 0, 0, read=True), rdPsum)
@@ -711,7 +713,10 @@ class FlashAttentionBackward(WarpSpecialized):
             tDsD_r2s = r2s.partition_D(sD_wg)
             cute.copy(r2s, cute.make_tensor(rD.iterator, tDsD_r2s.shape), tDsD_r2s)
             fence_async_shared()
-            named_barrier(EPI_BAR + wg, 128)
+            if wg == 0:
+                self.epi_sync_wg0.sync(aligned=True)
+            else:
+                self.epi_sync_wg1.sync(aligned=True)
             gD = cute.local_tile(mD[None, None, head, batch], (TILE_N, EPI_COLS), (n_block, wg))
             tDsD, tDgD = cpasync.tma_partition(
                 tma,
@@ -764,7 +769,7 @@ class FlashAttentionBackward(WarpSpecialized):
                         thr_r2s, cute.make_tensor(rdQ_chunks[None, c].iterator, dst.shape), dst
                     )
                     fence_async_shared()
-                    named_barrier(REDUCE_BAR, 128)
+                    self.reduce_sync.sync(aligned=True)
                     if tma_warp:
                         with cute.arch.elect_one():
                             fa_copy_utils.cpasync_reduce_bulk_add_f32(
@@ -774,7 +779,7 @@ class FlashAttentionBackward(WarpSpecialized):
                             )
                         bulk_commit_group()
                         bulk_wait_group(self.dq_stages - 1, read=True)  # the other buffer is free
-                    named_barrier(REDUCE_BAR, 128)
+                    self.reduce_sync.sync(aligned=True)
             work.advance()
         if tma_warp:
             bulk_wait_group(0, read=True)
