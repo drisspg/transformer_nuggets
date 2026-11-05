@@ -322,7 +322,29 @@ self.done.sync()
 ```
 
 The barrier orders the publishers' memory accesses before their arrival with the waiters'
-accesses after the sync, as for a named channel; asynchronous proxies still need their fences.
+accesses after the sync, as for a named channel. This includes ordinary SMEM stores: the
+[PTX ISA's `bar`/`barrier` contract](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-bar)
+says that **sync, red and arrive** make the calling thread's prior accesses performed relative
+to all participants when the barrier completes; a performed write is visible to them. Sync
+additionally prevents that thread from requesting new accesses before completion. Thus
+`st.shared; barrier.arrive id, N` in a publisher and `barrier.sync id, N; ld.shared` in a
+waiter publish the stores without an extra `membar`. The ISA explicitly allows this mixed
+arrive/sync producer-consumer pattern; `bar.arrive`/`bar.sync` are its aligned spellings.
+Every writer must reach the arrival, every waiter the sync, with the same ID and count.
+Asynchronous proxies still need their own completion waits and fences: this argument is for
+ordinary shared-memory accesses, not a replacement for a TMA or TMEM handoff.
+
+Racecheck can report this correctly ordered pattern. On the swap-AB decode (GB300, CuTeDSL
+4.8.0, compute-sanitizer 2025.4.1), it flags the correction warps' lane-0 SMEM row-sum stores
+against the load warp's reads after `sum_done.sync()`. All 128 correction threads arrive and
+all 32 load threads sync on the same 160-thread barrier; the generated PTX and SASS retain
+that order, and the row sums are not overwritten. These specific reports are false positives,
+not evidence that arrive lacks publication semantics. The same pair is reported for the
+older managed named-channel version and FA4's own decode. See
+[Decode racecheck](examples.md#decode-racecheck) for source/access mappings, versioned results
+and the isolated test invocation. Do not blanket-ignore named-barrier findings: recheck the
+accesses, participants, generations and emitted instructions for each report.
+
 It is sound when the flag completes at most once per launch, or once per work item with at
 most one item per CTA (the [decode example](../examples/fa4_decode_swapab.py) is `OneShot`).
 Otherwise a publisher could arrive for the next item before every waiter had synced, and its

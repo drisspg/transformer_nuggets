@@ -21,7 +21,6 @@ from cutlass import cute
 
 from transformer_nuggets.cute.jit_cache import jit_cache
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
-from transformer_nuggets.cute.warpdrive.channels import ConsumerEnd
 from transformer_nuggets.cute.warpdrive import (
     Consumer,
     CtaPair,
@@ -39,6 +38,7 @@ from transformer_nuggets.cute.warpdrive import (
     named_barrier,
     role,
 )
+from transformer_nuggets.cute.warpdrive.channels import ConsumerEnd
 
 K_MID = 3  # round-robin instances of the toy's middle role
 
@@ -109,9 +109,8 @@ class RoundRobinToy(WarpSpecialized):
                 with mail.produce() as h:
                     h.data[lane] = value
             else:
-                with turn.turn():
-                    with mail.produce() as h:
-                        h.data[lane] = value
+                with turn.turn(), mail.produce() as h:
+                    h.data[lane] = value
         return rr, nr, mail, turn
 
     @role(warps=4)
@@ -302,7 +301,7 @@ def test_named_channels_need_free_ids_and_one_cta():
 
 
 def test_named_turnstile_must_seat_the_round_robin_instances():
-    @role(warps=[range(0, 1), range(1, 2)])
+    @role(warps=[range(1), range(1, 2)])
     @cute.jit
     def prod(self, ctx, *, a: Producer):
         return a
@@ -434,6 +433,45 @@ def check_against_reference(decode, case, **config):
 @pytest.mark.parametrize("case", DECODE_CASES)
 def test_decode_matches_fp32_reference(requires_blackwell, decode, case, shared_kv):
     check_against_reference(decode, case, shared_kv=shared_kv)
+
+
+@pytest.mark.parametrize("backend", ["split", "shared", "fa4"])
+def test_decode_stats_handoff(requires_blackwell, decode, monkeypatch, backend):
+    """Isolate the one-shot stats handoff; the fp32 reference runs on CPU, not another kernel.
+
+    Racecheck reproduction (replace [split] with [shared] or [fa4]):
+
+        gpu-run --timeout 30 auto -- timeout --signal=TERM --kill-after=5s 60s \\
+          env CUTE_DSL_LINEINFO=1 CUDA_LAUNCH_BLOCKING=1 PYTORCH_NO_CUDA_MEMORY_CACHING=1 \\
+          compute-sanitizer --target-processes all --error-exitcode 99 --tool racecheck \\
+          --racecheck-report analysis .venv/bin/pytest -q \\
+          'test/test_cute_warpdrive_decode.py::test_decode_stats_handoff[split]'
+
+    Expected on GB300, CuTeDSL 4.8.0, sanitizer 2025.4.1: pytest passes, sanitizer exits 99.
+    Split/shared report one RAW analysis group (128 byte hazards) on the correction's
+    sRowSums stores and split_stats' read; FA4 reports four scalar-read groups for the same
+    handoff, plus a separate Q-mbarrier init/arrive warning. Grouping depends on codegen.
+    The arrive/sync ordering argument and historical comparison are in docs/examples.md,
+    "Decode racecheck", and docs/channels.md, "One-shot done flag". Synccheck is clean.
+    """
+    q, k, v, splits, *_ = decode_inputs((1, 1024, 8, 1, 1, None, None))
+    if backend == "fa4":
+        interface = pytest.importorskip("flash_attn.cute.interface")
+        monkeypatch.setenv("FLASH_ATTENTION_SM100_BACKEND", "swapab")
+        out, lse, *_ = interface._flash_attn_fwd(q, k, v, num_splits=splits, return_lse=True)
+    else:
+        partial, partial_lse = decode.decode_partials(
+            q, k, v, splits, shared_kv=backend == "shared"
+        )
+        out, lse = partial[0], partial_lse[0]
+    ref_out, ref_lse, _ = reference_partials(
+        q.cpu(), k.cpu(), v.cpu(), splits, [k.shape[1]], [splits]
+    )
+    # FA4 returns bf16 combined O; the port's partial remains fp32.
+    torch.testing.assert_close(
+        out.cpu().float()[:, 0], ref_out[0], atol=2e-2 if backend == "fa4" else 3e-3, rtol=0
+    )
+    torch.testing.assert_close(lse.cpu()[..., 0], ref_lse[0], atol=1e-4, rtol=0)
 
 
 @pytest.mark.parametrize(

@@ -806,6 +806,80 @@ now provide the ring and the skips; the skew contract stays the author's, as the
 recipe there shows. The raw prototype, source phase tables, matched Perfetto tracks, failed
 ablations and reproduction scripts are retained in `agent_space/decode_sass/`.
 
+### Decode racecheck
+
+The four reports from the split and shared-K/V decode are **false positives on the row-sum
+publication**, not four different races. Rechecked with source-line info on GB300,
+compute-sanitizer 2025.4.1 (CUDA 13.1), driver 580.126.20, CuTeDSL 4.8.0 and torch
+2.15.0.dev20260922+cu132, using the example at `0535f67`:
+
+- Dense: `(batch, KV length, heads, KV heads, splits) = (2, 1024, 8, 1, 1)`.
+- Per-sequence: `(3, 2048, 8, 1, 4)`, lengths `[1, 700, 2048]`, split counts `[1, 2, 4]`.
+- Two launches of each shape. Each launch produces one RAW analysis group, so the summary
+  is `4 hazards displayed (4 errors, 0 warnings)` for either build.
+
+All four groups map to the same two source accesses in `fa4_decode_swapab.py`: correction
+line 960 writes `sRowSums[warp, h]` from lane 0 of warps 12-15; `split_stats` line 610 reads
+`sums[0..3, lane]` from load warp 2, lanes 0-7. The four byte hazards per float are not four
+independent bugs. In this build, eight scalar stores feed one vectorized `LDS.128` per head:
+
+| build / shape (both launches) | read PC | write PCs (all line 960) |
+|---|---|---|
+| split / dense | `0x4080` | `0x8d20, 8d40, 8d70, 8d90, 8db0, 8de0, 8df0, 8e00` |
+| split / per-sequence | `0x43a0` | `0x9450, 9470, 94a0, 94c0, 94e0, 9510, 9520, 9530` |
+| shared / dense | `0x45b0` | `0x9250, 9270, 92a0, 92c0, 92e0, 9310, 9320, 9330` |
+| shared / per-sequence | `0x49d0` | `0x9a80, 9aa0, 9ad0, 9af0, 9b10, 9b40, 9b50, 9b60` |
+
+These are kernel-relative byte offsets, not stable API identifiers. With `--racecheck-report
+hazard`, the dense run shows writers 384/416/448/480 (lane 0 of each correction warp) and
+readers 64-71; the addresses are the four float words per head of `sRowSums`.
+
+The generated PTX and line-attributed SASS preserve this sequence:
+
+```text
+correction (128 threads)                 load / split_stats (32 threads)
+st.shared sRowSums[warp, h]              barrier.sync   sum_done_id, 160
+barrier.arrive sum_done_id, 160          ld.shared.v4.b32 sRowSums[:, lane]
+```
+
+The ID is 4 for split and 6 for shared K/V. All correction threads arrive (only the stores
+are lane-0-predicated), all load threads sync before the head predicate, and the allocation
+is never overwritten after these stores. The [one-shot done-flag recipe](channels.md#one-shot-done-flag)
+cites the PTX memory-model guarantee: arrival publishes prior ordinary SMEM writes at barrier
+completion, and sync prevents subsequent reads before completion. No extra SMEM fence or
+publisher-side wait is required. Each CTA runs at most one item, so the publisher cannot lap
+the waiter. This conclusion follows from the access/participation audit and emitted code,
+not from numerical tests or a clean synccheck alone. Racecheck does not credit this ordering
+in these kernels; its internal reason is not established.
+
+Historical example sources compiled against the same current layer reproduce the pair:
+
+| example source | protocol | store / read lines | four-launch racecheck summary |
+|---|---|---|---|
+| `fc45c88^` (`cf02a26`) | already one-shot `NamedBarrier` | 897 / 547 | 4 errors, 0 warnings |
+| `4b6bda4^` (`f3ce28f`), the actual pre-port version | managed named channels | 906 / 547 | 4 errors, 0 warnings |
+
+The latter used `with sum_done.produce()` and `sum_done.wait()` around exactly these stores
+and reads; its extra empty-barrier handshake did not remove the reports. `fc45c88` added
+width/schedule guards, not the NamedBarrier port (`4b6bda4`).
+
+FA4's own swap-AB decode at `00807a02` was also checked with the same Q/K/V shapes, lengths
+and requested split counts. Its per-sequence split table comes from FA4's prepare path, not
+the port's fixed `[1, 2, 4]` table. It reports the same row-sum handoff: correction
+`flash_fwd_decode_sm100.py:1502` writes `sRowSumWarp`, and `store_split_stats:1597-1598`
+reads the four warp sums after `bar_sum_done.arrive_and_wait()`. Four scalar read PCs yield
+four RAW groups per launch, for 16 errors over four launches. There are also four separate
+warnings on Q-mbarrier initialization (line 834) versus arrive/expect-tx (line 836), not on
+the row-sum data. No FA4 changes or blanket suppression of those warnings were made.
+
+`test/test_cute_warpdrive_decode.py::test_decode_stats_handoff` isolates one dense CTA and
+uses a CPU fp32 reference, so unrelated SDPA reference kernels cannot contaminate racecheck.
+Its docstring gives the reservation, timeout, `CUTE_DSL_LINEINFO=1` and sanitizer invocation
+for each backend and the expected nonzero result: one analysis error for split/shared,
+four errors plus one warning for FA4. All five four-launch runs also passed their CPU
+reference assertions; split/shared/FA4 pass synccheck on the isolated test. Hazard counts
+and grouping depend on launch count and codegen; new access pairs need a fresh audit.
+
 ### Shared KV ring
 
 ```python
