@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import functools
 import inspect
+import pickle
 import warnings
 from collections.abc import Callable
 from contextlib import contextmanager
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 from types import SimpleNamespace
 from typing import TypeVar
 
@@ -55,7 +57,11 @@ from transformer_nuggets.cute.warpdrive.scheduling import (
     _Fetch,
     scheduler_role,
 )
-from transformer_nuggets.cute.warpdrive.storage import SmemPlan, allocate, stage_extent
+from transformer_nuggets.cute.warpdrive.storage import (
+    SmemPlan,
+    allocate,
+    stage_extent,
+)
 from transformer_nuggets.cute.warpdrive.tma import TmaReport, clear_multicast_masks
 from transformer_nuggets.cute.warpdrive.tma import check_role as check_tma
 from transformer_nuggets.cute.warpdrive.tmem import TmemPlan, TmemView
@@ -305,6 +311,11 @@ def role(
 _HOST_SETTINGS = ("alias_check", "trace_protocol", "iket", "iket_waits")
 
 
+@functools.cache
+def _init_signature(cls) -> inspect.Signature:
+    return inspect.signature(cls.__init__)
+
+
 def _rebuild(cls, args, kwargs, settings):
     kernel = cls(*args, **kwargs)
     for name, value in settings.items():
@@ -349,9 +360,33 @@ class WarpSpecialized:
         settings = {k: vars(self)[k] for k in _HOST_SETTINGS if k in vars(self)}
         return _rebuild, (type(self), *self._ws_init, settings)
 
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        init = cls.__dict__.get("__init__")
+        if init is None:
+            return
+
+        @functools.wraps(init)
+        def tracked_init(self, *args, **kwargs):
+            # Assignments made while any __init__ of the call runs belong to the constructor.
+            depth = vars(self).get("_ws_init_depth", 0)
+            object.__setattr__(self, "_ws_init_depth", depth + 1)
+            try:
+                init(self, *args, **kwargs)
+            finally:
+                object.__setattr__(self, "_ws_init_depth", depth)
+
+        cls.__init__ = tracked_init
+
     def __setattr__(self, name, value):
         if isinstance(value, WorkStream):
             value.owner = self  # the stream's work unit follows this kernel's cluster
+        elif not (
+            vars(self).get("_ws_init_depth")
+            or name.startswith("_")
+            or name in (*_HOST_SETTINGS, "cluster", "num_warps", "default_regs")
+        ):
+            vars(self).setdefault("_ws_late", set()).add(name)  # not keyed: see __cute_cache_key__
         super().__setattr__(name, value)
 
     # ---- host-side analysis ------------------------------------------------ #
@@ -800,33 +835,75 @@ class WarpSpecialized:
             for r in self._ws_roles
         )
 
-    def get_key(self) -> str:
-        """The author's algorithm key: every compile-time choice the kernel reads (tiles,
-        stages, dtypes, flags). The default is ``get_name()``, which the examples build from
-        those choices; override it when the name leaves one out."""
-        return self.get_name()
-
     def __cute_cache_key__(self) -> tuple:
         """This kernel's key as a ``jit_cache`` compile argument (the examples' ``compile_*``).
 
-        ``jit_cache`` adds the class's module and name. On top of ``get_key()`` the layer keys
-        the resolved role placement and budgets, the cluster, each work stream, the IKET and
-        tracing settings, ``alias_check`` (a cached kernel skips the trace-time diagnostic, so a
-        "warn" build must not satisfy a "strict" one), and the source of every module defining
-        the kernel's, cluster's, and streams' classes: editing a kernel the compile function does
-        not import (a test's subclass) recompiles it instead of loading a stale entry."""
+        ``jit_cache`` adds the class's module and name. The key is the constructor call (its
+        bound arguments, defaults filled in) plus what may change after it: the cluster, each
+        work stream, and the host settings (IKET, ``trace_protocol``, ``alias_check``: a
+        "warn" build must not satisfy a "strict" one). The resolved role placement and budgets
+        and the source of every module defining the kernel's, cluster's, and streams' classes
+        complete it, so editing a kernel the compile function does not import (a test's
+        subclass) recompiles it. Other public attributes assigned after construction raise a
+        ``TypeError`` here: set them in ``__init__``."""
+        late = vars(self).get("_ws_late")
+        if late:
+            raise TypeError(
+                f"{type(self).__name__}: {sorted(late)} assigned after construction; a cached "
+                "compile keys the constructor call, so set them in __init__ (or a subclass)"
+            )
+        args, kwargs = self._ws_init
+        call = _init_signature(type(self)).bind(self, *args, **kwargs)
+        call.apply_defaults()
         streams = [v for v in vars(self).values() if isinstance(v, WorkStream)]
         parts = [self, self.cluster]
         parts += [part for s in streams for part in (s.schedule, s.mapping, s.ready)]
         modules = sorted({c.__module__ for part in parts for c in type(part).__mro__})
         return (
-            self.get_key(),
-            self.role_config_key(),
-            self.cluster.get_key(),
-            tuple(s.get_key() for s in streams),
+            tuple(call.arguments.items())[1:],  # without self
+            self.cluster,
+            tuple((s.schedule, s.mapping, s.ready, s.record, s.scheduler_warp) for s in streams),
             tuple(getattr(self, k) for k in _HOST_SETTINGS),
+            self.role_config_key(),
             tuple((m, module_source_digest(m)) for m in modules),
         )
+
+    def __cute_trace_record__(self) -> dict:
+        """What a trace left for ``describe()``, pipeline plans, and the trace-time warnings,
+        as plain data: ``jit_cache`` stores it beside the compiled kernel and hands it to
+        ``__cute_restore_trace__`` on every call it serves from memory or disk. None when this
+        instance was not traced."""
+        if not getattr(self, "_ws_traced", False):
+            return None
+        smem = {
+            name: replace(res, buffer=None, tensor=None, outer=None)
+            for name, res in self._ws_smem.items()
+        }
+        return {
+            "tma": self._ws_tma,
+            "smem": smem,
+            "alias": self._ws_alias,
+            "opt_outs": self._ws_opt_outs,
+            "uses": self._ws_uses,
+        }
+
+    def __cute_restore_trace__(self, record: dict) -> None:
+        """Take a cached build's trace record, so ``describe()`` and the warnings match a cold
+        compile. An instance that traced (or already took a record) keeps its own."""
+        self._collect()
+        if record is None or getattr(self, "_ws_traced", False):
+            return
+        record = pickle.loads(pickle.dumps(record))  # this instance's own copies
+        buffers = self.smem_plan.buffers if self.smem_plan is not None else {}
+        self._ws_tma = record["tma"]
+        self._ws_smem = {
+            name: replace(res, buffer=buffers[name]) for name, res in record["smem"].items()
+        }
+        self._ws_alias = record["alias"]
+        self._ws_opt_outs = record["opt_outs"]
+        self._ws_uses = record["uses"]
+        self._ws_traced = True
+        self._report_trace()
 
     def enable_iket(self, enabled: bool = True, *, waits: bool = True):
         """Emit IKET ranges in the next compile (``tracing.py`` lists the names). Off: no IR.
@@ -1142,7 +1219,6 @@ class WarpSpecialized:
             raise ValueError(f"alias_check must be one of {alias.MODES}, got {self.alias_check!r}")
         if self.alias_check != "off":
             self._ws_alias = alias.check(self, self._ws_alias_roles)
-            alias.report(self._ws_alias, self.alias_check, type(self).__name__)
         for name, ch in self._ws_chans.items():
             if isinstance(ch.producer, Tma) and not ch.internal:
                 report = self._ws_tma.setdefault(name, TmaReport())
@@ -1150,6 +1226,14 @@ class WarpSpecialized:
                     report.unverified.append(
                         "no TMA copy completes on a barrier taken from the layer (raw pointer?)"
                     )
+        self._ws_traced = True
+        self._report_trace()
+
+    def _report_trace(self):
+        """Raise (strict alias check) or warn about what a trace found, after the trace or when
+        a cached kernel's record is restored."""
+        if self._ws_alias is not None:
+            alias.report(self._ws_alias, self.alias_check, type(self).__name__)
         unverified = [n for n, rep in self._ws_tma.items() if rep.unverified]
         if unverified:
             details = "; ".join(f"{n}: {self._ws_tma[n].status()}" for n in unverified)

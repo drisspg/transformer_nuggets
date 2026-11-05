@@ -12,6 +12,7 @@ import cutlass
 from cuda.bindings import driver as cuda
 from cutlass import cute
 
+from transformer_nuggets.cute.jit_cache import jit_cache
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
     AtomicPersistent,
@@ -400,14 +401,18 @@ def test_threads_toy_scopes():
     assert op.up.scope.full_counts[4] == [64, 64] and op.down.scope.empty_counts[4] == [64, 64]
 
 
+@jit_cache
+def compile_cluster_toy(op, name: str):
+    fake = make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),), assumed_align=4)
+    return compile_tvm_ffi(op, fake, cutlass.Int32(1), name=name)
+
+
 @pytest.mark.parametrize("toy", [ClusterToy, ThreadsToy])
 @pytest.mark.parametrize("cluster", [PAIRS_2X2, Cluster(4, 2, pair=True), Cluster(2, 2)])
 @pytest.mark.parametrize("n", [1, 5, 64])
 def test_cluster_toy_runs(requires_blackwell, toy, cluster, n):
     out = torch.zeros(3 * 8, device="cuda", dtype=torch.int32)
-    fake = make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),), assumed_align=4)
-    name = f"{toy.__name__.lower()}_{cluster.get_key()}"
-    compile_tvm_ffi(toy(cluster), fake, cutlass.Int32(1), name=name)(out, n)
+    compile_cluster_toy(toy(cluster), f"{toy.__name__.lower()}_{cluster.get_key()}")(out, n)
     torch.cuda.synchronize()
     got = out.view(3, 8)[:, : cluster.size]
     want = 2 * n + 1 if toy is ClusterToy else n
@@ -493,7 +498,7 @@ def test_multicast_copy_needs_a_multicast_channel(requires_blackwell):
     assert isinstance(info.value, ProtocolError) or "ProtocolError" in repr(info.value)
 
 
-def test_2x2_gemm_tma_check_verifies_multicast(requires_blackwell, traced_compiles):
+def test_2x2_gemm_tma_check_verifies_multicast(requires_blackwell):
     op = PersistentGemm(cluster=PAIRS_2X2, tile_n=224)
     compile_persistent_gemm(op)
     assert "tma       verified CtaGroup.TWO, 30720 B/stage per CTA" in op.describe()

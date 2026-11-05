@@ -17,6 +17,7 @@ from cuda.bindings import driver as cuda
 from cutlass import cute, pipeline
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
+from transformer_nuggets.cute.jit_cache import jit_cache
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
     Barriers,
@@ -188,6 +189,7 @@ def make_tma_toy(cluster, consumer_cta="all", group="ONE", tx=TILE_BYTES, mode="
     return cls(cluster, group, tx, mode)
 
 
+@jit_cache
 def compile_tma_toy(op):
     src = make_fake_compact_tensor(cutlass.BFloat16, (cute.sym_int(divisibility=64), 64))
     out = make_fake_compact_tensor(cutlass.Float32, (cute.sym_int(),), assumed_align=4)
@@ -345,11 +347,16 @@ class RawStateToy(WarpSpecialized):
         self.kernel(out, n).launch(**self.launch_config(grid=(1, 1, 1)), stream=stream)
 
 
+@jit_cache
+def compile_raw_state_toy(op: RawStateToy):
+    fake = make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),), assumed_align=4)
+    return compile_tvm_ffi(op, fake, cutlass.Int32(1), name="warpdrive_raw_state")
+
+
 def test_raw_state_and_raw_signal(requires_blackwell):
     n = 5
     out = torch.full((4 * n,), -1, device="cuda", dtype=torch.int32)
-    fake = make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),), assumed_align=4)
-    compile_tvm_ffi(RawStateToy(), fake, cutlass.Int32(1), name="warpdrive_raw_state")(out, n)
+    compile_raw_state_toy(RawStateToy())(out, n)
     torch.cuda.synchronize()
     rows = out.view(n, 4).tolist()
     assert rows == [[i % 2, i // 2 % 2, i % 2, i // 2 % 2] for i in range(n)]
@@ -402,6 +409,7 @@ class OptOutToy(WarpSpecialized):
         self.kernel(out, n).launch(**self.launch_config(grid=(1, 1, 1)), stream=stream)
 
 
+@jit_cache
 def _compile_opt_out_toy(op):
     fake = make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),), assumed_align=4)
     name = f"warpdrive_opt_out_{op.mode}_{int(op.opt_out)}"
@@ -644,7 +652,7 @@ _MIXED = MixedGemm()
 
 
 @pytest.mark.parametrize("m, n, k", [(128, 256, 64), (300, 520, 136), (1000, 1000, 1000)])
-def test_mixed_managed_and_raw_gemm(requires_blackwell, traced_compiles, m, n, k):
+def test_mixed_managed_and_raw_gemm(requires_blackwell, m, n, k):
     from transformer_nuggets.cute.warpdrive.examples.gemm import compile_gemm
 
     torch.manual_seed(0)

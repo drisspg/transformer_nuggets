@@ -93,9 +93,9 @@ def test_fa4_rowmax_compiles_distinct_hardware_load(requires_sm103, tmp_path):
         pytest.skip("generated hardware-load check requires nvdisasm")
     software = FlashAttentionForward()
     hardware = FlashAttentionForward(use_ldred_rowmax=True)
-    assert software.get_key() != hardware.get_key()
+    assert software.__cute_cache_key__() != hardware.__cute_cache_key__()
     for op in (software, hardware):
-        compiled = compile_fa4_fwd(op)
+        compiled = compile_fa4_fwd.__wrapped__(op)  # the compiled IR, not a cached artifact
         obj = bytes(
             _aot_support.export_module_to_bytes(
                 compiled.ir_module, format="o", opt_level=3, enable_pic=True

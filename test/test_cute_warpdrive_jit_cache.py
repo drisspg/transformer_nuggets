@@ -13,7 +13,7 @@ pytest.importorskip("cutlass.cute")
 
 from transformer_nuggets.cute.jit_cache import CacheInfo, CompileTarget, compile_many
 from transformer_nuggets.cute.jit_cache import _key as cute_key
-from transformer_nuggets.cute.warpdrive import ClusterLaunchControl, CtaPair, StaticPersistent
+from transformer_nuggets.cute.warpdrive import AtomicPersistent, ClusterLaunchControl, CtaPair
 from transformer_nuggets.cute.warpdrive.examples.gemm import Gemm, compile_gemm, gemm
 from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import (
     PersistentGemm,
@@ -49,7 +49,7 @@ def test_key_names_each_compile_time_choice():
     """Equal configurations share a key; every knob that changes the kernel or its trace-time
     check gets its own (compile only)."""
     base = key_of(Gemm())
-    assert key_of(Gemm()) == base
+    assert key_of(Gemm()) == key_of(Gemm(ab_stages=3)) == base  # defaults are filled in
     strict = Gemm()
     strict.alias_check = "strict"
     changed = [
@@ -62,15 +62,20 @@ def test_key_names_each_compile_time_choice():
     ]
     keys = {key_of(op) for op in changed}
     assert base not in keys and len(keys) == len(changed)
-    pairs = [PersistentGemm(), PersistentGemm(schedule=StaticPersistent())]  # the default
-    assert key_of(pairs[0], compile_pgemm) == key_of(pairs[1], compile_pgemm)
-    others = [
+    pgemms = [
+        PersistentGemm(),
         PersistentGemm(schedule=ClusterLaunchControl()),
         PersistentGemm(cluster=CtaPair()),
         PersistentGemm(tile_n=224),
     ]
-    keys = {key_of(op, compile_pgemm) for op in [pairs[0], *others]}
-    assert len(keys) == len(others) + 1
+    assert len({key_of(op, compile_pgemm) for op in pgemms}) == len(pgemms)
+    reassigned = PersistentGemm()
+    reassigned.work = PersistentGemm(schedule=AtomicPersistent(stages=3)).work
+    assert key_of(reassigned, compile_pgemm) != key_of(pgemms[0], compile_pgemm)
+    retiled = PersistentGemm()
+    retiled.tile_n = 224  # the constructor call no longer describes the kernel
+    with pytest.raises(TypeError, match=r"\['tile_n'\] assigned after construction"):
+        key_of(retiled, compile_pgemm)
 
 
 def test_pickled_kernel_keeps_its_key():
@@ -86,7 +91,9 @@ def test_pickled_kernel_keeps_its_key():
 
 # A kernel module outside the package, as a test or user file would define one: its own source
 # is hashed for its compile function and, through module_source_digest, for its kernel class.
-FILL_MODULE = '''
+FILL_MODULE = """
+from dataclasses import dataclass
+
 import cutlass
 from cutlass import cute
 
@@ -97,19 +104,24 @@ from transformer_nuggets.cute.warpdrive import WarpSpecialized, role
 VALUE = {value}
 
 
+@dataclass(frozen=True)
+class FillCtx:
+    out: cute.Tensor
+
+
 class Fill(WarpSpecialized):
     def get_name(self):
         return "warpdrive_jit_cache_fill"
 
     @role(warps=1)
     @cute.jit
-    def fill(self, out):
-        out[cute.arch.lane_idx()] = VALUE
+    def fill(self, ctx: FillCtx):
+        ctx.out[cute.arch.lane_idx()] = VALUE
 
     @cute.kernel
     def kernel(self, out: cute.Tensor):
         self.begin_roles()
-        self.run_roles(out)
+        self.run_roles(FillCtx(out))
 
     @cute.jit
     def __call__(self, out: cute.Tensor, stream):
@@ -120,10 +132,12 @@ class Fill(WarpSpecialized):
 @jit_cache
 def compile_fill(op):
     return compile_tvm_ffi(op, make_fake_compact_tensor(cutlass.Int32, (32,), assumed_align=4))
-'''
+"""
 
 
-def test_editing_the_kernel_module_recompiles(requires_blackwell, isolated_cache, tmp_path_factory):
+def test_editing_the_kernel_module_recompiles(
+    requires_blackwell, isolated_cache, tmp_path_factory
+):
     """A warm process loads the kernel from disk; editing its module compiles a new entry, and
     restoring the source finds the old one again."""
     directory = tmp_path_factory.mktemp("kernels")
