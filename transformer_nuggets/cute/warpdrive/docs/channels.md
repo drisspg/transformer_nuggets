@@ -311,9 +311,10 @@ raise `ProtocolError` when the token:
 - is not a `Token` from this end's own probe (a value built by hand, another channel's end,
   or the other side of the channel);
 - names another slot;
-- is stale: an acquire/wait on the end (on that slot, for `Slots`) or an `end.state`
-  assignment happened since the probe, which covers reuse of the token and an epoch n stages
-  later with the same stage and parity;
+- is stale: an acquire/wait on the end (on that slot, for `Slots`) happened since the probe,
+  which covers reuse of the token and an epoch n stages later with the same stage and parity,
+  or raw code read or assigned `end.state` (reading hands out the live state, which may be
+  advanced in place);
 - was probed in another dynamic region (loop or branch). The trace sees a loop body once,
   so a token taken before a loop could be consumed by the first iteration and then reused as
   stale. Probe in the region that consumes the token, as FA4 does inside an unrolled K-step
@@ -345,16 +346,19 @@ S_{t+1}'s read of Q_{t+1}, while Q_t's handle stays open for dK_t.
 The next `wait()` on the end (same slot for `Slots`) after the peek, in trace order, owns the
 previewed epoch. The alias diagnostic records the preview's accesses under that handle, so
 they are checked against its release (its mechanism and fences, as for the handle's own
-accesses). While tracing, it is an error to use a preview after that handle closed, in
-another dynamic region than the peek, or to leave a preview with no later wait in its role.
+accesses). Trace order approximates the runtime owner: a preview taken in a loop body is
+attributed to the wait after the loop, while at runtime the next iteration's wait owns all
+but the last. Both are waits of the same channel and side. While tracing, it is an error to
+use a preview after that handle closed, in another dynamic region than the peek, to read or
+assign `end.state` between the peek and the owning wait, or to leave a preview with no later
+wait in its role.
 A loop that previews the next iteration's epoch therefore peels its last iteration, as the
 backward does; the peeled wait owns the loop's final preview. CuTeDSL also refuses to carry
 a preview through a dynamic loop or branch that calls one of its methods.
 
 These checks are trace-local. They don't prove that the owning wait takes the previewed
-epoch at runtime (for example if raw code reassigns the end's state between them), that the
-preview's asynchronous reads complete before the owner's release, or that the producer ever
-fills the epoch. Previews are not general carried handles: a handle still closes in the
+epoch at runtime, that the preview's asynchronous reads complete before the owner's release,
+or that the producer ever fills the epoch. Previews are not general carried handles: a handle still closes in the
 region that opened it.
 
 ## Storage and fences

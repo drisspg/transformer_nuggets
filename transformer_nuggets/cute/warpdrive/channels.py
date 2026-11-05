@@ -640,6 +640,7 @@ class Preview(_Stage):
         self.phase = phase
         self._slot = slot if end._chan.fixed else None
         self._key = slot  # the end's advance key: the slot, None for a ring
+        self._resets = end._rec.resets  # raw state access since the peek: no owner is known
         self._site = user_site()
         self._block = current_block()
         self._owner_rec = None  # the adopting wait's HandleRecord
@@ -721,7 +722,7 @@ class Token:
     next ``wait()``/``acquire()``, which then skips its blocking wait when ``ready`` holds. A
     token is readiness, not ownership: it cannot release, commit or index a stage. Only the end
     that probed it can use it, for that epoch, in the same dynamic region, before any other
-    acquire/wait on the end (or slot) and before ``end.state`` is reassigned."""
+    acquire/wait on the end (or slot) and before ``end.state`` is read or assigned."""
 
     def __init__(self, end, key, ready):
         self.ready = ready
@@ -734,19 +735,19 @@ class Token:
         self._epoch = end._epoch(key)
         self._block = current_block()
         self._site = user_site()
+        self._minted = False  # set by the end's probe; a token built elsewhere stays False
 
 
 @dataclass
 class _EndRecord:
     """Trace-time record shared by loop-carried copies of one end: the fixed ``slots`` it used
     (a tail drains only those), the acquires/waits traced per slot (``None`` for a ring) and
-    reassignments of ``end.state`` (together a token's epoch), the tokens it minted and the
-    previews no wait has adopted yet."""
+    raw accesses to ``end.state`` (together a token's epoch), and the previews no wait has
+    adopted yet."""
 
     slots: set = field(default_factory=set)
     advances: dict = field(default_factory=dict)
     resets: int = 0
-    tokens: list = field(default_factory=list)
     previews: list = field(default_factory=list)
     checked: bool = False  # the role-exit check of unadopted previews is registered
 
@@ -926,7 +927,10 @@ class _End:
     @property
     def state(self):
         """Ring: the ``PipelineState`` (index, phase, count); Slots: the Int32 phase-bit mask.
-        Assign a new value to resynchronize after raw waits or signals on this edge."""
+        Assign a new value to resynchronize after raw waits or signals on this edge. Reading
+        it hands out the live state, which raw code may advance in place, so it invalidates
+        the end's outstanding try tokens and unadopted previews, as assigning it does."""
+        self._rec.resets += 1
         return self._state
 
     @state.setter
@@ -1074,7 +1078,7 @@ class _End:
         index, phase, label = self._current(slot, op)
         self._trace.record(self._chan.name, op, label)
         token = Token(self, slot, cute.arch.mbarrier_try_wait(bar(index), phase))
-        self._rec.tokens.append(token)
+        token._minted = True
         return token
 
     def _take_token(self, token, slot, op: str):
@@ -1094,7 +1098,7 @@ class _End:
                 f"{where} got a token of the {token._what} (probed at {token._site}); a token "
                 "serves only the end that probed it"
             )
-        if not any(t is token for t in self._rec.tokens):
+        if not token._minted:
             raise ProtocolError(f"{where}: this token was not returned by {chan.name}.{probe}()")
         self._check_slot(slot, op)
         if token._key != slot:
@@ -1104,7 +1108,7 @@ class _End:
         if token._epoch != self._epoch(slot):
             raise ProtocolError(
                 f"{where}: stale token probed at {token._site}; an acquire/wait on this end (or "
-                "a reassigned end.state) since the probe moved it to another epoch"
+                "raw end.state access) since the probe may have moved it to another epoch"
             )
         if token._block != current_block():
             raise ProtocolError(
@@ -1243,6 +1247,12 @@ class ConsumerEnd(_End):
     def _adopt(self, slot, rec: HandleRecord):
         """The wait taking ``slot``'s next epoch owns the previews of that epoch."""
         for preview in [p for p in self._rec.previews if p._key == slot]:
+            if preview._resets != self._rec.resets:
+                raise ProtocolError(
+                    f"{self._trace.role_name}: {preview.describe()} taken at {preview._site}: "
+                    f"end.state was read or assigned before the wait at {rec.site}, so that "
+                    "wait may take another epoch than the one previewed"
+                )
             preview._adopt(rec)
             self._rec.previews.remove(preview)
 

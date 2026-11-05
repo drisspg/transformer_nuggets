@@ -76,7 +76,8 @@ user code.
   A build loaded through `jit_cache` restores its saved TMA/alias reports and warnings;
   protocol-traced builds compile uncached.
 - **Compilation:** also checks local handle lifetimes, required returned state, recognizable
-  work-loop structure and attributable TMA operations. It does not compare arbitrary role
+  work-loop structure, attributable TMA operations, and that try tokens and previews are used
+  by their own end, epoch and dynamic region. It does not compare arbitrary role
   bodies to prove balanced epochs or a live dependency graph.
 - **TMA `verified`:** recognized group and byte accounting. Not proof of descriptor legality,
   disjoint writes or async safety. Opaque uses may remain `unverified`; inspect the reasons.

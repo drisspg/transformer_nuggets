@@ -512,7 +512,9 @@ FA4 does (later measured at -0.4 to -0.7% and made the default; see
 the prologue, skipping all setup for dropped splits (slower: it serializes on the PDL wait), and
 prefetching the TMA descriptors (kept, as FA4 does).
 
-[Try tokens](channels.md#try-tokens) were measured on the split rings as FA4 uses them: the PV
+[Try tokens](channels.md#try-tokens) were measured on the split rings as FA4 uses them, in
+`fa4_decode_swapab.py` as of `5c8db04` (SHA-256 prefix `5aac3058290b9a8f`) behind a temporary
+constructor option, not kept: the PV
 warp probes V before its P wait and O acquire, consumes the token at the first V wait and
 re-probes after each V release; the QK warp probes K before its S acquire and likewise. An
 "all" variant also probed P, O and S as FA4 does. Partials stayed bitwise equal to FA4's in

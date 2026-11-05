@@ -173,6 +173,14 @@ class Misuse(Toy):
                 token = ch.try_wait()
                 ch.state = ch.state
                 ch.wait(token=token).release()
+            elif cutlass.const_expr(mode == "state_read"):
+                token = ch.try_wait()
+                ch.state.advance()  # raw code moving the live state in place
+                ch.wait(token=token).release()
+            elif cutlass.const_expr(mode == "preview_state"):
+                ch.peek()
+                ch.state = ch.state
+                ch.wait().release()
             elif cutlass.const_expr(mode == "slot"):
                 slots.wait(1, token=slots.try_wait(0)).release()
             elif cutlass.const_expr(mode == "named_try_wait"):
@@ -212,6 +220,7 @@ class Misuse(Toy):
         ("wrap", r"stale token"),
         ("reused", r"stale token"),
         ("state", r"stale token"),
+        ("state_read", r"stale token"),
         ("region", r"used in a different dynamic region"),
         ("slot", r"the token probed slot 0 .*, not 1"),
         ("named_try_wait", r"named\.try_wait\(\) at .*cannot be probed or previewed"),
@@ -222,10 +231,82 @@ class Misuse(Toy):
         ("preview_stale", r"after its epoch was handed back \(release at .*\): a stale preview"),
         ("preview_region", r"ch\[i\] peek taken at .* in a different dynamic region"),
         ("preview_unconsumed", r"previews no later wait consumes: ch\[i\] peek at"),
+        ("preview_state", r"ch\[i\] peek taken at .*: end\.state was read or assigned before"),
     ],
 )
 def test_misuse_raises_while_tracing(mode, error):
     _raises_protocol(error, lambda: compile_toy(Misuse(mode), f"misuse_{mode}"))
+
+
+class Accepted(Toy):
+    """Valid token and preview uses the checks must not reject (compiled only)."""
+
+    def __init__(self, mode: str):
+        self.mode = mode
+        self.ch = Ring(2, Threads, Threads, payload=(cutlass.Int32, (N,)))
+        self.slots = Slots(2, Threads, Threads)
+        self.rr = Ring(2, Threads, Threads, round_robin=True)
+
+    @role(warps=0)
+    @cute.jit
+    def prod(self, ctx, *, ch: Producer, slots: Producer, rr: Producer):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            for k in cutlass.range_constexpr(2):  # FA4's K steps: re-probe after each commit
+                token = ch.try_acquire()
+                with ch.produce(token=token):
+                    pass
+            for s in cutlass.range_constexpr(2):
+                with slots.produce(s):
+                    pass
+            for _ in cutlass.range_constexpr(2):
+                with rr.produce():
+                    pass
+        return ch, slots, rr
+
+    @role(warps=[range(1, 2), range(2, 3)])
+    @cute.jit
+    def cons(self, ctx, *, ch: Consumer, slots: Consumer, rr: Consumer):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            if cutlass.const_expr(self.mode == "slots"):
+                token = slots.try_wait(1)
+                slots.wait(0).release()  # another slot keeps slot 1's epoch
+                slots.wait(1, token=token).release()
+            else:
+                for s in cutlass.range_constexpr(2):
+                    with slots.consume(s):
+                        pass
+            if cutlass.const_expr(self.mode == "helper"):
+                token = ch.try_wait()
+                ch = pass_through(ch)  # a helper returning the end keeps its record
+                ch.wait(token=token).release()
+                ch.peek().view()
+                ch = pass_through(ch)
+                ch.wait().release()
+            elif cutlass.const_expr(self.mode == "token_then_peek"):
+                token = ch.try_wait()
+                ch.peek().view()
+                ch.wait(token=token).release()
+                ch.wait().release()
+            else:
+                token = ch.try_wait()
+                for k in cutlass.range_constexpr(2):
+                    with ch.consume(token=token):
+                        pass
+                    if cutlass.const_expr(k == 0):
+                        token = ch.try_wait()
+            token = rr.try_wait()  # this instance's own epoch of the round-robin ring
+            rr.peek()
+            rr.wait(token=token).release()
+        return ch, slots, rr
+
+
+def pass_through(end):
+    return end
+
+
+@pytest.mark.parametrize("mode", ["unrolled", "slots", "helper", "token_then_peek"])
+def test_valid_uses_compile(mode):
+    compile_toy(Accepted(mode), f"accepted_{mode}")
 
 
 # --------------------------------------------------------------------------- #
