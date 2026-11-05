@@ -46,8 +46,8 @@ class NamedBarrier:
     threads: int
     name: str = field(default="", init=False)
     _id: int | None = field(default=None, init=False, repr=False)
-    # ``id`` read by kernel code outside the role bodies in the current trace (the kernel's
-    # named-barrier check takes and clears it).
+    # ``id`` read by kernel code outside the role bodies in the current trace (reset by
+    # ``begin_roles``; the kernel's named-barrier check reads it).
     _native_outside_roles: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self):

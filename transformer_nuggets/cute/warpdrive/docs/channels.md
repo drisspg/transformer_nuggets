@@ -166,8 +166,8 @@ per-epoch owner count, lifts the equal-contribution check, and `describe()` mark
 unverified: each owner's release (typically `release(signal=False)` plus a raw arrive) must
 supply them. `skip()` exists only on an exclusive ring's consumer ends and is
 `end.state.advance(n)` plus bookkeeping. It takes a positive Python int or a dynamic `Int32`
-(n >= 0, as `PipelineState.advance` takes); a dynamic count leaves the ownership check
-`unverified`. Skipping makes the end's outstanding [try tokens](#try-tokens) stale, and
+(n >= 0, as `PipelineState.advance` takes); a dynamic count, or reading or assigning the
+end's `state` (raw code may advance it), leaves the ownership check `unverified`. Skipping makes the end's outstanding [try tokens](#try-tokens) stale, and
 skipping past an unconsumed [preview](#previews) raises.
 
 When every acquire, wait and skip on the ring is static (no dynamic loop or branch around

@@ -290,6 +290,10 @@ class Static(Toy):
             if cutlass.const_expr(self.mode == "double" and g == 0):
                 take(ctx, kv, 0, 2, ctx.delay_b)  # a owns epoch 0 too
                 kv.skip(1)
+            elif cutlass.const_expr(self.mode == "raw_state" and g == 0):
+                state = kv.state  # a raw skip of a's two epochs
+                state.advance(2)
+                kv.state = state
             else:
                 kv.skip(2)
             if cutlass.const_expr(not (self.mode == "gap" and g == 1)):
@@ -495,10 +499,17 @@ def test_static_ownership_per_work_item():
     assert "epochs    verified: 2 epochs per launch (a 1, b 1)\n" in op.describe()
 
 
-def test_dynamic_skip_count_leaves_ownership_unverified():
-    op = Static("dynamic_count")
-    compile_toy(op, "static_dynamic_count")
-    assert "epochs    unverified (a's skip count is dynamic)" in op.describe()
+@pytest.mark.parametrize(
+    "mode, reason",
+    [
+        ("dynamic_count", "a's skip count is dynamic"),
+        ("raw_state", "b reads or assigns end.state"),
+    ],
+)
+def test_dynamic_or_raw_skips_leave_ownership_unverified(mode, reason):
+    op = Static(mode)
+    compile_toy(op, f"static_{mode}")
+    assert f"epochs    unverified ({reason})" in op.describe()
 
 
 def test_static_check_names_a_wait_that_needs_a_rendezvous():

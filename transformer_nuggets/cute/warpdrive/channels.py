@@ -339,6 +339,12 @@ class Channel:
     def exclusive(self) -> bool:
         return self.consumer_mode == "exclusive"
 
+    @property
+    def empty_counts_overridden(self) -> bool:
+        """The empty counts are the author's: exclusive owners then need not contribute
+        equally, and their releases must supply the counts."""
+        return "empty_counts" in (self.override or {})
+
     def turns(self, side: str) -> int:
         """Instances taking turns on ``side``: ``k`` for a round-robin side, else 1."""
         bound = self.producers if side == "producer" else self.consumers
@@ -805,14 +811,24 @@ class Token:
 
     def _fresh(self) -> bool:
         """Does this token still name its end's next epoch (of its slot)?"""
+        return self._why_stale() is None
+
+    def _why_stale(self) -> str | None:
+        if self._stale is not None:
+            return self._stale
         current = (self._rec.resets, self._rec.advances.get(self._key, 0))
-        return self._minted and self._stale is None and self._epoch == current
+        if not self._minted or self._epoch != current:
+            return (
+                "an acquire/wait on this end (or raw end.state access) follows the probe, or it "
+                "was not returned by a probe"
+            )
+        return None
 
     def __extract_mlir_values__(self):
         # A region boundary: record whether the value crossing it is still fresh.
         block = current_block()
         self._crossed.append(block)
-        self._rec.token_exports.append((block, self._key, self._fresh(), self._site))
+        self._rec.token_exports.append((block, self._key, self._why_stale(), self._site))
         return [self.ready.ir_value()]
 
     def __new_from_mlir_values__(self, values):
@@ -853,7 +869,7 @@ class _EndRecord:
     advances: dict = field(default_factory=dict)
     resets: int = 0
     previews: list = field(default_factory=list)
-    # (block, slot, fresh, probe site) of each token crossing a region boundary (loop carry).
+    # (block, slot, why stale or None, probe site) of each token crossing a region boundary.
     token_exports: list = field(default_factory=list)
     checked: bool = False  # the role-exit check of unadopted previews is registered
     lineage: Lineage = field(default_factory=Lineage)
@@ -1048,6 +1064,8 @@ class _End:
     def _raw_state_access(self):
         self._rec.resets += 1  # outstanding tokens no longer name the end's epoch
         self._rec.lineage.advanced(self._copy)
+        if self._chan.exclusive:  # raw code may advance it: the epoch sequence is unknown
+            self._trace.record(self._chan.name, "state", None)
 
     @property
     def index(self):
@@ -1466,15 +1484,13 @@ def _stale_back_edge(rec: _EndRecord, key, body) -> str | None:
     """Why a token a loop ``body`` passes to its next iteration (or out of the loop) may not
     name the end's next epoch: an acquire/wait on the end after its probe. None if fresh."""
     stale = [
-        site
-        for block, k, fresh, site in rec.token_exports
-        if block == body and k == key and not fresh
+        (site, why)
+        for block, k, why, site in rec.token_exports
+        if block == body and k == key and why is not None
     ]
     if stale:
-        return (
-            f"the value one iteration passes to the next (probed at {stale[0]}) is stale: an "
-            "acquire/wait on this end (or raw end.state access) follows the probe"
-        )
+        site, why = stale[0]
+        return f"the value one iteration passes to the next (probed at {site}) is stale: {why}"
     return None
 
 

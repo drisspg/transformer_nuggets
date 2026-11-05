@@ -139,6 +139,10 @@ class Misuse(Toy):
                 token = ch.try_wait()
                 if cutlass.const_expr(mode == "carry_back_edge"):
                     ch.wait().release()  # the token passed on names a consumed epoch
+                if cutlass.const_expr(mode == "carry_branch"):
+                    if ctx.n > 1:  # the token passed on depends on the branch taken
+                        ch.wait(token=token).release()
+                        token = ch.try_wait()
         elif cutlass.const_expr(mode == "branch_merged"):
             token = ch.try_wait()
             if ctx.n > 1:
@@ -237,6 +241,7 @@ class Misuse(Toy):
             r"test_cute_warpdrive_tokens\.py:\d+\) is stale",
         ),
         ("branch_merged", r"carried through a loop or branch, and a branch merged it"),
+        ("carry_branch", r"passes to the next \(probed at .*\) is stale: a branch merged it"),
         ("slot", r"the token probed slot 0 .*, not 1"),
         ("named_try_wait", r"named\.try_wait\(\) at .*cannot be probed or previewed"),
         ("named_try_acquire", r"named\.try_acquire\(\) at .*cannot be probed or previewed"),
@@ -315,6 +320,22 @@ class Accepted(Toy):
                     ch.wait(token=token).release()
                     token = ch.try_wait()
                 ch.wait(token=token).release()  # the loop's last probe, after the loop
+                token = ch.try_wait()
+                k = cutlass.Int32(0)
+                while k < ctx.n:  # an scf.while carries it the same way
+                    ch.wait(token=token).release()
+                    token = ch.try_wait()
+                    k += 1
+                for _ in cutlass.range(2, unroll=1):  # nested: each loop carries it
+                    for _ in cutlass.range(2, unroll=1):
+                        ch.wait(token=token).release()
+                        token = ch.try_wait()
+                ch.wait(token=token).release()
+                slot_token = slots.try_wait(1)  # a slot's token, carried past slot 0's waits
+                for _ in cutlass.range(2, unroll=1):
+                    slots.wait(0).release()
+                    slots.wait(1, token=slot_token).release()
+                    slot_token = slots.try_wait(1)
             token = rr.try_wait()  # this instance's own epoch of the round-robin ring
             rr.peek()
             rr.wait(token=token).release()

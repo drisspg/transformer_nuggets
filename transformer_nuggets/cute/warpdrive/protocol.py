@@ -379,14 +379,17 @@ class RoleTrace:
 
     def epoch_sequence(self, chan: str) -> tuple[bool | None, list[tuple[str, int]]] | str:
         """``(per_item, [(op, n)])`` of this role's acquires, retires, waits and skips on
-        ``chan`` when none sits in a dynamic loop or branch other than the work-item loop: ``n``
+        ``chan`` when none sits in a dynamic loop or branch other than the work-item loop and
+        the role leaves ``end.state`` to the layer: ``n``
         is a skip's epochs, a retire's acquire (its handle's order), else 1; ``per_item`` says
         whether they run once per work item (inside that loop) or once per launch (None without
         ops). Otherwise why the sequence is not static."""
         seq, regions = [], set()
         for c, op, blocks, count, order in self.ops:
-            if c != chan or op not in ("acquire", "retire", "wait", "skip"):
+            if c != chan or op not in ("acquire", "retire", "wait", "skip", "state"):
                 continue
+            if op == "state":
+                return f"{self.role_name} reads or assigns end.state"
             inner = blocks[:-1]  # the enclosing blocks below the role body
             in_item = (
                 self.item_block is not None and len(inner) == 1 and inner[0] == self.item_block

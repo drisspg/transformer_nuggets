@@ -41,7 +41,8 @@ class FlagToy(WarpSpecialized):
     def __init__(self, mode: str = "ok"):
         self.mode = mode
         self.done = NamedBarrier(threads=96)
-        self.pair_sync = NamedBarrier(threads=96 if mode == "short_users" else 64)
+        short = mode in ("short_users", "host_id")
+        self.pair_sync = NamedBarrier(threads=96 if short else 64)
         if mode == "foreign":
             other = FlagToy()
             other.describe()  # allocates other.done the same ID as self.done
@@ -94,6 +95,8 @@ class FlagToy(WarpSpecialized):
 
     @cute.jit
     def __call__(self, out: cute.Tensor, value: cutlass.Int32, delay: cutlass.Int64, stream):
+        if cutlass.const_expr(self.mode == "host_id"):
+            print(self.pair_sync.id)  # host code: no native call joins the barrier
         self.kernel.set_name_prefix(f"warpdrive_named_barrier_toy_{self.mode}")
         self.kernel(out, value, delay).launch(
             grid=(1, 1, 1), block=(self.num_threads, 1, 1), stream=stream
@@ -166,6 +169,11 @@ def test_native_id_users_leave_the_count_unverified():
         ("foreign", r"publisher: NamedBarrier done at .* belongs to another kernel"),
         (
             "short_users",
+            r"NamedBarrier pair_sync counts 96 threads, but the roles using it \(waiters\) have "
+            r"only 64; it can never complete",
+        ),
+        (
+            "host_id",
             r"NamedBarrier pair_sync counts 96 threads, but the roles using it \(waiters\) have "
             r"only 64; it can never complete",
         ),

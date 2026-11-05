@@ -1086,6 +1086,8 @@ class WarpSpecialized(metaclass=_KernelType):
         self._ws_uses = {}  # (role, channel) -> acquires/waits per work item (0: inner loop)
         self._ws_epoch_seqs = {}  # (exclusive channel, role) -> RoleTrace.epoch_sequence
         take_opt_outs()  # drop opt-outs left over from an earlier, failed trace
+        for nb in self._ws_named_bars.values():  # this trace's native ID reads only
+            nb._native_outside_roles = False
         clear_multicast_masks()
         smem = memory.SmemAllocator()
         plan, total = self._barrier_plan()
@@ -1452,7 +1454,6 @@ class WarpSpecialized(metaclass=_KernelType):
         for name, nb in self._ws_named_bars.items():
             used = users[name]
             outside = nb._native_outside_roles  # kernel code every role's threads may run
-            nb._native_outside_roles = False
             if outside:
                 used["native"].append("kernel code")
             used_by = [roles[r] for r in dict.fromkeys(used["sync"] + used["arrive"])]
@@ -1772,7 +1773,7 @@ def _check_exclusive(name: str, chan):
             f"channel {name}: exclusive consumer role(s) {missing} take no Consumer end"
         )
     contributions = {r.name: arrivals(chan.consumer, r.num_threads) for r in consumers}
-    if "empty_counts" not in (chan.override or {}) and len(set(contributions.values())) > 1:
+    if not chan.empty_counts_overridden and len(set(contributions.values())) > 1:
         raise ProtocolError(
             f"channel {name}: exclusive consumers must contribute equal arrivals (each epoch "
             f"counts one of them), got {contributions}"

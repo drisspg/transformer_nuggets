@@ -210,7 +210,7 @@ def _channels(kernel) -> str:
             owners = ", ".join(r.name for r, _ in ch.consumers)
             counts = (
                 "empty counts overridden: each owner's release must supply them (unverified)"
-                if "empty_counts" in (ch.override or {})
+                if ch.empty_counts_overridden
                 else "counts are one consumer's"
             )
             details.append(
