@@ -146,9 +146,7 @@ def _roles(kernel) -> str:
 
 
 def _mech(mech) -> str:
-    if isinstance(mech, Tma):
-        return f"Tma({mech.tx_bytes} B)"
-    return getattr(mech, "__name__", repr(mech))
+    return f"Tma({mech.tx_bytes} B)" if isinstance(mech, Tma) else mech.__name__
 
 
 def _bound(bound) -> str:
@@ -160,6 +158,7 @@ def _channels(kernel) -> str:
     if not chans:
         return ""
     cs = kernel.cluster.size
+    pair = is_pair(kernel.cluster)
     width = max(len(n) for n in chans)
     pad = " " * (2 + width + 2)
     lines = ["Channels"]
@@ -178,7 +177,6 @@ def _channels(kernel) -> str:
         sc = ch.scope
         full_ranks = sc.full_ctas if sc.pair else range(cs)
         empty_ranks = sc.empty_ctas if sc.pair else range(cs)
-        pair = is_pair(kernel.cluster)
         full = fmt_per_cta(sc.full_counts, full_ranks, by_rank=sc.pair, pair=pair)
         if sc.tx is not None:
             # Leaders arm for both CTAs of their pair, or rank 0's scheduler for every CTA.
