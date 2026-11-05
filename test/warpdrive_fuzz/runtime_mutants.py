@@ -17,6 +17,7 @@ from transformer_nuggets.cute.warpdrive.channels import (
     Handle,
     ProducerEnd,
     Threads,
+    Warps,
     _End,
 )
 from transformer_nuggets.cute.warpdrive.tracing import wait_range
@@ -30,6 +31,19 @@ def join_short():
         counts = orig(self, side)
         if side == "consumer" and self.consumer is Threads and not self.internal:
             return [c - 32 if c > 32 else c for c in counts]
+        return counts
+
+    Channel.slot_counts = slot_counts
+
+
+def warps_short():
+    """``Warps`` sides expect one warp fewer: a stage completes before its last warp arrives."""
+    orig = Channel.slot_counts
+
+    def slot_counts(self, side):
+        counts = orig(self, side)
+        if (self.consumer if side == "consumer" else self.producer) is Warps:
+            return [c - 1 if c > 1 else c for c in counts]
         return counts
 
     Channel.slot_counts = slot_counts
@@ -216,6 +230,7 @@ def view_endpoint_stage():
 
 MUTANTS = {
     "join_short": (join_short, "join"),
+    "warps_short": (warps_short, "warps_join"),
     "ring_wait_phase": (ring_wait_phase, "payload"),
     "slots_shared_phase": (slots_shared_phase, "slots_threads_threads"),
     "static_stride": (static_stride, "schedule_static"),

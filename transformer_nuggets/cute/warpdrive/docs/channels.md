@@ -35,7 +35,7 @@ producing CTA. `Tma(tx_bytes, multicast="n")` declares copies multicast along a 
 see [clusters](clusters.md#multicast). `Tma(tx_bytes, fills="pair")` has one CTA issue the
 copies of others; see [one CTA loads for others](clusters.md#one-cta-loads-for-others). `Umma`
 signals with an elected `tcgen05.commit`; `Threads` has every thread of every bound role
-arrive. A TMA or UMMA side must bind to exactly one single-warp role (or the one instance whose
+arrive, `Warps` one elected lane of each of their warps. A TMA or UMMA side must bind to exactly one single-warp role (or the one instance whose
 turn it is on a round-robin side). TMA acquire arms the expected bytes; commit emits no arrival
 because the copies complete the full barrier.
 TMA is a producer mechanism, not a consumer mechanism.
@@ -61,7 +61,17 @@ Putting the whole `with` under `if output_in_bounds` would change who arrives wi
 the barrier count. Compilation doesn't prove that all the declared threads reach each signal,
 or that producers and consumers run the same number of iterations.
 
-Elected-per-warp arrivals, async-copy relay warps and sparse protocols can use
+`Warps` counts warps instead: `Ring(2, Umma, Warps)` expects 4 arrivals from warps 0–3.
+Every thread of the bound roles still runs the release, exactly as for `Threads`: it
+executes the side's fence, the warp synchronizes with `bar.warp.sync` (which orders the
+accesses of its lanes, PTX ISA `bar.warp.sync`), and one elected lane arrives. So the same
+rule holds: predicate the work, not the handoff; a lane that skips the release leaves its warp
+waiting at the `bar.warp.sync`. Cross-CTA `Warps` arrivals count one per warp of each
+signalling CTA. FA4's and CUTLASS's pipelines signal per warp: on the FA4 backward, 256
+per-thread arrivals per release instead of 8 cost about 1.5% of the main kernel. `Warps` is an mbarrier mechanism; named-barrier
+channels count threads and reject it.
+
+Async-copy relay warps and sparse protocols can use
 [count overrides or raw barriers](dropping_down.md). Changing a count doesn't select lanes
 or add the synchronization those lanes need.
 

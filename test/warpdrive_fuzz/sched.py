@@ -160,6 +160,11 @@ def _mask(targets: dict) -> int | dict:
     return masks.popitem()[1] if len(set(masks.values())) == 1 else masks
 
 
+def arrivals(mech: str, threads: int) -> int:
+    """Arrivals of one signalling instance: its threads, its warps, or one elected signal."""
+    return {"threads": threads, "warps": threads // 32}.get(mech, 1)
+
+
 def want_scope(
     n: int,
     prod_mech: str,
@@ -189,10 +194,7 @@ def want_scope(
 
     if same and not copies_cross:
         full, empty = (
-            [
-                sum(i.threads if mech == "threads" else 1 for i in per_slot(side, j))
-                for j in range(n)
-            ]
+            [sum(arrivals(mech, i.threads) for i in per_slot(side, j)) for j in range(n)]
             for mech, side in ((prod_mech, producers), (cons_mech, consumers))
         )
 
@@ -258,10 +260,10 @@ def want_scope(
             for j in range(n):
                 senders = [(i, s) for i in per_slot(side, j) for s in where[i.name]]
                 senders = [(i, s) for i, s in senders if c in targets.get(s, ())]
-                # Threads: every thread of every signalling (instance, CTA); a TMA arm or a
-                # multicast tcgen05.commit: one arrival per signalling CTA.
-                if mech == "threads":
-                    row.append(sum(i.threads for i, _ in senders))
+                # Threads: every thread of every signalling (instance, CTA); Warps: every warp;
+                # a TMA arm or a multicast tcgen05.commit: one arrival per signalling CTA.
+                if mech in ("threads", "warps"):
+                    row.append(sum(arrivals(mech, i.threads) for i, _ in senders))
                 else:
                     row.append(len({s for _, s in senders}))
             out[c] = row if any(row) else [1] * n
@@ -309,8 +311,8 @@ def expected_scopes(spec: gen.KernelSpec) -> dict[str, WantScope]:
             tma_bytes = (gen.MMA_M + spec.mma.n) * spec.mma.k * 2
         out[ch.name] = want_scope(
             ch.n,
-            ch.producer,
-            ch.consumer,
+            "warps" if "p" in ch.warps else ch.producer,
+            "warps" if "c" in ch.warps else ch.consumer,
             _insts(spec, list(ch.producers)),
             _insts(spec, list(ch.consumers)),
             geom,

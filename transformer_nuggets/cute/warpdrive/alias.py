@@ -104,6 +104,9 @@ RULES = {
     ),
 }
 
+# A Threads or Warps signal follows every bound thread's own accesses (a Warps arrival after the
+# warp's bar.warp.sync, which orders its lanes' accesses).
+THREAD_SIGNALS = ("Threads", "Warps")
 HAZARD = "potential hazard"
 RAW_ONLY = "only a raw signal (signal=False) would order them, and it is not visible"
 UNVERIFIED = "unverified"
@@ -377,7 +380,7 @@ def _completion(
             "complete_tx",
         )
     if a.agent == "tma":
-        if mech_name != "Threads":
+        if mech_name not in THREAD_SIGNALS:
             return Finding(
                 HAZARD,
                 f"{where}: nothing waits for the TMA store's source reads",
@@ -399,7 +402,7 @@ def _completion(
             f"{side} signal",
             "commit",
         )
-    if mech_name != "Threads":
+    if mech_name not in THREAD_SIGNALS:
         return Finding(
             HAZARD,
             f"{where}: a {mech_name} {side} signal does not publish this thread's accesses",

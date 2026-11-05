@@ -172,6 +172,9 @@ class ChannelSpec:
     # under an override of that side's counts given as an int, a per-slot list or {rank: list}.
     manual: str = ""
     override_form: str = ""
+    # Sides ("p", "c", "pc") of Threads mechanism declared ``Warps`` instead: every thread still
+    # closes the handle, the layer arrives once per warp.
+    warps: str = ""
     generic: bool = False  # declared as Channel(...) rather than Ring(...)
     # unchecked(...) site: "cross_region" (close inside a dynamic branch), "unclosed" (open
     # with the opt-out, signal through the raw barrier, never close) or "tma" (TMA barrier).
@@ -895,6 +898,7 @@ def generate(
     # kernel it had before them apart from the extensions (findings cite seeds).
     ext = random.Random(f"wdfuzz-ext-{seed}")
     fill_rng = random.Random(f"wdfuzz-fill-{seed}")  # Tma(fills=...), added after ext
+    warps_rng = random.Random(f"wdfuzz-warps-{seed}")  # Warps sides, added after fills
     cluster = tuple(cluster) if cluster is not None else ()
     if cluster:
         pair = cluster[2]
@@ -1242,6 +1246,17 @@ def generate(
             used -= 4 * 512 * ch["n"]
     smem_pad = min(smem_pad, max(0, (200_000 - used) // 4))
     _extend_channels(ext, channels, roles, geom)
+    for ch in channels:
+        sides = [
+            x
+            for x, mech in (("p", ch["producer"]), ("c", ch["consumer"]))
+            if mech == "threads"
+            and x not in ch.get("manual", "")
+            # an unclosed handle's raw signal arrives from every thread
+            and not (ch.get("unchecked") == "unclosed" and ch.get("unchecked_side") == x)
+        ]
+        if ch["kind"] != "raw" and sides and warps_rng.random() < 0.1:
+            ch["warps"] = "".join(x for x in sides if warps_rng.random() < 0.7) or sides[0]
     spec = KernelSpec(
         seed=seed,
         pair=pair,
@@ -1942,6 +1957,7 @@ def emit(spec: KernelSpec) -> str:
         "Turn",
         "Turnstile",
         "Umma",
+        "Warps",
         "WarpSpecialized",
         "WorkCursor",
         "WorkMap",
@@ -2019,7 +2035,8 @@ def emit(spec: KernelSpec) -> str:
             mcast = f', multicast="{ch.multicast}"' if ch.multicast else ""
             mcast += f', fills="{ch.fills}"' if ch.fills else ""
             prod = f"Tma({ch.tma_bytes}{mcast})" if ch.producer == "tma" else _MECH[ch.producer]
-        args = [str(ch.n), prod, _MECH[ch.consumer]]
+        prod = "Warps" if "p" in ch.warps else prod
+        args = [str(ch.n), prod, "Warps" if "c" in ch.warps else _MECH[ch.consumer]]
         if ch.mma == "ab":
             args.append('buffer={"A": ma, "B": mb}')
         elif ch.storage and ch.producer == "tma":
@@ -2377,6 +2394,10 @@ def features(spec: KernelSpec) -> set[str]:
         if ch.manual:
             out.add("override_signal_false")
             out.add(f"override_{ch.override_form}_{ch.manual}")
+        if ch.warps:
+            out.add(f"warps_{ch.warps}")
+            if any(max(warp_counts(spec, ch, side)) > 1 for side in ch.warps):
+                out.add("warps_join")
         if ch.generic:
             out.add("channel_class")
         if ch.unchecked:

@@ -29,6 +29,7 @@ from transformer_nuggets.cute.warpdrive.channels import (
     TurnEnd,
     Turnstile,
     Umma,
+    Warps,
 )
 from transformer_nuggets.cute.warpdrive.cluster import (
     ALL,
@@ -736,7 +737,7 @@ class WarpSpecialized(metaclass=_KernelType):
                     )
                 if chan.round_robin and len(bound) > 1:
                     _check_turns(name, side, bound)
-                if mech is Threads:
+                if mech is Threads or mech is Warps:
                     continue
                 how = getattr(mech, "__name__", repr(mech))  # Umma, or Tma(tx_bytes=...)
                 if len(bound) > 1 and not chan.round_robin:

@@ -360,7 +360,7 @@ def _masks(targets: dict) -> int | dict:
 
 def derive_scope(chan, cluster, *, internal: bool = False) -> Scope:
     """Derive ``chan``'s scope from the placement of its bound role instances."""
-    from transformer_nuggets.cute.warpdrive.channels import Threads, Tma, Umma
+    from transformer_nuggets.cute.warpdrive.channels import Threads, Tma, Umma, Warps, arrivals
 
     bound = [*chan.producers, *chan.consumers]
     ranks = range(cluster.size)
@@ -441,8 +441,8 @@ def derive_scope(chan, cluster, *, internal: bool = False) -> Scope:
                 senders = [
                     (ri, s) for ri in insts for s in placed[ri.name] if c in targets.get(s, ())
                 ]
-                if mech is Threads:
-                    per_slot.append(sum(ri.num_threads for ri, _ in senders))
+                if mech is Threads or mech is Warps:
+                    per_slot.append(sum(arrivals(mech, ri.num_threads) for ri, _ in senders))
                 else:  # Umma commit multicast or one TMA arm: one arrival per signalling CTA
                     per_slot.append(len({s for _, s in senders}))
             # Never waited in a CTA no signal reaches.

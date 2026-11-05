@@ -8,6 +8,8 @@ mechanism, which fixes how many arrivals the barrier expects:
 * ``Umma``: one elected ``tcgen05.commit`` (completes once all prior MMAs of the issuing
   thread have finished).
 * ``Threads``: every thread of every role instance bound to the slot arrives.
+* ``Warps``: every thread of those instances signals, but each warp synchronizes
+  (``__syncwarp``) and one elected lane arrives: one arrival per warp.
 
 The layer derives each slot's arrival count from the role instances bound to it, so a channel
 with several consumer roles (fan-out) has a join barrier that completes only when all of them
@@ -102,8 +104,20 @@ class Threads:
     """Side signalled by ``mbarrier.arrive`` from every thread of the bound role instances."""
 
 
+class Warps:
+    """Side signalled by one elected ``mbarrier.arrive`` per warp of the bound role instances.
+
+    Every thread of those instances still reaches the signal, as with ``Threads``: it runs the
+    side's fence, then the warp's ``bar.warp.sync``, which orders the memory accesses of its
+    participating lanes before the elected lane's arrive (PTX ISA, ``bar.warp.sync``), so
+    the arrival publishes the whole warp's work. The count is the warps, not the threads: FA4
+    and CUTLASS pipelines signal this way, avoiding 32 shared-memory arrivals per warp."""
+
+
 def arrivals(mech, threads: int) -> int:
-    return threads if mech is Threads else 1
+    if mech is Threads:
+        return threads
+    return threads // 32 if mech is Warps else 1
 
 
 def _fence(kind: str | None):
@@ -194,9 +208,10 @@ class Channel:
         if self.n <= 0:
             raise ValueError("channels need at least one stage")
         for side, mech in (("producer", self.producer), ("consumer", self.consumer)):
-            if mech is not Threads and mech is not Umma and not isinstance(mech, Tma):
+            if mech not in (Threads, Warps, Umma) and not isinstance(mech, Tma):
                 raise ValueError(
-                    f"channel {side} mechanism must be Threads, Umma, or Tma(bytes), got {mech!r}"
+                    f"channel {side} mechanism must be Threads, Warps, Umma, or Tma(bytes), "
+                    f"got {mech!r}"
                 )
         if isinstance(self.consumer, Tma):
             raise ValueError("TMA is a producer mechanism")  # noqa: TRY004
@@ -236,7 +251,7 @@ class Channel:
         if self.named:
             if self.producer is not Threads or self.consumer is not Threads:
                 raise ValueError(
-                    "a named-barrier channel synchronizes threads: both sides must be Threads"
+                    "a named-barrier channel counts threads: both sides must be Threads (not Warps)"
                 )
             if self.override:
                 raise ValueError(
@@ -815,29 +830,38 @@ class _End:
                 else:
                     cute.nvgpu.tcgen05.commit(bar)
         elif mech is Threads:
-            if not self._chan.scope.pair:
-                cute.arch.mbarrier_arrive(bar)
-                return
-            # See Channel.remote_scope: a cluster-scope release orders generic-memory data for
-            # the other CTA's waiter; "cta" (CUTLASS's default) only counts the arrival.
-            scope = _nvvm.MemScopeKind.CLUSTER if self._chan.remote_scope == "cluster" else None
-            shared = set(targets.values())
-            if len(shared) == 1:  # every CTA of the role signals the same ranks
-                for c in shared.pop():
-                    if self.ctas == (c,):
-                        cute.arch.mbarrier_arrive(bar, scope=scope)
-                    else:
-                        cute.arch.mbarrier_arrive(bar, c, scope=scope)
-                return
-            # Targets relative to the signalling CTA (its MMA pair): pick them by rank.
-            widths = {len(cs) for cs in targets.values()}
-            assert len(widths) == 1, targets
-            rank = cluster_rank()
-            for k in range(widths.pop()):
-                c = rank_value({r: cs[k] for r, cs in targets.items()}, rank)
-                cute.arch.mbarrier_arrive(bar, c, scope=scope)
+            self._thread_arrive(bar)
+        elif mech is Warps:
+            cute.arch.sync_warp()
+            with cute.arch.elect_one():
+                self._thread_arrive(bar)
         else:
             raise AssertionError(mech)
+
+    def _thread_arrive(self, bar):
+        """One ``mbarrier.arrive`` from this thread on ``bar`` in each target CTA."""
+        targets = self.targets
+        if not self._chan.scope.pair:
+            cute.arch.mbarrier_arrive(bar)
+            return
+        # See Channel.remote_scope: a cluster-scope release orders generic-memory data for
+        # the other CTA's waiter; "cta" (CUTLASS's default) only counts the arrival.
+        scope = _nvvm.MemScopeKind.CLUSTER if self._chan.remote_scope == "cluster" else None
+        shared = set(targets.values())
+        if len(shared) == 1:  # every CTA of the role signals the same ranks
+            for c in shared.pop():
+                if self.ctas == (c,):
+                    cute.arch.mbarrier_arrive(bar, scope=scope)
+                else:
+                    cute.arch.mbarrier_arrive(bar, c, scope=scope)
+            return
+        # Targets relative to the signalling CTA (its MMA pair): pick them by rank.
+        widths = {len(cs) for cs in targets.values()}
+        assert len(widths) == 1, targets
+        rank = cluster_rank()
+        for k in range(widths.pop()):
+            c = rank_value({r: cs[k] for r, cs in targets.items()}, rank)
+            cute.arch.mbarrier_arrive(bar, c, scope=scope)
 
     def _next(self, slot, op):
         """(index, phase, label) of the next use, advancing this end's state."""

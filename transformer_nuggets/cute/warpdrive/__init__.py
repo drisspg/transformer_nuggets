@@ -105,6 +105,7 @@ from transformer_nuggets.cute.warpdrive.channels import (
     Tma,
     Turnstile,
     Umma,
+    Warps,
 )
 from transformer_nuggets.cute.warpdrive.cluster import Cluster, CtaPair, SingleCta, TmaMulticast
 from transformer_nuggets.cute.warpdrive.kernel import (
@@ -174,6 +175,7 @@ __all__ = [
     "Turn",
     "Turnstile",
     "Umma",
+    "Warps",
     "WarpSpecialized",
     "WorkCursor",
     "WorkMap",

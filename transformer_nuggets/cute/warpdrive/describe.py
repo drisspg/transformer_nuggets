@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import textwrap
 
-from transformer_nuggets.cute.warpdrive.channels import Threads, Tma, Umma
+from transformer_nuggets.cute.warpdrive.channels import Threads, Tma, Umma, Warps
 from transformer_nuggets.cute.warpdrive.scheduling import _tile_grid, scheduler_role
 
 WIDTH = 100  # wrap channel flows past this many columns
@@ -226,7 +226,7 @@ def _channels(kernel) -> str:
                     scope.append(f"commit_mask {fmt_mask(sc.full_mask, kernel.cluster)}")
                 if ch.consumer is Umma:
                     scope.append(f"release_mask {fmt_mask(sc.empty_mask, kernel.cluster)}")
-                if Threads in (ch.producer, ch.consumer):
+                if {Threads, Warps} & {ch.producer, ch.consumer}:
                     scope.append(f"remote_scope {ch.remote_scope}")
                 if sc.tail:
                     scope.append("tail")
