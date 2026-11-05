@@ -71,7 +71,7 @@ def dump(output: Path, labels: list[str]) -> None:
     print(transformer_nuggets.__file__, flush=True)
     for label in labels or configs:
         build, op = configs[label]
-        compiled = build(op)
+        compiled = getattr(build, "__wrapped__", build)(op)  # a cached kernel has no IR
         obj = bytes(
             _aot_support.export_module_to_bytes(
                 compiled.ir_module, format="o", opt_level=3, enable_pic=True
