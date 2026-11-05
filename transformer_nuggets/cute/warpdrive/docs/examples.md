@@ -242,7 +242,9 @@ Split partials match FA4's bit for bit on every shape below, with FA4's own spli
 per-sequence table (captured at its combine call); the combined outputs are identical too.
 The initial timings below are CUPTI medians of CUDA-graph replays, in microseconds; the better
 of two interleaved rounds of 200 replays. Graph times also include FA4's prepare kernel (per-sequence
-rows) and the shared combine. Buffers are reused, so short shapes run from L2.
+rows) and the shared combine. Buffers are reused, so short shapes run from L2. These initial
+numbers used the earlier benchmark; the command below runs the updated method described
+under decode setup costs.
 
 ```bash
 gpu-run --timeout 1800 auto -- timeout --signal=TERM --kill-after=5s 900s \
@@ -279,9 +281,11 @@ These depend only on shapes; the per-sequence split counts are still read after 
 Batch, head counts and splits remain dynamic, and partials are still bitwise equal to FA4.
 
 Matched before/after, GB300, same versions as above and Triton `3.8.0`, November 4, 2026.
-The committed benchmark (`a9098cc`) ran against the original mapping at `c205c64` and fast
-divmod at `0e79027`, under one GPU reservation: three process pairs in A/B, B/A, A/B order,
-each with three alternating FA4/port rounds of 200 replays after three seconds of warmup.
+The benchmark source SHA-256 prefix was `78d54f3cf2c58af0`, against the mapping at `c205c64`
+and fast-divmod source `18088cc627d69597`. These source hashes were recorded before the
+jit_cache migration; the three decode builds' normalized SASS stayed identical after it.
+One GPU reservation covered three process pairs in A/B, B/A, A/B order, each with three
+alternating FA4/port rounds of 200 replays after three seconds of warmup.
 Fixed buffers, seed 0, normal-distributed BF16 inputs, normal DVFS without clock locking.
 The table gives CUPTI decode-kernel medians across the process medians, in microseconds;
 lower is better. Prepare and combine are excluded from these kernel times; whole-graph

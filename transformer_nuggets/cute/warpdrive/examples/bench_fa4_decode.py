@@ -4,11 +4,11 @@ For each shape FA4 runs through its interface (``FLASH_ATTENTION_SM100_BACKEND=s
 partials, split count and per-sequence split table are captured at the combine call. The port then
 runs with the same split count and table. Reported per shape:
 
-* partial O / LSE: max |port - FA4| over the splits each sequence owns, and the bitwise-equal
-  fraction; final O against an fp32 reference for both;
-* CUDA-graph replay, per kernel (CUPTI durations, median over replays): FA4's decode kernel vs the
-  port's, plus the whole call (FA4: prepare + decode + combine; port: decode + combine) as graph
-  replay time.
+* partial O / LSE: bitwise equality over the splits each sequence owns (a mismatch raises);
+  final O against an fp32 reference for both;
+* CUDA-graph replay, per kernel (CUPTI durations, median of round medians): FA4's decode kernel
+  vs the port's, plus the whole call (FA4: prepare + decode + combine; port: decode + combine)
+  as graph replay time.
 
 Run under ``gpu-run``:
 ``python -m transformer_nuggets.cute.warpdrive.examples.bench_fa4_decode --output results.json``.
