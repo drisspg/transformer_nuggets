@@ -1,10 +1,16 @@
 import math
+import random
 
 import pytest
 import torch
 
 pytest.importorskip("cutlass.cute")
 
+import cutlass
+from cutlass import Int32, cute
+
+from transformer_nuggets.cute.jit_cache import jit_cache
+from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
     AtomicPersistent,
     ClusterLaunchControl,
@@ -90,11 +96,34 @@ def test_grouped_gemm_rows_past_last_offset_are_untouched(requires_blackwell):
     _check([300, 0, 128, 77], 512, 256, rows_after=131)
 
 
+def _skewed_sizes(groups: int, total: int, seed: int = 0) -> list[int]:
+    """Heavy-tailed routing as in the benchmark: a few large groups, an eighth of them empty."""
+    gen = torch.Generator().manual_seed(seed)
+    weights = torch.rand(groups, generator=gen) ** 3
+    weights[torch.randperm(groups, generator=gen)[: groups // 8]] = 0
+    sizes = (weights / weights.sum() * total).floor().to(torch.int64)
+    sizes[sizes.argmax()] += total - int(sizes.sum())
+    return sizes.tolist()
+
+
+SCHEDULE_SIZES = {
+    "ragged_8": [1000, 24, 0, 129, 128, 1, 256, 300],
+    "skewed_96": _skewed_sizes(96, 6000),
+    "empty_runs": [0] * 30 + [5] + [0] * 40 + [300] + [0] * 9,
+}
+
+
+@pytest.mark.parametrize("max_ctas", [None, 7], ids=["full", "capped"])
+@pytest.mark.parametrize("sizes", SCHEDULE_SIZES.values(), ids=SCHEDULE_SIZES.keys())
 @pytest.mark.parametrize(
-    "schedule", [OneShot(), StaticPersistent(), ClusterLaunchControl()], ids=lambda s: s.get_key()
+    "schedule",
+    [OneShot(), StaticPersistent(), AtomicPersistent(), ClusterLaunchControl()],
+    ids=lambda s: s.get_key(),
 )
-def test_grouped_gemm_schedules(requires_blackwell, schedule):
-    _check([1000, 24, 0, 129, 128, 1, 256, 300], 520, 136, schedule=schedule)
+def test_grouped_gemm_schedules(requires_blackwell, schedule, sizes, max_ctas):
+    """Every schedule runs every tile once, whether a unit's indices cross several groups per
+    item (a full grid) or walk through all of them (7 CTAs)."""
+    _check(sizes, 264, 72, schedule=schedule, max_ctas=max_ctas)
 
 
 @pytest.mark.parametrize(
@@ -151,24 +180,18 @@ def _reference_tiles(sizes: list[int], tile_m: int) -> set[tuple[int, int, int]]
 
 
 def _python_locate_tile(mt: int, offsets: list[int], tile_m: int, total_m: int | None = None):
-    """Mirror of ``_locate_tile``: the padded row space gives group g the m-tiles from
-    ``ceil((offsets[g-1] + g * tile_m) / tile_m)`` on."""
+    """Mirror of ``GroupedTiles``' decode: ``(found, group, row0, rows)`` of m-tile ``mt``, the
+    groups' tiles numbered back to back, group ends clamped to ``[previous end, total_m]``."""
     total_m = offsets[-1] if total_m is None else total_m
-    count = len(offsets)
-    lo = 0
-    step = 1
-    while step < count:
-        step *= 2
-    while step > 1:
-        step //= 2
-        cand = lo + step
-        if cand < count and offsets[cand - 1] <= (mt - cand) * tile_m:
-            lo = cand
-    start = min(max(offsets[lo - 1] if lo else 0, 0), total_m)
-    first_tile = -(-(start + lo * tile_m) // tile_m)
-    row0 = start + (mt - first_tile) * tile_m
-    end = min(offsets[lo], total_m)
-    return row0 < end, lo, row0, min(end - row0, tile_m)
+    tile = row = 0
+    for group, end in enumerate(offsets):
+        end = min(max(end, row), total_m)
+        next_tile = tile + -(-(end - row) // tile_m)
+        if tile <= mt < next_tile:
+            row0 = row + (mt - tile) * tile_m
+            return True, group, row0, min(end - row0, tile_m)
+        tile, row = next_tile, end
+    return False, len(offsets) - 1, row, 0
 
 
 @pytest.mark.parametrize("tile_m", [128, 256])
@@ -186,13 +209,108 @@ def _python_locate_tile(mt: int, offsets: list[int], tile_m: int, total_m: int |
 )
 def test_grouped_tiles_decode_is_a_bijection(sizes, tile_m):
     """Every (group, row0, rows) tile of the work appears exactly once among the
-    ``ceil(total_M / tile_m) + G`` m-tile slots the host launches; the others are dropped."""
+    ``ceil(total_M / tile_m) + G`` m-tile slots the host launches, in order; the slots past
+    them are dropped."""
     offsets = list(torch.tensor(sizes).cumsum(0).tolist())
     slots = math.ceil(sum(sizes) / tile_m) + len(sizes)
     kept = [_python_locate_tile(mt, offsets, tile_m) for mt in range(slots)]
-    kept = [(g, row0, rows) for found, g, row0, rows in kept if found]
-    assert len(kept) == len(set(kept))
-    assert set(kept) == _reference_tiles(sizes, tile_m)
+    found = [f for f, *_ in kept]
+    assert found == sorted(found, reverse=True), "a dropped slot before a kept one"
+    kept = [(g, row0, rows) for f, g, row0, rows in kept if f]
+    assert kept == sorted(_reference_tiles(sizes, tile_m))
+
+
+class DecodeProbe:
+    """Decodes ``indices`` in order on one warp with ``GroupedTiles``, threading the state, and
+    decodes each again from a fresh ``start`` state: ``out[i] = (keep, words..., fresh keep,
+    fresh words...)``."""
+
+    def __init__(self, tile_m: int):
+        self.mapping = gg.GroupedTiles(tile_m=tile_m)
+
+    @cute.kernel
+    def kernel(self, space, indices: cute.Tensor, out: cute.Tensor):
+        mapping = self.mapping
+        state = mapping.start(space)
+        for i in cutlass.range(indices.shape[0], unroll=1):
+            keep, words, state = mapping.decode(indices[i], space, state)
+            fresh_keep, fresh, _ = mapping.decode(indices[i], space, mapping.start(space))
+            row = (cutlass.select_(keep, 1, 0), *words, cutlass.select_(fresh_keep, 1, 0), *fresh)
+            if cute.arch.lane_idx() == 0:
+                for j in cutlass.range_constexpr(len(row)):
+                    out[i, j] = Int32(row[j])
+
+    @cute.jit
+    def __call__(self, offsets, total_m: Int32, n_tiles: Int32, indices, out, stream):
+        space = self.mapping.bind((offsets, total_m, n_tiles))
+        self.kernel(space, indices, out).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+
+    def __cute_cache_key__(self):
+        return ("grouped_decode_probe", self.mapping)
+
+
+@jit_cache
+def compile_decode_probe(op: DecodeProbe):
+    i32 = cutlass.Int32
+    return compile_tvm_ffi(
+        op,
+        make_fake_compact_tensor(i32, (cute.sym_int(),)),
+        Int32(1),
+        Int32(1),
+        make_fake_compact_tensor(i32, (cute.sym_int(),)),
+        make_fake_compact_tensor(i32, (cute.sym_int(), 10)),
+        name=f"grouped_decode_probe{op.mapping.tile_m}",
+    )
+
+
+def _index_orders(count: int, units: int, seed: int) -> dict[str, list[int]]:
+    rng = random.Random(seed)
+    return {
+        "strided": [i for b in range(min(units, count)) for i in range(b, count, units)],
+        "ascending": list(range(count)),
+        "descending": list(range(count - 1, -1, -1)),
+        "random": rng.sample(range(count), count),
+        "jumps": [rng.choice([0, count - 1, rng.randrange(count)]) for _ in range(count)],
+    }
+
+
+@pytest.mark.parametrize("tile_m", [128, 256])
+@pytest.mark.parametrize(
+    "sizes, n_tiles, extra_rows",
+    [
+        ([1000, 24, 0, 129, 128, 1, 256, 300], 3, 0),
+        ([0, 0, 200, 0, 50, 0, 0, 7], 1, 131),  # rows past the last offset: trailing slots
+        ([0, 1, 127, 128, 129, 255, 256, 257] * 16, 2, 0),
+        ([37] * 64, 5, -400),  # offsets past A: clamped
+        ([300, -100, 50, 400, -500, 90, 0, 7], 2, 0),  # out of order: clamped to the last end
+    ],
+    ids=["ragged", "empty_runs", "mixed_128", "clamped", "unordered"],
+)
+def test_grouped_tiles_state_never_changes_the_item(
+    requires_blackwell, sizes, n_tiles, extra_rows, tile_m
+):
+    """Whatever indices a decoding site visited before (strided as static persistence visits
+    them, ascending, descending, random, large jumps back and forth), the stateful decode returns
+    the item a fresh decode does, which matches the host reference."""
+    offsets = list(torch.tensor(sizes).cumsum(0).tolist())
+    total_m = offsets[-1] + extra_rows
+    count = (math.ceil(total_m / tile_m) + len(sizes)) * n_tiles
+    fn = compile_decode_probe(DecodeProbe(tile_m))
+    offsets_t = torch.tensor(offsets, dtype=torch.int32, device="cuda")
+    want = []
+    for index in range(count):
+        found, g, row0, rows = _python_locate_tile(index // n_tiles, offsets, tile_m, total_m)
+        want.append((int(found), g, row0, rows, index % n_tiles))
+    for name, order in _index_orders(count, 7, seed=len(sizes)).items():
+        indices = torch.tensor(order, dtype=torch.int32, device="cuda")
+        out = torch.zeros(len(order), 10, dtype=torch.int32, device="cuda")
+        fn(offsets_t, total_m, n_tiles, indices, out)
+        torch.cuda.synchronize()
+        for index, row in zip(order, out.cpu().tolist(), strict=True):
+            stateful, fresh = tuple(row[:5]), tuple(row[5:])
+            assert stateful[0] == fresh[0] == want[index][0], (name, index, row)
+            if want[index][0]:
+                assert stateful == fresh == want[index], (name, index, row)
 
 
 def test_grouped_gemm_zero_work(requires_blackwell):
@@ -224,6 +342,22 @@ def test_grouped_gemm_clamps_offsets_to_a(requires_blackwell):
     grouped_gemm(a, b, offsets, out=out)
     torch.cuda.synchronize()
     ref = torch.cat([a[:64].float() @ b[0].float().T, a[64:].float() @ b[1].float().T])
+    assert (out.float() - ref).abs().max().item() <= 0.1
+
+
+@pytest.mark.parametrize(
+    "schedule", [StaticPersistent(), AtomicPersistent()], ids=["static", "atomic"]
+)
+def test_grouped_gemm_clamps_out_of_order_offsets(requires_blackwell, schedule):
+    """Decreasing or negative offsets (a routing bug) are clamped to the previous group's end,
+    so every group's rows stay inside ``A``: here group 0 takes rows [0, 300), groups 1-3 none
+    and group 4 the rest of the 400 rows."""
+    a, b, _ = _inputs([80] * 5, 72, 64)
+    offsets = torch.tensor([300, 100, -5, 250, 2000], device="cuda", dtype=torch.int32)
+    out = torch.full((400, 72), float("nan"), device="cuda", dtype=torch.bfloat16)
+    grouped_gemm(a, b, offsets, out=out, schedule=schedule)
+    torch.cuda.synchronize()
+    ref = torch.cat([a[:300].float() @ b[0].float().T, a[300:].float() @ b[4].float().T])
     assert (out.float() - ref).abs().max().item() <= 0.1
 
 
@@ -291,4 +425,4 @@ def test_grouped_gemm_rejects_unfit_configurations():
         GroupedGemm(c_stages=0)
     assert GroupedGemm(tile_n=128).get_name() != GroupedGemm().get_name()
     assert GroupedGemm(cluster=CtaPair()).work.mapping.tile_m == 256
-    assert "GroupedTiles(tile_m=128)" in GroupedGemm().describe()
+    assert "GroupedTiles(tile_m=128, state=Window: 5 x Int32)" in GroupedGemm().describe()

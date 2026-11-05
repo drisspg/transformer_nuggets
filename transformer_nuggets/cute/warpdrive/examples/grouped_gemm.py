@@ -21,6 +21,7 @@ affects accumulator rows that are never stored.
 """
 
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import cutlass
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -38,7 +39,6 @@ from cutlass.utils.gemm.sm100 import (
 from transformer_nuggets.cute.jit_cache import jit_cache
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
-    AtomicPersistent,
     Consumer,
     Producer,
     Ring,
@@ -46,6 +46,7 @@ from transformer_nuggets.cute.warpdrive import (
     SingleCta,
     SmemPlan,
     StageView,
+    StaticPersistent,
     Threads,
     Tma,
     Tmem,
@@ -68,48 +69,82 @@ from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import (
 
 RAGGED_ROWS = 2**30  # the row extent of the ragged output view; TMA clips there
 RAGGED_SELECT = 2**31 - 1  # extent of its row-selecting third mode
+INT32_MAX = 2**31 - 1
+LOOKAHEAD = 8  # groups a decode tests at once past its last group
 MAX_TILE_M = 2 * CTA_TILE_M  # a CTA pair's MMA tile
 
 
-@cute.jit
-def _locate_tile(mt: Int32, offsets: cute.Tensor, total_m: Int32, tile_m: int):
-    """The group of global m-tile ``mt``, that tile's first row and its valid rows:
-    ``(found, group, row0, rows)``. Group bounds are clamped to ``[0, total_m]``, so offsets
-    outside ``A`` cannot address rows outside it (the routing they describe is then wrong,
-    not unsafe), and the intermediate values stay within ``total_m + (G + 1) * tile_m``.
+class Window(NamedTuple):
+    """``GroupedTiles``' decode state: group ``group`` owns the m-tiles ``[tile_lo, tile_hi)``
+    and the rows ``[row_lo, row_hi)``."""
 
-    Group g's tiles start at m-tile ``ceil(P_g / tile_m)`` where ``P_g = offsets[g-1] +
-    g * tile_m``: the padded row space gives every group a gap of one tile, so its real tiles
-    fit in its range of m-tiles and at most one slot per group is unused (``found`` is false
-    there). ``P_g`` is strictly increasing, so a binary search over the offsets finds the group
-    in ``log2(G)`` loads instead of a scan.
+    group: Int32
+    tile_lo: Int32
+    tile_hi: Int32
+    row_lo: Int32
+    row_hi: Int32
+
+
+@cute.jit
+def _seek(window: Window, mt: Int32, offsets: cute.Tensor, total_m: Int32, tile_m: int):
+    """The window of the group that owns m-tile ``mt``: ``window`` itself when it does, which
+    costs no load. Otherwise a walk over the groups' tile counts, ``ceil(size_g / tile_m)``,
+    from the group after ``window`` (from group 0 when ``mt`` lies before it), ``LOOKAHEAD``
+    groups per round trip: their offsets are independent loads. Past the last group's tiles the
+    window is empty and runs to the end of the space.
+
+    Group ends are clamped to ``[0, total_m]`` and to the previous group's end, so offsets
+    outside ``A`` or out of order cannot address rows outside it (the routing they describe is
+    then wrong, not unsafe), and a walk from any window agrees with one from group 0.
     """
-    G = offsets.shape[0]
-    step = Int32(1)
-    while step < G:
-        step = step * 2
-    lo = Int32(0)  # invariant: group lo starts at or before mt
-    while step > 1:
-        step = step // 2
-        cand = lo + step
-        fits = (cand < G) & (offsets[cutlass.min(cand, G) - 1] <= (mt - cand) * tile_m)
-        lo = cutlass.select_(fits, cand, lo)
-    start_row = cutlass.select_(lo > 0, offsets[cutlass.max(lo, 1) - 1], Int32(0))
-    start_row = cutlass.min(cutlass.max(start_row, 0), total_m)
-    first_tile = (start_row + lo * tile_m + tile_m - 1) // tile_m
-    row0 = start_row + (mt - first_tile) * tile_m
-    end = cutlass.min(offsets[lo], total_m)
-    return row0 < end, lo, row0, cutlass.min(end - row0, tile_m)
+    if (mt < window.tile_lo) | (mt >= window.tile_hi):
+        G = offsets.shape[0]
+        back = mt < window.tile_lo
+        # Group g is the next to visit; it starts at m-tile `tile` and row `row`.
+        g = cutlass.select_(back, Int32(0), window.group + 1)
+        tile = cutlass.select_(back, Int32(0), window.tile_hi)
+        row = cutlass.select_(back, Int32(0), window.row_hi)
+        found = cutlass.Boolean(False)
+        while ~found & (g < G):
+            for j in cutlass.range_constexpr(LOOKAHEAD):
+                end = cutlass.min(cutlass.max(offsets[cutlass.min(g + j, G - 1)], row), total_m)
+                next_tile = tile + (end - row + tile_m - 1) // tile_m
+                owns = (g + j < G) & (tile <= mt) & (mt < next_tile)
+                window = Window(
+                    *(
+                        cutlass.select_(owns, new, old)
+                        for new, old in zip(
+                            (g + j, tile, next_tile, row, end), window, strict=True
+                        )
+                    )
+                )
+                found = found | owns
+                tile, row = next_tile, end
+            g = g + LOOKAHEAD
+        if ~found:
+            window = Window(G - 1, tile, Int32(INT32_MAX), row, row)
+    return window
 
 
 @dataclass(frozen=True)
 class GroupedTiles(WorkMap):
     """``(group, row0, rows, n_tile)`` items of a grouped GEMM, decoded on the device.
 
-    The space is ``(offsets, total_m, n_tiles)``. The host cannot count the groups' m-tiles
-    (``sum(ceil(size_g / tile_m))``), so the index space covers ``ceil(total_m / tile_m) + G``
-    m-tiles, an upper bound; the unused slot of a group (see ``_locate_tile``) is dropped. n is
-    the fast axis: consecutive items share a tile's rows of A.
+    The space is ``(offsets, total_m, n_tiles)``, with ``G >= 1`` groups. The m-tiles of the
+    groups are numbered back to back, but the host cannot count them (``sum(ceil(size_g /
+    tile_m))``), so the index space covers ``ceil(total_m / tile_m) + G`` m-tiles, an upper
+    bound, and the indices past the last group's tiles are dropped. n is the fast axis:
+    consecutive items share a tile's rows of A.
+
+    Finding an m-tile's group takes a prefix sum of the groups' tile counts, which the decode
+    state carries: the last group's ``Window`` (5 Int32 per decoding warp). A unit's indices
+    increase under static and atomic persistence (and in practice under CLC), so the walk
+    resumes where the previous item left it, usually in that group or a few groups on.
+    Indices that go backwards restart it from group 0, so the first decode of a site, and any
+    decode from ``start``, walks ``G / LOOKAHEAD`` round trips. Without the state every
+    decode would walk from group 0; the padded alternative (one unused slot per group, found
+    by a stateless binary search) scatters dropped items through the sequence, which
+    unbalanced static persistence by 10-27%.
     """
 
     tile_m: int = CTA_TILE_M
@@ -125,16 +160,23 @@ class GroupedTiles(WorkMap):
         m_tiles = (Int64(total_m) + self.tile_m - 1) // self.tile_m + offsets.shape[0]
         return m_tiles * Int64(n_tiles)
 
+    def start(self, space):
+        # Group -1's empty window: the first seek searches from group 0.
+        return Window(Int32(-1), Int32(0), Int32(0), Int32(0), Int32(0))
+
     def decode(self, index, space, state):
         offsets, total_m, n_tiles = space
-        found, group, row0, rows = _locate_tile(index // n_tiles, offsets, total_m, self.tile_m)
-        return found, (group, row0, rows, index % n_tiles), state
+        mt = index // n_tiles
+        w = _seek(state, mt, offsets, total_m, self.tile_m)
+        row0 = w.row_lo + (mt - w.tile_lo) * self.tile_m
+        rows = cutlass.min(w.row_hi - row0, self.tile_m)
+        return row0 < w.row_hi, (w.group, row0, rows, index % n_tiles), w
 
     def get_key(self) -> str:
         return f"grouped{self.tile_m}"
 
     def describe(self) -> str:
-        return f"GroupedTiles(tile_m={self.tile_m})"
+        return f"GroupedTiles(tile_m={self.tile_m}, state=Window: 5 x Int32)"
 
 
 @dataclass(frozen=True)
@@ -211,12 +253,11 @@ class GroupedGemm(WarpSpecialized):
         self.ab = Ring(ab_stages, Tma(stage_bytes), Umma, buffer={"A": a, "B": b})
         self.acc = Ring(acc_stages, Umma, Threads)
         self.tmem_plan = TmemPlan().region("acc", cta_tile[1], acc_stages)
-        # Decoding an item reads the offsets (a binary search, ~log2(G) dependent loads). A
-        # broadcast schedule does that once per item in the scheduler warp, ahead of the roles;
-        # a local one (StaticPersistent, OneShot) repeats it in every role between tiles,
-        # which measured ~30% slower at G=128, K=2048.
+        # Every tile costs the same and the decode numbers the real tiles back to back, so a
+        # static schedule balances as well as a claimed one, without a scheduler warp or
+        # workspace. Atomic and CLC measured the same.
         self.work = WorkStream(
-            mapping=GroupedTiles(tile_m=self.mma_tile[0]), schedule=schedule or AtomicPersistent()
+            mapping=GroupedTiles(tile_m=self.mma_tile[0]), schedule=schedule or StaticPersistent()
         )
         self.trace_protocol = trace
 
@@ -592,7 +633,7 @@ def grouped_gemm(
     """``out[s_g:e_g] = a[s_g:e_g] @ b[g].T`` for row-major bf16 ``a: (total_M, K)``,
     ``b: (G, N, K)`` and int32 ``offsets: (G,)`` of group end rows (``e_g = offsets[g]``,
     ``s_0 = 0``). Rows past ``offsets[-1]`` are left as they are. ``schedule`` defaults to
-    ``AtomicPersistent()``; ``max_ctas`` caps the persistent grid; ``config``:
+    ``StaticPersistent()``; ``max_ctas`` caps the persistent grid; ``config``:
     ``GroupedGemm``'s other keyword options (``tile_n``, ``ab_stages``, ``acc_stages``,
     ``c_stages``, ``epi_tile_n``, ``roles``)."""
     out = check_grouped_gemm_args(a, b, offsets, out)
