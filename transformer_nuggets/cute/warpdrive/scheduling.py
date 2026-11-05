@@ -652,16 +652,9 @@ class WorkStream:
                 "begin_roles()"
             )
         problem = problems[self.name]
-        if self.ready is not None:
-            self.ready.wait()
-        index = Int32(self.schedule.first_index(problem))
-        if self.mapping.skips:
-            index, words = _skip_local(self, index, problem)
-        elif _tile_grid(self):
-            words = problem.first_words
-        else:
-            words = _decode(self, index, problem)
-        return index < problem.total, self.mapping.unpack(list(words))
+        first = Int32(self.schedule.first_index(problem))
+        index, words = _local_start(self, first, problem)
+        return index < problem.total, self.mapping.unpack(words)
 
     # ---- host, plain Python ------------------------------------------------ #
 
@@ -882,6 +875,25 @@ def _skip_local(stream, index, problem):
     return index, list(words)
 
 
+def _local_item(stream, index, problem):
+    """``(index, words)`` of the first kept item at or after ``index`` in this unit's local
+    sequence: ``index`` itself unless the mapping skips."""
+    if stream.mapping.skips:
+        return _skip_local(stream, index, problem)
+    return index, _decode(stream, index, problem)
+
+
+def _local_start(stream, first, problem):
+    """``(index, words)`` a local-mode role starts with, from the unit's first index: the
+    readiness hook runs first, and a tile-grid stream takes the prologue's words. The cursor and
+    ``single_item`` share it, so a raw role sees what a managed role would (R20)."""
+    if stream.ready is not None:
+        stream.ready.wait()
+    if _tile_grid(stream):
+        return first, list(problem.first_words)
+    return _local_item(stream, first, problem)
+
+
 @cute.jit
 def _record(workspace, slot, index, total, count, cap: int):
     role, warp = slot
@@ -1036,9 +1048,9 @@ class WorkCursor:
 
     @staticmethod
     def create(stream, problem, end, trace, *, scheduler: bool = False, slot=None):
-        """Local mode: run the hooks and decode here. Broadcast mode: start at ``first_index``
-        decoded locally, or, when hooks may move the first item, receive it from the scheduler
-        (which publishes it in ``scheduler_role``)."""
+        """Local mode (``end`` is None): run the hooks and decode here. Broadcast mode: start at
+        ``first_index`` decoded locally, or, when hooks may move the first item, receive it from
+        the scheduler (which publishes it in ``scheduler_role``)."""
         rec = _CursorRecord(trace.role_name, stream.name or "work", trace=trace)
         trace.checks.append(rec.check)
         count = Int32(0) if stream.record else None
@@ -1046,25 +1058,16 @@ class WorkCursor:
         first = Int32(stream.schedule.first_index(problem))
         cur = WorkCursor(stream, problem, end, first, [], rec, count, slot, iket)
         if end is None:
-            if stream.ready is not None:
-                stream.ready.wait()
-            if stream.mapping.skips:
-                cur.index, cur._words = _skip_local(stream, cur.index, problem)
-                cur._first_item()
-                return cur
-        elif _hooked(stream):
-            if scheduler:
-                # scheduler_role runs the hooks, then publishes and receives the first item
-                # (and opens its range through _first_item()).
-                cur._words = [Int32(0)] * stream.mapping.words
-                return cur
-            cur._receive()
-            cur._first_item()
+            cur.index, cur._words = _local_start(stream, first, problem)
+        elif not _hooked(stream):
+            cur._words = _decode(stream, first, problem)
+        elif scheduler:
+            # scheduler_role runs the hooks, then publishes and receives the first item
+            # (and opens its range through _first_item()).
+            cur._words = [Int32(0)] * stream.mapping.words
             return cur
-        if end is None and _tile_grid(stream):
-            cur._words = list(problem.first_words)
         else:
-            cur._words = _decode(stream, cur.index, problem)
+            cur._receive()
         cur._first_item()
         return cur
 
@@ -1144,11 +1147,9 @@ class WorkCursor:
         stream, problem = self._stream, self._problem
         if self._end is None:
             self.index = Int32(stream.schedule.next_index(self.index, problem))
-            # OneShot: the stream has ended; keep the words (nothing past the end is decoded).
-            if stream.schedule.persistent and stream.mapping.skips:
-                self.index, self._words = _skip_local(stream, self.index, problem)
-            elif stream.schedule.persistent:
-                self._words = _decode(stream, self.index, problem)
+            # A non-persistent stream has ended: keep the words, nothing past the end is decoded.
+            if stream.schedule.persistent:
+                self.index, self._words = _local_item(stream, self.index, problem)
         else:
             self._receive()
         self._log()
@@ -1233,6 +1234,9 @@ def scheduler_role(kernel, ring, cursor: WorkCursor, fetch: _Fetch):
     stream = cursor._stream
     problem = cursor._problem
     mapping = stream.mapping
+    # The claim-skip loop below appears twice on purpose: moving it into a helper that returns
+    # ``fetch`` makes ``fetch`` a written loop-carried value of the work loop instead of an
+    # invoked one, which reorders its block arguments and changes register allocation.
     if cutlass.const_expr(_hooked(stream)):
         # Hooks may move the first item off blockIdx.x, so publish it like a claim.
         if cutlass.const_expr(stream.ready is not None):
