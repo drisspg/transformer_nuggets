@@ -2,6 +2,9 @@
 inputs, dQ to the TMA reduce-add order, all three against an fp32 reference, and the wrapper's
 input contract. Small shapes; the benchmark covers the large ones."""
 
+import re
+import warnings
+
 import pytest
 import torch
 
@@ -116,6 +119,26 @@ def test_describe_shows_the_derived_protocol():
     assert op.s.scope.empty_counts == {0: [8]} and op.dq.scope.empty_counts == {0: [4]}
     causal = FlashAttentionBackward(causal=True).describe()
     assert "0-3    reduce      136" in causal and "4-11   compute     144" in causal
+
+
+def test_traced_diagnostics_are_quiet():
+    """The port compiles without warpdrive diagnostic warnings: the LSE/dPsum bulk copies are
+    verified, and the TMEM alias pairs the MMA's peeled last tile leaves unmatched are
+    reported as unknown epoch correspondence (unverified), not as potential hazards."""
+    op = FlashAttentionBackward()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        compile_fa4_bwd(op)
+    assert [str(w.message) for w in caught if "warpdrive" in str(w.message)] == []
+    text = op.describe()
+    for channel in ("lse", "dpsum"):
+        assert op._ws_tma[channel].status().startswith("verified cp.async.bulk, 512 B/stage")
+    alias = text[text.index("Alias diagnostic") :]
+    assert "potential hazard" not in alias.split("\n", 1)[1]
+    for pair in ("P ~ S", "dS ~ dP", "dQ ~ dP", "dQ ~ dS"):
+        assert re.search(rf"\n  {re.escape(pair)} \(tmem\)  unverified\n", alias), alias
+    assert "unknown epoch correspondence" in alias
+    assert "[tmem_store]" not in alias  # the ds commit now declares both fences
 
 
 def test_rejects_unsupported_inputs(requires_blackwell):

@@ -10,9 +10,11 @@ close signals. Other pairs use a happens-before graph with epoch-matched channel
 loops unrolled twice and two persistent work items (one otherwise). ``RULES`` carries the
 PTX citations; raw ordering instructions are legal but invisible.
 
-Reports distinguish ``potential hazard`` (a conflicting pair with a missing edge),
-``unverified`` (an invisible access/edge or an unmodeled cluster) and ``no hazard found``
-(only among annotated accesses, not a proof). Default ``alias_check="warn"`` puts the report
+Reports distinguish ``potential hazard`` (a conflicting pair with an established missing
+edge), ``unverified`` (an invisible access/edge, an unmodeled cluster, or a channel whose
+epochs the trace does not match: unequal per-item counts from prologues or peeled iterations
+leave the correspondence unknown) and ``no hazard found`` (only among annotated accesses, not a
+proof). Default ``alias_check="warn"`` puts the report
 in ``describe()`` and warns once about findings; ``"strict"`` raises on potential hazards;
 ``"off"`` skips analysis. ``unchecked("alias", reason=...)`` excludes enclosed annotations.
 Annotations and wrappers add no device code. Usage and limits: ``docs/storage.md``.
@@ -110,6 +112,9 @@ THREAD_SIGNALS = ("Threads", "Warps")
 HAZARD = "potential hazard"
 RAW_ONLY = "only a raw signal (signal=False) would order them, and it is not visible"
 UNVERIFIED = "unverified"
+# Rule marker of a finding whose missing edge is an unknown epoch correspondence; ``_order``
+# reports it as a modeling gap (an unverified reason), not a finding.
+EPOCHS = "epochs"
 
 
 # --------------------------------------------------------------------------- #
@@ -591,7 +596,7 @@ def _unroll(role: RoleEvents, items: int) -> list[tuple[int, int]]:
     def emit(children, item):
         for c in children:
             if len(out) > UNROLL_LIMIT:
-                raise _TooLarge(role.name)
+                raise _TooLarge(f"role {role.name} unrolls past {UNROLL_LIMIT} events")
             if isinstance(c, int):
                 out.append((c, item))
             elif c[0] == role.item_key:
@@ -623,9 +628,15 @@ class _Graph:
         # The same edges from closes with signal=False: the user signals them, so a pair that
         # only they would order is unverified, not a potential hazard.
         self.raw_edges: dict = {}
+        # Candidate edges of channels whose epochs the trace does not match (unequal per-item
+        # counts): every close of one work item to every matching open of that item and the
+        # next, with the reason, minus those the established order contradicts. A pair ordered
+        # only through them is unverified (unknown correspondence), not a potential hazard.
+        self.guess_edges: dict = {}  # (role id, pos) -> [(role, pos, reason)]
         self.steps = 0  # search work, bounded by SEARCH_LIMIT
         self.cache: dict = {}  # (access, position, other agent) -> (reachable, failures, any)
         self._link(items)
+        self._prune_guesses()
 
     def _ops(self, role, want):
         """Per item: positions of ``want`` ("open" or "close" but retire) events per
@@ -663,18 +674,26 @@ class _Graph:
                     waits = opens[id(dst)].get((name, slot, not producer))
                     if not waits:
                         continue
+                    label = name if slot is None else f"{name}[{slot}]"
                     if producer:  # publication: commit k -> wait k of the same item
                         for item in span:
                             cs, ws = by_item.get(item, []), waits.get(item, [])
+                            if len(cs) != len(ws) and cs:
+                                # Unknown correspondence: the item's last wait follows every
+                                # commit the trace saw; any other pairing is a guess.
+                                why = _mismatch(
+                                    label, src, by_item, "commits", dst, waits, "waits"
+                                )
+                                self._guess(src, cs, dst, waits, item, why)
                             if not ws:
                                 continue
                             for k, c in enumerate(cs):
                                 w = ws[k] if len(cs) == len(ws) else ws[-1]
                                 self._edge(src, c, dst, w)
                     else:
-                        self._reuse(src, by_item, dst, waits, chan, span)
+                        self._reuse(src, by_item, dst, waits, chan, label, span)
 
-    def _reuse(self, src, releases, dst, acquires, chan, span):
+    def _reuse(self, src, releases, dst, acquires, chan, label, span):
         """release of epoch e -> acquire of epoch e + stages (one stage per Slots slot)."""
         equal = all(len(releases.get(i, [])) == len(acquires.get(i, [])) for i in span)
         flat_r = [p for i in span for p in releases.get(i, [])]
@@ -689,11 +708,15 @@ class _Graph:
             distance = 1 if chan.fixed else chan.n
             for release, acquire in zip(flat_r, flat_a[distance:]):
                 self._edge(src, release, dst, acquire)
-        elif chan.fixed:  # unmatched counts: the next item's first acquire follows them all
-            for i in span:
-                nxt = acquires.get(i + 1, [])
-                for r in releases.get(i, []) if nxt else []:
-                    self._edge(src, r, dst, nxt[0])
+            return
+        # Unknown correspondence (prologues, peeled iterations): guesses, plus for Slots the
+        # one edge that holds regardless: the next item's first acquire follows every release.
+        why = _mismatch(label, src, releases, "releases", dst, acquires, "acquires")
+        for i in span:
+            self._guess(src, releases.get(i, []), dst, acquires, i, why)
+            nxt = acquires.get(i + 1, [])
+            for r in releases.get(i, []) if chan.fixed and nxt else []:
+                self._edge(src, r, dst, nxt[0])
 
     def _events(self, role, positions):
         return [self.seq[id(role)][p][0] for p in positions]
@@ -702,6 +725,47 @@ class _Graph:
         close = src.events[self.seq[id(src)][p][0]]
         edges = self.edges if close.data["signal"] else self.raw_edges
         edges.setdefault((id(src), p), []).append((dst, q))
+
+    def _guess(self, src, closes, dst, opens, item, why):
+        """Every close of ``item`` may precede any matching open of that item or the next."""
+        targets = opens.get(item, []) + opens.get(item + 1, [])
+        for p in closes:
+            self.guess_edges.setdefault((id(src), p), []).extend((dst, q, why) for q in targets)
+
+    def _prune_guesses(self):
+        """Drop guesses the established order contradicts: an open that already precedes the
+        close (program order, established and raw edges) cannot be its match."""
+        after: dict = {}  # (role id, pos) -> what the established order puts after it
+        for key, guesses in list(self.guess_edges.items()):
+            kept = []
+            for dst, q, why in guesses:
+                if (id(dst), q) not in after:
+                    after[id(dst), q] = self._forward(id(dst), q)
+                if key not in after[id(dst), q]:
+                    kept.append((dst, q, why))
+            if kept:
+                self.guess_edges[key] = kept
+            else:
+                del self.guess_edges[key]
+
+    def _forward(self, rid, p) -> set:
+        """Every instance ``(role id, position)`` the established order puts after one."""
+        seen, todo = {(rid, p)}, deque([(rid, p)])
+        while todo:
+            self.steps += 1
+            if self.steps > SEARCH_LIMIT:
+                raise _TooLarge(f"the ordering search passed {SEARCH_LIMIT} steps")
+            rid, p = todo.popleft()
+            nxt = [(rid, p + 1)] if p + 1 < len(self.seq[rid]) else []
+            nxt += [
+                (id(dst), q)
+                for dst, q in self.edges.get((rid, p), []) + self.raw_edges.get((rid, p), [])
+            ]
+            for state in nxt:
+                if state not in seen:
+                    seen.add(state)
+                    todo.append(state)
+        return seen
 
     def reachable(self, a: Access, pos_a: int, check, raw: bool = False) -> set:
         """``(role id, position)`` of every instance a path from ``a``'s instance reaches after
@@ -730,6 +794,73 @@ class _Graph:
                     todo.append(state)
         return {(rid, p) for rid, p, left in seen if left}
 
+    def guessed(self, a: Access, pos_a: int):
+        """``reasons(target)``: the guesses a path from ``a``'s instance takes to reach
+        ``target`` when closes with ``signal=False`` count as signals, completion is ignored
+        and the guess edges are taken; None when no such path exists. Where it exists, a
+        missing edge may be an unknown epoch correspondence rather than an established gap.
+        A path back into ``a``'s role at or before ``a`` would be a cycle (guesses that
+        contradict each other), so those states are never entered."""
+        start = (id(a.role), pos_a, False)
+        parent: dict = {start: None}
+        todo = deque([start])
+        while todo:
+            self.steps += 1
+            if self.steps > SEARCH_LIMIT:
+                raise _TooLarge(f"the ordering search passed {SEARCH_LIMIT} steps")
+            rid, p, left = todo.popleft()
+            nxt = []
+            if p + 1 < len(self.seq[rid]):
+                nxt.append(((rid, p + 1, left), None))
+            for dst, q in self.edges.get((rid, p), []) + self.raw_edges.get((rid, p), []):
+                nxt.append(((id(dst), q, True), None))
+            for dst, q, why in self.guess_edges.get((rid, p), []):
+                nxt.append(((id(dst), q, True), why))
+            for state, why in nxt:
+                if state[0] == start[0] and state[1] <= pos_a:
+                    continue
+                if state not in parent:
+                    parent[state] = ((rid, p, left), why)
+                    todo.append(state)
+
+        def reasons(target):
+            state = (*target, True)
+            if state not in parent:
+                return None
+            used = []
+            while parent[state] is not None:
+                state, why = parent[state]
+                if why is not None:
+                    used.append(why)
+            return tuple(dict.fromkeys(reversed(used)))
+
+        return reasons
+
+
+def _mismatch(label, src, src_ops, src_what, dst, dst_ops, dst_what) -> str:
+    """Why a channel's epochs are not matched: the two roles' per-item counts."""
+
+    def counts(ops):
+        return "/".join(str(len(ops.get(i, []))) for i in sorted(src_ops.keys() | dst_ops.keys()))
+
+    return (
+        f"{label}: {src.name} {src_what} {counts(src_ops)} vs {dst.name} {dst_what} "
+        f"{counts(dst_ops)} per traced work item"
+    )
+
+
+def _soft(finding: Finding) -> bool:
+    """A failure that is a visibility or modeling gap, not an established missing edge."""
+    return RAW_ONLY in finding.text or finding.rule == EPOCHS
+
+
+def _prefer(first: Finding | None, found: Finding) -> Finding:
+    """The unverified finding to keep across instance pairs: the first one, unless it is only
+    an unknown epoch correspondence and ``found`` names something more concrete."""
+    if first is None or (first.rule == EPOCHS and found.rule != EPOCHS):
+        return found
+    return first
+
 
 def _cross_channel(graph: _Graph, a: Access, b: Access) -> Finding | None:
     """Every instance pair of ``a`` and ``b`` in the unrolled window must be ordered one way.
@@ -742,8 +873,13 @@ def _cross_channel(graph: _Graph, a: Access, b: Access) -> Finding | None:
                 ordered, failures = _graph_order(graph, x, px, y, py)
                 if ordered:
                     break
-                # A direction only a raw signal might order makes the pair unverified at worst.
-                if failures and (found is None or RAW_ONLY in failures[0].text):
+                # A direction only a raw signal might order makes the pair unverified at worst;
+                # an unknown epoch correspondence yields to any other failure.
+                if failures and (
+                    found is None
+                    or (RAW_ONLY in failures[0].text and found.rule != EPOCHS)
+                    or (found.rule == EPOCHS and failures[0].rule != EPOCHS)
+                ):
                     found = failures[0]
             else:
                 items = (graph.seq[id(a.role)][pa][1], graph.seq[id(b.role)][pb][1])
@@ -760,7 +896,7 @@ def _cross_channel(graph: _Graph, a: Access, b: Access) -> Finding | None:
                 )
                 if found.severity == HAZARD:
                     return found
-                first = first or found
+                first = _prefer(first, found)
     return first
 
 
@@ -782,11 +918,11 @@ def _unclosed(graph: _Graph, a: Access, b: Access) -> Finding | None:
     return None
 
 
-def _reach(graph: _Graph, x: Access, px: int, other: str) -> tuple[set, list, set, set]:
+def _reach(graph: _Graph, x: Access, px: int, other: str) -> tuple:
     """What a path from instance ``px`` of ``x`` orders it before (for a conflicting ``other``
     agent), the completion failures of the signals it could not use, what it would reach
-    ignoring completion, and what it reaches when closes with ``signal=False`` count as
-    signals. Cached per instance."""
+    ignoring completion, what it reaches when closes with ``signal=False`` count as signals,
+    and the guesses it would need beyond that (``_Graph.guessed``). Cached per instance."""
     key = (id(x), px, other)
     if key not in graph.cache:
         seq = [e for e, _ in graph.seq[id(x.role)]]
@@ -807,14 +943,22 @@ def _reach(graph: _Graph, x: Access, px: int, other: str) -> tuple[set, list, se
         ordered = graph.reachable(x, px, check)
         anyway = graph.reachable(x, px, lambda pos_e: True) if failures else ordered
         raw = graph.reachable(x, px, raw_or_check, raw=True) if graph.raw_edges else ordered
-        graph.cache[key] = (ordered, failures, anyway, raw)
+        search: list = []  # the guess search, run on the first target not reached otherwise
+
+        def guessed(target):
+            if not search:
+                search.append(graph.guessed(x, px) if graph.guess_edges else lambda t: None)
+            return search[0](target)
+
+        graph.cache[key] = (ordered, failures, anyway, raw, guessed)
     return graph.cache[key]
 
 
 def _graph_order(graph: _Graph, x: Access, px: int, y: Access, py: int) -> tuple[bool, list]:
     """Does a path order instance ``px`` of ``x`` before ``py`` of ``y``? Also the completion
-    failures of the signals that would have ordered it, or the raw signal that might."""
-    ordered, failures, anyway, raw = _reach(graph, x, px, y.agent)
+    failures of the signals that would have ordered it, the raw signal that might, or the
+    epoch guesses a path would need."""
+    ordered, failures, anyway, raw, guessed = _reach(graph, x, px, y.agent)
     target = (id(y.role), py)
     if target in ordered:
         return True, []
@@ -826,7 +970,25 @@ def _graph_order(graph: _Graph, x: Access, px: int, y: Access, py: int) -> tuple
                 "channel",
             )
         ]
-    return False, failures if target in anyway else []
+    if target in anyway:
+        return False, failures
+    reasons = guessed(target)
+    if reasons is None:
+        return False, []
+    if not reasons:  # a raw edge plus a failed completion: no guess involved
+        return False, failures or [
+            Finding(UNVERIFIED, f"{x.describe()} before {y.describe()}: {RAW_ONLY}", "channel")
+        ]
+    return False, [
+        Finding(
+            UNVERIFIED,
+            f"{x.describe()} before {y.describe()}: ordered only through channel epochs the "
+            f"trace does not match ({'; '.join(reasons)}): unknown epoch correspondence "
+            "(prologues or peeled iterations change the traced counts), not an established "
+            "missing edge",
+            EPOCHS,
+        )
+    ]
 
 
 def _same_role(graph: _Graph, a: Access, b: Access, warp_pairs) -> Finding | None:
@@ -845,13 +1007,13 @@ def _same_role(graph: _Graph, a: Access, b: Access, warp_pairs) -> Finding | Non
                 continue
             ordered, failures = _graph_order(graph, x, px, y, py)
             if not ordered:
-                raw = failures and RAW_ONLY in failures[0].text
-                found = failures[0] if failures and (found.severity != HAZARD or raw) else found
+                soft = failures and _soft(failures[0])
+                found = failures[0] if failures and (found.severity != HAZARD or soft) else found
                 if found.severity == HAZARD:
                     found = _unclosed(graph, a, b) or found
                 if found.severity == HAZARD:
                     return found
-                first = first or found
+                first = _prefer(first, found)
     return first
 
 
@@ -905,7 +1067,7 @@ def check(kernel, roles: list[RoleEvents]) -> AliasReport:
         try:
             return _Graph([r for r in roles if not r.raw], items)
         except _TooLarge as exc:
-            return f"role {exc} unrolls past {UNROLL_LIMIT} events; not modeled"
+            return f"{exc}; not modeled"
 
     for kind, (x, y) in pairs:
         res = AliasResult((x, y), kind)
@@ -978,11 +1140,16 @@ def _order(a: Access, b: Access, warp_pairs, get_graph) -> Finding | str | None:
     if isinstance(graph, str):
         return graph
     try:
-        if a.role is b.role:
-            return _same_role(graph, a, b, warp_pairs)
-        return _cross_channel(graph, a, b)
+        found = (
+            _same_role(graph, a, b, warp_pairs)
+            if a.role is b.role
+            else _cross_channel(graph, a, b)
+        )
     except _TooLarge as exc:
         return f"{a.describe()} and {b.describe()}: {exc}; not modeled"
+    if found is not None and found.rule == EPOCHS:
+        return found.text  # a modeling gap, like an unmodeled cluster: not a finding
+    return found
 
 
 def report(rep: AliasReport, mode: str, kernel_name: str):

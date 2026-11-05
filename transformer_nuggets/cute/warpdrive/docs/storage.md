@@ -191,10 +191,11 @@ and never closed might order, is reported `unverified`.
 
 `describe()` reports each declared alias as one of:
 
-- `potential hazard`: conflicting annotated accesses with a missing ordering edge. The report
-  names the accesses, source lines and rule involved.
-- `unverified`: insufficient modeled information, such as an unannotated access, raw ordering
-  or a cluster. Phase 1 only models single-CTA kernels.
+- `potential hazard`: conflicting annotated accesses with an established missing ordering
+  edge. The report names the accesses, source lines and rule involved.
+- `unverified`: insufficient modeled information, such as an unannotated access, raw ordering,
+  a cluster, or a channel whose epochs the trace does not match (below). Phase 1 only models
+  single-CTA kernels.
 - `no hazard found`: none found among the annotated conflicting pairs, not a proof of safety.
 
 Warn mode emits a warning for findings and leaves the report in `describe()`. Some unverified
@@ -208,12 +209,22 @@ all memory accesses or prove cross-role convergence. `h.data`, `tmem.ptr`, `tmem
 A deeper ring orders epoch e before e + n, not the next epoch. Its stage handoff only orders
 storage indexed by that ring's own stage, with static, disjoint stage spans. Ring-stage SMEM
 shared by different channels is unverified. Consumers of one fan-out epoch, and producers of
-one fan-in epoch, are not ordered with respect to each other. Round-robin channels add no
-ordering edges to the model, so accesses ordered only through them can be reported as hazards.
+one fan-in epoch, are not ordered with respect to each other. Round-robin channels, and ring
+reuse whose ops sit in a loop inside the work item, add no ordering edges to the model, so
+accesses ordered only through them can be reported as hazards.
 
-The model assumes balanced per-item counts and matching epochs across roles. When traced
-counts differ, an item's commits link only to the consumer's last wait for that item.
-It assumes loops run at least twice, TMEM loads finish before the next signal, and tcgen05
+The model matches epochs across roles by traced per-item counts. When two roles' counts on a
+channel differ (a prologue, a peeled last tile or a differently shaped loop on one side), the
+correspondence is unknown: an item's commits still link to the consumer's last wait for that
+item and a Slots release to the next item's first acquire, and every other pairing within the
+item and the next is a guess. A pair ordered only through such guesses is reported
+`unverified` with the channel and both counts ("unknown epoch correspondence"), in the report
+but without a warning; a pair no correspondence could order stays a `potential hazard`. The
+guesses over-approximate: a real hazard whose roles also exchange an unbalanced channel can be
+reported unverified rather than as a hazard, so treat those entries as unchecked and balance
+the traced counts (or check the pair by hand) when the overlap matters. The diagnostic does
+not pick loop counts to balance channels itself: that could hide a missing publication or
+release. It assumes loops run at least twice, TMEM loads finish before the next signal, and tcgen05
 thread-sync fences surround recorded barriers and channel signals. SMEM accesses in one role
 are treated as one thread set; there is no cross-warp SMEM check. Annotations are trusted to
 cover the role's uses of each region it annotates.

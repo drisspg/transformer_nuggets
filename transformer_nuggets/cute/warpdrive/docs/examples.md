@@ -413,16 +413,17 @@ Dropped down, each documented at its site:
   IDs 3-6, the hand-picked IDs they replaced) and `bulk_commit_group`/`bulk_wait_group`, as in
   the persistent GEMM epilogue.
 
-Diagnostics that stay noisy:
+Diagnostics that stay incomplete:
 
-- The alias diagnostic reports potential hazards on P~S, dS~dP, dQ~dP and dQ~dS that the
-  channel round trips do order. Its graph matches epochs only when the traced per-item counts
-  agree; the MMA role peels its last tile, so its s/dp/dq counts (prologue, two unrolled
-  iterations and the peeled tile) differ from the compute and reduce roles' (two iterations), and ring channels with unequal
-  counts get no reuse edges. Proposal: unroll each role's loops to counts that balance every
-  channel (here three compute iterations for two MMA iterations plus the peeled tile), or
-  accept per-loop trip-count offsets from the author. The compute role's TMEM accesses declare
-  their exact columns, so its cross-warpgroup ordering is checked.
+- The alias diagnostic reports P~S, dS~dP, dQ~dP and dQ~dS as `unverified` (unknown epoch
+  correspondence), not as potential hazards: the channel round trips do order them, but the
+  graph matches epochs only when the traced per-item counts agree, and the MMA role peels its
+  last tile, so its s/dp/dq/ds counts (two unrolled iterations and the peeled tile) differ from
+  the compute and reduce roles' (two iterations). The report names the channels and counts;
+  no warning is emitted. Matching those epochs needs loop bounds and peeled iterations in the
+  model (not loop counts chosen to balance the channels, which could hide a missing
+  publication or release). The compute role's TMEM accesses declare their exact columns, so its
+  cross-warpgroup ordering is checked.
 
 ### Size
 

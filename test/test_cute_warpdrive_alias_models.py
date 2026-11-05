@@ -210,6 +210,78 @@ def test_loop_carried_same_role_pair_is_checked():
 
 
 # --------------------------------------------------------------------------- #
+# Unknown epoch correspondence: the MMA peels its last tile out of the loop (as FA4 backward
+# does), so its traced per-item channel counts (two unrolled iterations plus one) differ from
+# the softmax's (two). The round trip through ``s`` orders the loop-carried S write -> P read
+# pair in reality, but the trace cannot match the epochs: unverified, not a potential hazard.
+# A pair no epoch correspondence could order (S written before P is read in one handle) stays
+# a potential hazard.
+# --------------------------------------------------------------------------- #
+
+
+class PeeledRoundTrip(Model):
+    def __init__(self, peel: bool, swap: bool = False):
+        self.peel, self.swap = peel, swap
+        self.s = Slots(1, Umma, Threads, release_fence="tmem_store")
+        self.tmem_plan = TmemPlan().region("S", 128).alias("P", of="S", offset=64, cols=64)
+
+    @cute.jit
+    def tile(self, s, tmem):
+        with s.produce(0):
+            if cutlass.const_expr(self.swap):
+                tmem.access("S", write=True, by="umma")  # QK overwrites P before PV reads it
+                tmem.access("P", read=True, by="umma")
+            else:
+                tmem.access("P", read=True, by="umma")  # PV of the previous tile
+                tmem.access("S", write=True, by="umma")  # QK of this tile
+        return s
+
+    @role(warps=0)
+    @cute.jit
+    def mma(self, ctx, *, s: Producer, tmem: Tmem):
+        for _ in cutlass.range(ctx.n - 1 if self.peel else ctx.n, unroll=1):
+            s = self.tile(s, tmem)
+        if cutlass.const_expr(self.peel):
+            s = self.tile(s, tmem)
+        return s
+
+    @role(warps=1)
+    @cute.jit
+    def softmax(self, ctx, *, s: Consumer, tmem: Tmem):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            with s.consume(0):
+                tmem.access("S", read=True)
+                tmem.access("P", write=True)
+        return s
+
+
+@pytest.mark.parametrize(
+    "peel, swap, expected",
+    [
+        (False, False, "no hazard found"),
+        (True, False, "unverified"),
+        (True, True, "potential hazard"),
+    ],
+    ids=["balanced", "peeled", "peeled_real_hazard"],
+)
+def test_unknown_epoch_correspondence_is_unverified_not_a_hazard(peel, swap, expected):
+    op = PeeledRoundTrip(peel, swap)
+    _, alias = compile_quietly(op, f"peeled_{int(peel)}{int(swap)}")
+    text = alias_section(op)
+    assert status(op, "P ~ S") == expected, text
+    if expected == "unverified":
+        assert alias == []  # a modeling gap, not a finding
+        assert re.search(
+            r"unverified: mma write S\[0\] by umma @ .* before mma read P\[0\] by umma @ .*: "
+            r"ordered only through channel epochs the trace does not match \(s\[0\]: mma "
+            r"commits 3 vs softmax waits 2 per traced work item.*unknown epoch correspondence",
+            text,
+        ), text
+    elif expected == "potential hazard":
+        assert len(alias) == 1 and "not a pipelined pair" in text
+
+
+# --------------------------------------------------------------------------- #
 # A TMA load is published only by its own handle's transaction count: a reader that waits on
 # another TMA channel the loader fills is not ordered after it.
 # --------------------------------------------------------------------------- #
@@ -396,7 +468,9 @@ def test_commit_fences_are_emitted_in_declaration_order(monkeypatch, fences, sig
             return ds
 
     tag = ("_".join(fences) if isinstance(fences, tuple) else fences) + f"_{int(signal)}"
-    compile_toy.__wrapped__(Op(fences), f"fence_order_{tag}")  # traced, not a cached artifact
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # the single-fence and raw variants are unverified
+        compile_toy.__wrapped__(Op(fences), f"fence_order_{tag}")  # traced, not cached
     expected = list(fences if isinstance(fences, tuple) else (fences,)) if signal else []
     assert emitted == expected
 
