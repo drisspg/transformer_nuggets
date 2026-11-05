@@ -643,6 +643,134 @@ CUPTI tick (-31 ns) and 1x32768 by +31 ns; computing the split range in the kern
 added nothing on top. Before the allocator change, both had been worth about 2%. Try-wait-
 first channel waits, patched in for every wait of the port, changed nothing.
 
+### Per-instruction attribution of the ragged gap
+
+The remaining `8x65536`, `8/1` ragged gap is mostly the K/V stage-ownership and forward-progress
+protocol, not barrier initialization or correction arithmetic. A scratch port using FA4's shared
+K/V ring and two skipping MMA cursors closes most of it. It is not the example's default: the
+same change regresses other shapes, and currently needs raw synchronization.
+
+Matched November 4, 2026 captures used GB300, CuTeDSL 4.8.0, PyTorch
+`2.15.0.dev20260922+cu132`, Triton 3.8.0, FA4 `00807a02`, and the port source SHA-256 prefix
+`2a592081cfa1db52`. The committed benchmark source prefix was `949e2f06ee0a44cd` (before the
+stateful-WorkMap migration; the seven standard configurations' normalized SASS stayed identical
+through that migration). NCU 2025.4.1 collected `SourceCounters`, `WarpStateStats`,
+`InstructionStats` and `LaunchStats`, with source import, kernel replay, no cache flushing and
+no clock locking. Both paths used the same inputs and FA4 split table.
+
+```bash
+gpu-run --timeout 1800 auto -- timeout --signal=TERM --kill-after=5s 900s \
+  env CUTE_DSL_LINEINFO=1 TRANSFORMER_NUGGETS_CUTE_CACHE_DIR=$PWD/agent_space/decode-cache \
+  ncu --profile-from-start off --replay-mode kernel --cache-control none --clock-control none \
+  --section SourceCounters --section WarpStateStats --section InstructionStats \
+  --section LaunchStats --warp-sampling-interval 0 --warp-sampling-max-passes 10 \
+  --import-source yes -k 'regex:attn_kernel|warpdrive_fa4_decode' -o agent_space/decode-source \
+  .venv/bin/python -m transformer_nuggets.cute.warpdrive.examples.bench_fa4_decode \
+  --profile --profile-reps 5 --shapes 3 --output agent_space/decode-profile.json
+ncu -i agent_space/decode-source.ncu-rep --page source --print-source sass --csv
+```
+
+`--profile-reps` alternates FA4/port and port/FA4 pairs after three seconds of warmup;
+`--output` records source hashes, split counts and launch order, not NCU timings. Read the
+report's effective sampling interval: requesting interval 0 did not always produce 32-cycle
+sampling. The ragged repeat used two aggregated passes and 128 or 256 cycles. The following
+means are normalized to 256-cycle, two-pass equivalent samples, not nanoseconds. Static PCs
+include out-of-line wait stubs assigned to the phase they return to. FA4 shares its softmax
+body between warpgroups; the port's counts combine its two copies.
+
+| Phase | static PCs FA4 / port | equivalent samples FA4 / port | dominant reason |
+|---|---:|---:|---|
+| Entry, mapping and role setup | 370 / 619 | 1830 / 1980 | memory dependencies, instruction fetch, barriers |
+| KV load | 586 / 435 | 806 / 914 | long scoreboard |
+| PV MMA, including its waits | 290 / 367 | 831 / 1260 | long scoreboard, barriers |
+| Softmax S wait | 10 / 10 | 5344 / 5494 | long scoreboard |
+| Softmax P acquire | 3 / 6 | 14 / 83 | long scoreboard |
+| Correction loop | 165 / 157 | 2720 / 2862 | barriers, long scoreboard |
+| Correction final O wait/load | 37 / 93 | 41 / 106 | long scoreboard |
+| Epilogue wait/store | 58 / 63 | 875 / 884 | FA4 named barrier; port mbarrier |
+
+The source view does not export every sampled PC: the repeat leaves 1381/1630 equivalent
+samples uncorrelated. The full phase accounting retains that residual. Source-instrumented
+instruction counts also differ from hardware counts collected in another pass. Neither is
+an additive model of kernel latency, and parked epilogue warps are not a new critical path.
+
+Native `enable_iket(waits=True)` captures, joined by logical CTA, warp and channel epoch, show
+the dependency behind the V stalls. All 76 kept CTAs have 16 blocks; both kernels' wait
+cardinalities match. In a warmed representative capture, the port's mid-loop loader V acquires
+sum to about 0.5 us per block, versus FA4's 0.16–0.19 us. The port's PV warp waits about
+0.7–0.9 us on V; FA4 waits about 0.45–0.59 us at QKIssued first, then roughly 0.16 us on V.
+Those waits partly relocate the same dependency, so their widths cannot be subtracted as
+extra work. The port's last V-ready observation is about 0.8 us later and its correction and
+O-store finishes about 0.9 us later, relative to each CTA's first warp entry.
+
+The stage-lifetime join explains the difference: a split V-ring acquisition often starts
+before the prior PV reader is ready. In the warmed capture this occurs for 22.5% of reused
+V stages, versus 4.3% in FA4, whose V loads mostly reuse K stages released by QK. The port's
+feedback path is PV -> V-stage reuse -> loader -> subsequent K/QK -> V/PV. FA4's shared
+capacity and QKIssued/PVIssued rendezvous change that path. The median V consumer-read-ready
+to empty-barrier reply interval is similar in both, about 0.2 us; this is not a different
+mbarrier implementation.
+
+IKET widths remain perturbed. Seven alternating warmed eager captures, excluding initial
+correctness launches, give minimal/native-waits kernel warp-lifetime envelopes of
+28.096/28.992 us for the port and 26.368/27.904 us for FA4 on the same GPU. These are separate
+from stabilized CUPTI graph timing. `plan_from_warpdrive` joins the seven role ranges, but its
+work-item-granular plan promotes the within-item stats/epilogue feedback to the next work
+item; its RecMII is not a per-block model of this OneShot decode. The raw per-warp wait
+timelines and explicit stage epochs supply the causal evidence instead.
+
+Two ablations rule out tempting alternatives. Moving the PDL wait and validity test before
+setup really reduces TMEM allocations from 256 to 76 and hardware warp instructions from
+2.403M to 2.117M, but changes CUPTI time by only -32 ns. Keeping the identical 76 partials
+while capping the allocated splits from 32 to 16 removes 128 dropped CTAs for -97 ns. A
+uniform-count control with no dropped CTAs still has a 5.1% port gap. Increasing K/V from
+7/5 to 8/4 regresses the ragged case by 2.1%; blocking on V before P/O changes nothing.
+
+The shared-ring prototype keeps the math and partials bitwise. It uses one TMA producer and
+two exclusive UMMA consumers: each cursor skips the other's epochs, with FA4's two-block
+K lookahead. The full/empty counts are one, not a join of both readers. A raw-done split-ring
+control isolates the three one-ID OneShot stats flags needed to free named-barrier IDs.
+The table is a single five-way isolated-decode comparison: nine rotating rounds of 200
+fixed-buffer graph replays after three seconds of warmup, CUPTI medians in microseconds.
+Shared ring depth equals the original K+V depth (12 for the 8-head tiles). No row may be
+compared with a different run's table above.
+
+| batch x kv_len, heads/kv_heads | FA4 | split default | raw-done split | shared, no KV precheck | shared, KV precheck |
+|---|---:|---:|---:|---:|---:|
+| 1x8192, 8/1 | 4.544 | 4.512 | 4.512 | 4.672 | 4.640 |
+| 4x16384, 32/8 | 40.257 | 40.368 | 40.352 | 40.737 | 40.736 |
+| 8x32768, 32/8 | 152.559 | 148.530 | 148.625 | 150.498 | 150.337 |
+| 8x65536 ragged, 8/1 | 26.849 | 28.033 | 27.936 | 27.136 | 27.073 |
+| 16x32768 ragged, 64/8 | 180.065 | 179.969 | 179.986 | 180.529 | 180.354 |
+| 1x32768, 32/1 | 7.424 | 7.520 | 7.488 | 7.456 | 7.328 |
+| 2x131072 ragged, 16/1 | 9.312 | 9.056 | 9.058 | 9.568 | 9.504 |
+
+For the ragged case, the one-shot flags account for 0.097 us, shared capacity/rendezvous
+without KV prechecks for another 0.800 us, and prechecks for 0.063 us. Together they close
+81% of this run's 1.184 us gap, leaving 0.224 us unexplained. A matched source capture reduces
+the four V-wait branch samples from 592 to 252 and correction O-wait branch samples from
+1264 to 1054 (FA4: 1039), despite increasing hardware instructions by 2.9%. NCU duration
+sometimes disagrees with the CUPTI direction; it did not select the winner.
+
+The unchanged committed benchmark confirms the direction through the usual wrappers (FA4:
+prepare/decode/combine; port: decode/combine), still timing only the decode kernel with CUPTI.
+Three process pairs in A/B, B/A, A/B order on one GPU,
+each with seven alternating FA4/port rounds of 200 replays, give ragged split/shared medians
+27.487/26.592 us (-3.26%; FA4 26.239 us). That closes about 72% of the 1.248 us gap under this
+contract. The 32-head small case improves from 7.616 to 7.360 us, while other cases regress
+by up to 5.4%. All seven shapes pass the partial-bitwise assertions in every process. These
+wrapper measurements and the isolated-kernel table are different contracts, not one pooled
+sample set.
+
+The missing layer capability is a shared TMA ring with multiple independent, exclusive MMA
+cursors, including explicit skipped epochs and a bootstrap/skew contract preventing parity
+aliasing. `Slots` requires Python-int slot IDs and only advances a reader's visited slots;
+it does not supply that dynamic ownership protocol. This is a capability requirement, not
+a shipped API or a recommendation to replace every split ring. The raw prototype, source
+phase tables, matched Perfetto tracks, failed ablations and reproduction scripts are retained
+in `agent_space/decode_sass/`; the example's split-ring default and the seven-config SASS gate
+remain unchanged.
+
 ## warpdrive fixed costs
 
 [bench_overhead.py](../examples/bench_overhead.py) times the layer against hand-written
