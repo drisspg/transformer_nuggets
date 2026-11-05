@@ -2,15 +2,17 @@
 
 Variants, each one graph of a whole backward call (preprocess, main kernel, dQ postprocess):
 
-* ``warpdrive``: ``fa4_bwd`` (FA4's pre/postprocess around the warpdrive main kernel);
-* ``fa4_1cta``: FA4's ``_flash_attn_bwd`` with the 1-CTA configuration the port matches
+* ``warpdrive``: ``fa4_bwd`` (FA4's pre/postprocess around the warpdrive 1-CTA main kernel);
+* ``warpdrive_2cta``: ``fa4_bwd(..., cluster=CtaPair())``, the warpdrive 2-CTA main kernel;
+* ``fa4_1cta``: FA4's ``_flash_attn_bwd`` with the 1-CTA configuration the 1-CTA port matches
   (``disable_2cta``: 128 x 128 tiles, Q_stage 2, FA4's register split);
-* ``fa4``: FA4's default configuration (2-CTA for head_dim 128 on SM100).
+* ``fa4``: FA4's default configuration (2-CTA for head_dim 128 on SM100), which the 2-CTA port
+  matches.
 
-Before timing, dK/dV of ``warpdrive`` must equal ``fa4_1cta`` bitwise and dQ must agree to
-the reduce-order rounding. Per round, each graph replays ``--reps`` times under the profiler:
-CUPTI gives the main kernel's duration, CUDA events the whole graph. Seven rounds alternate
-the variant order; the table reports the minimum round median, in microseconds.
+Before timing, dK/dV of each port must equal its FA4 counterpart's bitwise (when both run) and
+dQ must agree to the reduce-order rounding. Per round, each graph replays ``--reps`` times under
+the profiler: CUPTI gives the main kernel's duration, CUDA events the whole graph. Seven rounds
+alternate the variant order; the table reports the minimum round median, in microseconds.
 
 Run under ``gpu-run``:
 ``python -m transformer_nuggets.cute.warpdrive.examples.bench_fa4_bwd --output bwd.json``.
@@ -26,6 +28,7 @@ import torch
 from flash_attn.cute import flash_bwd_sm100
 from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd
 
+from transformer_nuggets.cute.warpdrive import CtaPair
 from transformer_nuggets.cute.warpdrive.examples import fa4_bwd as port
 from transformer_nuggets.cute.warpdrive.examples.bench_support import (
     provenance,
@@ -35,7 +38,14 @@ from transformer_nuggets.cute.warpdrive.examples.bench_support import (
 
 # (batch, heads, seqlen_q, seqlen_k)
 SHAPES = [(2, 16, 1024, 1024), (4, 16, 4096, 4096), (1, 16, 8192, 8192), (4, 16, 3000, 2900)]
-MAIN_KERNELS = {"warpdrive": "warpdrive_fa4_bwd", "fa4_1cta": "Backward", "fa4": "Backward"}
+MAIN_KERNELS = {
+    "warpdrive": "warpdrive_fa4_bwd",
+    "warpdrive_2cta": "warpdrive_fa4_bwd_pair",
+    "fa4_1cta": "Backward",
+    "fa4": "Backward",
+}
+# Each port and the FA4 kernel it reproduces.
+COUNTERPARTS = {"warpdrive": "fa4_1cta", "warpdrive_2cta": "fa4"}
 
 
 def main_kernel(names, variant):
@@ -60,19 +70,27 @@ def run_shape(b, h, sq, sk, causal, variants, reps, rounds):
 
     calls = {
         "warpdrive": lambda: port.fa4_bwd(q, k, v, out, dout, lse, scale, causal=causal),
+        "warpdrive_2cta": lambda: port.fa4_bwd(
+            q, k, v, out, dout, lse, scale, causal=causal, cluster=CtaPair()
+        ),
         "fa4_1cta": lambda: fa4(one_cta),
         "fa4": lambda: fa4(default),
     }
     calls = {name: calls[name] for name in variants}
-    if "warpdrive" in calls:
-        ours, ref = calls["warpdrive"](), calls["fa4_1cta"]() if "fa4_1cta" in calls else None
-        if ref is not None:
-            dq_err = (ours[0].float() - ref[0].float()).abs().max().item()
-            if not (torch.equal(ours[1], ref[1]) and torch.equal(ours[2], ref[2])):
-                raise AssertionError("dK/dV differ from FA4's 1-CTA backward")
-            if dq_err > 2e-3 * ref[0].float().abs().max().item() + 1e-3:
-                raise AssertionError(f"dQ differs from FA4's 1-CTA backward by {dq_err}")
-            print((b, h, sq, sk, causal), "dK/dV bitwise equal to fa4_1cta; dQ max abs", dq_err)
+    for ours_name, ref_name in COUNTERPARTS.items():
+        if ours_name not in calls or ref_name not in calls:
+            continue
+        ours, ref = calls[ours_name](), calls[ref_name]()
+        dq_err = (ours[0].float() - ref[0].float()).abs().max().item()
+        if not (torch.equal(ours[1], ref[1]) and torch.equal(ours[2], ref[2])):
+            raise AssertionError(f"{ours_name}: dK/dV differ from {ref_name}")
+        if dq_err > 2e-3 * ref[0].float().abs().max().item() + 1e-3:
+            raise AssertionError(f"{ours_name}: dQ differs from {ref_name} by {dq_err}")
+        print(
+            (b, h, sq, sk, causal),
+            f"{ours_name}: dK/dV bitwise equal to {ref_name}; dQ max abs",
+            dq_err,
+        )
     graphs = {}
     for name, call in calls.items():
         call()

@@ -1,6 +1,7 @@
-"""The FA4 SM100 backward port: dK/dV bit for bit against FA4's 1-CTA backward on the same
-inputs, dQ to the TMA reduce-add order, all three against an fp32 reference, and the wrapper's
-input contract. Small shapes; the benchmark covers the large ones."""
+"""The FA4 SM100 backward ports: dK/dV bit for bit against FA4's 1-CTA backward (the 1-CTA
+kernel) or FA4's default 2-CTA backward (``cluster=CtaPair()``) on the same inputs, dQ to the TMA
+reduce-add order, all three against an fp32 reference, and the wrapper's input contract. Small
+shapes; the benchmark covers the large ones."""
 
 import re
 import warnings
@@ -13,9 +14,10 @@ pytest.importorskip("flash_attn.cute")
 
 from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd
 
-from transformer_nuggets.cute.warpdrive import StaticPersistent, WorkStream
+from transformer_nuggets.cute.warpdrive import Cluster, CtaPair, StaticPersistent, WorkStream
 from transformer_nuggets.cute.warpdrive.examples.fa4_bwd import (
     FlashAttentionBackward,
+    FlashAttentionBackward2Cta,
     compile_fa4_bwd,
     fa4_bwd,
     fa4_config,
@@ -46,22 +48,29 @@ def reference(q, k, v, dout, scale, causal):
 
 
 SHAPES = [
-    (1, 2, 128, 128),  # one Q tile: no pipelined loop iteration
+    (1, 2, 128, 128),  # one Q tile: no pipelined loop iteration; the pair's peer has no keys
     (1, 2, 384, 256),  # Q ring wraps; two key tiles
     (2, 3, 200, 330),  # ragged Q and K tails
     (1, 2, 1000, 64),  # one partial key tile, eight Q tiles
+    (1, 2, 640, 520),  # three CTA pairs, the last one's peer key tile partial
 ]
+CLUSTERS = [None, CtaPair()]
 
 
+def cluster_id(cluster):
+    return "pair" if cluster else "single"
+
+
+@pytest.mark.parametrize("cluster", CLUSTERS, ids=cluster_id)
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
 @pytest.mark.parametrize("shape", SHAPES, ids=lambda s: "x".join(map(str, s)))
-def test_matches_fa4_and_fp32(requires_blackwell, shape, causal):
+def test_matches_fa4_and_fp32(requires_blackwell, shape, causal, cluster):
     scale = 0.3  # not the default 1/sqrt(d)
     q, k, v, out, dout, lse = inputs(*shape, scale, causal)
-    ours = fa4_bwd(q, k, v, out, dout, lse, scale, causal=causal)
-    theirs = _flash_attn_bwd(
-        q, k, v, out, dout, lse, scale, causal, config=fa4_config(q, k, causal, True)
-    )[:3]
+    ours = fa4_bwd(q, k, v, out, dout, lse, scale, causal=causal, cluster=cluster)
+    # The 1-CTA kernel reproduces FA4's disable_2cta configuration, the pair FA4's default.
+    config = fa4_config(q, k, causal, disable_2cta=cluster is None)
+    theirs = _flash_attn_bwd(q, k, v, out, dout, lse, scale, causal, config=config)[:3]
     ref = reference(q, k, v, dout, scale, causal)
     assert torch.equal(ours[1], theirs[1]) and torch.equal(ours[2], theirs[2])
     for name, a, b, r in zip(("dq", "dk", "dv"), ours, theirs, ref):
@@ -71,15 +80,16 @@ def test_matches_fa4_and_fp32(requires_blackwell, shape, causal):
         assert err <= 1.1 * fa4_err + 2e-3 * r.abs().max().item(), (name, err, fa4_err)
 
 
-def test_repeated_launches_and_shapes(requires_blackwell):
+@pytest.mark.parametrize("cluster", CLUSTERS, ids=cluster_id)
+def test_repeated_launches_and_shapes(requires_blackwell, cluster):
     """One compiled kernel across shapes; dK/dV are deterministic, dQ is not bitwise (the
     reduce-adds of different key tiles race), but stays within reduce-order rounding."""
     scale = D**-0.5
-    fa4_bwd(*inputs(1, 1, 128, 128, scale, False), scale)
+    fa4_bwd(*inputs(1, 1, 128, 128, scale, False), scale, cluster=cluster)
     before = compile_fa4_bwd.cache_info()
     for shape in [(1, 2, 256, 384), (2, 1, 130, 129)]:
         args = inputs(*shape, scale, False)
-        first, again = (fa4_bwd(*args, scale) for _ in range(2))
+        first, again = (fa4_bwd(*args, scale, cluster=cluster) for _ in range(2))
         assert torch.equal(first[1], again[1]) and torch.equal(first[2], again[2])
         assert torch.allclose(first[0].float(), again[0].float(), atol=2e-3, rtol=0)
     after = compile_fa4_bwd.cache_info()
@@ -111,6 +121,39 @@ def test_describe_shows_the_derived_protocol():
     assert op.s.scope.empty_counts == {0: [8]} and op.dq.scope.empty_counts == {0: [4]}
     causal = FlashAttentionBackward(causal=True).describe()
     assert "0-3    reduce      136" in causal and "4-11   compute     144" in causal
+
+
+def test_describe_shows_the_pair_protocol():
+    """The pair: FA4's 2-CTA register split, the leader-only MMA, dQ over S's tail, and the dS
+    handoff joining both CTAs' compute warps and relay warps on the leader's barrier."""
+    op = FlashAttentionBackward2Cta(causal=True)
+    text = op.describe()
+    for line in (
+        "0-3    reduce      136",
+        "4-11   compute     136",
+        "12     mma         104  leader",
+        "14     relay       104  all",
+        "tmem dQ  [64, 128) (inside S)",
+        "xchg  1 mbarriers",
+    ):
+        assert line in text, text
+    assert op.ds.scope.full_counts[0] == [2 * (8 + 1)]  # compute and relay warps of both CTAs
+    assert op.s.scope.empty_counts[0] == [16] and op.dq.scope.empty_counts[0] == [8]
+    assert op.k.scope.tx == 2 * 128 * D * 2  # the leader arms both CTAs' halves
+
+
+def test_pair_traced_diagnostics():
+    """The pair compiles without warpdrive warnings and every TMA load is verified (the alias
+    diagnostic does not model CTA pairs)."""
+    op = FlashAttentionBackward2Cta()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        compile_fa4_bwd(op)
+    assert [str(w.message) for w in caught if "warpdrive" in str(w.message)] == []
+    for channel in ("k", "kt", "v", "q", "qt", "do"):
+        assert op._ws_tma[channel].status().startswith("verified CtaGroup.TWO"), channel
+    for channel in ("lse", "dpsum"):
+        assert op._ws_tma[channel].status().startswith("verified cp.async.bulk, 512 B/stage")
 
 
 def test_traced_diagnostics_are_quiet():
@@ -145,6 +188,10 @@ def test_rejects_unsupported_inputs(requires_blackwell):
         fa4_bwd(q.transpose(1, 2).contiguous().transpose(1, 2), k, v, out, dout, lse)
     with pytest.raises(ValueError, match="lse"):
         fa4_bwd(q, k, v, out, dout, lse.transpose(1, 2))
+    with pytest.raises(ValueError, match="dq_stages"):
+        fa4_bwd(q, k, v, out, dout, lse, cluster=CtaPair(), dq_stages=2)
+    with pytest.raises(ValueError, match="one CTA or a CTA pair"):
+        fa4_bwd(q, k, v, out, dout, lse, cluster=Cluster(2, 2, pair=True))
     with pytest.raises(ValueError, match="one work item"):
         op = FlashAttentionBackward()
         op.work = WorkStream(schedule=StaticPersistent())
