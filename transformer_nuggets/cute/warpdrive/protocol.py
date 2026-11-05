@@ -225,7 +225,7 @@ class RoleTrace:
         """The key ``where()`` gave ``block`` (None if no event was recorded inside it)."""
         return next((key for b, key, _ in self._blocks if b == block), None)
 
-    def event(self, kind: str, **data):
+    def event(self, kind: str, /, **data):  # positional: an event may carry a "kind" field
         site = user_site()
         opted_out = False
         if kind == "access":

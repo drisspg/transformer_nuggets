@@ -114,7 +114,7 @@ UNVERIFIED = "unverified"
 # --------------------------------------------------------------------------- #
 
 
-def _record(kind: str, **data):
+def _record(kind: str, /, **data):
     trace = current_trace()
     if trace is not None:
         trace.event(kind, **data)

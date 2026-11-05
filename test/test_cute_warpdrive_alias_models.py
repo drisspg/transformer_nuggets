@@ -26,6 +26,7 @@ from transformer_nuggets.cute.warpdrive import (
     TmemPlan,
     Umma,
     WarpSpecialized,
+    fence_async_shared,
     named_barrier,
     role,
     unchecked,
@@ -257,6 +258,48 @@ def test_tma_load_is_published_only_by_its_own_handle():
     compile_quietly(op, "tma_other_channel")
     assert status(op, "Y ~ X") == "potential hazard", alias_section(op)
     assert "[complete_tx]" in alias_section(op)
+
+
+class ThreadsWriteForUmma(Model):
+    """Threads write X, an MMA reads its overlap Y: the generic-to-async proxy fence comes from
+    ``fence_async_shared()`` in the writer, not from the channel."""
+
+    def __init__(self, fence: bool):
+        self.fence = fence
+        self.smem_plan = SmemPlan()
+        x = self.smem_plan.buffer("X", cutlass.Int32, align=128)
+        y = self.smem_plan.buffer("Y", cutlass.Int32, overlaps=x)
+        self.a = Ring(2, Threads, Umma, buffer={"X": x, "Y": y})
+
+    def layouts(self):
+        return {"X": cute.make_layout((32, 2)), "Y": cute.make_layout((32, 2))}
+
+    @role(warps=0)
+    @cute.jit
+    def writer(self, ctx, *, a: Producer):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            with a.produce() as h:
+                h.access("X", write=True)
+                if cutlass.const_expr(self.fence):
+                    fence_async_shared()
+        return a
+
+    @role(warps=1)
+    @cute.jit
+    def mma(self, ctx, *, a: Consumer):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            with a.consume() as h:
+                h.access("Y", read=True, by="umma")
+        return a
+
+
+@pytest.mark.parametrize("fence", [False, True])
+def test_fence_async_shared_supplies_the_proxy_fence(fence):
+    op = ThreadsWriteForUmma(fence)
+    compile_quietly(op, f"threads_for_umma_{int(fence)}")
+    expected = "no hazard found" if fence else "unverified"
+    assert status(op, "Y ~ X") == expected, alias_section(op)
+    assert ("[proxy]" in alias_section(op)) != fence
 
 
 class LoopInsideHandle(LoopCarriedMma):
