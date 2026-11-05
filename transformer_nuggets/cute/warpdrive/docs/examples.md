@@ -139,9 +139,13 @@ per call and TFLOP/s on the real rows. `grouped_mm` is `torch._grouped_mm`, `mm 
 | 128, 16384, 7168 x 2048 | 726 (663) | 826 | 612 (786) | 627 | 725 |
 | 128, 32768, 4096 x 4096 | 1090 (1009) | 1230 | 1116 (986) | 1108 | 1163 |
 
-Small skewed groups waste rows in 128-row tiles (1.5x the real rows at G=64 and G=128 here)
-for every kernel; a pair's 256-row tiles waste twice that, so `CtaPair()` only ties on the
-G=8 shapes.
+Small skewed groups waste rows in 128-row tiles for every kernel (1.5x the real rows at
+G=64 with 8192 tokens and G=128 with 16384, 1.13-1.25x at 32768); a pair's 256-row tiles
+waste about twice that, so `CtaPair()` only ties on the G=8 shapes.
+
+`offsets` must be nonnegative, nondecreasing and at most `total_M`, and must not change while
+the kernel runs; the kernel clamps them to `A`, so other values compute wrong rows but stay in
+bounds. `out` must not overlap `a`, `b` or `offsets`.
 
 ## Attention forward
 

@@ -57,6 +57,7 @@ from transformer_nuggets.cute.warpdrive import (
     WorkStream,
     role,
 )
+from transformer_nuggets.cute.warpdrive.examples.gemm import _overlaps
 from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import (
     CTA_TILE_M,
     EPI_BARRIER_ID,
@@ -67,12 +68,15 @@ from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import (
 
 RAGGED_ROWS = 2**30  # the row extent of the ragged output view; TMA clips there
 RAGGED_SELECT = 2**31 - 1  # extent of its row-selecting third mode
+MAX_TILE_M = 2 * CTA_TILE_M  # a CTA pair's MMA tile
 
 
 @cute.jit
-def _locate_tile(mt: Int32, offsets: cute.Tensor, tile_m: int):
+def _locate_tile(mt: Int32, offsets: cute.Tensor, total_m: Int32, tile_m: int):
     """The group of global m-tile ``mt``, that tile's first row and its valid rows:
-    ``(found, group, row0, rows)``.
+    ``(found, group, row0, rows)``. Group bounds are clamped to ``[0, total_m]``, so offsets
+    outside ``A`` cannot address rows outside it (the routing they describe is then wrong,
+    not unsafe), and the intermediate values stay within ``total_m + (G + 1) * tile_m``.
 
     Group g's tiles start at m-tile ``ceil(P_g / tile_m)`` where ``P_g = offsets[g-1] +
     g * tile_m``: the padded row space gives every group a gap of one tile, so its real tiles
@@ -91,9 +95,10 @@ def _locate_tile(mt: Int32, offsets: cute.Tensor, tile_m: int):
         fits = (cand < G) & (offsets[cutlass.min(cand, G) - 1] <= (mt - cand) * tile_m)
         lo = cutlass.select_(fits, cand, lo)
     start_row = cutlass.select_(lo > 0, offsets[cutlass.max(lo, 1) - 1], Int32(0))
+    start_row = cutlass.min(cutlass.max(start_row, 0), total_m)
     first_tile = (start_row + lo * tile_m + tile_m - 1) // tile_m
     row0 = start_row + (mt - first_tile) * tile_m
-    end = offsets[lo]
+    end = cutlass.min(offsets[lo], total_m)
     return row0 < end, lo, row0, cutlass.min(end - row0, tile_m)
 
 
@@ -117,12 +122,12 @@ class GroupedTiles(WorkMap):
 
     def count64(self, space):
         offsets, total_m, n_tiles = space
-        m_tiles = (total_m + self.tile_m - 1) // self.tile_m + offsets.shape[0]
-        return Int64(m_tiles) * Int64(n_tiles)
+        m_tiles = (Int64(total_m) + self.tile_m - 1) // self.tile_m + offsets.shape[0]
+        return m_tiles * Int64(n_tiles)
 
     def decode(self, index, space):
-        offsets, _, n_tiles = space
-        found, group, row0, rows = _locate_tile(index // n_tiles, offsets, self.tile_m)
+        offsets, total_m, n_tiles = space
+        found, group, row0, rows = _locate_tile(index // n_tiles, offsets, total_m, self.tile_m)
         return found, (group, row0, rows, index % n_tiles)
 
     def get_key(self) -> str:
@@ -526,13 +531,21 @@ def check_grouped_gemm_args(
     a: torch.Tensor, b: torch.Tensor, offsets: torch.Tensor, out: torch.Tensor | None
 ) -> torch.Tensor:
     """Check the operands and return ``out`` (allocated when ``None``). ``offsets`` holds
-    the groups' end rows; its values are read only on the device."""
+    the groups' end rows; its values are read only on the device, so they are not checked
+    here: they must be nondecreasing and at most ``total_M`` for the result to be right (the
+    kernel clamps them to ``A``, so other values give wrong rows, not out-of-bounds accesses).
+
+    ``out`` must not share memory with the inputs: one tile's TMA store can overwrite rows
+    another tile still loads. The decode's Int32 arithmetic needs
+    ``total_M + (G + 1) * tile_m`` to fit, hence the bound on ``total_M``."""
     if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16:
         raise TypeError("grouped_gemm expects bfloat16 operands")
     if offsets.dtype != torch.int32:
         raise TypeError(f"offsets must be int32, got {offsets.dtype}")
     if a.ndim != 2 or b.ndim != 3 or a.shape[1] != b.shape[2]:
         raise ValueError(f"incompatible shapes {tuple(a.shape)}, {tuple(b.shape)}")
+    if a.shape[0] + (b.shape[0] + 1) * MAX_TILE_M > 2**31 - 1:
+        raise ValueError(f"total_M + (G + 1) * {MAX_TILE_M} must fit in int32")
     if offsets.ndim != 1 or offsets.shape[0] != b.shape[0]:
         raise ValueError(f"offsets must have shape ({b.shape[0]},), got {tuple(offsets.shape)}")
     if not (a.is_contiguous() and b.is_contiguous() and offsets.is_contiguous()):
@@ -554,6 +567,8 @@ def check_grouped_gemm_args(
         )
     if not out.is_contiguous() or out.data_ptr() % 16:
         raise ValueError("out must be contiguous and 16-byte aligned")
+    if _overlaps(out, a) or _overlaps(out, b) or _overlaps(out, offsets):
+        raise ValueError("out must not overlap a, b or offsets")
     return out
 
 
@@ -581,10 +596,11 @@ def grouped_gemm(
     ``GroupedGemm``'s other keyword options (``tile_n``, ``ab_stages``, ``acc_stages``,
     ``c_stages``, ``epi_tile_n``, ``roles``)."""
     out = check_grouped_gemm_args(a, b, offsets, out)
-    if out.numel() == 0:
+    if out.numel() == 0 or b.shape[0] == 0:  # nothing to compute, or no group covers a row
         return out
     if a.shape[1] == 0:  # no K tiles: the MMA would publish an unwritten accumulator
-        return out.zero_()
+        covered = torch.arange(out.shape[0], device=out.device) < offsets[-1:]
+        return out.masked_fill_(covered[:, None], 0)
     frozen = {k: _frozen_roles(v) if k == "roles" else v for k, v in config.items()}
     key = (schedule, cluster, *sorted(frozen.items()))
     op = _OPS.get(key)

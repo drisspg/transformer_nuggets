@@ -150,9 +150,10 @@ def _reference_tiles(sizes: list[int], tile_m: int) -> set[tuple[int, int, int]]
     return tiles
 
 
-def _python_locate_tile(mt: int, offsets: list[int], tile_m: int):
+def _python_locate_tile(mt: int, offsets: list[int], tile_m: int, total_m: int | None = None):
     """Mirror of ``_locate_tile``: the padded row space gives group g the m-tiles from
     ``ceil((offsets[g-1] + g * tile_m) / tile_m)`` on."""
+    total_m = offsets[-1] if total_m is None else total_m
     count = len(offsets)
     lo = 0
     step = 1
@@ -163,10 +164,10 @@ def _python_locate_tile(mt: int, offsets: list[int], tile_m: int):
         cand = lo + step
         if cand < count and offsets[cand - 1] <= (mt - cand) * tile_m:
             lo = cand
-    start = offsets[lo - 1] if lo else 0
+    start = min(max(offsets[lo - 1] if lo else 0, 0), total_m)
     first_tile = -(-(start + lo * tile_m) // tile_m)
     row0 = start + (mt - first_tile) * tile_m
-    end = offsets[lo]
+    end = min(offsets[lo], total_m)
     return row0 < end, lo, row0, min(end - row0, tile_m)
 
 
@@ -195,14 +196,35 @@ def test_grouped_tiles_decode_is_a_bijection(sizes, tile_m):
 
 
 def test_grouped_gemm_zero_work(requires_blackwell):
-    """Empty K writes zeros over the covered rows; an empty output launches nothing."""
+    """Empty K writes zeros over the covered rows only; an empty output or G=0 launches
+    nothing and leaves ``out`` alone."""
     a, b, offsets = _inputs([64, 0, 24], 24, 0)
-    out = torch.full((88, 24), float("nan"), device="cuda", dtype=torch.bfloat16)
+    a = torch.cat([a, a[:10]])
+    out = torch.full((98, 24), float("nan"), device="cuda", dtype=torch.bfloat16)
     assert grouped_gemm(a, b, offsets, out) is out
     torch.cuda.synchronize()
-    assert torch.equal(out, torch.zeros_like(out))
+    assert torch.equal(out[:88], torch.zeros_like(out[:88]))
+    assert torch.isnan(out[88:]).all()
     a, b, offsets = _inputs([0, 0], 8, 64)
     assert grouped_gemm(a, b, offsets).shape == (0, 8)
+    a, b, offsets = _inputs([], 8, 64)
+    a = torch.randn(16, 64, device="cuda", dtype=torch.bfloat16)
+    out = torch.full((16, 8), float("nan"), device="cuda", dtype=torch.bfloat16)
+    assert grouped_gemm(a, b, offsets, out) is out
+    assert torch.isnan(out).all()
+
+
+def test_grouped_gemm_clamps_offsets_to_a(requires_blackwell):
+    """Offsets past the end of ``A`` (a routing bug) must not read or write outside it: the
+    rows that exist are computed with the group the offsets name, the rest do not exist."""
+    sizes = [64, 300]
+    a, b, offsets = _inputs(sizes, 72, 64)
+    a = a[:200].clone()  # offsets say [0, 64) and [64, 364) but A has 200 rows
+    out = torch.full((200, 72), float("nan"), device="cuda", dtype=torch.bfloat16)
+    grouped_gemm(a, b, offsets, out=out)
+    torch.cuda.synchronize()
+    ref = torch.cat([a[:64].float() @ b[0].float().T, a[64:].float() @ b[1].float().T])
+    assert (out.float() - ref).abs().max().item() <= 0.1
 
 
 @pytest.mark.parametrize(
@@ -236,8 +258,20 @@ def test_grouped_gemm_rejects_bad_operands(requires_blackwell, mutate, error, ma
         grouped_gemm(*mutate(a, b, offsets))
 
 
+def test_grouped_gemm_rejects_too_many_rows(requires_blackwell):
+    """The decode's Int32 arithmetic covers ``total_M + (G + 1) * 256`` rows."""
+    _, b, offsets = _inputs([64, 64], 64, 64)
+    a = torch.empty(1, 64, device="cuda", dtype=torch.bfloat16).expand(2**31 - 600, 64)
+    with pytest.raises(ValueError, match="fit in int32"):
+        grouped_gemm(a, b, offsets)
+
+
 def test_grouped_gemm_rejects_bad_out(requires_blackwell):
     a, b, offsets = _inputs([64, 64], 64, 64)
+    with pytest.raises(ValueError, match="must not overlap"):
+        grouped_gemm(a, b, offsets, out=a)
+    with pytest.raises(ValueError, match="must not overlap"):
+        grouped_gemm(a, b, offsets, out=b.view(128, 64))
     with pytest.raises(TypeError, match="out must be bfloat16"):
         grouped_gemm(a, b, offsets, out=torch.empty(128, 64, device="cuda"))
     with pytest.raises(ValueError, match="out must have shape"):
