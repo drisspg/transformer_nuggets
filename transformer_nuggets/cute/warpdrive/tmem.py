@@ -72,9 +72,7 @@ class TmemPlan:
 
     @property
     def alloc_cols(self) -> int:
-        cols = 32
-        while cols < self._next:
-            cols *= 2
+        cols = 1 << (max(32, self._next) - 1).bit_length()
         if cols > TMEM_COLS:
             raise ValueError(f"TMEM plan needs {self._next} > {TMEM_COLS} columns")
         return cols

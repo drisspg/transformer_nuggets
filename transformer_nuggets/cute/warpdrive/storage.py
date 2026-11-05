@@ -177,18 +177,10 @@ def allocate(smem, buf: SmemBuffer, layout, resolved: dict) -> ResolvedBuffer:
     return out
 
 
-def _leaves(value):
-    if isinstance(value, tuple):
-        for v in value:
-            yield from _leaves(v)
-    else:
-        yield value
-
-
 def _stage_stride(shape, stride) -> int | None:
     """The element stride between stages of a (possibly nested) stage mode: the stride of its
     only non-unit sub-mode (CUTLASS's epilogue layouts write a stage mode as ``(1, n)``)."""
-    live = [d for n, d in zip(_leaves(shape), _leaves(stride)) if n != 1]
+    live = [d for n, d in zip(cute.flatten((shape,)), cute.flatten((stride,))) if n != 1]
     if len(live) != 1 or not isinstance(live[0], int):
         return None
     return live[0]
@@ -217,4 +209,4 @@ def project(tensor, axis: int, index, coord: tuple = ()):
         raise ProtocolError(
             f"a stage view of a rank-{rank} tensor takes {rank - 1} coordinates, got {len(rest)}"
         )
-    return tensor[tuple([*rest[:norm], index, *rest[norm:]])]
+    return tensor[(*rest[:norm], index, *rest[norm:])]
