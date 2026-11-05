@@ -284,7 +284,7 @@ def test_leader_placement_is_a_noop_for_one_cta():
 def test_pair_gemm_declared_graph():
     from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import PersistentGemm
 
-    op = PersistentGemm(schedule=ClusterLaunchControl(), cluster=PAIR)
+    op = PersistentGemm(schedule=ClusterLaunchControl(), cluster=PAIR, tile_n=256)
     text = op.describe()
     chans = op._ws_chans
     # Both CTAs' TMA bytes (2 x 32 KB) complete on the leader, armed once by its producer.
@@ -430,13 +430,15 @@ def test_pair_record_workspace_covers_whole_clusters(requires_blackwell):
 GEMM_SHAPES = [
     (1, 8, 8),  # the peer CTA's half and most of the tile are out of bounds
     (300, 520, 136),  # ragged M, N, K
-    (256, 256, 64),  # exactly one 2-CTA tile
+    (256, 224, 64),  # exactly one 2-CTA tile at the default tile_n
+    (256, 256, 64),  # a second, 32-wide ragged tile along N
     (1000, 1000, 1000),  # 4 x 4 tiles: far fewer clusters than SMs
     (4097, 2056, 520),  # 17 x 9 tiles, ragged, more than one wave
 ]
 
 
-def _check_gemm(schedule, m, n, k, max_ctas=None, reps=2, tile_n=256):
+def _check_gemm(schedule, m, n, k, max_ctas=None, reps=2, tile_n=None):
+    """``tile_n=None`` runs the pair's default width (224)."""
     from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import persistent_gemm
 
     torch.manual_seed(0)
@@ -463,10 +465,24 @@ def test_pair_gemm(requires_blackwell, schedule, m, n, k):
     _check_gemm(SCHEDULES[schedule], m, n, k)
 
 
-@pytest.mark.parametrize("tile_n", [224, 192, 128])
+def test_default_tile_n():
+    """224 for a pair alone (the measured default), 256 for one CTA and larger clusters."""
+    from transformer_nuggets.cute.warpdrive import Cluster, SingleCta
+    from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import PersistentGemm
+
+    assert PersistentGemm().tile_n == 256
+    assert PersistentGemm(cluster=PAIR).tile_n == 224
+    assert PersistentGemm(cluster=Cluster(2, 1, pair=True)).tile_n == 224
+    assert PersistentGemm(cluster=Cluster(1, 2)).tile_n == 256
+    assert PersistentGemm(cluster=Cluster(2, 2, pair=True)).tile_n == 256
+    assert PersistentGemm(cluster=SingleCta(), tile_n=224).tile_n == 224
+
+
+@pytest.mark.parametrize("tile_n", [256, 192, 128])
 @pytest.mark.parametrize("schedule", ["static", "clc"])
 def test_pair_gemm_tile_n(requires_blackwell, schedule, tile_n):
-    """Narrower MMA tiles: each CTA loads tile_n / 2 rows of B; ragged M and N edges."""
+    """Other widths than the default 224: each CTA loads tile_n / 2 rows of B; ragged M and N
+    edges."""
     _check_gemm(SCHEDULES[schedule], 3000, 1000, 520, tile_n=tile_n)
 
 
@@ -485,10 +501,10 @@ def test_pair_gemm_capped_grid(requires_blackwell, schedule, max_ctas):
 
 
 def test_pair_gemm_counter_resets(requires_blackwell):
-    from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import _OPS
+    from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import _OPS, default_tile_n
 
     _check_gemm(SCHEDULES["atomic"], 1500, 1800, 64, max_ctas=8, reps=3)
-    op = _OPS[(SCHEDULES["atomic"], None, PAIR, 256)]
+    op = _OPS[(SCHEDULES["atomic"], None, PAIR, default_tile_n(PAIR))]
     ws, _ = op.work.launch_args("cuda")
     torch.cuda.synchronize()
     assert ws[:2].tolist() == [0, 0]

@@ -9,14 +9,19 @@ mapping and cluster are constructor arguments::
     PersistentGemm(schedule=StaticPersistent())  # or OneShot(), AtomicPersistent()
     PersistentGemm(schedule=ClusterLaunchControl())  # or your own IndexSchedule
     PersistentGemm(mapping=CutlassRaster(swizzle=8))  # any WorkMap, or an adapter
-    PersistentGemm(cluster=CtaPair())  # 2-CTA: 256x256 MMA tiles, CtaGroup.TWO
+    PersistentGemm(cluster=CtaPair())  # 2-CTA: 256x224 MMA tiles, CtaGroup.TWO
     PersistentGemm(cluster=Cluster(2, 2, pair=True), tile_n=224)  # two pairs share A tiles
 
-With ``CtaPair`` the MMA tile is 256x256x64: each CTA of the pair loads its 128 rows of A and
-its 128 rows of B, the leader's MMA warp issues 2-CTA MMAs reading both CTAs' SMEM, and each
-CTA's epilogue stores its 128x256 half from its own TMEM. The only source differences are the
-``self.cluster`` declaration, ``cta="leader"`` on the MMA role (a no-op for one CTA), and the tile
-shapes derived from the cluster; the layer derives every cross-CTA barrier.
+With ``CtaPair`` the MMA tile is 256 x tile_n x 64: each CTA of the pair loads its 128 rows of A
+and its tile_n / 2 rows of B, the leader's MMA warp issues 2-CTA MMAs reading both CTAs' SMEM,
+and each CTA's epilogue stores its 128 x tile_n half from its own TMEM. The only source
+differences are the ``self.cluster`` declaration, ``cta="leader"`` on the MMA role (a no-op for
+one CTA), and the tile shapes derived from the cluster; the layer derives every cross-CTA
+barrier.
+
+``tile_n`` defaults to 224 for a CTA pair and 256 otherwise (``default_tile_n``), from the
+measurements in docs/examples.md. Which width wins is mostly wave quantization of the tile count
+against the resident CTAs, so pass ``tile_n`` for a shape you care about.
 
 A larger ``Cluster`` runs one MMA tile per pair (per CTA without pairs) and multicasts the loads
 its CTAs share: pairs side by side along N need the same rows of A, so each CTA loads a part of
@@ -72,6 +77,11 @@ C_STAGES = 2  # SMEM staging buffers for the TMA-store epilogue
 EPI_BARRIER_ID = 3  # named barrier for the 4 epilogue warps (layer owns 1 and 2)
 
 
+def default_tile_n(cluster) -> int:
+    """224 for a CTA pair, 256 for one CTA and for larger clusters (measured defaults)."""
+    return 224 if cluster.size == cluster.pair_size == 2 else 256
+
+
 @dataclass(frozen=True)
 class PersistentGemmParams:
     """Kernel-prologue values the roles read; built once in ``PersistentGemm.kernel``."""
@@ -106,10 +116,12 @@ class PersistentGemm(WarpSpecialized):
         acc_stages: int = 2,
         trace: bool = False,
         cluster=None,
-        tile_n: int = 256,
+        tile_n: int | None = None,
     ):
         self.cluster = cluster or SingleCta()
         cs = self.cluster.pair_size  # CTAs per MMA
+        if tile_n is None:
+            tile_n = default_tile_n(self.cluster)
         if tile_n % EPI_TILE[1] or not 0 < tile_n <= 256 or tile_n // cs % 8:
             raise ValueError(
                 f"tile_n must be a multiple of {EPI_TILE[1]} in (0, 256], got {tile_n}"
@@ -439,17 +451,20 @@ def persistent_gemm(
     mapping: WorkMap | None = None,
     max_ctas: int | None = None,
     cluster=None,
-    tile_n: int = 256,
+    tile_n: int | None = None,
 ) -> torch.Tensor:
     """``a @ b.T`` for row-major bf16 ``a: (M, K)``, ``b: (N, K)``. ``schedule`` defaults to
     ``StaticPersistent()``; ``max_ctas`` caps the persistent grid in CTAs (default: the CTAs of
     the clusters that fit at once, the SM count for one CTA or a pair); ``cluster=CtaPair()``
-    runs 2-CTA 256x256 tiles, ``Cluster(2, 2, pair=True)`` two such pairs sharing A."""
+    runs 2-CTA 256 x ``tile_n`` tiles, ``Cluster(2, 2, pair=True)`` two such pairs sharing A.
+    ``tile_n`` defaults to ``default_tile_n(cluster)``: 224 for a pair, 256 otherwise."""
     out = check_gemm_args(a, b, out)
     if out.numel() == 0:
         return out
     if a.shape[1] == 0:  # no K tiles: the MMA would publish an unwritten accumulator
         return out.zero_()
+    if tile_n is None:
+        tile_n = default_tile_n(cluster or SingleCta())
     key = (schedule, mapping, cluster, tile_n)
     op = _OPS.get(key)
     if op is None:
