@@ -104,12 +104,12 @@ class CutlassRaster(WorkMap):
         _, extents = space
         return Raster().count64(self._pad(extents, lambda e: _round_up(e, self.swizzle)))
 
-    def decode(self, index, space):
+    def decode(self, index, space, state):
         padded, (em, en, _) = space
-        _, (m, n, li) = self._raster.decode(index, padded)
+        _, (m, n, li), _ = self._raster.decode(index, padded, None)
         if self.swizzle == 1:  # no padding: every tile is inside the space
-            return True, (m, n, li)
-        return (m < em) & (n < en), (m, n, li)
+            return True, (m, n, li), state
+        return (m < em) & (n < en), (m, n, li), state
 
     def get_key(self) -> str:
         return f"cutlasssp{self.along}{self.swizzle}"
@@ -203,13 +203,13 @@ class Fa4Mapping(WorkMap):
         _, extents = space
         return Raster().count64(extents)
 
-    def decode(self, index, space):
+    def decode(self, index, space, state):
         params, _ = space
         if self._persistent:
             scheduler = self.scheduler(params, Int32(index))
         else:
             scheduler = self.scheduler(params, Int32(index), Int32(0))
-        return True, tuple(scheduler.get_current_work().tile_idx[:3])
+        return True, tuple(scheduler.get_current_work().tile_idx[:3]), state
 
     def get_key(self) -> str:
         if self._persistent:

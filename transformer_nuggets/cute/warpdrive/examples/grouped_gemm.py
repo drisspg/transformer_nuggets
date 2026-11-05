@@ -125,10 +125,10 @@ class GroupedTiles(WorkMap):
         m_tiles = (Int64(total_m) + self.tile_m - 1) // self.tile_m + offsets.shape[0]
         return m_tiles * Int64(n_tiles)
 
-    def decode(self, index, space):
+    def decode(self, index, space, state):
         offsets, total_m, n_tiles = space
         found, group, row0, rows = _locate_tile(index // n_tiles, offsets, total_m, self.tile_m)
-        return found, (group, row0, rows, index % n_tiles)
+        return found, (group, row0, rows, index % n_tiles), state
 
     def get_key(self) -> str:
         return f"grouped{self.tile_m}"

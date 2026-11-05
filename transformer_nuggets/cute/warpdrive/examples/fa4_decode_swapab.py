@@ -139,16 +139,16 @@ class SplitKV(WorkMap):
         splits, heads, batch, *_ = space
         return Int64(splits) * heads * batch
 
-    def decode(self, index, space):
+    def decode(self, index, space, state):
         splits, _, _, table, major_divisor, head_divisor = space
         if self.per_sequence:
             split, rest = divmod(index, major_divisor)
             b, head = divmod(rest, head_divisor)
             count = table[b]
-            return split < count, (split, head, b, count)
+            return split < count, (split, head, b, count), state
         bh, split = divmod(index, major_divisor)
         b, head = divmod(bh, head_divisor)
-        return True, (split, head, b, splits)
+        return True, (split, head, b, splits), state
 
     def get_key(self) -> str:
         return "splitkv_seq" if self.per_sequence else "splitkv"

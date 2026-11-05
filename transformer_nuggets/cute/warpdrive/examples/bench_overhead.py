@@ -476,8 +476,8 @@ class GridItems(WorkMap):
         a, b, c, *_ = space
         return Int64(a) * b * c
 
-    def decode(self, index, space):
-        return True, grid_item(index, space[3], space[4])
+    def decode(self, index, space, state):
+        return True, grid_item(index, space[3], space[4]), state
 
     def get_key(self) -> str:
         return "grid_items"

@@ -55,12 +55,12 @@ class PackedWork(WorkMap):
         capacity = table.shape[0]
         return capacity if isinstance(capacity, int) else Int64(capacity)
 
-    def decode(self, index, space):
+    def decode(self, index, space, state):
         table, length = space
         # index < capacity, so the row read is in bounds even past the length (its words are
         # then ignored), and no branch is needed.
         row = tuple(table[index, w] for w in range(self.words))
-        return index < length[0], row
+        return index < length[0], row, state
 
     def get_key(self) -> str:
         return f"packed{self.words}"

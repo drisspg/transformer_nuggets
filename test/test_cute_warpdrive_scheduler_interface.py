@@ -2,12 +2,14 @@
 work-item accessor, swapped into the same kernels with one argument."""
 
 import importlib
+import itertools
 import math
 import os
 import sys
 import warnings
 from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import NamedTuple
 
 import pytest
 import torch
@@ -248,6 +250,182 @@ def test_custom_schedule_with_skips(requires_blackwell, schedule, ready):
         for m in range(ext[0])
     ]
     assert hits[0].tolist() == want and hits[1].tolist() == want
+
+
+# --------------------------------------------------------------------------- #
+# Stateful decoding: WorkMap.start and the state threaded through decode
+# --------------------------------------------------------------------------- #
+
+
+class Chain(NamedTuple):
+    prev: Int32  # the index this site decoded last, -1 before its first decode
+    decodes: Int32  # decodes at this site so far
+
+
+@dataclass(frozen=True)
+class Chained(Raster):
+    """A diagnostic stateful mapping: its words report the decoding site's state, so the test
+    sees which indices each site decoded before an item. (Words that depend on the state break
+    the cache contract for a real mapping; here every site of a unit sees one index sequence,
+    so its roles still agree.) ``drop_odd`` drops tiles whose m + n is odd."""
+
+    drop_odd: bool = False
+    words = 5
+
+    @property
+    def skips(self) -> bool:
+        return self.drop_odd
+
+    def start(self, space):
+        return Chain(Int32(-1), Int32(0))
+
+    def decode(self, index, space, state):
+        _, (m, n, li), _ = super().decode(index, space, None)
+        keep = (m + n) % 2 == 0 if self.drop_odd else True
+        return keep, (m, n, li, state.prev, state.decodes), Chain(index, state.decodes + 1)
+
+    def get_key(self) -> str:
+        return f"chained{int(self.drop_odd)}_" + super().get_key()
+
+
+@dataclass(frozen=True)
+class ChainedAnyIndex(Chained):
+    """Decodable at any index: broadcast roles decode the first item locally."""
+
+    decodes_any_index = True
+
+
+class ChainToy(WarpSpecialized):
+    """Roles ``a`` (warp 0) and ``b`` (warps 1-2), in every CTA, log ``(index, prev, decodes)``
+    of each item in ``log[role, cta, k]``."""
+
+    MAX_ITEMS = 32
+
+    def __init__(self, schedule, mapping, cluster=None):
+        self.cluster = cluster or SingleCta()
+        self.work = WorkStream(mapping=mapping, schedule=schedule)
+
+    def get_name(self) -> str:
+        return f"warpdrive_chain_toy_{self.work.get_key()}_cs{self.cluster.size}"
+
+    @cute.jit
+    def _log(self, r: int, work, count, ctx):
+        log = ctx.log
+        _, _, _, prev, decodes = work.item
+        if cute.arch.lane_idx() == 0 and cute.arch.warp_idx() == r and count < self.MAX_ITEMS:
+            bidx, _, _ = cute.arch.block_idx()
+            log[r, bidx, count, 0] = work.index
+            log[r, bidx, count, 1] = prev
+            log[r, bidx, count, 2] = decodes
+
+    @role(warps=0)
+    @cute.jit
+    def a(self, work: WorkCursor, ctx):
+        count = Int32(0)
+        while work.valid:
+            self._log(0, work, count, ctx)
+            count += 1
+            work.advance()
+        return work
+
+    @role(warps=range(1, 3))
+    @cute.jit
+    def b(self, work: WorkCursor, ctx):
+        count = Int32(0)
+        while work.valid:
+            self._log(1, work, count, ctx)
+            count += 1
+            work.advance()
+        return work
+
+    @cute.kernel
+    def kernel(self, log: cute.Tensor, bound):
+        self.begin_roles(work=bound)
+        self.run_roles(SimpleNamespace(log=log))
+
+    @cute.jit
+    def __call__(
+        self,
+        log: cute.Tensor,
+        workspace: cute.Tensor,
+        em: Int32,
+        en: Int32,
+        el: Int32,
+        max_ctas: Int32,
+        stream: cuda.CUstream,
+    ):
+        bound = self.work.bind((em, en, el), workspace, max_ctas)
+        self.kernel.set_name_prefix(self.get_name())
+        self.kernel(log, bound).launch(**self.launch_config(bound), stream=stream)
+
+
+@jit_cache
+def compile_chain_toy(op: ChainToy):
+    return compile_tvm_ffi(
+        op,
+        make_fake_compact_tensor(cutlass.Int32, (2, cute.sym_int(), ChainToy.MAX_ITEMS, 3)),
+        make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),)),
+        *(Int32(1) for _ in range(4)),
+        name=op.get_name(),
+    )
+
+
+CHAIN_SCHEDULES = {
+    "oneshot": OneShot(),
+    "static": StaticPersistent(),
+    "atomic": AtomicPersistent(stages=2),
+    "clc": ClusterLaunchControl(stages=2),
+    **CUSTOM,
+}
+
+
+@pytest.mark.parametrize("cluster", [SingleCta(), CtaPair()], ids=["single", "pair"])
+@pytest.mark.parametrize(
+    "mapping",
+    [Chained(swizzle=2), Chained(swizzle=2, drop_odd=True), ChainedAnyIndex(swizzle=2)],
+    ids=["chained", "chained_skip", "chained_any_index"],
+)
+@pytest.mark.parametrize("schedule", list(CHAIN_SCHEDULES))
+def test_decode_state_follows_each_site(requires_blackwell, schedule, mapping, cluster):
+    """Each decoding site threads its state through every decode, dropped items included: a
+    local role decodes its unit's whole sequence, the broadcast scheduler every index it
+    claims, and roles never decode a broadcast item themselves. Every kept tile still runs once
+    per CTA of its unit, and both roles see the same items."""
+    sched = CHAIN_SCHEDULES[schedule]
+    op = ChainToy(sched, mapping, cluster)
+    fn = compile_chain_toy(op)
+    em, en, el = 9, 7, 2
+    total, max_ctas, cs = em * en * el, 16 * cluster.size, cluster.size
+    units = min(total, max_ctas // cs) if sched.uses_max_ctas else total
+    log = torch.full((2, units * cs, ChainToy.MAX_ITEMS, 3), -2, dtype=torch.int32, device="cuda")
+    ws, _ = op.work.launch_args("cuda")
+    fn(log, ws, em, en, el, max_ctas)
+    torch.cuda.synchronize()
+    log = log.cpu()
+    assert torch.equal(log[0], log[1])
+    kept = [i for i in range(total) if not mapping.drop_odd or _even_tile(i, (em, en, el))]
+    seen = sorted(int(i) for i in log[0, :, :, 0].flatten() if i >= 0)
+    assert seen == sorted(kept * cs)
+    stride = {"static": units, "reverse_static": -units, "reverse_broadcast": -units}.get(schedule)
+    for cta in range(units * cs):
+        items = [tuple(int(v) for v in row) for row in log[0, cta] if row[0] >= 0]
+        if stride is not None:  # a strided sequence: the site decoded every index before it
+            unit = cta // cs
+            first = unit if stride > 0 else total - 1 - unit
+            for index, prev, decodes in items:
+                assert decodes == (index - first) // stride
+                assert prev == (-1 if index == first else index - stride)
+        elif not mapping.drop_odd:  # the site decoded exactly the items it published
+            for k, (index, prev, decodes) in enumerate(items):
+                assert decodes == k and prev == (items[k - 1][0] if k else -1)
+        else:
+            assert all(a[2] < b[2] for a, b in itertools.pairwise(items))
+            assert all((prev == -1) == (decodes == 0) for _, prev, decodes in items)
+
+
+def _even_tile(index, ext):
+    m, n, _ = Raster(swizzle=2).decode(index, ext, None)[1]
+    return (m + n) % 2 == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -684,9 +862,9 @@ class PackedToy(WarpSpecialized):
 
     PRODUCER_THREADS = 128
 
-    def __init__(self, schedule, cluster=None):
+    def __init__(self, schedule, cluster=None, mapping=None):
         self.cluster = cluster or SingleCta()
-        self.work = WorkStream(mapping=PackedWork(), schedule=schedule, ready=PdlWait())
+        self.work = WorkStream(mapping=mapping or PackedWork(), schedule=schedule, ready=PdlWait())
 
     def get_name(self) -> str:
         return f"warpdrive_packed_toy_{self.work.get_key()}_cs{self.cluster.size}"
@@ -785,20 +963,40 @@ def compile_packed_toy(op: PackedToy):
     )
 
 
+@dataclass(frozen=True)
+class CachedLength(PackedWork):
+    """``PackedWork`` whose decode state caches the device-side length, read in ``start``: right
+    only if ``start`` runs after the readiness hook."""
+
+    def start(self, space):
+        _, length = space
+        return (Int32(length[0]),)
+
+    def decode(self, index, space, state):
+        table, _ = space
+        row = tuple(table[index, w] for w in range(self.words))
+        return index < state[0], row, state
+
+    def get_key(self) -> str:
+        return "cached_" + super().get_key()
+
+
+@pytest.mark.parametrize("mapping", [PackedWork(), CachedLength()], ids=["packed", "cached"])
 @pytest.mark.parametrize("cluster", [SingleCta(), CtaPair()], ids=["single", "pair"])
 @pytest.mark.parametrize("schedule", ["oneshot", "static", "atomic", "clc"])
-def test_device_built_list_under_pdl(requires_blackwell, schedule, cluster):
+def test_device_built_list_under_pdl(requires_blackwell, schedule, cluster, mapping):
     """The consumer launches before the producer finishes (PDL), waits in ``PdlWait``, and runs
     exactly the rows the producer wrote: every kept item once per CTA of its unit, in both
     roles, nothing past the device-side length (the table has spare capacity, prefilled with
-    rows that would hit item 0)."""
+    rows that would hit item 0). ``CachedLength`` reads the length in ``start``, which must
+    follow the wait at every decoding site."""
     schedules = {
         "oneshot": OneShot(),
         "static": StaticPersistent(),
         "atomic": AtomicPersistent(stages=2),
         "clc": ClusterLaunchControl(stages=2),
     }
-    op = PackedToy(schedules[schedule], cluster)
+    op = PackedToy(schedules[schedule], cluster, mapping)
     fn = compile_packed_toy(op)
     em, en, el = 7, 5, 3
     total = em * en * el
@@ -871,14 +1069,14 @@ class SplitK(WorkMap):
         extents, splits, _ = space
         return _wide(Raster().count64(extents)) * _wide(splits)
 
-    def decode(self, index, space):
+    def decode(self, index, space, state):
         extents, splits, k_tiles = space
         tile = index // splits
         split = index - tile * splits
-        _, (m, n, li) = Raster().decode(tile, extents)
+        _, (m, n, li), _ = Raster().decode(tile, extents, None)
         begin = split * k_tiles // splits
         end = (split + 1) * k_tiles // splits
-        return begin < end, (m, n, li, split, begin, end)
+        return begin < end, (m, n, li, split, begin, end), state
 
     def get_key(self) -> str:
         return "split_k"
@@ -892,7 +1090,7 @@ def test_split_k_ranges_partition_k(splits, k_tiles):
     space = mapping.bind(((3, 2, 2), splits, k_tiles))
     ranges = {}
     for index in range(mapping.count64(space)):
-        keep, (m, n, li, split, begin, end) = mapping.decode(index, space)
+        keep, (m, n, li, split, begin, end), _ = mapping.decode(index, space, None)
         assert bool(keep) == (begin < end)
         if keep:
             ranges.setdefault((m, n, li), []).append((begin, end))
@@ -1034,7 +1232,7 @@ class SplitKv(WorkMap):
         num_head, num_batch, _, _ = space
         return _wide(num_head) * _wide(num_batch) * self.max_splits
 
-    def decode(self, index, space):
+    def decode(self, index, space, state):
         num_head, _, seqlen_k, num_splits = space
         split = index % self.max_splits
         hb = index // self.max_splits
@@ -1044,7 +1242,7 @@ class SplitKv(WorkMap):
         blocks = (seqlen_k[batch] + self.n_block - 1) // self.n_block
         begin = split * blocks // splits
         end = (split + 1) * blocks // splits
-        return (split < splits) & (begin < end), (0, head, batch, split, begin, end)
+        return (split < splits) & (begin < end), (0, head, batch, split, begin, end), state
 
     def get_key(self) -> str:
         return f"split_kv{self.max_splits}_{self.n_block}"
@@ -1060,7 +1258,7 @@ def test_split_kv_items_follow_per_sequence_splits():
     space = mapping.bind((3, len(seqlen_k), seqlen_k, num_splits))
     kept = {}
     for index in range(mapping.count64(space)):
-        keep, (q_block, head, batch, split, begin, end) = mapping.decode(index, space)
+        keep, (q_block, head, batch, split, begin, end), _ = mapping.decode(index, space, None)
         assert q_block == 0
         if keep:
             assert split < num_splits[batch] and begin < end

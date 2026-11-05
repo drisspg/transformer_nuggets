@@ -81,6 +81,7 @@ and which on the device, and what each must guarantee. ``adapters.py`` wraps ext
 from __future__ import annotations
 
 import functools
+import inspect
 import re
 from dataclasses import dataclass, field, fields, is_dataclass
 
@@ -131,12 +132,25 @@ class WorkMap:
       ``BoundWork.total`` the kernel receives; a count the launch cannot index in Int32 is
       rejected at launch (``BoundWork.grid``), so the narrowing never truncates a launched
       count. An empty space counts 0 and runs no items.
-    * ``decode(index, space)``, device: ``(keep, words)``, a boolean and ``words``
-      Int32-convertible values. The layer calls it only for valid indices, ``0 <= index <
-      total``, after the readiness hook, so it may read per-item tables and a device-written
-      length there. ``keep = False`` removes the item permanently for every role; only a mapping
-      that sets ``skips = True`` may return a runtime ``keep`` (any other must return the
-      constant ``True``, checked at trace time). The words of a dropped item are ignored.
+    * ``start(space)``, device: the decode state of a decoding site, once at its startup (each
+      role in local mode, the scheduler warp in broadcast mode, ``single_item``), after the
+      readiness hook, also when the stream is empty. Default ``None``: a stateless mapping. A
+      stateful one returns DSL values (``Int32(0)``, not ``0``) in a tuple or ``NamedTuple``
+      (not a plain dataclass, whose fields are not carried), safe for every bound space: read
+      item tables in ``decode``, which is guarded. It lives in registers of every decoding warp,
+      so keep it to a few words.
+    * ``decode(index, space, state)``, device: ``(keep, words, state)``, a boolean, ``words``
+      Int32-convertible values, and the next state (the same structure and types; ``None`` for
+      a stateless mapping). The layer calls it only for valid indices, ``0 <= index < total``,
+      after the readiness hook, so it may read per-item tables and a device-written length
+      there. ``keep = False`` removes the item permanently for every role; only a mapping that
+      sets ``skips = True`` may return a runtime ``keep`` (any other must return the constant
+      ``True``, checked at trace time). The words of a dropped item are ignored. Each site
+      passes the state its previous decode returned (dropped items included), or ``start``'s.
+      The state is a cache, never an input to the answer: from any state reachable from
+      ``start``, ``decode`` must return the ``keep`` (and kept words) that ``start``'s state
+      would, for indices in any order (schedules jump, CLC and custom schedules may go
+      backwards). Make it fast for increasing indices and correct for the rest.
     * ``decodes_any_index`` (class attribute, default ``False``): set it only when ``decode`` is
       a pure function defined for every nonnegative Int32 index, including ``index >= total``
       and empty spaces, of launch-time data only (no table reads, no division by a runtime
@@ -145,15 +159,16 @@ class WorkMap:
       decoding warps; ``keep`` of a skipping mapping is still only used for valid indices.
       ``Raster`` and the ``adapters.py`` mappings set it; it is the one exception to "decoded
       only for valid indices, after readiness". A subclass that overrides ``decode`` does not
-      inherit it.
+      inherit it. A speculative decode updates the state, which must remain a valid state.
     * ``unpack(words)``, device: what ``work.item`` returns (default: the tuple of words).
     * ``get_key()``, host: compile-key fragment naming every compile-time choice (never runtime
       extents), in lowercase letters, digits and underscores (examples put it in kernel names).
       ``describe()`` (optional): text for ``describe()``.
 
-    Every method sees the bound space. ``decode`` must be a pure function of its arguments (plus
-    tables written before the launch, or before ``ready`` returns), so every role that decodes an
-    index gets the same item; ``keep`` must give the same answer in every role and CTA. A
+    Every method sees the bound space. ``decode``'s item must be a pure function of the index and
+    space (plus tables written before the launch, or before ``ready`` returns), so every role
+    that decodes an index gets the same item, whatever its state; ``keep`` must give the same
+    answer in every role and CTA. A
     device-built work list binds a host-visible capacity as the count and reads its true length
     in ``decode`` (``examples/packed_work.py``); the host never reads device memory.
     """
@@ -168,6 +183,13 @@ class WorkMap:
         # the opt-in; it must state decodes_any_index again.
         if "decode" in vars(cls) and "decodes_any_index" not in vars(cls):
             cls.decodes_any_index = False
+        if "decode" in vars(cls):
+            params = inspect.signature(cls.decode).parameters
+            if len(params) != 4 and not any(p.kind is p.VAR_POSITIONAL for p in params.values()):
+                raise TypeError(
+                    f"{cls.__name__}.decode takes (self, index, space, state) and returns "
+                    "(keep, words, state); a stateless mapping passes state through (None)"
+                )
 
     def bind(self, space):
         return space
@@ -175,7 +197,10 @@ class WorkMap:
     def count64(self, space):
         raise NotImplementedError
 
-    def decode(self, index, space):
+    def start(self, space):
+        return None
+
+    def decode(self, index, space, state):
         raise NotImplementedError
 
     def unpack(self, words):
@@ -246,7 +271,7 @@ class Raster(WorkMap):
             return min(min(em * en, limit) * el, limit)
         return cutlass.min(cutlass.min(Int64(em) * en, limit) * el, limit)
 
-    def decode(self, index, space):
+    def decode(self, index, space, state):
         em, en, el = space
         per_l = em * en
         li = index // per_l
@@ -270,7 +295,7 @@ class Raster(WorkMap):
             n = en - 1 - n
         if "l" in self.reverse:
             li = el - 1 - li
-        return True, (m, n, li)
+        return True, (m, n, li), state
 
     def get_key(self) -> str:
         return f"{self.along}{self.swizzle}" + (
@@ -653,7 +678,7 @@ class WorkStream:
             )
         problem = problems[self.name]
         first = Int32(self.schedule.first_index(problem))
-        index, words = _local_start(self, first, problem)
+        index, words, _ = _local_start(self, first, problem)
         return index < problem.total, self.mapping.unpack(words)
 
     # ---- host, plain Python ------------------------------------------------ #
@@ -836,75 +861,120 @@ def _narrow(count):
     return Int32(cutlass.min(Int64(count), Int64(INT32_MAX)))
 
 
-def _keep_words(mapping, index, space):
-    """``(keep, words)`` of ``mapping.decode``, with the words as Int32 values."""
-    keep, words = mapping.decode(index, space)
+def _state_schema(mapping, state):
+    """Trace-time structure of a non-``None`` decode state: its tuple/``NamedTuple`` nesting and
+    each leaf's MLIR types. Rejects the leaves the layer's flat carry would drop."""
+    name = type(mapping).__name__
+    if isinstance(state, tuple):
+        return type(state), tuple(_state_schema(mapping, leaf) for leaf in state)
+    if state is None or isinstance(state, (bool, int, float)):
+        raise ProtocolError(
+            f"{name} decode state has a Python value {state!r}; state leaves are DSL values "
+            "(Int32(0), not 0), so the cursor can carry them"
+        )
+    if is_dataclass(state):
+        raise ProtocolError(
+            f"{name} decode state holds a dataclass {type(state).__name__}, whose fields are not "
+            "carried across work items; use a NamedTuple"
+        )
+    values = cutlass.extract_mlir_values(state)
+    if not values:
+        raise ProtocolError(f"{name} decode state holds {state!r}, which carries no DSL values")
+    return type(state), tuple(str(v.type) for v in values)
+
+
+def _start(mapping, space):
+    """A decoding site's initial state: ``mapping.start``, checked to be carriable."""
+    state = mapping.start(space)
+    if state is not None:
+        _state_schema(mapping, state)
+    return state
+
+
+def _keep_words(mapping, index, space, state):
+    """``(keep, words, state)`` of ``mapping.decode``, with the words as Int32 values."""
+    name = type(mapping).__name__
+    result = mapping.decode(index, space, state)
+    if not isinstance(result, tuple) or len(result) != 3:
+        raise ProtocolError(f"{name}.decode must return (keep, words, state)")
+    keep, words, next_state = result
     words = [Int32(w) for w in words]
     if len(words) != mapping.words:
         raise ProtocolError(
-            f"{type(mapping).__name__}.decode returned {len(words)} words; its words is "
-            f"{mapping.words}"
+            f"{name}.decode returned {len(words)} words; its words is {mapping.words}"
         )
     if not mapping.skips and keep is not True:
         raise ProtocolError(
-            f"{type(mapping).__name__}.decode returned keep={keep!r}; a mapping that drops items "
+            f"{name}.decode returned keep={keep!r}; a mapping that drops items "
             "sets skips = True (any other returns the constant True)"
         )
-    return keep, words
+    if (state is None) != (next_state is None) or (
+        state is not None and _state_schema(mapping, next_state) != _state_schema(mapping, state)
+    ):
+        raise ProtocolError(
+            f"{name}.decode returned a state of another structure or type than it received "
+            f"({next_state!r} for {state!r}); the state is carried from item to item"
+        )
+    return keep, words, next_state
 
 
-def _decode(stream, index, problem):
-    """Item words of ``index``: decoded for a valid index, zeros past the end. Only a mapping
-    with ``decodes_any_index`` is evaluated unconditionally (no branch)."""
+def _decode(stream, index, problem, state):
+    """``(words, state)`` of ``index``: decoded for a valid index, zeros (and ``state``) past the
+    end. Only a mapping with ``decodes_any_index`` is evaluated unconditionally (no branch)."""
     mapping = stream.mapping
     if mapping.decodes_any_index:
-        return _keep_words(mapping, index, problem.space)[1]
-    return list(_decode_kept(mapping, index, problem.total, problem.space)[1])
+        _, words, state = _keep_words(mapping, index, problem.space, state)
+        return words, state
+    _, words, state = _decode_kept(mapping, index, problem.total, problem.space, state)
+    return list(words), state
 
 
 @cute.jit
-def _decode_kept(mapping, index, total, space):
-    """``(dropped, words)`` of a valid index; ``(False, zeros)`` past the end, which is never
-    decoded (``decode`` may read per-item tables). One decode yields both."""
+def _decode_kept(mapping, index, total, space, state):
+    """``(dropped, words, state)`` of a valid index; ``(False, zeros, state)`` past the end,
+    which is never decoded (``decode`` may read per-item tables). One decode yields all three."""
     dropped = cutlass.Boolean(False)
     words = tuple(Int32(0) for _ in range(mapping.words))
     if index < total:
-        keep, kept_words = _keep_words(mapping, index, space)
+        keep, kept_words, state = _keep_words(mapping, index, space, state)
         dropped = ~cutlass.Boolean(keep)
         words = tuple(kept_words)
-    return dropped, words
+    return dropped, words, state
 
 
 @cute.jit
-def _skip_local(stream, index, problem):
-    """``(index, words)``: the first index at or after ``index`` (in this CTA's local sequence)
-    the mapping keeps, or a terminal index, with the words its last decode returned."""
+def _skip_local(stream, index, problem, state):
+    """``(index, words, state)``: the first index at or after ``index`` (in this CTA's local
+    sequence) the mapping keeps, or a terminal index, with the words and state its last decode
+    returned."""
     step = stream.schedule.next_index  # a method call on `stream` in the loop would carry it
     mapping, total, space = stream.mapping, problem.total, problem.space
-    dropped, words = _decode_kept(mapping, index, total, space)
+    dropped, words, state = _decode_kept(mapping, index, total, space, state)
     while dropped:
         index = Int32(step(index, problem))
-        dropped, words = _decode_kept(mapping, index, total, space)
-    return index, list(words)
+        dropped, words, state = _decode_kept(mapping, index, total, space, state)
+    return index, list(words), state
 
 
-def _local_item(stream, index, problem):
-    """``(index, words)`` of the first kept item at or after ``index`` in this unit's local
-    sequence: ``index`` itself unless the mapping skips."""
+def _local_item(stream, index, problem, state):
+    """``(index, words, state)`` of the first kept item at or after ``index`` in this unit's
+    local sequence: ``index`` itself unless the mapping skips."""
     if stream.mapping.skips:
-        return _skip_local(stream, index, problem)
-    return index, _decode(stream, index, problem)
+        return _skip_local(stream, index, problem, state)
+    return index, *_decode(stream, index, problem, state)
 
 
 def _local_start(stream, first, problem):
-    """``(index, words)`` a local-mode role starts with, from the unit's first index: the
-    readiness hook runs before any decode, and a tile-grid stream takes the prologue's words. The
-    cursor and ``single_item`` share it, so a raw role sees what a managed role would (R20)."""
+    """``(index, words, state)`` a local-mode role starts with, from the unit's first index: the
+    readiness hook runs before ``start`` and any decode, and a tile-grid stream takes the
+    prologue's words. The cursor and ``single_item`` share it, so a raw role sees what a managed
+    role would (R20)."""
     if stream.ready is not None:
         stream.ready.wait()
+    state = _start(stream.mapping, problem.space)
     if _tile_grid(stream):
-        return first, list(problem.first_words)
-    return _local_item(stream, first, problem)
+        return first, list(problem.first_words), state
+    return _local_item(stream, first, problem, state)
 
 
 @cute.jit
@@ -1020,7 +1090,7 @@ def _grid_item(mapping, space, m, n, li):
     _, en, el = space
     _, gdy, gdz = cute.arch.grid_dim()
     if (gdy * gdz == 1) & (en * el > 1):
-        _, (dm, dn, dl) = decode(m, space)
+        _, (dm, dn, dl), _ = decode(m, space, None)
         m, n, li = Int32(dm), Int32(dn), Int32(dl)
     return m, n, li
 
@@ -1040,9 +1110,13 @@ def _tile_grid(stream) -> bool:
     )
 
 
-def _hooked(stream) -> bool:
-    """Hooks can move a CTA's first item off ``schedule.first_index``."""
-    return stream.ready is not None or stream.mapping.skips
+def _publishes_first(stream) -> bool:
+    """A broadcast scheduler decodes and publishes the first item too, so ring receivers never
+    decode, unless the mapping is a pure any-index decoder without hooks: every role then decodes
+    ``first_index`` from launch data. Hooks (readiness, skipping) can move the first item off
+    ``first_index``."""
+    mapping = stream.mapping
+    return stream.ready is not None or mapping.skips or not mapping.decodes_any_index
 
 
 class WorkCursor:
@@ -1050,20 +1124,25 @@ class WorkCursor:
 
     Also the role annotation: a role parameter ``work: WorkCursor`` receives the cursor over the
     stream declared as ``self.work``. A DSL value carrying the linear index, the decoded item
-    words, and, in broadcast mode, the role's consumer end of the work ring.
+    words, the mapping's decode state where this cursor decodes (local mode and the scheduler
+    warp), and, in broadcast mode, the role's consumer end of the work ring.
     """
 
-    def __init__(self, stream, problem, end, index, words, rec, count=None, slot=None, iket=None):
+    def __init__(
+        self, stream, problem, end, index, words, rec, count=None, slot=None, iket=None, state=None
+    ):
         self._stream, self._problem, self._end, self._rec = stream, problem, end, rec
         self.index, self._words = index, words
         self._count, self._slot = count, slot  # recording: items seen, (role ordinal, warp)
         self._iket = iket  # IKET range name of one work item (the role name), or None
+        self._state = state  # WorkMap.decode state of a decoding cursor (None: stateless)
 
     @staticmethod
     def create(stream, problem, end, trace, *, scheduler: bool = False, slot=None):
         """Local mode (``end`` is None): run the hooks and decode here. Broadcast mode: start at
-        ``first_index`` decoded locally, or, when hooks may move the first item, receive it from
-        the scheduler (which publishes it in ``scheduler_role``)."""
+        ``first_index`` decoded locally (a pure any-index mapping without hooks), or receive the
+        first item from the scheduler, which publishes it in ``scheduler_role``. Only the
+        scheduler's cursor keeps a decode state in broadcast mode."""
         rec = _CursorRecord(trace.role_name, stream.name or "work", trace=trace)
         trace.checks.append(rec.check)
         count = Int32(0) if stream.record else None
@@ -1071,11 +1150,15 @@ class WorkCursor:
         first = Int32(stream.schedule.first_index(problem))
         cur = WorkCursor(stream, problem, end, first, [], rec, count, slot, iket)
         if end is None:
-            cur.index, cur._words = _local_start(stream, first, problem)
-        elif not _hooked(stream):
-            cur._words = _decode(stream, first, problem)
+            cur.index, cur._words, cur._state = _local_start(stream, first, problem)
+        elif not _publishes_first(stream):
+            cur._words, state = _decode(
+                stream, first, problem, _start(stream.mapping, problem.space)
+            )
+            if scheduler:
+                cur._state = state
         elif scheduler:
-            # scheduler_role runs the hooks, then publishes and receives the first item
+            # scheduler_role runs the hooks and start(), then publishes and receives the first item
             # (and opens its range through _first_item()).
             cur._words = [Int32(0)] * stream.mapping.words
             return cur
@@ -1105,6 +1188,8 @@ class WorkCursor:
         values = [self.index.ir_value()] + [w.ir_value() for w in self._words]
         if self._count is not None:
             values.append(self._count.ir_value())
+        if self._state is not None:
+            values += cutlass.extract_mlir_values(self._state)
         if self._end is not None:
             values += self._end.__extract_mlir_values__()
         return values
@@ -1115,6 +1200,10 @@ class WorkCursor:
         count = None
         if self._count is not None:
             count, n = Int32(values[n]), n + 1
+        state = None
+        if self._state is not None:
+            k = len(cutlass.extract_mlir_values(self._state))
+            state, n = cutlass.new_from_mlir_values(self._state, values[n : n + k]), n + k
         end = None if self._end is None else self._end.__new_from_mlir_values__(values[n:])
         return WorkCursor(
             self._stream,
@@ -1126,6 +1215,7 @@ class WorkCursor:
             count,
             self._slot,
             self._iket,
+            state,
         )
 
     @property
@@ -1162,7 +1252,9 @@ class WorkCursor:
             self.index = Int32(stream.schedule.next_index(self.index, problem))
             # A non-persistent stream has ended: keep the words, nothing past the end is decoded.
             if stream.schedule.persistent:
-                self.index, self._words = _local_item(stream, self.index, problem)
+                self.index, self._words, self._state = _local_item(
+                    stream, self.index, problem, self._state
+                )
         else:
             self._receive()
         self._log()
@@ -1236,20 +1328,23 @@ def _publish_pair(slot_ptr, full, values, targets: cutlass.Constexpr):
 
 
 @cute.jit
-def _publish_kept(h, fetch, stream, problem, index):
+def _publish_kept(h, fetch, stream, problem, index, state):
     """Publish into ``h`` the first kept item at or after ``index``, claiming past dropped
-    ones. Returns ``fetch``: the skip loop rebinds it, so the caller must take it back."""
+    ones. Returns ``(fetch, state)``: the skip loop rebinds both, so the caller must take them
+    back."""
     mapping = stream.mapping
     if cutlass.const_expr(mapping.skips):
-        dropped, words = _decode_kept(mapping, index, problem.total, problem.space)
+        dropped, words, state = _decode_kept(mapping, index, problem.total, problem.space, state)
         while dropped:
             index = fetch.claim_next(index)
-            dropped, words = _decode_kept(mapping, index, problem.total, problem.space)
+            dropped, words, state = _decode_kept(
+                mapping, index, problem.total, problem.space, state
+            )
         words = list(words)
     else:
-        words = _decode(stream, index, problem)
+        words, state = _decode(stream, index, problem, state)
     _publish(h, index, words, problem.total)
-    return fetch
+    return fetch, state
 
 
 @cute.jit
@@ -1263,18 +1358,22 @@ def scheduler_role(kernel, ring, cursor: WorkCursor, fetch: _Fetch):
     """
     stream = cursor._stream
     problem = cursor._problem
-    if cutlass.const_expr(_hooked(stream)):
-        # Hooks may move the first item off blockIdx.x, so publish it like a claim.
+    # The decode state travels beside the cursor, which only receives here.
+    state, cursor._state = cursor._state, None
+    if cutlass.const_expr(_publishes_first(stream)):
+        # Publish the first item like a claim: hooks may move it off blockIdx.x, and ring
+        # receivers decode no other mapping.
         if cutlass.const_expr(stream.ready is not None):
             stream.ready.wait()
+        state = _start(stream.mapping, problem.space)
         with ring.produce() as h0:
-            fetch = _publish_kept(h0, fetch, stream, problem, cursor.index)
+            fetch, state = _publish_kept(h0, fetch, stream, problem, cursor.index, state)
         cursor._receive()
         cursor._first_item()
     while cursor.valid:
         with ring.produce() as h:
             index = fetch.claim_next(cursor.index)
-            fetch = _publish_kept(h, fetch, stream, problem, index)
+            fetch, state = _publish_kept(h, fetch, stream, problem, index, state)
         cursor.advance()
     fetch.close_claims()
     return ring, cursor

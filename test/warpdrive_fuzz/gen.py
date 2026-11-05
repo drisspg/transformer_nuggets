@@ -1905,9 +1905,9 @@ class TableMap(WorkMap):
     def count64(self, space):
         return Int64(space[2])
 
-    def decode(self, index, space):
+    def decode(self, index, space, state):
         table, bad, total = space
-        return True, D.table_row(table, bad, index, total)
+        return True, D.table_row(table, bad, index, total), state
 
     def get_key(self):
         return "fuzztable"
@@ -1977,9 +1977,9 @@ def emit(spec: KernelSpec) -> str:
         src.block("class SkipMod(Raster):")
         src("skips = True")
         src()
-        src.block("def decode(self, index, space):")
-        src("_, (m, n, l) = super().decode(index, space)")
-        src(f"return (m * {a} + n * {b} + l * {c}) % {k} != 0, (m, n, l)")
+        src.block("def decode(self, index, space, state):")
+        src("_, (m, n, l), state = super().decode(index, space, state)")
+        src(f"return (m * {a} + n * {b} + l * {c}) % {k} != 0, (m, n, l), state")
         src.end()
         src()
         src.block("def get_key(self):")

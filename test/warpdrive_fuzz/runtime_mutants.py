@@ -169,9 +169,9 @@ def signal_false_signals():
 
 def decode_unguarded():
     """Every mapping is decoded at any index, as if it declared ``decodes_any_index``."""
-    scheduling._decode = lambda stream, index, problem: scheduling._keep_words(
-        stream.mapping, index, problem.space
-    )[1]
+    scheduling._decode = lambda stream, index, problem, state: scheduling._keep_words(
+        stream.mapping, index, problem.space, state
+    )[1:]
 
 
 def pdl_no_wait():

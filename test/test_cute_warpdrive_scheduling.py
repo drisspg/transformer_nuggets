@@ -31,8 +31,8 @@ from transformer_nuggets.cute.warpdrive import (
     WorkMap,
     WorkStream,
     role,
+    scheduling,
 )
-from transformer_nuggets.cute.warpdrive import scheduling
 from transformer_nuggets.cute.warpdrive.scheduling import tile_grid_dims
 
 SCHEDULES = {
@@ -60,7 +60,7 @@ def requires_blackwell() -> None:
 
 def _all_coords(mapping, ext):
     total = ext[0] * ext[1] * ext[2]
-    return [mapping.decode(i, ext)[1] for i in range(total)]
+    return [mapping.decode(i, ext, None)[1] for i in range(total)]
 
 
 EXTENTS = [(1, 1, 1), (1, 7, 1), (7, 1, 2), (5, 3, 1), (16, 16, 1), (13, 29, 3), (3, 100, 1)]
@@ -151,7 +151,7 @@ def test_bound_empty_space_has_no_items_and_decodes(mapping, space):
     bound = mapping.bind(space)
     assert int(mapping.count64(bound)) == 0
     for index in range(4):
-        mapping.decode(Int32(index), bound)
+        mapping.decode(Int32(index), bound, None)
 
 
 @pytest.mark.parametrize(
@@ -196,8 +196,8 @@ def test_swizzled_decode_does_not_overflow_int32(mapping):
     bound = mapping.bind(ext)
     total = 3 * 2**29
     for index in [0, 5, 2**29 + 7, total - 2**29 - 1, total - 1]:
-        got = tuple(int(w) for w in mapping.decode(Int32(index), bound)[1])
-        assert got == mapping.decode(index, ext)[1]
+        got = tuple(int(w) for w in mapping.decode(Int32(index), bound, None)[1])
+        assert got == mapping.decode(index, ext, None)[1]
 
 
 def test_stream_keys_exclude_runtime_values():
@@ -219,9 +219,9 @@ class SkipOdd(Raster):
 
     skips = True
 
-    def decode(self, index, space):
-        _, item = super().decode(index, space)
-        return self.kept(item), item
+    def decode(self, index, space, state):
+        _, item, state = super().decode(index, space, state)
+        return self.kept(item), item, state
 
     def kept(self, item):
         m, n, _ = item
@@ -259,11 +259,11 @@ class CheckedRaster(WorkMap):
     def count64(self, space):
         return Raster().count64(space)
 
-    def decode(self, index, space):
+    def decode(self, index, space, state):
         em, en, el = space
         _trap_outside(index, em * en * el)
-        _, item = SWIZZLED.decode(index, space)
-        return self.kept(item), item
+        _, item, state = SWIZZLED.decode(index, space, state)
+        return self.kept(item), item, state
 
     def kept(self, item):
         if not self.drop_odd:
@@ -432,7 +432,7 @@ def test_every_role_sees_every_tile_once(requires_blackwell, schedule, ext, max_
         mapping = op.work.mapping
         for b in range(grid):
             for k in range(min(ScheduleToy.MAX_ITEMS, len(range(b, total, grid)))):
-                _, (m, n, li) = mapping.decode(b + k * grid, ext)
+                _, (m, n, li), _ = mapping.decode(b + k * grid, ext, None)
                 assert log[0, b, k] == (li * ext[1] + n) * ext[0] + m
     assert ws[:2].tolist() == [0, 0], "atomic counter must self-reset"
 
@@ -598,9 +598,9 @@ class UndeclaredDrop(CheckedRaster):
 
 @dataclass(frozen=True)
 class ShortDecode(CheckedRaster):
-    def decode(self, index, space):
-        _, (m, n, _) = super().decode(index, space)
-        return True, (m, n)  # two words for a three-word mapping
+    def decode(self, index, space, state):
+        _, (m, n, _), state = super().decode(index, space, state)
+        return True, (m, n), state  # two words for a three-word mapping
 
 
 def test_decode_word_count_is_checked(requires_blackwell):
@@ -609,13 +609,72 @@ def test_decode_word_count_is_checked(requires_blackwell):
         compile_count_toy(op)
 
 
+@dataclass(frozen=True)
+class Counter:
+    count: Int32
+
+
+@dataclass(frozen=True)
+class BadState(CheckedRaster):
+    """A stateful mapping whose state breaks a carry rule (``kind``)."""
+
+    kind: str = "dataclass"
+
+    def start(self, space):
+        match self.kind:
+            case "dataclass":
+                return Counter(Int32(0))
+            case "python_int":
+                return (0,)
+        return (Int32(0),)
+
+    def decode(self, index, space, state):
+        keep, words, state = super().decode(index, space, state)
+        match self.kind:
+            case "grows":
+                return keep, words, (*state, Int32(1))
+            case "retyped":
+                return keep, words, (cutlass.Int64(state[0]),)
+            case "two_values":
+                return keep, words
+        return keep, words, state
+
+
+@pytest.mark.parametrize(
+    "kind, message",
+    [
+        ("dataclass", "use a NamedTuple"),
+        ("python_int", r"Int32\(0\), not 0"),
+        ("grows", "another structure or type"),
+        ("retyped", "another structure or type"),
+        ("two_values", r"must return \(keep, words, state\)"),
+    ],
+)
+def test_decode_state_must_be_carriable(requires_blackwell, kind, message):
+    """The cursor carries the state from item to item as flat DSL values: a container whose
+    fields would not be carried, a Python number, or a state that changes shape is a trace-time
+    error naming the rule."""
+    op = CountToy(StaticPersistent(), BadState(kind=kind), SingleCta())
+    with pytest.raises(Exception, match=message):
+        compile_count_toy(op)
+
+
+def test_decode_takes_a_state():
+    """A mapping written for the stateless signature fails when it is defined."""
+    with pytest.raises(TypeError, match=r"takes \(self, index, space, state\)"):
+
+        class Stateless(WorkMap):
+            def decode(self, index, space):
+                return True, (index,)
+
+
 def test_overriding_decode_drops_the_any_index_opt_in():
     """A Raster subclass that replaces decode (it might read a table) is decoded only for valid
     indices unless it opts in again; one that keeps Raster's decode keeps the opt-in."""
 
     class TableRaster(Raster):
-        def decode(self, index, space):
-            return super().decode(index, space)
+        def decode(self, index, space, state):
+            return super().decode(index, space, state)
 
     class OptedIn(TableRaster):
         decodes_any_index = True
