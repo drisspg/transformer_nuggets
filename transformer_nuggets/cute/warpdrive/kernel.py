@@ -320,7 +320,11 @@ def role(
 # --------------------------------------------------------------------------- #
 
 
+# Keyed settings that may change after construction. The first collection derives the channel
+# scopes from the cluster and the scheduler roles from the work streams, and opens the protocol
+# log for trace_protocol; these cannot change after it. The rest are read when tracing.
 _HOST_SETTINGS = ("alias_check", "trace_protocol", "iket", "iket_waits")
+_COLLECTED_SETTINGS = ("cluster", "trace_protocol")
 
 
 @functools.cache
@@ -407,14 +411,22 @@ class WarpSpecialized(metaclass=_KernelType):
         return _rebuild, (type(self), *self._ws_init, settings)
 
     def __setattr__(self, name, value):
-        if isinstance(value, WorkStream):
-            value.owner = self  # the stream's work unit follows this kernel's cluster
+        state = vars(self)
+        if isinstance(value, WorkStream) or name in _COLLECTED_SETTINGS:
+            if state.get("_ws_roles") is not None:
+                raise ProtocolError(
+                    f"{type(self).__name__}.{name} cannot change after collection (describe, "
+                    "compile-cache lookup, or tracing derived the channels from it); construct "
+                    "a new kernel"
+                )
+            if isinstance(value, WorkStream):
+                value.owner = self  # the stream's work unit follows this kernel's cluster
         elif not (
-            "_ws_init" not in vars(self)  # still constructing
+            "_ws_init" not in state  # still constructing
             or name.startswith("_")
-            or name in (*_HOST_SETTINGS, "cluster", "num_warps", "default_regs")
+            or name in _HOST_SETTINGS
         ):
-            vars(self).setdefault("_ws_late", set()).add(name)  # not keyed: see __cute_cache_key__
+            state.setdefault("_ws_late", set()).add(name)  # not keyed: see __cute_cache_key__
         super().__setattr__(name, value)
 
     # ---- host-side analysis ------------------------------------------------ #
@@ -573,10 +585,10 @@ class WarpSpecialized(metaclass=_KernelType):
         self._validate_placement(chans, turns, roles)
         self._ws_named = _allocate_named(chans, named_bars)
         for name, nb in named_bars.items():
-            if nb.threads > self.num_warps * WARP_SIZE:
+            if nb.threads > self._ws_num_warps * WARP_SIZE:
                 raise ProtocolError(
                     f"NamedBarrier {name} counts {nb.threads} threads, but the kernel launches "
-                    f"{self.num_warps * WARP_SIZE}; it can never complete"
+                    f"{self._ws_num_warps * WARP_SIZE}; it can never complete"
                 )
         self._ws_chans, self._ws_turns, self._ws_roles = chans, turns, roles
         self._ws_raw_bars = raw_bars
@@ -829,8 +841,8 @@ class WarpSpecialized(metaclass=_KernelType):
         uses_regs = any(r.regs is not None for r in roles)
         # setmaxnreg is .aligned per warpgroup: pad to whole warpgroups and require every warp
         # of a warpgroup to request the same budget.
-        self.num_warps = -(-num_warps // WARPGROUP) * WARPGROUP if uses_regs else num_warps
-        self.default_regs = min(REGS_PER_SM // (self.num_warps * WARP_SIZE) // 8 * 8, 256)
+        self._ws_num_warps = -(-num_warps // WARPGROUP) * WARPGROUP if uses_regs else num_warps
+        self._ws_default_regs = min(REGS_PER_SM // (self._ws_num_warps * WARP_SIZE) // 8 * 8, 256)
         # (warps, regs) for each run of warps no role owns, holes included: they take their
         # warpgroup's budget (MIN_REGS for an all-idle warpgroup).
         self._ws_padding = []
@@ -838,7 +850,7 @@ class WarpSpecialized(metaclass=_KernelType):
         self._ws_wg_regs = []
         if uses_regs:
             regs_of = {w: r.regs for r in roles for w in r.warps}
-            for g in range(self.num_warps // WARPGROUP):
+            for g in range(self._ws_num_warps // WARPGROUP):
                 group = range(g * WARPGROUP, (g + 1) * WARPGROUP)
                 budgets = {owner[w]: regs_of[w] for w in group if w in owner}
                 vals = set(budgets.values())
@@ -849,21 +861,21 @@ class WarpSpecialized(metaclass=_KernelType):
                 idle = [w for w in group if w not in owner]
                 self._ws_padding += [(run, regs) for run in _runs(idle)]
             total = sum(
-                (regs if regs is not None else self.default_regs) * len(warps) * WARP_SIZE
+                (regs if regs is not None else self._ws_default_regs) * len(warps) * WARP_SIZE
                 for warps, regs in [*((r.warps, r.regs) for r in roles), *self._ws_padding]
             )
             # Every warp starts at default_regs and setmaxnreg.inc only takes registers other
             # warps released, so the budgets share default_regs per launched thread, which is
             # below REGS_PER_SM when 65536 / threads is not a multiple of 8 (12, 20, 24, 28
             # warps). A larger total compiles but its setmaxnreg.inc waits forever.
-            pool = self.default_regs * self.num_warps * WARP_SIZE
+            pool = self._ws_default_regs * self._ws_num_warps * WARP_SIZE
             if total > pool:
                 raise ValueError(
-                    f"register budgets need {total} registers, but {self.num_warps} warps start "
-                    f"with {self.default_regs} each ({pool} in all; setmaxnreg can only move them)"
+                    f"register budgets need {total} registers, but {self._ws_num_warps} warps start "
+                    f"with {self._ws_default_regs} each ({pool} in all; setmaxnreg can only move them)"
                 )
         # (regs, warpgroups, role indices): one dispatch branch per register budget.
-        wg_of = [w // WARPGROUP for w in range(self.num_warps)]
+        wg_of = [w // WARPGROUP for w in range(self._ws_num_warps)]
         if self._ws_wg_regs:
             budgets = list(dict.fromkeys(self._ws_wg_regs))
             self._ws_budget_groups = [
@@ -880,7 +892,7 @@ class WarpSpecialized(metaclass=_KernelType):
             ]
         else:
             self._ws_budget_groups = [
-                (None, tuple(range(-(-self.num_warps // WARPGROUP))), tuple(range(len(roles))))
+                (None, tuple(range(-(-self._ws_num_warps // WARPGROUP))), tuple(range(len(roles))))
             ]
 
     def role_config_key(self) -> tuple:
@@ -1002,8 +1014,13 @@ class WarpSpecialized(metaclass=_KernelType):
             pop()
 
     @property
-    def num_threads(self) -> int:
+    def num_warps(self) -> int:
+        """Warps launched: the roles' warps, padded to whole warpgroups when a role sets regs."""
         self._collect()
+        return self._ws_num_warps
+
+    @property
+    def num_threads(self) -> int:
         return self.num_warps * WARP_SIZE
 
     def describe(self) -> str:
@@ -1562,9 +1579,9 @@ class WarpSpecialized(metaclass=_KernelType):
     def _set_regs(self, regs):
         if regs is None:
             return
-        if regs > self.default_regs:
+        if regs > self._ws_default_regs:
             cute.arch.setmaxregister_increase(regs)
-        elif regs < self.default_regs:
+        elif regs < self._ws_default_regs:
             cute.arch.setmaxregister_decrease(regs)
 
     def _role_args(self, r: RoleInstance, ctx, trace: RoleTrace):

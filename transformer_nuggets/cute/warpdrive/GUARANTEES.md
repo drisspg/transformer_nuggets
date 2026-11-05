@@ -68,7 +68,9 @@ raw named barriers clear of IDs 1 and 2, `op.named_barrier_ids` and each `NamedB
 producer tails cover the managed protocol, not arbitrary user async operations.
 
 **Keep configuration and workspaces valid.** Construct a new op when static declarations
-change; do not mutate a collected one. Include all static algorithm choices in its compile
+change; do not mutate a collected one (reassigning its cluster, a work stream or
+`trace_protocol` after collection raises; other declarations are not checked). Include all
+static algorithm choices in its compile
 key, using the [cache integration](docs/roles.md#compile-keys). Do not share a scheduler
 workspace between concurrent launches; use `launch_args()` for the current device and stream.
 The launch checks do not validate arbitrary indices, pointer arithmetic or resource use in

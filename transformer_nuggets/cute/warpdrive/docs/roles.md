@@ -195,8 +195,10 @@ modules defining the kernel's classes. So `Gemm()` and
 kernel subclass in your own file recompiles it. Pass static choices to the constructor:
 assigning another public attribute after construction (`op.tile_n = 128`) makes the key raise
 `TypeError`, because the constructor call no longer describes the kernel. The cluster, work
-streams and those four settings may be reassigned. Changes inside objects the constructor
-built (`op.ab.n = 4`) are not seen at all, so don't make them.
+streams and those four settings may be reassigned before the first collection; after it,
+assigning the cluster, a work stream or `trace_protocol` raises `ProtocolError`, because the
+collected channels were derived from them. Changes inside objects the constructor built
+(`op.ab.n = 4`) are not seen at all, so don't make them.
 
 A cached kernel was not traced, but `describe()` still shows the trace's findings: `jit_cache`
 restores the TMA, SMEM and alias reports and the opt-outs saved with the build, and repeats

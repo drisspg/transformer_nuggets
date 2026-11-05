@@ -13,7 +13,12 @@ pytest.importorskip("cutlass.cute")
 
 from transformer_nuggets.cute.jit_cache import CacheInfo, CompileTarget, compile_many
 from transformer_nuggets.cute.jit_cache import _key as cute_key
-from transformer_nuggets.cute.warpdrive import AtomicPersistent, ClusterLaunchControl, CtaPair
+from transformer_nuggets.cute.warpdrive import (
+    AtomicPersistent,
+    ClusterLaunchControl,
+    CtaPair,
+    ProtocolError,
+)
 from transformer_nuggets.cute.warpdrive.examples.gemm import Gemm, compile_gemm, gemm
 from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import (
     PersistentGemm,
@@ -130,6 +135,25 @@ def test_pickled_kernel_keeps_its_key():
     stages[0] = 4  # the key froze the call as made; the rebuilt kernel must be that call too
     copy = pickle.loads(pickle.dumps(listed))
     assert copy.ab.n == 2 and key_of(copy) == key_of(listed)
+
+
+def test_collected_kernel_rejects_cluster_and_stream_reassignment():
+    """The cluster, the work stream and trace_protocol may change until the first collection
+    (describe, key, trace); after it the derived channels would be stale, so they raise."""
+    op = PersistentGemm()
+    op.cluster = CtaPair()
+    op.work = PersistentGemm(schedule=AtomicPersistent(stages=3)).work
+    op.trace_protocol = True
+    before = op.describe()
+    with pytest.raises(ProtocolError, match="cluster.*after collection"):
+        op.cluster = CtaPair()
+    with pytest.raises(ProtocolError, match="work.*after collection"):
+        op.work = PersistentGemm(schedule=AtomicPersistent(stages=3)).work
+    with pytest.raises(ProtocolError, match="trace_protocol.*after collection"):
+        op.trace_protocol = False
+    assert op.describe() == before and op.work.roles
+    with pytest.raises(AttributeError):
+        op.num_warps = 4  # derived from the roles, not a setting
 
 
 # A kernel module outside the package, as a test or user file would define one: its own source
