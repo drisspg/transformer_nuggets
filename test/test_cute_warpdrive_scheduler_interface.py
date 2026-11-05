@@ -174,6 +174,8 @@ def test_custom_schedule_keys_and_launch_needs():
     # Built-ins take the same default key as custom schedules.
     stream = WorkStream(mapping=Raster(swizzle=8), schedule=ClusterLaunchControl())
     assert stream.get_key() == "clusterlaunchcontrol2_m8"
+    # A mapping without describe() is named by its class.
+    assert WorkStream(mapping=SplitK()).describe() == "OneShot(), SplitK"
     assert ReverseStatic().uses_max_ctas and not ReverseStatic().uses_workspace
     with pytest.raises(ValueError, match="AtomicPersistent.*workspace"):
         WorkStream(schedule=AtomicPersistent()).bind((1, 1, 1))
