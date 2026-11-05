@@ -247,6 +247,43 @@ done: arrive by consumer; native id by watcher;
 
 `test/test_cute_warpdrive_raw_interop.py` exercises several stage counts and epoch counts.
 
+## Compiler pitfall: saved indices across loops
+
+Optimized ptxas (reproduced with 12.8–13.5, SM90+ targets) can miscompile this valid
+PTX dataflow:
+
+```text
+read tid -> role dispatch branch -> saved = tid + nonzero_constant
+                                -> loop advances tid's PTX register
+                                -> address after loop uses saved
+```
+
+It may fold `base + (tid + C) * scale` into `base + tid * scale + C * scale`, but use
+the **loop-advanced register** instead of the original tid. The result can silently
+corrupt an in-bounds location; a clean memcheck alone does not rule it out. The bug
+also occurs with non-thread-index sources. Role dispatch makes the block placement
+natural, but neither managed channels nor raw synchronization causes the wrong code.
+
+Inspect kept PTX and SASS when an index survives a loop. The CPU-only candidate gate is:
+
+```bash
+CUTE_DSL_ARCH=sm_100a python scripts/warpdrive_sass.py dump agent_space/ptx-audit
+python scripts/warpdrive_ptx_audit.py agent_space/ptx-audit
+```
+
+The gate follows explicit thread-index register dataflow and add/sub recurrences;
+findings need SASS inspection and a targeted numerical or sentinel check against a
+ptxas `-O0` build. It is not a general compiler verifier: unsupported patterns and
+non-thread-index sources can escape it. An empty PTX inventory fails the gate.
+
+Verified PTX workarounds include computing the address before the loop, keeping a
+separate induction register, or defining the saved index in the same basic block as
+its source read. A post-loop fresh `%tid.x` read also works at PTX level, but another
+`cute.arch.thread_idx()` call can be removed by NVVM's common-subexpression elimination.
+Check the emitted PTX rather than trusting the Python spelling. `cute.PtxasOptions("-O0")`
+is a diagnostic/workaround for the whole kernel, not a cheap performance-neutral fix.
+There is no universal layer-level thread-index guard for arbitrary role bodies.
+
 ## Rules that still apply
 
 - **Counts are not identities.** An mbarrier count does not elect a lane or order other
