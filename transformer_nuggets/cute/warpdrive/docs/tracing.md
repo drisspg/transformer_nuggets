@@ -115,19 +115,27 @@ come back with a cached kernel ([compile keys](roles.md#compile-keys)).
 ### TMA checks
 
 Compilation follows recognizable direct SSA uses of channel barriers and counts static copy
-boxes in the handle's opening region. A known wrong CTA group, undeclared multicast mode or
-complete byte-count mismatch raises `ProtocolError`. Recognized copies report their group,
-bytes per stage per CTA and source locations. For multicast, the counted bytes are the SMEM
-destination box; in a symmetric `Cluster.multicast` partition this equals the issuing CTA's
-delivery across its mask's CTAs.
+boxes in the handle's opening region. It recognizes tensor TMA loads (`tma_bar_ptr=`) and bulk
+`cp.async.bulk` loads (`CopyBulkG2SOp`, and `CopyBulkG2SMulticastOp` by atom type, whose mask
+takes the tensor multicast check); a bulk load completes on the issuing CTA's barrier, like a
+`CtaGroup.ONE` tensor load, and is counted only directly inside an `elect_one()` block of the
+handle's region: bulk copies do not elect a lane themselves, so one written directly in the
+region (every lane issues it) leaves the stage unverified. A known wrong CTA group (a bulk load into a pair-scoped channel
+included), undeclared multicast mode or complete byte-count mismatch raises `ProtocolError`.
+Recognized copies report their group (`cp.async.bulk` for bulk loads), bytes per stage per CTA
+and source locations. For multicast, the counted bytes are the SMEM destination box; in a
+symmetric `Cluster.multicast` partition this equals the issuing CTA's delivery across its mask's
+CTAs.
 
-Unknown atoms, opaque pointers, nested/dynamic copies, multicast masks not obtained from
-`Cluster.multicast`, or unsupported IR can leave this check incomplete. Incomplete inspection
-alone does not reject; compilation continues with a warning and `unverified` reasons in
-`describe()`. Positive wrong-group or undeclared-multicast evidence still rejects even when
-byte accounting is incomplete. Validate raw, unverified and opted-out uses independently.
-`verified` means the recognized group and byte accounting match; it does not certify descriptor
-legality, disjoint writes or all async ordering. You still supply `Tma(tx_bytes)` yourself.
+Unknown atoms, opaque pointers, nested/dynamic/conditional copies (other than `elect_one()`),
+multicast masks not obtained from `Cluster.multicast`, or unsupported IR can leave this check
+incomplete. Incomplete inspection alone does not reject; compilation continues with a warning
+and `unverified` reasons in `describe()`. Positive wrong-group or undeclared-multicast evidence
+still rejects even when byte accounting is incomplete. Validate raw, unverified and opted-out
+uses independently. `verified` means the recognized group and byte accounting match; it does not
+certify descriptor legality, the per-instruction size a bulk copy's layout lowers to (a bulk
+copy moves whole contiguous vectors; give it flat views), disjoint writes or all async ordering.
+You still supply `Tma(tx_bytes)` yourself.
 
 Context atom checks inspect direct fields for MMA CTA span and unsupported group-TWO or
 multicast G2S atoms. They do not recursively inspect nested objects and are not disabled by a

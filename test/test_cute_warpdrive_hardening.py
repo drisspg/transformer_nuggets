@@ -112,6 +112,17 @@ class _TmaToy(WarpSpecialized):
                 cute.copy(
                     ctx.tma, ctx.tg[None, i % ctx.tiles], ctx.ts[None, h.index], tma_bar_ptr=bar
                 )
+            elif cutlass.const_expr(self.mode == "bulk"):
+                # A cp.async.bulk (non-tensor) copy of the whole tile, like FA4 bwd's LSE rows;
+                # bulk copies do not elect a lane themselves.
+                with cute.arch.elect_one():
+                    cute.copy(ctx.bulk, *self.flat(ctx, i, h), mbar_ptr=h.barrier)
+            elif cutlass.const_expr(self.mode == "bulk_lane0"):
+                if cute.arch.lane_idx() == 0:  # a generic branch, not elect_one(): not counted
+                    cute.copy(ctx.bulk, *self.flat(ctx, i, h), mbar_ptr=h.barrier)
+            elif cutlass.const_expr(self.mode == "bulk_direct"):
+                # Every lane of the warp issues the copy: 32 x the bytes (never launched).
+                cute.copy(ctx.bulk, *self.flat(ctx, i, h), mbar_ptr=h.barrier)
             elif cutlass.const_expr(self.mode == "optout"):
                 with unchecked("tma", reason="toy: atom verified by hand"):
                     bar = h.barrier
@@ -129,6 +140,14 @@ class _TmaToy(WarpSpecialized):
         return ld
 
     @cute.jit
+    def flat(self, ctx, i, h):
+        """The tile and its stage as flat vectors (a bulk copy moves contiguous bytes)."""
+        flat = cute.make_layout(TILE_ROWS * 64)
+        src = cute.make_tensor(ctx.g[None, None, i % ctx.tiles].iterator, flat)
+        dst = cute.make_tensor(ctx.s[None, None, h.index].iterator, flat)
+        return src, dst
+
+    @cute.jit
     def consume(self, ld, ctx):
         rank = self.cluster.rank()  # warp-uniform: not inside the lane-0 branch
         for i in cutlass.range(ctx.n, unroll=1):
@@ -140,13 +159,17 @@ class _TmaToy(WarpSpecialized):
         return ld
 
     @cute.kernel
-    def kernel(self, tma, tg, out, n: cutlass.Int32, tiles: cutlass.Int32, s_layout):
+    def kernel(self, tma, tg, g, out, n: cutlass.Int32, tiles: cutlass.Int32, s_layout):
         smem = self.begin_roles()
         s = smem.allocate_tensor(cutlass.BFloat16, s_layout, 128)
         ts, tgp = cpasync.tma_partition(
             tma, 0, cute.make_layout(1), cute.group_modes(s, 0, 2), cute.group_modes(tg, 0, 2)
         )
-        self.run_roles(SimpleNamespace(tma=tma, tg=tgp, ts=ts, s=s, out=out, n=n, tiles=tiles))
+        bulk = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), cutlass.BFloat16)
+        ctx = SimpleNamespace(
+            tma=tma, tg=tgp, ts=ts, s=s, g=g, bulk=bulk, out=out, n=n, tiles=tiles
+        )
+        self.run_roles(ctx)
 
     @cute.jit
     def __call__(self, src: cute.Tensor, out: cute.Tensor, n: cutlass.Int32, stream):
@@ -159,7 +182,8 @@ class _TmaToy(WarpSpecialized):
             (TILE_ROWS, 64),
         )
         tiles = cute.local_tile(tg, (TILE_ROWS, 64), (None, 0))
-        self.kernel(tma, tiles, out, n, src.shape[0] // TILE_ROWS, s_layout).launch(
+        g = cute.local_tile(src, (TILE_ROWS, 64), (None, 0))  # plain (rows, cols, tile) view
+        self.kernel(tma, tiles, g, out, n, src.shape[0] // TILE_ROWS, s_layout).launch(
             **self.launch_config(grid=(self.cluster.size, 1, 1)), stream=stream
         )
 
@@ -241,12 +265,36 @@ def test_tma_check_rejects_mismatched_atom(cluster, consumer_cta, group, message
     assert "test_cute_warpdrive_hardening.py:" in str(err)  # points at the user's copy line
 
 
+@pytest.mark.parametrize("mode", ["plain", "bulk"])
 @pytest.mark.parametrize("tx", [TILE_BYTES // 2, 2 * TILE_BYTES])
-def test_tma_check_rejects_wrong_tx_bytes(tx):
+def test_tma_check_rejects_wrong_tx_bytes(tx, mode):
     effect = "completes before every copy lands" if tx < TILE_BYTES else "never completes"
     _raises_protocol(
         rf"deliver {TILE_BYTES} bytes, but the layer arms {tx} .*{effect}.*Tma\({TILE_BYTES}\)",
-        lambda: compile_tma_toy(make_tma_toy(SingleCta(), tx=tx)),
+        lambda: compile_tma_toy(make_tma_toy(SingleCta(), tx=tx, mode=mode)),
+    )
+
+
+def test_tma_check_verifies_bulk_copies(requires_blackwell):
+    """A ``cp.async.bulk`` load (``CopyBulkG2SOp``, ``mbar_ptr=``) inside ``elect_one()`` is
+    counted like a tensor TMA load: its bytes complete on the issuing CTA's barrier."""
+    op = make_tma_toy(SingleCta(), mode="bulk")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        run_tma_toy(op)
+    report = op._ws_tma["ld"]
+    assert report.groups == {"bulk"} and report.stage_bytes == {TILE_BYTES}
+    assert not report.unverified
+    assert f"tma       verified cp.async.bulk, {TILE_BYTES} B/stage per CTA @ " in op.describe()
+
+
+def test_tma_check_rejects_bulk_copy_on_pair_scoped_channel():
+    """The leader arms both CTAs' bytes, but a bulk copy from the peer completes on the peer's
+    own barrier: rejected like a CtaGroup.ONE tensor load."""
+    _raises_protocol(
+        r"a cp\.async\.bulk copy, which completes on the issuing CTA's barrier, but ld needs "
+        r"CtaGroup\.TWO: ld is pair-scoped.*use a tensor TMA atom",
+        lambda: compile_tma_toy(make_tma_toy(CtaPair(), "leader", "TWO", mode="bulk")),
     )
 
 
@@ -275,6 +323,8 @@ def test_tma_check_fails_open_on_opaque_barrier(requires_blackwell):
         ("half_opaque", 2 * TILE_BYTES, r"barrier taken at .* reaches no recognized TMA copy"),
         ("mixed_end", 2 * TILE_BYTES, r"bytes of ld\[i\] acquire at .*end\.full_barrier\(\)"),
         ("nested", TILE_BYTES, r"bytes of ld\[i\] acquire at .*nested loop/branch"),
+        ("bulk_lane0", TILE_BYTES, r"bytes of ld\[i\] acquire at .*nested loop/branch"),
+        ("bulk_direct", TILE_BYTES, r"bulk copy at .* sits outside elect_one\(\), so every lane"),
         ("rawptr", TILE_BYTES, r"no TMA copy completes on a barrier taken from the layer"),
     ],
 )

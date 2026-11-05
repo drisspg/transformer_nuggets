@@ -1,10 +1,12 @@
 """Trace-time check of TMA loads against the channel they complete on.
 
-A TMA load names its barrier through ``cute.copy(atom, src, dst, tma_bar_ptr=ptr)``. Whether the
-bytes land where the layer armed them depends on the atom: a ``CtaGroup.TWO`` load completes on
-the leader CTA's barrier from either CTA of a pair, a ``CtaGroup.ONE`` load on the issuing CTA's
-own barrier. A mismatch with the channel's derived scope, or a ``Tma(tx_bytes)`` that differs from
-the bytes actually copied, leaves a barrier that never completes (a hang) or completes early.
+A TMA load names its barrier through ``cute.copy(atom, src, dst, tma_bar_ptr=ptr)``, a bulk
+(non-tensor) ``cp.async.bulk`` load through ``mbar_ptr=ptr``. Whether the bytes land where the
+layer armed them depends on the atom: a ``CtaGroup.TWO`` tensor load completes on the leader
+CTA's barrier from either CTA of a pair, a ``CtaGroup.ONE`` tensor load and a bulk load on the
+issuing CTA's own barrier. A mismatch with the channel's derived scope, or a ``Tma(tx_bytes)``
+that differs from the bytes actually copied, leaves a barrier that never completes (a hang) or
+completes early.
 
 The layer binds copies to channels by usage, with no change to user code. Every full-barrier
 pointer of a ``Tma`` channel it hands out (``handle.barrier``, ``end.full_barrier(i)``) is recorded
@@ -12,14 +14,18 @@ with its SSA value. When the role returns, the check follows that value's uses i
 ``cute_nvgpu.atom.set_value<tma_bar>`` ops, reads the atom's type (load kind, ``copy_bits`` per
 box) and each ``cute.copy`` destination layout, and compares:
 
-* the atom's CTA group with the one the channel's scope requires;
+* the atom's completion scope (its CTA group) with the one the channel's scope requires;
 * per acquired stage, the bytes of every copy issued in the stage's region with the bytes the
-  layer arms (``Scope.tx``, per producing CTA).
+  layer arms (``Scope.tx``, per producing CTA). A tensor copy counts as issued once per stage
+  when it sits directly in the region that acquired the stage or in an ``elect_one()`` block
+  there; a bulk copy does not elect a lane itself, so it counts only inside ``elect_one()``
+  (directly in the region, every active lane would issue it).
 
 The check fails open: anything it cannot recognize (a CuTeDSL IR change, an unknown atom kind, a
-copy inside a dynamic loop, a pointer the layer did not hand out) marks the channel *unverified*
-in ``describe()`` and emits one warning per kernel. It raises only on a positively identified
-mismatch. Values are inspected without the DSL's value casters, which emit ops when invoked.
+copy inside a dynamic loop or branch, a pointer the layer did not hand out) marks the channel
+*unverified* in ``describe()`` and emits one warning per kernel. It raises only on a positively
+identified mismatch. Values are inspected without the DSL's value casters, which emit ops when
+invoked.
 """
 
 from __future__ import annotations
@@ -32,7 +38,10 @@ from transformer_nuggets.cute.warpdrive.protocol import ProtocolError
 
 SET_VALUE = "cute_nvgpu.atom.set_value"
 MAKE_EXEC = "cute_nvgpu.atom.make_exec_tma"
+MAKE_ATOM = "cute.make_atom"
+BULK_G2S = "!cute_nvgpu.atom.bulk_copy_g2s<"
 COPY = "cute.copy"
+ELECT = "nvvm.elect.sync"
 # TiledTmaLoadEnum spelling -> (CtaGroup, multicast)
 KINDS = {
     "sm_90": ("ONE", False),
@@ -104,7 +113,7 @@ class TmaReport:
             return f"unverified ({'; '.join(dict.fromkeys(self.unverified))})"
         if not self.copies:
             return "opted out (unchecked)" if self.opted_out else "no TMA copies traced"
-        groups = "/".join(f"CtaGroup.{g}" for g in sorted(self.groups))
+        groups = "/".join(_atom_label(g) for g in sorted(self.groups))
         nbytes = ", ".join(str(b) for b in sorted(self.stage_bytes)) or "not counted"
         sites = (fmt_sites or (lambda s: ", ".join(sorted(s))))(self.copies)
         partial = "; some barriers opted out" if self.opted_out else ""
@@ -114,9 +123,11 @@ class TmaReport:
 @dataclass
 class _Copy:
     site: str
-    group: str
+    group: str  # the CTA group whose barrier the bytes complete on ("ONE" for a bulk copy)
     nbytes: int | None  # None: not countable (dynamic layout or unparsed type)
     in_stage_region: bool  # issued in the region that acquired the stage (runs once per stage)
+    bulk: bool = False  # a cp.async.bulk (non-tensor) load
+    unelected: bool = False  # a bulk copy outside elect_one(): issued by every active lane
     # The cluster mode of a multicast copy's mask ("fill": a single-CTA Cluster.fill mask, "?": a
     # mask the layer did not hand out); None when not multicast.
     multicast: str | None = None
@@ -217,7 +228,7 @@ def check_role(trace, cluster, reports: dict) -> None:
                 if tma.fills and stage is not None:
                     # Its CTAs are unknown, so the bytes it delivers are too.
                     stage.incomplete.append(f"multicast copy at {cp.site} has an unknown mask")
-            report.groups.add(cp.group)
+            report.groups.add("bulk" if cp.bulk else cp.group)
             report.copies.add(cp.site)
         if stage is not None:
             stage.copies.extend(copies)
@@ -232,6 +243,11 @@ def check_role(trace, cluster, reports: dict) -> None:
             why.append(partial_chans[use.chan.name])
         if untracked:
             why.append(untracked)
+        for cp in stage.copies:
+            if cp.unelected:
+                why.append(
+                    f"the bulk copy at {cp.site} sits outside elect_one(), so every lane issues it"
+                )
         if any(cp.nbytes is None or not cp.in_stage_region for cp in stage.copies):
             why.append("a copy sits in a nested loop/branch or has a dynamic layout")
         filled = _fill_count(use.chan)
@@ -261,13 +277,19 @@ def _copies(use: TmaUse) -> tuple[list[_Copy], list, str | None]:
             kind = _kind(op)
             if kind is None:
                 return [], ops, f"unrecognized TMA atom {str(op.results[0].type)[:60]!r}"
-            group, multicast = kind
+            group, multicast, bulk = kind
             copy_bits = re.search(r"copy_bits = (\d+)", str(op.results[0].type))
             for copy_op in _copy_ops(op):
-                nbytes = _copy_bytes(copy_op, copy_bits)
-                in_stage = use.handle is not None and copy_op.block == use.handle.block
+                nbytes = _copy_bytes(copy_op, copy_bits, bulk)
+                region = use.handle.block if use.handle is not None else None
+                elected = _elect_parent(copy_op)
+                direct = region is not None and copy_op.block == region
+                in_stage = (region is not None and elected is not None and elected == region) or (
+                    direct and not bulk
+                )
+                unelected = bulk and direct
                 mode, key = _mask_mode(copy_op) if multicast else (None, None)
-                copies.append(_Copy(use.site, group, nbytes, in_stage, mode, key))
+                copies.append(_Copy(use.site, group, nbytes, in_stage, bulk, unelected, mode, key))
     except (AttributeError, KeyError, IndexError, ValueError, RuntimeError) as e:
         return [], ops, f"cannot inspect the IR at {use.site}: {type(e).__name__}: {e}"
     return copies, ops, None
@@ -318,15 +340,33 @@ def _untracked_tma_copies(root, reached: list) -> str | None:
     return f"{extra} TMA copy(ies) use a barrier the layer did not hand out" if extra else None
 
 
-def _kind(set_value) -> tuple[str, bool] | None:
-    """(CTA group, multicast) of the atom an exec-atom ``set_value`` chain starts from."""
+def _kind(set_value) -> tuple[str, bool, bool] | None:
+    """(CTA group, multicast, bulk) of the atom a ``set_value`` chain starts from: a tensor TMA
+    exec atom, or a bulk ``cp.async.bulk`` G2S atom, whose bytes complete on the barrier at the
+    given offset in the issuing CTA (in every CTA of its mask when multicast), like a
+    ``CtaGroup.ONE`` tensor load."""
     op = set_value
-    while op.name == SET_VALUE:  # earlier fields set on the same exec atom
+    while op.name == SET_VALUE:  # earlier fields set on the same atom
         op = op.operands[0].owner.operation  # atom-typed values have no DSL caster
+    if op.name == MAKE_ATOM and str(op.results[0].type).startswith(BULK_G2S):
+        return "ONE", "mcast = true" in str(op.results[0].type), True
     if op.name != MAKE_EXEC:
         return None
     kind = re.match(r"!cute_nvgpu\.atom\.non_exec_tiled_tma_load<(\w+),", str(op.operands[0].type))
-    return KINDS.get(kind.group(1)) if kind else None
+    return (*KINDS[kind.group(1)], False) if kind and kind.group(1) in KINDS else None
+
+
+def _atom_label(group: str) -> str:
+    return "cp.async.bulk" if group == "bulk" else f"CtaGroup.{group}"
+
+
+def _elect_parent(copy_op):
+    """The enclosing block when a copy sits directly in an ``elect_one()`` region (one lane per
+    warp issues it once per execution of that block), else None."""
+    owner = copy_op.block.owner.operation
+    if owner.name == "scf.if" and owner.operands[0].owner.operation.name == ELECT:
+        return owner.block
+    return None
 
 
 def _mask_mode(copy_op) -> tuple[str, object]:
@@ -359,10 +399,11 @@ def _copy_ops(set_value) -> list:
     return out
 
 
-def _copy_bytes(copy_op, copy_bits) -> int | None:
+def _copy_bytes(copy_op, copy_bits, bulk: bool = False) -> int | None:
     """Bytes one ``cute.copy`` delivers: every element of its static SMEM destination, which
-    must be a whole number of ``copy_bits`` boxes. None when the type is not recognized."""
-    if copy_bits is None:
+    must be a whole number of ``copy_bits`` boxes (a bulk copy without ``copy_bits`` moves the
+    destination in one instruction). None when the type is not recognized."""
+    if copy_bits is None and not bulk:
         return None
     text = str(copy_op)
     dst = re.search(r'!cute\.memref<([a-z]+)(\d+)\w*, smem[^"]*"([^"]*)">\) -> \(\)\s*$', text)
@@ -374,7 +415,7 @@ def _copy_bytes(copy_op, copy_bits) -> int | None:
     bits = int(dst.group(2))
     for leaf in _leaves(shape):
         bits *= leaf
-    box = int(copy_bits.group(1))
+    box = int(copy_bits.group(1)) if copy_bits is not None else 8
     return bits // 8 if bits % box == 0 and bits % 8 == 0 else None
 
 
@@ -413,16 +454,20 @@ def _leaves(shape):
 
 def _group_message(role: str, use: TmaUse, cp: _Copy, need: str, cluster) -> str:
     chan = use.chan
+    if cp.bulk:
+        what = "a cp.async.bulk copy, which completes on the issuing CTA's barrier"
+    else:
+        what = f"a CtaGroup.{cp.group} atom"
     head = (
         f"{role}: the TMA copy at {cp.site} completes on channel {chan.name}'s full barrier with "
-        f"a CtaGroup.{cp.group} atom, but {chan.name} needs CtaGroup.{need}: "
+        f"{what}, but {chan.name} needs CtaGroup.{need}: "
     )
     if cluster.size == 1:
         why = "a 2-CTA load in a single-CTA kernel completes on a peer CTA's barrier"
     elif need == "TWO":
         why = (
             f"{chan.name} is pair-scoped, so its full barrier lives in the leader, which arms "
-            f"{chan.scope.tx} bytes for both CTAs' copies; a CtaGroup.ONE copy in the peer "
+            f"{chan.scope.tx} bytes for both CTAs' copies; a copy that completes in the peer "
             "completes on the peer's own barrier, which nobody waits on, and the leader hangs"
         )
     else:
@@ -430,7 +475,9 @@ def _group_message(role: str, use: TmaUse, cp: _Copy, need: str, cluster) -> str
             f"{chan.name} is CTA-local (each CTA arms its own barrier with {chan.scope.tx} bytes); "
             "a CtaGroup.TWO copy from the peer completes on the leader's barrier instead"
         )
-    if need == "TWO" or cluster.size == 1:
+    if cp.bulk:
+        fix = "use a tensor TMA atom built with self.cluster.cta_group"
+    elif need == "TWO" or cluster.size == 1:
         fix = "build the atom's op with self.cluster.cta_group"
     else:
         fix = "build the atom's op with CtaGroup.ONE"
