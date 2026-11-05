@@ -240,8 +240,8 @@ empty split runs the normal tail with zero sums.
 
 Split partials match FA4's bit for bit on every shape below, with FA4's own split count and
 per-sequence table (captured at its combine call); the combined outputs are identical too.
-Kernel times are CUPTI medians of CUDA-graph replays, in microseconds; the better of two
-interleaved rounds of 200 replays. Graph times also include FA4's prepare kernel (per-sequence
+The initial timings below are CUPTI medians of CUDA-graph replays, in microseconds; the better
+of two interleaved rounds of 200 replays. Graph times also include FA4's prepare kernel (per-sequence
 rows) and the shared combine. Buffers are reused, so short shapes run from L2.
 
 ```bash
@@ -269,11 +269,85 @@ Changes measured and ruled out as the cause, each within noise: allocating TMEM 
 FA4 does, aligned instead of unaligned named barriers, K/V stage splits from 4:7 to 9:3
 (FA4's shared ring has no direct equivalent), decoding the item and reading `seqused_k` once in
 the prologue, skipping all setup for dropped splits (slower: it serializes on the PDL wait), and
-prefetching the TMA descriptors (kept, as FA4 does). The remaining gap is unattributed.
+prefetching the TMA descriptors (kept, as FA4 does).
 
-Code size, counting lines that are neither blank, comments nor docstrings: FA4's file has 1,496,
-of which 1,347 are the kernel without the interface adapter, including paging, masks, score
-mods and varlen Q. The port has 993, including its wrappers and work mapping.
+### Decode setup costs
+
+`SplitKV.bind()` now builds `FastDivmodDivisorV2` values for the launch's split/head mapping,
+as FA4's scheduler does. The roles use them instead of repeating general integer division.
+These depend only on shapes; the per-sequence split counts are still read after `PdlWait()`.
+Batch, head counts and splits remain dynamic, and partials are still bitwise equal to FA4.
+
+Matched before/after, GB300, same versions as above and Triton `3.8.0+gitc01b6774`, November 4,
+2026: fixed-buffer graphs of 100 decode calls, no prepare or combine, two seconds of warmup,
+five alternating rounds of 15 replays. The table gives the median of round medians in
+microseconds per call; lower is better. Normal DVFS, no clock locking. The baseline is the
+original mapping at `c205c64`; no synchronization or layer code changed.
+
+| batch x kv_len, heads/kv_heads | before | fast divmod | delta |
+|---|---:|---:|---:|
+| 1x8192, 8/1 | 5.175 | 4.990 | -3.58% |
+| 1x32768, 32/1 | 8.549 | 8.387 | -1.91% |
+| 4x16384, 32/8 | 41.012 | 40.589 | -1.03% |
+| 8x32768, 32/8 | 149.852 | 149.263 | -0.39% |
+| 8x65536 ragged, 8/1 | 28.449 | 28.408 | -0.14% |
+| 16x32768 ragged, 64/8 | 180.491 | 180.244 | -0.14% |
+| 2x131072 ragged, 16/1 | 9.547 | 9.171 | -3.94% |
+
+Matched NCU 2025.4.1 at 1x8192 (`--cache-control none --clock-control none`, kernel replay,
+12 passes) counts 121,600 -> 111,184 executed warp instructions (-8.57%). FA4 counts 117,200:
+removing the extra instructions alone does not close the gap. Both port builds still use
+68 registers and 216,096 bytes dynamic SMEM, at 0.11 launch waves; no spills. NCU duration is
+7.296 -> 6.912 us, under its separate replay contract. The fixed buffers fit in L2, and this
+report's DRAM reads are nearly zero. Source-level PC sampling has too few samples to assign
+hundreds of nanoseconds to one particular load or wait.
+
+Sparse IKET ranges on all 16 CTAs and 16 warps localize the original port's delay. Both kernels
+have a kernel-entry marker and four marker pairs per warp. The port reaches its post-prologue
+CTA synchronization around 480 ns, versus FA4's 672 ns, relative to each CTA's first marker.
+Its role bodies start at 736-928 ns: item decoding, TMEM pointer retrieval and role setup
+happen after that synchronization. FA4 starts its dispatched work at 672 ns. The critical
+O-store warp finishes around 3,904 ns in the port and 3,200 ns in FA4; the correction and
+statistics also finish later. These are instrumented phase boundaries, not production latency
+estimates. With body markers, median CTA lifetime envelopes are FA4/port 3,936/4,512 ns;
+trampoline-only IKET (`--warp-trace`) gives 3,904/4,512 ns on the same GPU. Both outputs match
+bitwise. This supports a post-sync setup and body/tail delay, not a slower
+barrier-init/TMEM-allocation phase or a full critical-cycle model.
+
+| Suspected cause | Evidence | Change tested | Time delta / decision |
+|---|---|---|---|
+| Repeated mapping divides | Source/SASS and -8.57% executed instructions | Host-built fast divmod | Kept; -1.9 to -3.9% on the three small cases above |
+| TMEM base round trip | FA4 allocates all 512 columns and uses constant addresses | Full allocation and constant TMEM views | -0.5% at 1x8192; noise, removed |
+| Q load after the CTA sync | FA4 starts Q TMA before synchronization | Prologue-owned raw Q barrier and early TMA | +5.9% at 1x8192; removed |
+| Long-hint mbarrier waits | Port/FA4 execute 3,335/1,315 `NANOSLEEP.SYNCS` instructions in the first matched report | Try-wait first / hintless retry in channel waits | +0.4% / -1.1% at 1x8192; no general win, removed |
+| O-staging handoff | Port uses an mbarrier ring; FA4 a one-shot named barrier | Raw one-shot named O-done barrier | -0.8% / -1.7% at 1x8192 / 1x32768; not kept |
+
+The wait prototypes changed all seven standard configurations' SASS. At FA4 2-CTA CLC
+split-P, try-first adds 144 static instructions; hintless retry removes 40 and removes 70
+suspend sites. Neither is a general improvement: two interleaved runs made this FA4 case
+1.2-2.2% slower, while persistent-GEMM results changed direction between runs. No layer patch
+was retained. The normal seven-config SASS gate is unchanged.
+
+Run the benchmark with `--output` to save versions, source hashes, kernel names and every
+replay sample. It now uses three seconds of warmup and seven alternating rounds, reporting
+the median of round medians. The updated port still trails FA4 by about 8-9% on 1x8192,
+1x32768 and 8x65536 ragged in that contract; long splits tie. The ragged gap and the remaining
+body/tail delay are not yet attributed to a specific instruction sequence.
+
+```bash
+gpu-run --timeout 1800 auto -- timeout --signal=TERM --kill-after=5s 900s \
+  .venv/bin/python -m transformer_nuggets.cute.warpdrive.examples.bench_fa4_decode \
+  --output agent_space/decode.json
+```
+
+For matched NCU source attribution, add `--profile --shapes 0` and run with
+`CUTE_DSL_LINEINFO=1 ncu --profile-from-start off --cache-control none --import-source yes`.
+The script compiles and warms both paths before profiling one complete call each, including
+prepare/combine where present; filter the reports to `attn_kernel|warpdrive_fa4_decode`.
+
+Original code size, counting lines that are neither blank, comments nor docstrings: FA4's file
+had 1,496, of which 1,347 were the kernel without the interface adapter, including paging,
+masks, score mods and varlen Q. The initial port had 993, including its wrappers and mapping.
 
 ## Historical timings
 
