@@ -13,9 +13,9 @@ PTX citations; raw ordering instructions are legal but invisible.
 Reports distinguish ``potential hazard`` (a conflicting pair with an established missing
 edge), ``unverified`` (an invisible access/edge, an unmodeled cluster, or a channel whose
 epochs the trace does not match: unequal per-item counts from prologues or peeled iterations
-leave the correspondence unknown) and ``no hazard found`` (only among annotated accesses, not a
-proof). Default ``alias_check="warn"`` puts the report
-in ``describe()`` and warns once about findings; ``"strict"`` raises on potential hazards;
+leave the correspondence unknown, as do an exclusive ring's skipped epochs) and ``no hazard
+found`` (only among annotated accesses, not a proof). Default ``alias_check="warn"`` puts the
+report in ``describe()`` and warns once about findings; ``"strict"`` raises on potential hazards;
 ``"off"`` skips analysis. ``unchecked("alias", reason=...)`` excludes enclosed annotations.
 Annotations and wrappers add no device code. Usage and limits: ``docs/storage.md``.
 """
@@ -541,7 +541,9 @@ def _handoff(a: Access, b: Access, chan, slot, warp_pairs) -> Finding | None:
             found = _same_period(a, b, warp_pairs)
             if found is not None:
                 return found
-    elif ha.producer == hb.producer:
+    elif ha.producer == hb.producer and not (chan.exclusive and not ha.producer):
+        # Exclusive consumers never share an epoch: the producer's reuse of the stage orders
+        # one owner's epoch before the next's, which the completion checks below cover.
         side = "producers" if ha.producer else "consumers"
         return Finding(
             HAZARD,
@@ -675,7 +677,13 @@ class _Graph:
                     if not waits:
                         continue
                     label = name if slot is None else f"{name}[{slot}]"
-                    if producer:  # publication: commit k -> wait k of the same item
+                    if chan.exclusive:
+                        # Which consumer owns which epoch follows its runtime skips, which the
+                        # traced counts do not give: every pairing is a guess.
+                        why = f"{label}: exclusive ring, epoch owners follow runtime skips"
+                        for item in span:
+                            self._guess(src, by_item.get(item, []), dst, waits, item, why)
+                    elif producer:  # publication: commit k -> wait k of the same item
                         for item in span:
                             cs, ws = by_item.get(item, []), waits.get(item, [])
                             if len(cs) != len(ws) and cs:
@@ -984,8 +992,8 @@ def _graph_order(graph: _Graph, x: Access, px: int, y: Access, py: int) -> tuple
             UNVERIFIED,
             f"{x.describe()} before {y.describe()}: ordered only through channel epochs the "
             f"trace does not match ({'; '.join(reasons)}): unknown epoch correspondence "
-            "(prologues or peeled iterations change the traced counts), not an established "
-            "missing edge",
+            "(prologues, peeled iterations or exclusive-ring skips change the traced counts), "
+            "not an established missing edge",
             EPOCHS,
         )
     ]

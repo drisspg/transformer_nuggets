@@ -222,6 +222,13 @@ def mutations() -> list[Mutation]:
             message="previews no later wait consumes",
         ),
         Mutation(
+            "skip_join",
+            "E131",
+            loop + "    ch.skip(1)\n    h = ch.wait(SLOT)\n    h.release()",
+            kind="consumer",
+            message="only consumers of an exclusive ring",
+        ),
+        Mutation(
             "helper_discards_end", "U10", loop + "    self.step(ch)", error=None, obligation=True
         ),
         Mutation(

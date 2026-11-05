@@ -200,7 +200,9 @@ class RoleTrace:
         self.log = log
         self.iket = iket  # emit IKET work-item/role ranges (tracing.py)
         self.iket_waits = iket and iket_waits  # and ranges around blocking waits
-        self.ops: list = []  # (channel, op, enclosing blocks innermost first) per recorded op
+        # (channel, op, enclosing blocks innermost first, epochs) per recorded op; epochs is
+        # the count of a skip, else 1.
+        self.ops: list = []
         self.item_block = None  # the work-item loop body (set by the WorkCursor's advance())
         self.open: list = []
         self.checks: list = []  # end-of-role trace checks (e.g. work cursors)
@@ -247,19 +249,20 @@ class RoleTrace:
         d = _block_depth(current_block(), self.root)
         return 0 if d is None else d
 
-    def record(self, chan, op, slot):
+    def record(self, chan, op, slot, count: int = 1):
         # Blocks are captured while live: a region the tracer later discards must not be
         # walked afterwards (dereferencing an erased block crashes).
-        self.ops.append((chan, op, _ancestors(current_block(), self.root)))
+        self.ops.append((chan, op, _ancestors(current_block(), self.root), count))
         if self.log is not None:
-            self.log.record(self.role_name, chan, op, slot, self.depth(), user_site())
+            logged = op if count == 1 else f"{op} {count}"
+            self.log.record(self.role_name, chan, logged, slot, self.depth(), user_site())
 
     def uses_per_item(self) -> dict:
         """``{channel: n}``: acquires/waits per work item, 0 when inside an inner loop."""
         uses: dict = {}
         if self.item_block is None:
             return uses
-        for chan, op, blocks in self.ops:
+        for chan, op, blocks, _ in self.ops:
             if op not in ("acquire", "wait") or self.item_block not in blocks:
                 continue
             depth = blocks.index(self.item_block)
@@ -268,6 +271,26 @@ class RoleTrace:
             elif depth:  # nested inside the item loop: a dynamic count per item
                 uses[chan] = 0
         return uses
+
+    def epoch_sequence(self, chan: str) -> list[tuple[str, int]] | str:
+        """``[(op, epochs)]`` of this role's acquires, waits and skips on ``chan``, per work
+        item when they are inside the work-item loop, when none sits in another dynamic loop or
+        branch; otherwise why the sequence is not static."""
+        seq, regions = [], set()
+        for c, op, blocks, count in self.ops:
+            if c != chan or op not in ("acquire", "wait", "skip"):
+                continue
+            inner = blocks[:-1]  # the enclosing blocks below the role body
+            in_item = (
+                self.item_block is not None and len(inner) == 1 and inner[0] == self.item_block
+            )
+            if inner and not in_item:
+                return f"{self.role_name}'s {op} runs inside a dynamic loop or branch"
+            regions.add(bool(inner))
+            seq.append((op, count))
+        if len(regions) > 1:
+            return f"{self.role_name} uses it both inside and outside the work-item loop"
+        return seq
 
     def opened(self, handle):
         if active_opt_out("unclosed") is not None:

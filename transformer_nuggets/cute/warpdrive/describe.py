@@ -206,6 +206,16 @@ def _channels(kernel) -> str:
             details.append(("full", full))
             empty = fmt_per_cta(sc.empty_counts, empty_ranks, by_rank=sc.pair, pair=pair)
             details.append(("empty", empty))
+        if ch.exclusive:
+            owners = ", ".join(r.name for r, _ in ch.consumers)
+            details.append(
+                (
+                    "owners",
+                    f"exclusive: one of {owners} owns each epoch, the others skip it; counts "
+                    "are one consumer's; bootstrap and skew are the author's",
+                )
+            )
+            details.append(("epochs", kernel._ws_ownership.get(name, "ownership not traced")))
         for side in ("producer", "consumer"):
             if ch.turns(side) > 1:
                 details.append(

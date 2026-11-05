@@ -211,7 +211,9 @@ storage indexed by that ring's own stage, with static, disjoint stage spans. Rin
 shared by different channels is unverified. Consumers of one fan-out epoch, and producers of
 one fan-in epoch, are not ordered with respect to each other. Round-robin channels, and ring
 reuse whose ops sit in a loop inside the work item, add no ordering edges to the model, so
-accesses ordered only through them can be reported as hazards.
+accesses ordered only through them can be reported as hazards. An exclusive ring's stage
+handoff is checked like any ring's (its consumers never share an epoch), but its epochs follow
+runtime skips, so a path through it and another channel is a guess: `unverified`.
 
 The model matches epochs across roles by traced per-item counts. When two roles' counts on a
 channel differ (a prologue, a peeled last tile or a differently shaped loop on one side), the

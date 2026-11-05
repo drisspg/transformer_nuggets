@@ -15,9 +15,10 @@ The layer derives each slot's arrival count from the role instances bound to it,
 with several consumer roles (fan-out) has a join barrier that completes only when all of them
 have released. A ``Tma`` or ``Umma`` side signals once, so it must be bound to one single-warp
 role (the warp that issues the copies or MMAs). ``Channel(override={...})`` replaces any
-derived value; ``Barriers`` reserves mbarriers that user code drives directly.
+derived value; ``Barriers`` reserves mbarriers that user code drives directly. (Round-robin and
+exclusive sides, below, bind several such roles, one signalling per epoch.)
 
-Two declaration options change how a channel synchronizes:
+Three declaration options change how a channel synchronizes:
 
 * ``round_robin=True`` (``Ring`` only): the role instances on a side take the epochs in turn.
   With ``k`` instances, instance ``j`` handles epochs ``j, j + k, j + 2k, ...``, and each epoch's
@@ -31,6 +32,15 @@ Two declaration options change how a channel synchronizes:
   their sum. Every consumer instance arrives once on its slots' empty barriers at role start, the
   equivalent of an mbarrier ring starting empty. IDs are allocated from 15 downward; see
   ``WarpSpecialized.named_barrier_ids``.
+
+* ``consumer_mode="exclusive"`` (``Ring`` only): each epoch belongs to exactly one of the
+  declared ``consumer_roles``, which waits and releases it; the other consumers ``skip()`` it
+  (advance their end without waiting or arriving). Each epoch's count is one consumer's
+  contribution. Which consumer owns which epoch is the author's protocol: the layer checks the
+  topology (CTA-local, one producer, equal contributions) and, when every wait and skip is
+  static, that each epoch has one owner. A wait is exact only if the waiter's previous wait
+  was at most one ring lap earlier; otherwise the author orders it after the stage's previous
+  epoch (FA4's decode uses two named barriers; see ``docs/channels.md``).
 
 A named barrier cannot tell two instances apart: if round-robin instances share a stage's barrier
 (``n % k != 0``, e.g. a one-stage mailbox written by two warpgroups in turn), their threads could
@@ -154,6 +164,7 @@ def _fences(side: str, value) -> tuple[str, ...]:
 
 
 SYNC_KINDS = ("mbarrier", "named")
+CONSUMER_MODES = ("join", "exclusive")
 
 
 @dataclass
@@ -187,9 +198,9 @@ class Channel:
     multicast masks). Example: per-warp elected releases need ``empty_counts=4`` for a
     four-warp consumer, with the role signalling via ``handle.release(signal=False)``.
 
-    ``round_robin`` and ``sync`` are described in the module docstring. A named channel takes
-    no override and must stay CTA-local; ``named_ids`` holds its ``(full, empty)`` barrier IDs
-    per slot once the kernel is collected.
+    ``round_robin``, ``sync`` and ``consumer_mode`` are described in the module docstring. A
+    named channel takes no override and must stay CTA-local; ``named_ids`` holds its ``(full,
+    empty)`` barrier IDs per slot once the kernel is collected.
     """
 
     n: int
@@ -206,6 +217,7 @@ class Channel:
     round_robin: bool = False
     sync: str = "mbarrier"
     turnstile: str | None = None
+    consumer_mode: str = "join"
     name: str = field(default="", init=False)
     fixed: bool = field(default=False, init=False)
     producers: list = field(default_factory=list, init=False)  # (RoleInstance, slot | None)
@@ -270,6 +282,29 @@ class Channel:
             raise ValueError(f"channel sync must be one of {SYNC_KINDS}, got {self.sync!r}")
         if self.turnstile is not None and not (self.named and self.round_robin):
             raise ValueError("turnstile= serializes round-robin instances of a named channel")
+        if self.consumer_mode not in CONSUMER_MODES:
+            raise ValueError(
+                f"consumer_mode must be one of {CONSUMER_MODES}, got {self.consumer_mode!r}"
+            )
+        if self.exclusive:
+            if self.named or self.round_robin or self.override:
+                what = (
+                    "sync='named'"
+                    if self.named
+                    else "round_robin=True"
+                    if self.round_robin
+                    else "override="
+                )
+                raise ValueError(
+                    f"consumer_mode='exclusive' cannot be combined with {what}: exclusive "
+                    "consumers own whole epochs of an mbarrier ring through explicit skips, with "
+                    "one consumer's derived count"
+                )
+            if not self.consumer_roles:
+                raise ValueError(
+                    "consumer_mode='exclusive' needs consumer_roles=(...) naming the roles that "
+                    "take the epochs"
+                )
         if self.named:
             if self.producer is not Threads or self.consumer is not Threads:
                 raise ValueError(
@@ -292,6 +327,10 @@ class Channel:
     def named(self) -> bool:
         return self.sync == "named"
 
+    @property
+    def exclusive(self) -> bool:
+        return self.consumer_mode == "exclusive"
+
     def turns(self, side: str) -> int:
         """Instances taking turns on ``side``: ``k`` for a round-robin side, else 1."""
         bound = self.producers if side == "producer" else self.consumers
@@ -300,7 +339,8 @@ class Channel:
     def slot_counts(self, side: str) -> list[int]:
         mech = self.producer if side == "producer" else self.consumer
         bound = self.producers if side == "producer" else self.consumers
-        if self.turns(side) > 1:  # one instance signals each epoch
+        if self.turns(side) > 1 or (side == "consumer" and self.exclusive and bound):
+            # One instance signals each epoch (the layer checks that they contribute equally).
             return [arrivals(mech, bound[0][0].num_threads)] * self.n
         return [
             sum(arrivals(mech, ri.num_threads) for ri, slot in bound if slot in (None, j))
@@ -325,6 +365,10 @@ class Slots(Channel):
         super().__post_init__()
         if self.round_robin:
             raise ValueError("round_robin needs a Ring: a Slots caller names the slot itself")
+        if self.exclusive:
+            raise ValueError(
+                "consumer_mode='exclusive' needs a Ring: a Slots consumer names its slots instead"
+            )
         self.fixed = True
         if self.n > 31:
             raise ValueError("Slots supports at most 31 slots (phase bits share one Int32)")
@@ -1228,6 +1272,33 @@ class ConsumerEnd(_End):
         return handle
 
     consume = wait
+
+    def skip(self, n: int = 1):
+        """Exclusive ring: advance past ``n`` epochs that other consumers own, without waiting
+        or arriving. Outstanding try tokens of this end go stale; an unadopted preview raises.
+        ``n`` is a positive Python int (put a dynamic skip under a dynamic branch)."""
+        chan, who, site = self._chan, self._trace.role_name, user_site()
+        if not chan.exclusive:
+            mode = "round-robin" if chan.round_robin else "joining"
+            raise ProtocolError(
+                f"{who}: {chan.name}.skip() at {site}: only consumers of an exclusive ring "
+                f"(consumer_mode='exclusive') skip epochs; {mode} consumers take every epoch "
+                "they are bound to"
+            )
+        if type(n) is not int or n < 1:
+            raise ProtocolError(
+                f"{who}: {chan.name}.skip({n!r}) at {site}: the skip count must be a positive "
+                "Python int"
+            )
+        if self._rec.previews:
+            raise ProtocolError(
+                f"{who}: {chan.name}.skip() at {site} with an unconsumed preview "
+                f"({self._rec.previews[0].describe()} at {self._rec.previews[0]._site}): the "
+                "next wait would take another epoch than the one previewed"
+            )
+        self._trace.record(chan.name, "skip", None, count=n)
+        self._state.advance(n)
+        self._rec.advances[None] = self._rec.advances.get(None, 0) + 1
 
     def peek(self, slot=None) -> Preview:
         """Wait until the stage the next ``wait`` takes is full and return a read-only

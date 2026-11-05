@@ -40,6 +40,9 @@ with acc.consume() as h:
 Putting the whole `with` inside a lane-dependent condition changes the arrivals without
 changing the count. Likewise, producing n+1 stages while consuming n can compile. Counts
 alone do not establish liveness: two roles can each wait for a value the other hasn't produced.
+On a ring with [exclusive consumers](docs/channels.md#exclusive-consumers), every epoch needs
+exactly one owner (checked only when the waits and skips are static), and a wait that follows
+more than a ring lap of skips needs a rendezvous with the epoch's previous owner.
 
 **Carry current state.** Return every managed endpoint, work cursor and turnstile seat from a
 role. Helpers return updated state and callers reassign it. Close each handle once, in its
@@ -77,12 +80,14 @@ user code.
   protocol-traced builds compile uncached.
 - **Compilation:** also checks local handle lifetimes, required returned state, recognizable
   work-loop structure, attributable TMA operations, and that try tokens and previews are used
-  by their own end, epoch and dynamic region. It does not compare arbitrary role
+  by their own end, epoch and dynamic region, and an exclusive ring's epoch ownership when
+  every acquire, wait and skip on it is static. It does not compare arbitrary role
   bodies to prove balanced epochs or a live dependency graph.
 - **TMA `verified`:** recognized group and byte accounting. Not proof of descriptor legality,
   disjoint writes or async safety. Opaque uses may remain `unverified`; inspect the reasons.
 - **Alias `no hazard found`:** no conflicting annotated pair found under the diagnostic's
-  rules. Not proof of safe aliasing. Clusters, raw accesses and round-robin channels have
+  rules. Not proof of safe aliasing. Clusters, raw accesses, round-robin channels and
+  orderings through an exclusive ring's epochs have
   [limited or no ordering coverage](docs/storage.md#read-the-result).
 - **Passing tests:** evidence for the executed shapes, schedules and toolchain, not all
   accepted programs. Neither profiling plans nor protocol logs prove liveness or performance.

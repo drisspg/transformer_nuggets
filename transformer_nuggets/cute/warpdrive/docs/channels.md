@@ -36,7 +36,8 @@ see [clusters](clusters.md#multicast). `Tma(tx_bytes, fills="pair")` has one CTA
 copies of others; see [one CTA loads for others](clusters.md#one-cta-loads-for-others). `Umma`
 signals with an elected `tcgen05.commit`; `Threads` has every thread of every bound role
 arrive, `Warps` one elected lane of each of their warps. A TMA or UMMA side must bind to exactly one single-warp role (or the one instance whose
-turn it is on a round-robin side). TMA acquire arms the expected bytes; commit emits no arrival
+turn it is on a round-robin side, or the owner of each epoch of
+[exclusive consumers](#exclusive-consumers)). TMA acquire arms the expected bytes; commit emits no arrival
 because the copies complete the full barrier.
 TMA is a producer mechanism, not a consumer mechanism.
 
@@ -128,6 +129,95 @@ stage count must be a multiple of k, and the layer adds no turn-taking. A parity
 when the waiter saw the stage's previous epoch itself; with 3 instances on 2 stages, instance 2's
 first wait would pass on a barrier nobody has filled.
 The [decode example](../examples/fa4_decode_swapab.py) alternates KV blocks this way.
+
+## Exclusive consumers
+
+```python
+self.kv = Ring(
+    12, Tma(stage_bytes), Umma,
+    consumer_roles=("mma_qk", "mma_pv"), consumer_mode="exclusive",
+    buffer={"K": k_buf, "V": v_buf},
+)
+
+# in mma_qk, for each KV block j >= 3:
+kv.skip(v_stages)  # V(j - 3), which mma_pv owns, was filled before K(j)
+for _ in cutlass.range_constexpr(k_stages):
+    with kv.consume() as h:  # this warp's own epochs: wait, read, release
+        ...
+```
+
+With `consumer_mode="exclusive"` each epoch of the ring has exactly one owner among the
+consumers. The owner waits for it and releases it as usual; every other consumer calls
+`skip(n)`, which advances its end's stage, phase and count by n epochs without waiting or
+arriving. The counts are one consumer's contribution (1 for `Umma`), not a join's, and the
+producer still fills every epoch in order. The default, `"join"`, keeps the fan-out join
+described in [counts](#counts-come-from-the-roles). Selecting neither mode changes nothing in
+other channels; `skip()` emits only the index arithmetic.
+
+The layer checks the topology: a `Ring` with mbarriers, without `round_robin`, `sync="named"`
+or `override`; `consumer_roles` declared, each bound to a consumer end; at least two consumer
+instances with equal contributions (single-warp roles for `Umma`); one producer instance; and
+CTA-local placement. `skip()` exists only on an exclusive ring's consumer ends and takes a
+positive Python int (put a conditional skip inside a dynamic branch). Skipping makes the
+end's outstanding [try tokens](#try-tokens) stale, and skipping past an unconsumed
+[preview](#previews) raises.
+
+When every acquire, wait and skip on the ring is static within the work item (no dynamic loop
+or branch around them except the work-item loop), collection checks ownership: each epoch the
+producer fills has exactly one waiting consumer, no consumer runs past the producer, and
+under a persistent schedule every consumer advances through every epoch of an item. A
+violation raises. `describe()` prints `epochs  verified: ...` or, when any of them is dynamic,
+`unverified (...)` with the reason; then ownership is your obligation.
+
+**A skip can make the next wait inexact.** A wait of epoch e tests parity `(e // n) % 2` on
+stage `e % n`, which is exact once epoch e - n was filled: before that, the stage is one
+generation behind and the wait passes at once. A joining or round-robin waiter observed epoch
+e - n itself. An exclusive consumer observed only the epochs it waited for, so its wait is
+exact only when its previous wait was of epoch e - n or later, and its first wait of an epoch
+below n. Otherwise another consumer must tell it that epoch e - n was filled. The ownership
+check names the first wait that needs this; dynamic schedules leave it to you. A test toy with
+a three-stage ring whose second consumer first waits for epoch 4 hangs without that
+rendezvous. The layer synthesizes no handshake; the recipe below is FA4's.
+
+The alias diagnostic treats an exclusive ring's stage handoff like any ring's: the owner's
+release precedes the stage's reuse, so accesses ordered through one stage of the ring are
+checked, and two consumers are not an unordered fan-out. It cannot match epochs across
+channels, because owners follow runtime skips: an ordering that goes through the exclusive
+ring and another channel is reported `unverified` ("exclusive ring, epoch owners follow
+runtime skips").
+
+### Rendezvous recipe: FA4's QKIssued/PVIssued
+
+The [decode example](../examples/fa4_decode_swapab.py) (`shared_kv=True`) shares one ring
+between its QK and PV MMA warps. The loader fills K(0), K(1), then K(j + 2) and V(j) for each
+block j, then the last two V blocks. With 12 stages of four K and four V stages per block,
+PV's first wait, of V(0), is epoch 12: a full lap after launch. Two
+[named barriers](#named-barriers) bound the skew:
+
+```python
+self.qk_issued = NamedBarrier(threads=64)  # mma_qk arrives, mma_pv syncs
+self.pv_issued = NamedBarrier(threads=64)  # mma_pv arrives, mma_qk syncs
+
+# mma_qk, per block j (after skipping V(j - 3) for j >= 3):
+self.pv_issued.sync()
+...  # wait for, issue and release K(j)'s stages
+self.qk_issued.arrive()
+# after the last block: two more pv_issued.sync(); qk_issued.arrive()
+
+# mma_pv: pv_issued.arrive(), then for each of K(0) and K(1): skip it, qk_issued.sync(),
+# pv_issued.arrive(); per block j (after skipping K(j + 2) if it exists):
+self.qk_issued.sync()
+...  # wait for, issue and release V(j)'s stages; arrive on pv_issued after the last MMA
+```
+
+When PV waits for V(j), QK has issued K(j + 2), the group filled just before V(j); when QK
+waits for K(j) (j >= 3), PV has issued V(j - 3), the group just before K(j). Every earlier
+epoch is therefore filled, and both waits are exact for any ring depth. Each side syncs on one
+barrier between two arrivals on the other, so neither can arrive twice in one generation (see
+[reusable rendezvous](#reusable-rendezvous)). PV's last `pv_issued` arrival is never matched,
+as in FA4: that is sound because the decode is `OneShot`, one work item per CTA. A persistent
+kernel would balance it. The barriers also pace the two warps, which is part of the measured
+effect, not only correctness.
 
 ## Named-barrier channels
 

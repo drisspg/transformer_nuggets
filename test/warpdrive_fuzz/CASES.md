@@ -144,6 +144,9 @@ inside a compiled entry point.
 | E126 | Recognized multicast TMA copy into a channel whose `Tma` declares no multicast, or whose mask (from `Cluster.multicast`/`Cluster.fill`) has an undeclared mode; a `Cluster.fill` mask into a channel without `fills` | ProtocolError (trace time) / tma.py |
 | E127 | `token=` that is not this end's own `try_wait`/`try_acquire` result, names another slot, is stale (an acquire/wait or `end.state` assignment on the end since the probe) or was probed in another dynamic region; a probe or `token=` on a named channel | ProtocolError (trace time) / channels.py |
 | E128 | A preview written, committed, released or retired; used after its owning wait's handle closed or in another dynamic region; left with no later wait in its role; `peek()` on a named channel | ProtocolError (trace time) / channels.py |
+| E129 | `consumer_mode` other than join/exclusive; exclusive on `Slots`, with `sync="named"`, `round_robin` or `override`, or without `consumer_roles` | ValueError / channels.py |
+| E130 | Exclusive consumers with fewer than two consumer instances, unequal contributions, more than one producer instance, a declared consumer role without a Consumer end, or crossing CTAs | ProtocolError / kernel.py |
+| E131 | `skip()` on a join or round-robin end, with a count that is not a positive Python int, or past an unconsumed preview; a token used across a skip; static exclusive ownership with an epoch waited by no or several consumers, or a consumer past the producer's epochs | ProtocolError (trace time) / channels.py, kernel.py |
 
 ## Runtime labels
 
@@ -169,6 +172,7 @@ established merely by accepting the source.
 | R20 | [Raw-role work items](../../transformer_nuggets/cute/warpdrive/docs/scheduling.md#one-item-in-a-raw-role) |
 | R21 | [Buffer allocation and stage projection](../../transformer_nuggets/cute/warpdrive/docs/storage.md) |
 | R22–R23 | [Round-robin and named channels](../../transformer_nuggets/cute/warpdrive/docs/channels.md#round-robin-instances) |
+| R24 | [Exclusive consumers](../../transformer_nuggets/cute/warpdrive/docs/channels.md#exclusive-consumers) |
 
 ## Caller-obligation labels
 
@@ -190,6 +194,7 @@ Accepted negative controls use these labels; acceptance does not make them safe 
 | U15 | [Custom schedule/map correctness](../../transformer_nuggets/cute/warpdrive/docs/scheduling.md#custom-index-schedules) |
 | U16 | [Storage identity, partitions and overlapping lifetimes](../../transformer_nuggets/cute/warpdrive/docs/storage.md) |
 | U17 | [Named-barrier IDs and per-epoch participation](../../transformer_nuggets/cute/warpdrive/docs/channels.md#named-barrier-channels) |
+| U18 | [Exclusive ownership completeness, bootstrap and skew](../../transformer_nuggets/cute/warpdrive/docs/channels.md#exclusive-consumers) |
 
 ## Historical gap labels
 

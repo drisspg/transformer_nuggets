@@ -30,6 +30,7 @@ from transformer_nuggets.cute.warpdrive.channels import (
     Turnstile,
     Umma,
     Warps,
+    arrivals,
 )
 from transformer_nuggets.cute.warpdrive.cluster import (
     ALL,
@@ -567,6 +568,7 @@ class WarpSpecialized(metaclass=_KernelType):
         self._ws_raw_bars = raw_bars
         self._ws_named_bars = named_bars
         self._ws_named_users = {}  # NamedBarrier name -> {"sync"/"arrive": role names}, traced
+        self._ws_ownership = {}  # exclusive channel -> epoch-ownership verdict, traced
         self._ws_streams = streams
         self._ws_tma = {}  # channel name -> tma.TmaReport, filled while tracing
         self._ws_smem = {}  # SmemPlan buffer name -> storage.ResolvedBuffer, after begin_roles
@@ -728,8 +730,14 @@ class WarpSpecialized(metaclass=_KernelType):
             ch.cluster = cluster
             ch.derived_scope = derive_scope(ch, cluster, internal=ch.internal)
             ch.scope = apply_overrides(ch, ch.derived_scope, cluster)
-            if ch.scope.pair and (ch.named or ch.round_robin):
-                what = "named barriers are per CTA" if ch.named else "round_robin is CTA-local"
+            if ch.scope.pair and (ch.named or ch.round_robin or ch.exclusive):
+                what = (
+                    "named barriers are per CTA"
+                    if ch.named
+                    else "round_robin is CTA-local"
+                    if ch.round_robin
+                    else "exclusive consumers are CTA-local"
+                )
                 raise ProtocolError(
                     f"channel {name}: it crosses CTAs (its roles run in different CTAs, or its "
                     f"copies are multicast), but {what}; give both sides the same placement "
@@ -759,7 +767,8 @@ class WarpSpecialized(metaclass=_KernelType):
                 if mech is Threads or mech is Warps:
                     continue
                 how = getattr(mech, "__name__", repr(mech))  # Umma, or Tma(tx_bytes=...)
-                if len(bound) > 1 and not chan.round_robin:
+                one_at_a_time = chan.round_robin or (side == "consumer" and chan.exclusive)
+                if len(bound) > 1 and not one_at_a_time:
                     raise ProtocolError(
                         f"channel {name}: {side} side signals once ({how}) but has several "
                         f"roles {[r.name for r, _ in bound]}"
@@ -773,6 +782,8 @@ class WarpSpecialized(metaclass=_KernelType):
                             f"elected thread, but role {r.name} spans {r.num_warps} warps and "
                             "each would signal; issue it from a single-warp role"
                         )
+            if chan.exclusive:
+                _check_exclusive(name, chan)
             if chan.round_robin and chan.turns("producer") == chan.turns("consumer") == 1:
                 raise ProtocolError(
                     f"channel {name}: round_robin needs several instances of one role on a side "
@@ -921,6 +932,7 @@ class WarpSpecialized(metaclass=_KernelType):
             "opt_outs": self._ws_opt_outs,
             "uses": self._ws_uses,
             "named_users": self._ws_named_users,
+            "ownership": self._ws_ownership,
         }
 
     def __cute_restore_trace__(self, record: dict) -> None:
@@ -940,6 +952,7 @@ class WarpSpecialized(metaclass=_KernelType):
         self._ws_opt_outs = record["opt_outs"]
         self._ws_uses = record["uses"]
         self._ws_named_users = record["named_users"]
+        self._ws_ownership = record["ownership"]
         self._ws_traced = True
         self._report_trace()
 
@@ -1066,6 +1079,7 @@ class WarpSpecialized(metaclass=_KernelType):
         self._ws_tma = {}
         self._ws_alias_roles = []  # alias.RoleEvents of every dispatched role
         self._ws_uses = {}  # (role, channel) -> acquires/waits per work item (0: inner loop)
+        self._ws_epoch_seqs = {}  # (exclusive channel, role) -> RoleTrace.epoch_sequence
         take_opt_outs()  # drop opt-outs left over from an earlier, failed trace
         clear_multicast_masks()
         smem = memory.SmemAllocator()
@@ -1275,6 +1289,7 @@ class WarpSpecialized(metaclass=_KernelType):
         the alias diagnostic."""
         self._ws_opt_outs = take_opt_outs()
         self._check_named_barriers()
+        self._check_ownership()
         self._ws_alias = None
         if self.alias_check not in alias.MODES:
             raise ValueError(f"alias_check must be one of {alias.MODES}, got {self.alias_check!r}")
@@ -1289,6 +1304,74 @@ class WarpSpecialized(metaclass=_KernelType):
                     )
         self._ws_traced = True
         self._report_trace()
+
+    def _check_ownership(self):
+        """Exclusive rings whose acquires, waits and skips are all static (per work item):
+        every epoch the producer fills is owned (waited) by exactly one consumer and skipped by
+        the others. Raises on a static violation; dynamic sequences stay unverified.
+
+        Also names the first wait whose parity test is exact only behind a rendezvous: a wait
+        of epoch e is exact once epoch e - n was filled, which the waiter itself observed only
+        if its previous wait was of epoch e - n or later (``docs/channels.md``)."""
+        persistent = any(st.schedule.persistent for st in self._ws_streams.values())
+        self._ws_ownership = {}
+        for name, ch in self._ws_chans.items():
+            if not ch.exclusive:
+                continue
+            producer = ch.producers[0][0].name
+            consumers = [ri.name for ri, _ in ch.consumers]
+            seqs = {who: self._ws_epoch_seqs[(name, who)] for who in [producer, *consumers]}
+            dynamic = [seq for seq in seqs.values() if isinstance(seq, str)]
+            if dynamic:
+                self._ws_ownership[name] = f"unverified ({dynamic[0]})"
+                continue
+            epochs = sum(count for _, count in seqs[producer])
+            owners: list[list[str]] = [[] for _ in range(epochs)]
+            waited = {who: [] for who in consumers}
+            blind = None  # (consumer, epoch) of the first wait that needs a rendezvous
+            for who in consumers:
+                e, seen = 0, -1  # the next epoch; the last one this consumer waited for
+                for op, count in seqs[who]:
+                    if op == "wait":
+                        if e >= epochs:
+                            raise ProtocolError(
+                                f"channel {name}: {who} waits on epoch {e}, but {producer} "
+                                f"fills only {epochs} per work item"
+                            )
+                        owners[e].append(who)
+                        waited[who].append(e)
+                        if e - ch.n > seen and blind is None:
+                            blind = (who, e)
+                        seen = e
+                    e += count
+                # The next item's first wait follows this item's last one.
+                mine = waited[who]
+                if persistent and mine and mine[0] + epochs - mine[-1] > ch.n:
+                    blind = blind or (who, mine[0] + epochs)
+                # A persistent role continues into the next item: it must cover every epoch.
+                if e > epochs or (persistent and e != epochs):
+                    raise ProtocolError(
+                        f"channel {name}: {who} advances {e} epochs per work item (waits and "
+                        f"skips), but {producer} fills {epochs}"
+                    )
+            bad = next(((e, o) for e, o in enumerate(owners) if len(o) != 1), None)
+            if bad is not None:
+                e, o = bad
+                who = "no consumer" if not o else " and ".join(o)
+                raise ProtocolError(
+                    f"channel {name}: epoch {e} of {epochs} per work item is waited by {who}; "
+                    "each epoch of an exclusive ring has exactly one owner, which the other "
+                    "consumers skip()"
+                )
+            share = ", ".join(f"{who} {len(mine)}" for who, mine in waited.items())
+            verdict = f"verified: {epochs} epochs per work item ({share})"
+            if blind is not None:
+                who, e = blind
+                verdict += (
+                    f"; {who}'s wait of epoch {e} is exact only after epoch {e - ch.n} was "
+                    "filled, which it did not observe: order it with a rendezvous"
+                )
+            self._ws_ownership[name] = verdict
 
     def _check_named_barriers(self):
         """Reject hand-picked ``alias.named_barrier`` IDs that are out of range or owned by the
@@ -1424,6 +1507,11 @@ class WarpSpecialized(metaclass=_KernelType):
             trace.finish()
         for chan, n in trace.uses_per_item().items():
             self._ws_uses[(r.name, chan)] = n
+        for name, ch in self._ws_chans.items():
+            if ch.exclusive and any(ri is r for ri, _ in ch.producers + ch.consumers):
+                self._ws_epoch_seqs[(name, r.name)] = (
+                    "raw role: its waits are not visible" if r.raw else trace.epoch_sequence(name)
+                )
         # The role's regions are live now; the diagnostic keeps plain data only.
         self._ws_alias_roles.append(alias.RoleEvents.from_trace(trace, r))
         if r.uses_tmem:
@@ -1604,6 +1692,34 @@ def _check_turns(name: str, side: str, bound):
         raise ProtocolError(
             f"channel {name}: round-robin {side}s {[r.name for r, _ in bound]} must be "
             "instances of one role with the same width (each epoch counts one instance)"
+        )
+
+
+def _check_exclusive(name: str, chan):
+    """An exclusive ring: one producer instance and at least two consumer instances of the
+    declared roles, each contributing the same arrivals (each epoch counts one of them)."""
+    producers = [r.name for r, _ in chan.producers]
+    consumers = [r for r, _ in chan.consumers]
+    if len(producers) != 1:
+        raise ProtocolError(
+            f"channel {name}: exclusive consumers need one producer instance (it fills every "
+            f"epoch in order), got {producers}"
+        )
+    if len(consumers) < 2:
+        raise ProtocolError(
+            f"channel {name}: consumer_mode='exclusive' needs at least two consumer instances, "
+            f"got {[r.name for r in consumers]}"
+        )
+    missing = [role for role in chan.consumer_roles if all(r.role != role for r in consumers)]
+    if missing:
+        raise ProtocolError(
+            f"channel {name}: exclusive consumer role(s) {missing} take no Consumer end"
+        )
+    contributions = {r.name: arrivals(chan.consumer, r.num_threads) for r in consumers}
+    if len(set(contributions.values())) > 1:
+        raise ProtocolError(
+            f"channel {name}: exclusive consumers must contribute equal arrivals (each epoch "
+            f"counts one of them), got {contributions}"
         )
 
 

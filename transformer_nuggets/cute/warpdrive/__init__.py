@@ -12,6 +12,8 @@ passed to ``run_roles`` (a frozen dataclass of prologue values in the examples) 
 parameter annotated with its type, or to the role's single unannotated parameter; any other
 annotation is a ``ProtocolError``.
 ``Ring(..., round_robin=True)`` lets the instances of one role take a side's epochs in turn;
+``Ring(..., consumer_mode="exclusive")`` gives each epoch one owner among the consumer roles,
+which ``skip()`` the epochs they do not own;
 ``sync="named"`` builds a Threads-to-Threads channel from CTA named barriers (``channels.py``);
 ``end.try_wait()``/``try_acquire()`` probe a stage once and ``wait``/``acquire(token=...)`` skip
 the blocking wait when it was ready; ``end.peek()`` returns a read-only ``Preview`` of the epoch
