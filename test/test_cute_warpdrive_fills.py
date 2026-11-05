@@ -2,6 +2,7 @@
 rank0 consumer: derived scopes, placement errors, the TMA check, and toy protocols on 2-, 4- and
 8-CTA clusters that move distinct tiles and compare every element."""
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -16,18 +17,28 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
     Cluster,
+    ClusterLaunchControl,
     Consumer,
     CtaPair,
     Producer,
     ProtocolError,
     Ring,
     RoleConfig,
+    StageView,
+    StaticPersistent,
     Threads,
     Tma,
+    Umma,
     WarpSpecialized,
+    WorkCursor,
     role,
 )
 from transformer_nuggets.cute.warpdrive.cluster import rank_value
+from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import (
+    PersistentGemm,
+    PersistentGemmParams,
+    compile_persistent_gemm,
+)
 
 ROWS = 32  # one 32x64 bf16 tile lands in each CTA per stage
 TILE_BYTES = ROWS * 64 * 2
@@ -392,3 +403,142 @@ def test_fill_mask_needs_a_fills_channel(requires_blackwell):
 
     with pytest.raises(Exception, match="takes a Cluster.fill mask, but its Tma declares no"):
         compile_toy(Undeclared())
+
+
+# --------------------------------------------------------------------------- #
+# The persistent GEMM with leader-issued loads: each pair leader copies both CTAs' A/B rows
+# (Tma(fills="pair")), so the peer's 2-CTA copies complete on the leader's barrier and the
+# leader's 2-CTA MMA reads them from the peer's SMEM. Slower than loading from both CTAs (see
+# docs/clusters.md), so it lives here as an end-to-end test of filled 2-CTA operands.
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class LeaderLoadParams(PersistentGemmParams):
+    peer_tAgA: cute.Tensor = None  # the peer's A/B tiles and masks, copied by its leader
+    peer_tBgB: cute.Tensor = None
+    peer_mcast_a: object = None
+    peer_mcast_b: object = None
+
+
+class LeaderLoadGemm(PersistentGemm):
+    params_type = LeaderLoadParams
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        tma = self.ab.producer
+        self.ab = Ring(
+            self.ab.n,
+            Tma(tma.tx_bytes, multicast=tma.multicast, fills="pair"),
+            Umma,
+            buffer=self.ab.buffer,
+        )
+
+    def get_name(self) -> str:
+        return super().get_name() + "_leaderload"
+
+    def load_op(self, sharing_ctas: int):
+        return cpasync.CopyBulkTensorTileG2SMulticastOp(self.cluster.cta_group)  # fill masks
+
+    def load_partitions(self, tiled_mma, mma_rank, tma_a, tma_b, sA, sB, gA, gB) -> dict:
+        """The leader's own loads and its peer's (only the leader issues them). Both CTAs of a
+        pair sit at the same position along N and M, so the SMEM partitions agree."""
+        leader = self.cluster.rank() - mma_rank
+        out = {}
+        for j, prefix in ((0, ""), (1, "peer_")):
+            fill_a, fill_b = self.cluster.fill(leader + j, "n"), self.cluster.fill(leader + j, "m")
+            thr = tiled_mma.get_slice(j)
+            tAsA, tAgA = cpasync.tma_partition(
+                tma_a,
+                fill_a.coord,
+                fill_a.layout,
+                cute.group_modes(sA, 0, 3),
+                cute.group_modes(thr.partition_A(gA), 0, 3),
+            )
+            tBsB, tBgB = cpasync.tma_partition(
+                tma_b,
+                fill_b.coord,
+                fill_b.layout,
+                cute.group_modes(sB, 0, 3),
+                cute.group_modes(thr.partition_B(gB), 0, 3),
+            )
+            out |= {f"{prefix}tAgA": tAgA, f"{prefix}tBgB": tBgB}
+            out |= {f"{prefix}mcast_a": fill_a.mask, f"{prefix}mcast_b": fill_b.mask}
+            if j == 0:
+                out |= {"tAsA": StageView(tAsA, axis=1), "tBsB": StageView(tBsB, axis=1)}
+        return out
+
+    @role(warps=4, regs=40, cta="leader")
+    @cute.jit
+    def load(self, params: LeaderLoadParams, *, ab: Producer, work: WorkCursor):
+        ab = ab.views(A=params.tAsA, B=params.tBsB)
+        copies = [
+            (params.tAgA, params.tBgB, params.mcast_a, params.mcast_b),
+            (params.peer_tAgA, params.peer_tBgB, params.peer_mcast_a, params.peer_mcast_b),
+        ]
+        while work.valid:
+            m, n = self.mma_tile_mn(params, work.item)
+            for k in cutlass.range(params.num_k_tiles, unroll=1):
+                with ab.produce() as s:
+                    a, b = s.view("A"), s.view("B")
+                    for tAgA, tBgB, mask_a, mask_b in copies:
+                        cute.copy(
+                            params.tma_a,
+                            tAgA[None, m, k],
+                            a,
+                            tma_bar_ptr=s.barrier,
+                            mcast_mask=mask_a,
+                        )
+                        cute.copy(
+                            params.tma_b,
+                            tBgB[None, n, k],
+                            b,
+                            tma_bar_ptr=s.barrier,
+                            mcast_mask=mask_b,
+                        )
+            work.advance()
+        return ab, work
+
+
+def run_leader_gemm(op, m, n, k, max_ctas=None, reps=2):
+    torch.manual_seed(0)
+    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    ref = torch.nn.functional.linear(a.float(), b.float())
+    torch_err = (torch.nn.functional.linear(a, b).float() - ref).abs().max().item()
+    fn = compile_persistent_gemm(op)
+    first = None
+    for _ in range(reps):
+        out = torch.full((m, n), float("nan"), device="cuda", dtype=torch.bfloat16)
+        workspace, sms = op.work.launch_args(a.device)
+        fn(a, b, out, workspace, max_ctas or sms)
+        err = (out.float() - ref).abs().max().item()
+        assert err <= 2 * torch_err + 1e-3, (op.get_name(), (m, n, k), err, torch_err)
+        first = out if first is None else first
+        assert torch.equal(out, first), "leader-load GEMM is not bitwise deterministic"
+
+
+def test_leader_load_gemm_scope():
+    op = LeaderLoadGemm(cluster=PAIRS_2X2)
+    text = op.describe()
+    ab = op.ab.scope
+    assert ab.full_targets == {0: (0,), 2: (2,)} and ab.tx_ctas == 2
+    # Each leader's copies reach both pairs along N, so each leader's MMA releases both.
+    assert ab.empty_targets == {0: (0, 2), 2: (0, 2)} and ab.tail
+    assert "  4      load         40  leader\n" in text
+    assert "tx 65536 B (2 CTAs' copies), rank 0 arms 0, rank 2 arms 2\n" in text
+
+
+SCHEDULES = {"static": StaticPersistent(), "clc": ClusterLaunchControl(stages=2)}
+
+
+@pytest.mark.parametrize(
+    "cluster", [CtaPair(), PAIRS_2X2, Cluster(4, 1, pair=True)], ids=["pair", "2x2p", "4x1p"]
+)
+@pytest.mark.parametrize("schedule", list(SCHEDULES))
+def test_leader_load_gemm(requires_blackwell, cluster, schedule):
+    op = LeaderLoadGemm(schedule=SCHEDULES[schedule], cluster=cluster, tile_n=256)
+    for m, n, k in [(300, 520, 136), (3000, 1000, 520)]:
+        run_leader_gemm(op, m, n, k)
+    run_leader_gemm(op, 1100, 2064, 200, max_ctas=7, reps=3)  # a capped grid wraps every ring
+    assert "tma       verified CtaGroup.TWO" in op.describe()

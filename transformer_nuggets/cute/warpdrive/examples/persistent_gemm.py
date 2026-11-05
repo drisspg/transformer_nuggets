@@ -308,13 +308,38 @@ class PersistentGemm(WarpSpecialized):
     ):
         self.begin_roles(work=bound, layouts={"A": a_layout, "B": b_layout, "C": c_layout})
         sA, sB, sC = self.buffer("A"), self.buffer("B"), self.buffer("C")
-        # This CTA's slice of the (possibly 2-CTA) MMA: its rows of A and of B.
         mma_rank, pair_m, pair_n = self.cluster.coords(self.cluster.rank())
-        thr_mma = tiled_mma.get_slice(mma_rank)
         # Whole-problem tile views: (BM, BK, m_tiles, k_tiles) and (BN, BK, n_tiles, k_tiles).
         gA = cute.local_tile(mA, self.mma_tile, (None, None, None), proj=(1, None, 1))
         gB = cute.local_tile(mB, self.mma_tile, (None, None, None), proj=(None, 1, 1))
-        # Each CTA loads its part of the tiles it shares with the CTAs along N (A) or M (B).
+        loads = self.load_partitions(tiled_mma, mma_rank, tma_a, tma_b, sA, sB, gA, gB)
+        acc_shape = tiled_mma.partition_shape_C(self.mma_tile[:2])
+        acc_staged = tiled_mma.make_fragment_C(cute.append(acc_shape, self.acc_stages))
+        params = self.params_type(
+            tiled_mma=tiled_mma,
+            tma_a=tma_a,
+            tma_b=tma_b,
+            tile_m=pair_m,
+            tile_n=pair_n,
+            **loads,
+            tCrA=StageView(tiled_mma.make_fragment_A(sA), axis=3),
+            tCrB=StageView(tiled_mma.make_fragment_B(sB), axis=3),
+            num_k_tiles=cute.size(gA, mode=[3]),
+            acc_layout=acc_staged.layout,
+            epi_tile=EPI_TILE,
+            tma_c=tma_c,
+            mC_tma=mC_tma,
+            sC=sC,
+        )
+        self.run_roles(params)
+
+    params_type = PersistentGemmParams  # a subclass may extend the prologue's values
+
+    def load_partitions(self, tiled_mma, mma_rank, tma_a, tma_b, sA, sB, gA, gB) -> dict:
+        """``PersistentGemmParams`` fields of the A/B loads this CTA issues: TMA partitions and
+        multicast masks. Each CTA loads its slice of the (possibly 2-CTA) MMA tile, its rows of A
+        and of B, and its part of the tiles it shares with the CTAs along N (A) or M (B)."""
+        thr_mma = tiled_mma.get_slice(mma_rank)
         share_a, share_b = self.cluster.multicast("n"), self.cluster.multicast("m")
         tAsA, tAgA = cpasync.tma_partition(
             tma_a,
@@ -330,30 +355,14 @@ class PersistentGemm(WarpSpecialized):
             cute.group_modes(sB, 0, 3),
             cute.group_modes(thr_mma.partition_B(gB), 0, 3),
         )
-        acc_shape = tiled_mma.partition_shape_C(self.mma_tile[:2])
-        acc_staged = tiled_mma.make_fragment_C(cute.append(acc_shape, self.acc_stages))
-        params = PersistentGemmParams(
-            tiled_mma=tiled_mma,
-            tma_a=tma_a,
-            tma_b=tma_b,
+        return dict(
             mcast_a=share_a.mask,
             mcast_b=share_b.mask,
-            tile_m=pair_m,
-            tile_n=pair_n,
             tAsA=StageView(tAsA, axis=1),
             tAgA=tAgA,
             tBsB=StageView(tBsB, axis=1),
             tBgB=tBgB,
-            tCrA=StageView(tiled_mma.make_fragment_A(sA), axis=3),
-            tCrB=StageView(tiled_mma.make_fragment_B(sB), axis=3),
-            num_k_tiles=cute.size(gA, mode=[3]),
-            acc_layout=acc_staged.layout,
-            epi_tile=EPI_TILE,
-            tma_c=tma_c,
-            mC_tma=mC_tma,
-            sC=sC,
         )
-        self.run_roles(params)
 
     # ------------------------------------------------------------------- host
 
