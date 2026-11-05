@@ -13,7 +13,8 @@ runs with the same split count and table. Reported per shape:
 Run under ``gpu-run``:
 ``python -m transformer_nuggets.cute.warpdrive.examples.bench_fa4_decode --output results.json``.
 Timing uses fixed buffers and the median of seven interleaved round medians. ``--profile`` warms
-both variants, then brackets one complete call each with CUDA profiler start/stop for NCU.
+both variants, then brackets matched complete calls with CUDA profiler start/stop for NCU.
+``--profile-reps`` repeats alternating pairs; ``--output`` also saves profiling provenance.
 """
 
 import argparse
@@ -164,22 +165,33 @@ def git_metadata(directory: Path) -> tuple[str | None, bool | None]:
         return None, None
 
 
+def write_results(output: Path | None, metadata: dict, results: list[dict]) -> None:
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps({"metadata": metadata, "results": results}, indent=2))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--reps", type=int, default=200)
     parser.add_argument("--rounds", type=int, default=7, help="interleaved A/B rounds")
     parser.add_argument("--shapes", type=int, nargs="*", help="indices into SHAPES")
     parser.add_argument(
-        "--output", type=Path, help="save provenance and all replay samples as JSON"
+        "--output", type=Path, help="save provenance and replay samples (or profiling launches)"
     )
     parser.add_argument(
-        "--profile", action="store_true", help="warm, then profile one call per variant"
+        "--profile", action="store_true", help="warm, then profile matched calls per variant"
+    )
+    parser.add_argument(
+        "--profile-reps", type=int, default=1, help="alternating FA4/port pairs under NCU"
     )
     args = parser.parse_args()
     if args.reps < 1 or args.rounds < 1 or args.rounds % 2 == 0:
         parser.error("--reps must be positive and --rounds must be positive and odd")
-    if args.profile and args.output is not None:
-        parser.error("--profile writes profiler reports, not --output replay samples")
+    if args.profile_reps < 1:
+        parser.error("--profile-reps must be positive")
+    if not args.profile and args.profile_reps != 1:
+        parser.error("--profile-reps requires --profile")
     sys.argv = sys.argv[:1]  # CuTeDSL also parses application arguments during compilation.
     shape_indices = args.shapes or list(range(len(SHAPES)))
     results = []
@@ -204,7 +216,12 @@ def main():
             "fa4_dirty": fa4_dirty,
             "reps": args.reps,
             "rounds": args.rounds,
-            "contract": "fixed-buffer CUDA graph; CUPTI kernel durations; normal DVFS; capture excluded",
+            "profile_reps": args.profile_reps if args.profile else None,
+            "contract": (
+                "fixed-buffer complete calls; replay, caches and clocks controlled by external profiler"
+                if args.profile
+                else "fixed-buffer CUDA graph; CUPTI kernel durations; normal DVFS; capture excluded"
+            ),
         }
     for shape_index in shape_indices:
         b, s, h, hkv, pattern = SHAPES[shape_index]
@@ -253,24 +270,55 @@ def main():
         g_port = graph_of(
             partial(fa4_decode, q, k, v, splits, seqused_k=used_port, splits_per_seq=table)
         )
-        if args.profile:
-            torch.cuda.cudart().cudaProfilerStart()
-            interface._flash_attn_fwd(
-                q, k, v, seqused_k=used, max_seqlen_k=s, num_splits=0, return_lse=True
-            )
-            fa4_decode(q, k, v, splits, seqused_k=used_port, splits_per_seq=table)
-            torch.cuda.synchronize()
-            torch.cuda.cudart().cudaProfilerStop()
-            print(
-                f"shape {shape_index}: warmed and profiled matched {splits}-split decodes",
-                flush=True,
-            )
-            continue
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
             g_fa4.replay()
             g_port.replay()
             torch.cuda.synchronize()
+        if args.profile:
+            calls = {
+                "fa4": partial(
+                    interface._flash_attn_fwd,
+                    q,
+                    k,
+                    v,
+                    seqused_k=used,
+                    max_seqlen_k=s,
+                    num_splits=0,
+                    return_lse=True,
+                ),
+                "port": partial(
+                    fa4_decode, q, k, v, splits, seqused_k=used_port, splits_per_seq=table
+                ),
+            }
+            launch_order = []
+            torch.cuda.cudart().cudaProfilerStart()
+            try:
+                for pair in range(args.profile_reps):
+                    order = ("fa4", "port") if pair % 2 == 0 else ("port", "fa4")
+                    for variant in order:
+                        calls[variant]()
+                        launch_order.append(variant)
+                torch.cuda.synchronize()
+            finally:
+                torch.cuda.cudart().cudaProfilerStop()
+            results.append(
+                {
+                    "shape_index": shape_index,
+                    "shape": SHAPES[shape_index],
+                    "splits": splits,
+                    "counts": counts,
+                    "partials_bitwise_equal": same and same_lse,
+                    "profile_launch_order": launch_order,
+                }
+            )
+            write_results(args.output, metadata, results)
+            print(
+                f"shape {shape_index}: warmed and profiled {args.profile_reps} matched "
+                f"{splits}-split decode pairs; counts {counts}",
+                flush=True,
+            )
+            continue
         rounds = {"fa4": [], "port": []}
         graphs = {"fa4": g_fa4, "port": g_port}
         for round_index in range(args.rounds):
@@ -300,11 +348,7 @@ def main():
                 "rounds": {name: [asdict(r) for r in samples] for name, samples in rounds.items()},
             }
         )
-        if args.output is not None:
-            args.output.parent.mkdir(parents=True, exist_ok=True)
-            args.output.write_text(
-                json.dumps({"metadata": metadata, "results": results}, indent=2)
-            )
+        write_results(args.output, metadata, results)
         print(
             f"b{b} s{s} h{h}/{hkv} {pattern} splits {splits} "
             f"{'per-seq ' + str(counts) if table is not None else 'static'}\n"
