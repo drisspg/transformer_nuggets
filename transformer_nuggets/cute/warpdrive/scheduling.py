@@ -1223,6 +1223,23 @@ def _publish_pair(slot_ptr, full, values, targets: cutlass.Constexpr):
 
 
 @cute.jit
+def _publish_kept(h, fetch, stream, problem, index):
+    """Publish into ``h`` the first kept item at or after ``index``, claiming past dropped
+    ones. Returns ``fetch``: the skip loop rebinds it, so the caller must take it back."""
+    mapping = stream.mapping
+    if cutlass.const_expr(mapping.skips):
+        dropped, words = _decode_kept(mapping, index, problem.total, problem.space)
+        while dropped:
+            index = fetch.claim_next(index)
+            dropped, words = _decode_kept(mapping, index, problem.total, problem.space)
+        words = list(words)
+    else:
+        words = _decode(stream, index, problem)
+    _publish(h, index, words, problem.total)
+    return fetch
+
+
+@cute.jit
 def scheduler_role(kernel, ring, cursor: WorkCursor, fetch: _Fetch):
     """Layer-owned scheduler warp for broadcast schedules: claim, decode, publish, repeat.
 
@@ -1233,37 +1250,18 @@ def scheduler_role(kernel, ring, cursor: WorkCursor, fetch: _Fetch):
     """
     stream = cursor._stream
     problem = cursor._problem
-    mapping = stream.mapping
-    # The claim-skip loop below appears twice on purpose: moving it into a helper that returns
-    # ``fetch`` makes ``fetch`` a written loop-carried value of the work loop instead of an
-    # invoked one, which reorders its block arguments and changes register allocation.
     if cutlass.const_expr(_hooked(stream)):
         # Hooks may move the first item off blockIdx.x, so publish it like a claim.
         if cutlass.const_expr(stream.ready is not None):
             stream.ready.wait()
         with ring.produce() as h0:
-            first = cursor.index
-            if cutlass.const_expr(mapping.skips):
-                dropped, words = _decode_kept(mapping, first, problem.total, problem.space)
-                while dropped:
-                    first = fetch.claim_next(first)
-                    dropped, words = _decode_kept(mapping, first, problem.total, problem.space)
-                _publish(h0, first, list(words), problem.total)
-            else:
-                _publish(h0, first, _decode(stream, first, problem), problem.total)
+            fetch = _publish_kept(h0, fetch, stream, problem, cursor.index)
         cursor._receive()
         cursor._first_item()
     while cursor.valid:
         with ring.produce() as h:
             index = fetch.claim_next(cursor.index)
-            if cutlass.const_expr(mapping.skips):
-                dropped, words = _decode_kept(mapping, index, problem.total, problem.space)
-                while dropped:
-                    index = fetch.claim_next(index)
-                    dropped, words = _decode_kept(mapping, index, problem.total, problem.space)
-                _publish(h, index, list(words), problem.total)
-            else:
-                _publish(h, index, _decode(stream, index, problem), problem.total)
+            fetch = _publish_kept(h, fetch, stream, problem, index)
         cursor.advance()
     fetch.close_claims()
     return ring, cursor
