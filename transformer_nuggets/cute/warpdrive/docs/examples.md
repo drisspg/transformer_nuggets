@@ -104,7 +104,7 @@ GQA or other head dimension. The example imports `flash_attn.cute` and `quack` h
 
 O has Q's shape. LSE is fp32 `(batch, heads, seqlen_q)` in natural-log units. The input checks
 are not a complete validator of all these requirements; see the example-wrapper gap in
-[GUARANTEES.md](../GUARANTEES.md#known-gaps).
+[maintainer reference](contract-reference.md#known-gaps).
 
 `fa4_fwd(..., schedule=..., mapping=...)` lets you change index assignment and work order.
 See [scheduling](scheduling.md) for `Raster` and the FA4 mappings. `roles=Fa4Roles(...)`
@@ -390,4 +390,4 @@ analysis and completion-aware epoch checks. Its current limits are in
 [storage](storage.md#read-the-result).
 
 For the normal and quick-fuzz commands, see [Tests](../README.md#tests). Long campaigns and
-what their oracles cover are in [GUARANTEES.md](../GUARANTEES.md#fuzzing-and-evidence).
+what their oracles cover are in the [maintainer reference](contract-reference.md#fuzzing-and-evidence).

@@ -11,9 +11,12 @@ self.acc = Ring(1, Umma, Threads)
 You still choose the tiles, layouts, warps and register budgets. warpdrive handles the barrier
 counts and phases, role dispatch and TMEM allocation/free. The math is ordinary CuTeDSL.
 
-Experimental. Requires `nvidia-cutlass-dsl` 4.8 and a Blackwell SM100/SM103 GPU. A kernel that
-compiles can still deadlock if its roles disagree about the work. See [GUARANTEES.md](GUARANTEES.md)
-for what is checked and what you have to get right.
+Experimental. Requires `nvidia-cutlass-dsl` 4.8 and a Blackwell SM100/SM103 GPU.
+
+**Start with [Write a kernel](docs/writing-kernels.md):** run the complete GEMM, define a work
+item, connect the roles, and validate the handoffs. The [safety contract](GUARANTEES.md) explains
+what warpdrive handles and what you must establish. Compilation alone does not prove liveness.
+For agent-assisted implementation, use the repo-local [authoring skill](SKILL.md).
 
 ## A GEMM
 
@@ -144,7 +147,7 @@ The first pytest command runs the normal suite; fuzz tests are skipped by defaul
 opts into quick fuzzing. Compiled kernels stay in the [compile cache](../jit_cache/README.md#the-disk-cache),
 so a second run mostly loads them: on a GB300 the normal suite took 43 s cold and 22 s warm
 (48 s before the cache). FA4 tests skip without `flash_attn.cute`. Long campaigns, sanitizer and
-CUTracer runs are described in [GUARANTEES.md](GUARANTEES.md#fuzzing-and-evidence).
+CUTracer runs are described in the [maintainer reference](docs/contract-reference.md#fuzzing-and-evidence).
 
 The suite covers numerical correctness and determinism, shape reuse, schedules, CTA pairs and
 larger clusters, protocol errors, raw/managed synchronization, TMA and alias diagnostics, and

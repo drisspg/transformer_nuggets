@@ -44,7 +44,7 @@ have to double the thread count manually. All UMMA signalers in a `CtaPair` must
 leader-only, even on CTA-local channels.
 
 `print(op.describe())` shows the per-CTA counts, targets, masks and transaction bytes. The
-exact placement rules are in [GUARANTEES.md](../GUARANTEES.md#cluster-placement-rules-r11).
+exact placement rules are in the [contract reference](contract-reference.md#cluster-placement-rules-r11).
 
 ## Work and exit
 

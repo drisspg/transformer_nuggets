@@ -8,6 +8,14 @@
 - `.agents/skills/analyzing-pytorch-rooflines/SKILL.md` — eager/AOT roofline capture,
   formula registration, trace interpretation, ranking, replay, and NCU follow-ups.
 
+# Authoring warpdrive kernels
+
+- Read `transformer_nuggets/cute/warpdrive/SKILL.md` when authoring or porting a kernel.
+  The skill, authoring guide, safety contract and examples live with the library and must
+  match the checkout being used.
+- The numbered E/R/U/G catalog lives in `transformer_nuggets/cute/warpdrive/docs/contract-reference.md`.
+  It is a maintainer/test reference, not an error-code API or the authoring guide.
+
 # CuTeDSL Conventions
 
 - Standalone compiled kernels use `transformer_nuggets.cute.compile_tvm_ffi`, which owns
