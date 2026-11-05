@@ -11,9 +11,12 @@ with the group as a coordinate, so no per-group descriptors have to be built or 
 device.
 
 A group's last m-tile is ragged (its rows end inside the tile) unless it is also the last rows
-of ``A``. TMA stores clip only at the tensor's edge, so such a tile is stored with predicated
-register stores and every other tile through SMEM with TMA (``epilogue``). The loads of the
-ragged tile read the next group's rows into the unused part of the A stage, which only
+of ``A``. TMA clips only at a tensor's edge, so the output is stored through a *ragged* TMA
+view (Triton's ``ragged_tma`` trick, as used by quack): a 3-D ``(2^30, N, 2^31 - 1)`` tensor
+whose row mode ends at the clipping edge and whose third mode (stride ``N``) selects the real
+row; a tile of ``rows`` valid rows ending at ``end`` is addressed at ``(2^30 - rows, n, end)``,
+so rows past the group's end fall outside the view and are dropped by the store. The loads of
+the ragged tile read the next group's rows into the unused part of the A stage, which only
 affects accumulator rows that are never stored.
 """
 
@@ -61,6 +64,9 @@ from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import (
     MAX_C_STAGES,
     TILE_K,
 )
+
+RAGGED_ROWS = 2**30  # the row extent of the ragged output view; TMA clips there
+RAGGED_SELECT = 2**31 - 1  # extent of its row-selecting third mode
 
 
 @cute.jit
@@ -144,11 +150,9 @@ class GroupedGemmParams:
     acc_layout: cute.Layout  # all accumulator stages
     epi_tile: cute.Tile
     tma_c: cute.CopyAtom
-    mC_tma: cute.Tensor  # TMA coordinate tensor of the output (total_M, N)
-    mC: cute.Tensor  # the output itself, for predicated stores
-    cC: cute.Tensor  # its coordinates
+    mC_tma: cute.Tensor  # ragged TMA coordinate tensor of the output (RAGGED_ROWS, N, SELECT)
+    mC: cute.Tensor  # the output itself (total_M, N), for the fragment layouts
     sC: cute.Tensor  # epilogue staging buffers
-    total_m: cutlass.Int32
 
 
 class GroupedGemm(WarpSpecialized):
@@ -285,10 +289,8 @@ class GroupedGemm(WarpSpecialized):
     @cute.jit
     def epilogue(self, params: GroupedGemmParams, *, acc: Consumer, work: WorkCursor, tmem: Tmem):
         """TMEM -> registers -> swizzled SMEM -> TMA store, one ``epi_tile`` subtile at a time
-        through ``c_stages`` SMEM buffers, for a tile whose rows all belong to its group (or end
-        at the tensor's edge, where TMA clips). A tile that ends inside ``A`` before its group's
-        last row is stored from registers instead, 16 bytes at a time, skipping the rows of the
-        next group and the columns past N."""
+        through ``c_stages`` SMEM buffers. The ragged TMA view clips the rows past the
+        group's end and the columns past N."""
         tidx, _, _ = cute.arch.thread_idx()
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         rank = self.cluster.coords(self.cluster.rank())[0]  # this CTA's rows of the MMA tile
@@ -306,7 +308,6 @@ class GroupedGemm(WarpSpecialized):
         t2r, tTR_tAcc, tTR_rAcc = epilogue_tmem_copy_and_partition(
             self, tidx, tAcc, gC_l, params.epi_tile, self.cluster.pair
         )
-        thr_t2r = t2r.get_slice(tidx)
         tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.dtype)
         r2s, tRS_rC, tRS_sC = epilogue_smem_copy_and_partition(self, t2r, tTR_rC, tidx, params.sC)
         bSG_sC, _ = cpasync.tma_partition(
@@ -318,37 +319,26 @@ class GroupedGemm(WarpSpecialized):
         )
         tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc) - 1)  # (..., SUB, STAGE)
         subtiles = cute.size(tTR_tAcc, mode=[3])
-        # A thread's fragment is one row of 32 consecutive columns: store it as 16-byte vectors.
-        vec = cute.make_layout((8, cute.size(tTR_rC) // 8))
-        rC_v = cute.make_tensor(tTR_rC.iterator, vec)
-        n_cols = params.mC.shape[1]
         # Buffers rotate across tiles too: with a subtile count that is not a multiple of
         # c_stages (tile_n=224: 7), a tile's first subtile alternates buffers.
         rotate = subtiles % self.c_stages != 0
         first = Int32(0)  # the buffer of this tile's first subtile
         while work.valid:
             _, row0, rows, nt = work.item
-            row0 = row0 + CTA_TILE_M * rank
+            # This CTA's rows of the MMA tile; a pair's peer may hold none of a ragged tile.
             rows = cutlass.max(cutlass.min(rows - CTA_TILE_M * rank, CTA_TILE_M), 0)
-            row_end = row0 + rows
-            # TMA clips at the tensor's edge, not at the group's.
-            tma_ok = (rows == CTA_TILE_M) | (row_end == params.total_m)
-            gC, cC, gC_tma = (
-                cute.flat_divide(
-                    transform_partitioned_tensor_layout(
-                        thr_mma.partition_C(
-                            cute.local_tile(
-                                cute.domain_offset((row0 - CTA_TILE_M * rank, 0), t),
-                                self.mma_tile[:2],
-                                (0, nt),
-                            )
-                        )
-                    ),
-                    params.epi_tile,
-                )
-                for t in (params.mC, params.cC, params.mC_tma)
+            end = row0 + CTA_TILE_M * rank + rows
+            # The ragged view's rows [RAGGED_ROWS - rows, RAGGED_ROWS) alias C's rows
+            # [end - rows, end); the MMA-tile partition below adds this CTA's row offset.
+            mC_item = cute.domain_offset(
+                (RAGGED_ROWS - rows - CTA_TILE_M * rank, 0), params.mC_tma[None, None, end]
             )
-            tTR_gC, tTR_cC = (thr_t2r.partition_D(t) for t in (gC, cC))
+            gC_tma = cute.flat_divide(
+                transform_partitioned_tensor_layout(
+                    thr_mma.partition_C(cute.local_tile(mC_item, self.mma_tile[:2], (0, nt)))
+                ),
+                params.epi_tile,
+            )
             _, bSG_gC = cpasync.tma_partition(
                 params.tma_c,
                 0,
@@ -361,24 +351,16 @@ class GroupedGemm(WarpSpecialized):
                     buf = (first + i) % self.c_stages if rotate else i % self.c_stages
                     cute.copy(t2r, tTR_tAcc[None, None, None, i, a.index], tTR_rAcc)
                     tTR_rC.store(tTR_rAcc.load().to(self.dtype))
-                    if tma_ok:
-                        cute.copy(r2s, tRS_rC, tRS_sC[None, None, None, buf])
-                        cute.arch.fence_view_async_shared()  # st.shared -> TMA store
-                        cute.arch.barrier(barrier_id=EPI_BARRIER_ID, number_of_threads=128)
-                        if warp == 0:
-                            cute.copy(params.tma_c, bSG_sC[None, buf], bSG_gC[None, 0, i])
-                            cute.arch.cp_async_bulk_commit_group()
-                            # Buffer `buf` is rewritten c_stages subtiles later; keep at most
-                            # c_stages - 1 stores still reading SMEM.
-                            cute.arch.cp_async_bulk_wait_group(self.c_stages - 1, read=True)
-                        cute.arch.barrier(barrier_id=EPI_BARRIER_ID, number_of_threads=128)
-                    else:
-                        g = cute.make_tensor(tTR_gC[None, None, None, 0, i].iterator, vec)
-                        crd = tTR_cC[None, None, None, 0, i]
-                        for v in cutlass.range_constexpr(cute.size(vec, mode=[1])):
-                            row, col = crd[8 * v]
-                            if (row < row_end) & (col + 8 <= n_cols):
-                                cute.autovec_copy(rC_v[None, v], g[None, v])
+                    cute.copy(r2s, tRS_rC, tRS_sC[None, None, None, buf])
+                    cute.arch.fence_view_async_shared()  # st.shared -> TMA store
+                    cute.arch.barrier(barrier_id=EPI_BARRIER_ID, number_of_threads=128)
+                    if warp == 0:
+                        cute.copy(params.tma_c, bSG_sC[None, buf], bSG_gC[None, 0, i])
+                        cute.arch.cp_async_bulk_commit_group()
+                        # Buffer `buf` is rewritten c_stages subtiles later; keep at most
+                        # c_stages - 1 stores still reading SMEM.
+                        cute.arch.cp_async_bulk_wait_group(self.c_stages - 1, read=True)
+                    cute.arch.barrier(barrier_id=EPI_BARRIER_ID, number_of_threads=128)
             if cutlass.const_expr(rotate):
                 first = (first + subtiles) % self.c_stages
             work.advance()
@@ -402,7 +384,6 @@ class GroupedGemm(WarpSpecialized):
         a_layout,
         b_layout,
         c_layout,
-        total_m,
         bound,
     ):
         self.begin_roles(work=bound, layouts={"A": a_layout, "B": b_layout, "C": c_layout})
@@ -445,9 +426,7 @@ class GroupedGemm(WarpSpecialized):
             tma_c=tma_c,
             mC_tma=mC_tma,
             mC=mC,
-            cC=cute.make_identity_tensor(mC.shape),
             sC=sC,
-            total_m=total_m,
         )
         self.run_roles(params)
 
@@ -490,12 +469,23 @@ class GroupedGemm(WarpSpecialized):
         c_layout = sm100_utils.make_smem_layout_epi(
             self.dtype, self.c_layout, self.epi_tile, self.c_stages
         )
-        tma_c, mC_tma = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileS2GOp(), c, cute.select(c_layout, mode=[0, 1]), self.epi_tile
+        # The ragged output view (see the module docstring); its base lies RAGGED_ROWS rows
+        # before C, which a store-only descriptor tolerates.
+        row_stride = c.stride[0]
+        c_ragged = cute.make_tensor(
+            cute.domain_offset((-RAGGED_ROWS, 0), c).iterator,
+            cute.make_layout(
+                (RAGGED_ROWS, c.shape[1], RAGGED_SELECT), stride=(row_stride, 1, row_stride)
+            ),
         )
-        total_m = Int32(a.shape[0])
+        tma_c, mC_tma = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileS2GOp(),
+            c_ragged,
+            cute.select(c_layout, mode=[0, 1]),
+            cute.composition(cute.make_identity_layout(c_ragged.shape), self.epi_tile),
+        )
         n_tiles = cute.ceil_div(c.shape[1], tile[1])
-        bound = self.work.bind((offsets, total_m, n_tiles), workspace, max_ctas)
+        bound = self.work.bind((offsets, Int32(a.shape[0]), n_tiles), workspace, max_ctas)
         self.kernel.set_name_prefix(self.get_name())
         self.kernel(
             tiled_mma,
@@ -509,7 +499,6 @@ class GroupedGemm(WarpSpecialized):
             a_layout,
             b_layout,
             c_layout,
-            total_m,
             bound,
         ).launch(**self.launch_config(bound), stream=stream)
 
