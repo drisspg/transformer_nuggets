@@ -16,6 +16,8 @@ pytest.importorskip("cutlass.cute")
 import cutlass
 from cutlass import cute
 
+from warpdrive_test_helpers import alias_section, status
+
 from transformer_nuggets.cute.warpdrive import (
     Consumer,
     CtaPair,
@@ -45,14 +47,6 @@ from transformer_nuggets.cute.warpdrive.examples.fa4_fwd import (  # noqa: E402
 )
 
 
-@pytest.fixture
-def requires_blackwell() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("warpdrive tests require SM100-family GPUs")
-
-
 def compile_quietly(op, compile_fn=compile_fa4_fwd):
     """Compile, returning the alias diagnostic's warnings (other warnings pass through)."""
     with warnings.catch_warnings(record=True) as caught:
@@ -60,17 +54,6 @@ def compile_quietly(op, compile_fn=compile_fa4_fwd):
         fn = compile_fn(op)
     alias = [str(w.message) for w in caught if "alias diagnostic" in str(w.message)]
     return fn, alias
-
-
-def alias_section(op) -> str:
-    text = op.describe()
-    return text[text.index("Alias diagnostic") :]
-
-
-def status(op, pair: str) -> str:
-    match = re.search(rf"\n  {re.escape(pair)} \((?:tmem|smem)\)  ([a-z ]+)", alias_section(op))
-    assert match, alias_section(op)
-    return match.group(1).strip().split(" among")[0]
 
 
 # --------------------------------------------------------------------------- #

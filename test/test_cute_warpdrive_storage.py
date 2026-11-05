@@ -11,6 +11,8 @@ pytest.importorskip("cutlass.cute")
 import cutlass
 from cutlass import cute
 
+from warpdrive_test_helpers import raises_protocol as _raises_protocol
+
 from transformer_nuggets.cute.jit_cache import jit_cache
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
@@ -27,20 +29,6 @@ from transformer_nuggets.cute.warpdrive import (
 )
 
 STAGES = 3
-
-
-@pytest.fixture
-def requires_blackwell() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("warpdrive tests require SM100-family GPUs")
-
-
-def _raises_protocol(match: str, fn):
-    with pytest.raises(Exception, match=match) as info:
-        fn()
-    assert isinstance(info.value, ProtocolError) or "ProtocolError" in repr(info.value)
 
 
 # --------------------------------------------------------------------------- #

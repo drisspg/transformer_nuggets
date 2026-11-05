@@ -29,14 +29,6 @@ from transformer_nuggets.cute.warpdrive import (
 N = 128  # payload words: one per producer thread
 
 
-@pytest.fixture
-def requires_blackwell() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("warpdrive tests require SM100-family GPUs")
-
-
 @cute.jit
 def spin(cycles):
     start = cute.arch.clock64()

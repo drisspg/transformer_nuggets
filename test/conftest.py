@@ -1,5 +1,17 @@
 import pytest
 
+pytest.register_assert_rewrite("warpdrive_test_helpers")
+
+
+@pytest.fixture
+def requires_blackwell() -> None:
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("warpdrive tests require SM100-family GPUs")
+
 
 @pytest.fixture(autouse=True, scope="session")
 def _isolated_roofline_cache(tmp_path_factory):

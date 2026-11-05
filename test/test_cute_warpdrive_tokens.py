@@ -16,12 +16,13 @@ from cuda.bindings import driver as cuda
 from cutlass import cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
+from warpdrive_test_helpers import raises_protocol as _raises_protocol
+
 from transformer_nuggets.cute.jit_cache import jit_cache
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
     Consumer,
     Producer,
-    ProtocolError,
     Ring,
     Slots,
     SmemPlan,
@@ -35,20 +36,6 @@ from transformer_nuggets.cute.warpdrive import (
 
 N = 32  # payload words per stage: one per consumer lane
 DELAY = 200_000  # cycles: far longer than one try_wait probe may suspend
-
-
-@pytest.fixture
-def requires_blackwell() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("warpdrive tests require SM100-family GPUs")
-
-
-def _raises_protocol(match: str, fn):
-    with pytest.raises(Exception, match=match) as info:
-        fn()
-    assert isinstance(info.value, ProtocolError) or "ProtocolError" in repr(info.value)
 
 
 @cute.jit

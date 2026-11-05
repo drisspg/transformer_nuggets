@@ -24,14 +24,6 @@ from transformer_nuggets.cute.warpdrive.examples.fa4_bwd import (
 D = 128
 
 
-@pytest.fixture
-def requires_blackwell() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("warpdrive tests require SM100-family GPUs")
-
-
 def inputs(b, h, sq, sk, scale, causal, seed=0):
     torch.manual_seed(seed)
     q = torch.randn(b, sq, h, D, device="cuda", dtype=torch.bfloat16)
