@@ -893,6 +893,27 @@ class SwapABDecode(WarpSpecialized):
                             + row_sum_acc[None, None, None, fin].load()
                             + acc_scale.load() * tLrL.load()
                         )
+            else:
+                with max_done.produce():
+                    pass
+
+            # Row sums across lanes, then per warp to the stats warp. The sums and 1/L need only
+            # the row sums, so this round trip runs while the last PV MMAs finish (FA4's order).
+            with sum_done.produce() as sh:
+                for h in cutlass.range_constexpr(tile_hq):
+                    row_sum_final[h] = cute.arch.warp_reduction_sum(row_sum_final[h])
+                    if lane == 0:
+                        sh.data[warp, h] = row_sum_final[h]
+            # 1/L comes back through sRowMax.
+            with stats_ready.consume():
+                cute.autovec_copy(params.sRowMax, tLrL)
+
+            # Then the last two O slots (slot (n-2) % 2 is unwritten, and reads as zero, in a
+            # one-block split).
+            if n_blocks > 0:
+                for ph in cutlass.range_constexpr(O_STAGES):
+                    if n_blocks % O_STAGES == ph:
+                        fin = ph ^ 1
                         oh0 = o.wait()
                         oh1 = o.wait()
                         if n_blocks > 1:
@@ -909,19 +930,6 @@ class SwapABDecode(WarpSpecialized):
                         cute.arch.fence_view_async_tmem_load()
                         oh0.release()
                         oh1.release()
-            else:
-                with max_done.produce():
-                    pass
-
-            # Row sums across lanes, then per warp to the stats warp.
-            with sum_done.produce() as sh:
-                for h in cutlass.range_constexpr(tile_hq):
-                    row_sum_final[h] = cute.arch.warp_reduction_sum(row_sum_final[h])
-                    if lane == 0:
-                        sh.data[warp, h] = row_sum_final[h]
-            # 1/L comes back through sRowMax.
-            with stats_ready.consume():
-                cute.autovec_copy(params.sRowMax, tLrL)
 
             # Normalize the merged O in fp32 and stage it for the TMA store.
             tail0 = tOrO_tail[None, None, None, None, 0].load().reshape((vec_size, self.d_tiles))

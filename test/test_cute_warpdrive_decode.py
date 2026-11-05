@@ -489,17 +489,27 @@ def test_decode_rejects_unfit_configurations(decode):
         decode.SwapABDecode(32, tile_n=256, p_stages=12)
 
 
-def test_decode_matches_fa4_partials_bitwise(requires_blackwell, decode, monkeypatch):
-    """Same split partials as FA4's swap-AB decode (per-sequence split counts from FA4's prepare
-    kernel, then FA4's combine) bit for bit, and the same combined output."""
+@pytest.mark.parametrize(
+    "b, s, used",
+    [
+        # FA4 picks per-sequence splits from a 32K capacity and the lengths.
+        (4, 32768, [300, 32768, 9000, 1]),
+        # No seqused_k: one split count, every sequence at the capacity (no length read).
+        (1, 8192, None),
+    ],
+)
+def test_decode_matches_fa4_partials_bitwise(requires_blackwell, decode, monkeypatch, b, s, used):
+    """Same split partials as FA4's swap-AB decode (with per-sequence lengths, the split counts
+    from FA4's prepare kernel; then FA4's combine) bit for bit, and the same combined output."""
     interface = pytest.importorskip("flash_attn.cute.interface")
     monkeypatch.setenv("FLASH_ATTENTION_SM100_BACKEND", "swapab")
     torch.manual_seed(0)
-    b, s, h, hkv = 4, 32768, 8, 1  # FA4 picks per-sequence splits from a 32K capacity
+    h, hkv = 8, 1
     q = torch.randn(b, 1, h, 128, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(b, s, hkv, 128, device="cuda", dtype=torch.bfloat16)
     v = torch.randn(b, s, hkv, 128, device="cuda", dtype=torch.bfloat16)
-    used = torch.tensor([300, 32768, 9000, 1], device="cuda", dtype=torch.int32)
+    if used is not None:
+        used = torch.tensor(used, device="cuda", dtype=torch.int32)
     captured = {}
     combine = interface._flash_attn_fwd_combine
 
@@ -516,10 +526,11 @@ def test_decode_matches_fa4_partials_bitwise(requires_blackwell, decode, monkeyp
     )
     monkeypatch.undo()
     table = captured["table"]
-    assert table is not None, "FA4 did not take per-sequence split counts"
+    assert (table is None) == (used is None), "FA4 took unexpected per-sequence split counts"
     splits = captured["o"].shape[0]
     o, lse = decode.decode_partials(q, k, v, splits, seqused_k=used, splits_per_seq=table)
-    owned = torch.arange(splits, device="cuda")[:, None] < table[None, :]
+    counts = table if table is not None else torch.full((b,), splits, device="cuda")
+    owned = torch.arange(splits, device="cuda")[:, None] < counts[None, :]
     assert torch.equal(o[owned], captured["o"][owned])
     assert torch.equal(lse[..., 0][owned], captured["lse"][:, :, 0][owned])
     out, lse_out = decode.fa4_decode(q, k, v, splits, seqused_k=used, splits_per_seq=table)
