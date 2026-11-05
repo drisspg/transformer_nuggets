@@ -35,6 +35,7 @@ from cutlass.utils.gemm.sm100 import (
 from transformer_nuggets.cute.jit_cache import jit_cache
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
+    AtomicPersistent,
     Consumer,
     Producer,
     Ring,
@@ -42,7 +43,6 @@ from transformer_nuggets.cute.warpdrive import (
     SingleCta,
     SmemPlan,
     StageView,
-    StaticPersistent,
     Threads,
     Tma,
     Tmem,
@@ -65,23 +65,30 @@ from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import (
 
 @cute.jit
 def _locate_tile(mt: Int32, offsets: cute.Tensor, tile_m: int):
-    """The group whose m-tiles contain global m-tile ``mt``, that tile's first row and valid
-    rows. Groups are scanned in order (``G`` is small): group g owns ``ceil(size_g / tile_m)``
-    tiles, so the global tile count is not computable from one offset. Returns
-    ``(found, group, row0, rows)``; ``found`` is false for ``mt`` past the last tile."""
-    prev, cum = Int32(0), Int32(0)
-    group, row0, rows = Int32(0), Int32(0), Int32(0)
-    for g in cutlass.range(offsets.shape[0], unroll=1):
-        end = offsets[g]
-        tiles = (end - prev + tile_m - 1) // tile_m
-        hit = (mt >= cum) & (mt < cum + tiles)
-        start = prev + (mt - cum) * tile_m
-        group = cutlass.select_(hit, g, group)
-        row0 = cutlass.select_(hit, start, row0)
-        rows = cutlass.select_(hit, cutlass.min(end - start, tile_m), rows)
-        cum += tiles
-        prev = end
-    return mt < cum, group, row0, rows
+    """The group of global m-tile ``mt``, that tile's first row and its valid rows:
+    ``(found, group, row0, rows)``.
+
+    Group g's tiles start at m-tile ``ceil(P_g / tile_m)`` where ``P_g = offsets[g-1] +
+    g * tile_m``: the padded row space gives every group a gap of one tile, so its real tiles
+    fit in its range of m-tiles and at most one slot per group is unused (``found`` is false
+    there). ``P_g`` is strictly increasing, so a binary search over the offsets finds the group
+    in ``log2(G)`` loads instead of a scan.
+    """
+    G = offsets.shape[0]
+    step = Int32(1)
+    while step < G:
+        step = step * 2
+    lo = Int32(0)  # invariant: group lo starts at or before mt
+    while step > 1:
+        step = step // 2
+        cand = lo + step
+        fits = (cand < G) & (offsets[cutlass.min(cand, G) - 1] <= (mt - cand) * tile_m)
+        lo = cutlass.select_(fits, cand, lo)
+    start_row = cutlass.select_(lo > 0, offsets[cutlass.max(lo, 1) - 1], Int32(0))
+    first_tile = (start_row + lo * tile_m + tile_m - 1) // tile_m
+    row0 = start_row + (mt - first_tile) * tile_m
+    end = offsets[lo]
+    return row0 < end, lo, row0, cutlass.min(end - row0, tile_m)
 
 
 @dataclass(frozen=True)
@@ -90,8 +97,8 @@ class GroupedTiles(WorkMap):
 
     The space is ``(offsets, total_m, n_tiles)``. The host cannot count the groups' m-tiles
     (``sum(ceil(size_g / tile_m))``), so the index space covers ``ceil(total_m / tile_m) + G``
-    m-tiles, an upper bound; indices past the real tile count are dropped. n is the fast axis:
-    consecutive items share a tile's rows of A.
+    m-tiles, an upper bound; the unused slot of a group (see ``_locate_tile``) is dropped. n is
+    the fast axis: consecutive items share a tile's rows of A.
     """
 
     tile_m: int = CTA_TILE_M
@@ -195,8 +202,12 @@ class GroupedGemm(WarpSpecialized):
         self.ab = Ring(ab_stages, Tma(stage_bytes), Umma, buffer={"A": a, "B": b})
         self.acc = Ring(acc_stages, Umma, Threads)
         self.tmem_plan = TmemPlan().region("acc", cta_tile[1], acc_stages)
+        # Decoding an item reads the offsets (a binary search, ~log2(G) dependent loads). A
+        # broadcast schedule does that once per item in the scheduler warp, ahead of the roles;
+        # a local one (StaticPersistent, OneShot) repeats it in every role between tiles,
+        # which measured ~30% slower at G=128, K=2048.
         self.work = WorkStream(
-            mapping=GroupedTiles(tile_m=self.mma_tile[0]), schedule=schedule or StaticPersistent()
+            mapping=GroupedTiles(tile_m=self.mma_tile[0]), schedule=schedule or AtomicPersistent()
         )
         self.trace_protocol = trace
 
@@ -272,9 +283,7 @@ class GroupedGemm(WarpSpecialized):
 
     @role(warps=range(4), regs=160)
     @cute.jit
-    def epilogue(
-        self, params: GroupedGemmParams, *, acc: Consumer, work: WorkCursor, tmem: Tmem
-    ):
+    def epilogue(self, params: GroupedGemmParams, *, acc: Consumer, work: WorkCursor, tmem: Tmem):
         """TMEM -> registers -> swizzled SMEM -> TMA store, one ``epi_tile`` subtile at a time
         through ``c_stages`` SMEM buffers, for a tile whose rows all belong to its group (or end
         at the tensor's edge, where TMA clips). A tile that ends inside ``A`` before its group's
@@ -579,7 +588,7 @@ def grouped_gemm(
     """``out[s_g:e_g] = a[s_g:e_g] @ b[g].T`` for row-major bf16 ``a: (total_M, K)``,
     ``b: (G, N, K)`` and int32 ``offsets: (G,)`` of group end rows (``e_g = offsets[g]``,
     ``s_0 = 0``). Rows past ``offsets[-1]`` are left as they are. ``schedule`` defaults to
-    ``StaticPersistent()``; ``max_ctas`` caps the persistent grid; ``config``:
+    ``AtomicPersistent()``; ``max_ctas`` caps the persistent grid; ``config``:
     ``GroupedGemm``'s other keyword options (``tile_n``, ``ab_stages``, ``acc_stages``,
     ``c_stages``, ``epi_tile_n``, ``roles``)."""
     out = check_grouped_gemm_args(a, b, offsets, out)

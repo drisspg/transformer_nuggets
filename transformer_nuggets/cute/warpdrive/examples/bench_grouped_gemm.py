@@ -126,7 +126,9 @@ def run_shape(groups, tokens, n, k, labels, samples, rounds) -> dict:
     shape = f"G={groups} M={tokens} N={n} K={k}"
     print(
         shape,
-        "  ".join(f"{label} {us:.1f} us ({tflops[label]:.0f} TFLOP/s)" for label, us in best.items()),
+        "  ".join(
+            f"{label} {us:.1f} us ({tflops[label]:.0f} TFLOP/s)" for label, us in best.items()
+        ),
         flush=True,
     )
     return {
@@ -153,9 +155,7 @@ def main() -> None:
     args = parser.parse_args()
     sys.argv = sys.argv[:1]  # CuTeDSL's argparse must not see the application's arguments
     shapes = SHAPES if not args.shape else [SHAPES[i] for i in args.shape]
-    results = [
-        run_shape(*shape, args.variants, args.samples, args.rounds) for shape in shapes
-    ]
+    results = [run_shape(*shape, args.variants, args.samples, args.rounds) for shape in shapes]
     if args.output is not None:
         args.output.write_text(
             json.dumps({"gpu": torch.cuda.get_device_name(), "results": results}, indent=2)
