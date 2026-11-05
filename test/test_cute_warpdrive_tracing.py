@@ -72,7 +72,9 @@ def test_gemm_range_names_match_plan(iket_recorder):
     names = set(iket_recorder.pushed)
     assert set(plan.roles) == set(plan.regions) == {"epilogue", "load", "mma"}
     assert set(plan.regions) <= names  # every plan region is an emitted range
-    assert names == {"epilogue", "load", "mma", "ab.acquire", "ab.wait", "acc.acquire", "acc.wait"}
+    # The epilogue's NamedBarrier sync is a wait range too, though plans model channels only.
+    waits = {"ab.acquire", "ab.wait", "acc.acquire", "acc.wait", "epi_sync.sync"}
+    assert names == {"epilogue", "load", "mma", *waits}
     assert set(plan.resources) == {"ab", "acc"}
     # Every traced push has a pop: wait ranges, each item's range (closed by advance()), and the
     # last item's range a loop exit other than `valid` would leave open (closed at role exit).

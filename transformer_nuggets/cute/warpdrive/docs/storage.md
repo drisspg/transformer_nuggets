@@ -171,7 +171,7 @@ from transformer_nuggets.cute.warpdrive import (
 fence_async_shared()  # cute.arch.fence_view_async_shared()
 bulk_commit_group()  # cute.arch.cp_async_bulk_commit_group()
 bulk_wait_group(0, read=True)  # cute.arch.cp_async_bulk_wait_group(...)
-named_barrier(3, number_of_threads=128)  # cute.arch.barrier(...)
+named_barrier(barrier_id, number_of_threads=128)  # cute.arch.barrier(...)
 ```
 
 These are separate examples, not a general synchronization recipe. Named barrier IDs 1 and 2

@@ -4,7 +4,8 @@
 kernel allocates its ID together with the named-barrier channels' IDs (``kernel.py``); role
 bodies call ``self.<name>.sync()`` or ``.arrive()``. Each call records a trace event, so the
 alias diagnostic sees the barrier, the kernel rejects hand-picked ``alias.named_barrier`` IDs
-that collide with it, and ``describe()`` lists the roles that used it.
+that collide with it, and ``describe()`` lists the roles that used it. Pipeline plans
+(``pipeline_plan.py``) model channels only and leave named barriers out.
 
 The resource supplies the ID and a consistent count, nothing more: which threads arrive in
 which generation, and why a fast participant cannot arrive twice before slow ones finish a
@@ -19,6 +20,7 @@ from cutlass import cute
 
 from transformer_nuggets.cute.warpdrive.channels import _named_arrive, _named_sync
 from transformer_nuggets.cute.warpdrive.protocol import ProtocolError, current_trace
+from transformer_nuggets.cute.warpdrive.tracing import wait_range
 
 WARP_SIZE = 32
 MAX_THREADS = 1024  # CUDA's block limit
@@ -64,11 +66,13 @@ class NamedBarrier:
         return self._id
 
     def sync(self, *, aligned: bool = False):
-        """Arrive, then wait until ``threads`` threads have arrived in this generation."""
-        if aligned:
-            cute.arch.barrier(barrier_id=self.id, number_of_threads=self.threads)
-        else:
-            _named_sync(self.id, self.threads)
+        """Arrive, then wait until ``threads`` threads have arrived in this generation. With IKET
+        waits enabled, the wait is a ``<name>.sync`` range."""
+        with wait_range(current_trace(), f"{self.name}.sync"):
+            if aligned:
+                cute.arch.barrier(barrier_id=self.id, number_of_threads=self.threads)
+            else:
+                _named_sync(self.id, self.threads)
         self._record("barrier")
 
     def arrive(self, *, aligned: bool = False):

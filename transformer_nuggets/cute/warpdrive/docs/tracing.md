@@ -147,7 +147,7 @@ Start there: instrumentation around short waits can distort the timing you are t
 
 Roles taking `WorkCursor` get one range per work item. Other roles get one range over their
 body. With the default `waits=True`, blocking operations also get names such as `ab.acquire`,
-`ab.wait`, `ab.tail` and `mufu.turn`.
+`ab.wait`, `ab.tail`, `mufu.turn` and a `NamedBarrier`'s `compute_sync.sync`.
 
 Add a region in a role:
 

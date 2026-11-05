@@ -42,7 +42,7 @@ def _raises_protocol(match: str, fn):
 
 
 class FlagToy(WarpSpecialized):
-    """publisher (warp 0) -> done -> waiters (warps 1-2), then pair_sync inside the waiters.
+    """publisher (warp 0, raw) -> done -> waiters (warps 1-2), then pair_sync inside the waiters.
 
     The publisher stalls for ``delay`` cycles, writes ``value + lane`` to SMEM and arrives on
     the one-shot ``done`` flag; the waiters sync on it, so they read the value rather than the
@@ -58,7 +58,7 @@ class FlagToy(WarpSpecialized):
             other.describe()  # allocates other.done the same ID as self.done
             self.borrowed = (other.done,)
 
-    @role(warps=0)
+    @role(warps=0, raw=True)
     @cute.jit
     def publisher(self, ctx):
         lane = cute.arch.lane_idx()
@@ -128,25 +128,30 @@ def test_one_shot_flag_and_intra_role_sync(requires_blackwell, value, delay):
 
 
 def test_describe_lists_named_barriers_and_their_users():
-    op = FlagToy()
-    assert "Named barriers" in op.describe()
-    assert "users known after a compile" in op.describe()
-    compile_flag_toy(op)
-    rows = [line.split() for line in op.describe().splitlines()]
-    assert [
-        "done",
-        "id",
-        "3",
-        "96",
-        "threads",
-        "arrive",
-        "by",
-        "publisher;",
-        "sync",
-        "by",
-        "waiters",
-    ] in rows
-    assert ["pair_sync", "id", "4", "64", "threads", "sync", "by", "waiters"] in rows
+    """A compile lists each barrier's users; a second instance served from the cache restores
+    them from the trace record."""
+    expected = [
+        [
+            "done",
+            "id",
+            "3",
+            "96",
+            "threads",
+            "arrive",
+            "by",
+            "publisher;",
+            "sync",
+            "by",
+            "waiters",
+        ],
+        ["pair_sync", "id", "4", "64", "threads", "sync", "by", "waiters"],
+    ]
+    for op in (FlagToy(), FlagToy()):
+        assert "users known after a compile" in op.describe()
+        compile_flag_toy(op)
+        rows = [line.split() for line in op.describe().splitlines()]
+        assert all(row in rows for row in expected)
+    assert compile_flag_toy.cache_info().hits >= 1
 
 
 @pytest.mark.parametrize(
