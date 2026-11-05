@@ -27,7 +27,8 @@ counts arrivals, not thread identities.
 `h.release(signal=False)` closes the handle without its signal or release fence.
 `h.commit(signal=False)` does the same on the producer side. Your manual signals must use
 the effective counts, target CTAs and masks. The type checks on an override don't prove that
-its values describe a valid protocol.
+its values describe a valid protocol: `tx=0` is permitted, and a well-typed mask can still
+name a nonexistent target rank. Check both against the actual copies and participants.
 
 ## Raw barriers and roles
 
@@ -74,7 +75,8 @@ tmem.base
 
 Barrier pointers are local. A peer CTA has its barriers at the same offsets, but the pointer
 alone doesn't perform a remote arrival. Raw phase/barrier accessors do not provide full
-bounds or ownership checks. Restoring an old `end.state` can break the protocol without
+bounds or ownership checks. In particular, `Slots.phase(slot)` checks for a Python int, not
+slot range or instance binding. Restoring an old `end.state` can break the protocol without
 triggering a diagnostic.
 
 ## Suppress one check
@@ -94,4 +96,6 @@ could not recognize.
 checks or certify the unmodeled access.
 
 An opt-out changes the diagnostic, not the hardware synchronization. Keep the raw protocol's
-counts, completion waits and memory ordering documented at the call site.
+counts, completion waits and memory ordering documented at the call site. Opt-out bookkeeping
+is tracing-global, not a thread-safe compilation API; use isolated processes rather than
+concurrent compilation threads.

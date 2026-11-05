@@ -29,9 +29,11 @@ later, in `begin_roles(layouts=...)`, because it often depends on the tiled MMA 
 entry point. Supply one layout for every plan buffer, including overlaps. Plain and swizzled
 layouts are supported.
 
-Buffers allocate in declaration order after the internal barriers, payloads and TMEM bookkeeping.
+Buffers allocate in declaration order after the internal barriers, payloads and TMEM bookkeeping,
+using their declared dtype, alignment and supplied layout, including its swizzle.
 You can keep allocating through the returned `smem` allocator. `self.buffer(name)` returns
-the whole tensor after `begin_roles()`.
+the whole tensor after `begin_roles()`; accesses through it or prologue tensors bypass handle
+stage selection and do not acquire channel ownership.
 
 The stage mode defaults to the last layout mode; set `stage_axis` if it is elsewhere.
 Its extent must be static and match the channel's stage count. A buffer must belong to this
@@ -89,9 +91,9 @@ v = self.smem_plan.buffer("V", cutlass.BFloat16, align=1024, overlaps=k)
 self.kv = Ring(kv_stages, Tma(stage_bytes), Umma, buffer={"K": k, "V": v})
 ```
 
-V reuses K's bytes from the same base address. It can have another layout or dtype, but must
-fit the backing allocation and cannot require stricter alignment. Static byte sizes are
-checked during allocation; dynamic sizes do not get that static bounds check. Several
+V reuses the root buffer's first byte, recast to V's dtype, swizzle and layout, without
+allocating storage. It must fit the backing allocation and cannot require stricter alignment.
+Static byte sizes are checked during allocation; dynamic sizes do not get that static bounds check. Several
 channels can bind the same buffer without allocating it again.
 
 Nothing in `overlaps=` orders K and V. Your channel epochs must prevent a reader of K from
@@ -205,7 +207,8 @@ all memory accesses or prove cross-role convergence. `h.data`, `tmem.ptr`, `tmem
 A deeper ring orders epoch e before e + n, not the next epoch. Its stage handoff only orders
 storage indexed by that ring's own stage, with static, disjoint stage spans. Ring-stage SMEM
 shared by different channels is unverified. Consumers of one fan-out epoch, and producers of
-one fan-in epoch, are not ordered with respect to each other.
+one fan-in epoch, are not ordered with respect to each other. Round-robin channels add no
+ordering edges to the model, so accesses ordered only through them can be reported as hazards.
 
 The model assumes balanced per-item counts and matching epochs across roles. When traced
 counts differ, an item's commits link only to the consumer's last wait for that item.

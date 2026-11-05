@@ -43,8 +43,52 @@ threads release back to the leader. Counts and masks follow the declared placeme
 have to double the thread count manually. All UMMA signalers in a `CtaPair` must be
 leader-only, even on CTA-local channels.
 
-`print(op.describe())` shows the per-CTA counts, targets, masks and transaction bytes. The
-exact placement rules are in the [contract reference](contract-reference.md#cluster-placement-rules-r11).
+`print(op.describe())` shows the per-CTA counts, targets, masks and transaction bytes derived
+by the [placement rules](#placement-rules).
+
+## Placement rules
+
+Let `C(role)` be the ranks where a role runs: every rank for `all`, the even ranks for
+`leader` with MMA pairs (every rank without pairs), and `{0}` for `rank0`.
+`reach(p)` is the SMEM written by producer rank p: p itself plus the ranks on
+`Cluster.line(p, mode)` for each declared multicast mode. This is a union of lines, not a
+Cartesian product when both modes are declared.
+
+When every participant has the same `C` and there is no multicast, the channel is CTA-local.
+It uses ordinary per-slot counts, unscaled transaction bytes and self-targets, with no tail.
+Masks are 1 except that a UMMA commit to its own CTA uses `1 << rank`.
+
+Otherwise, define a synchronization unit for each rank r:
+
+- r alone when every participant has the same `C` (only multicast crosses CTAs);
+- r's MMA pair when each participant runs somewhere in every pair;
+- the whole cluster otherwise, when placement restricts a participant to rank 0.
+
+The full targets of producer rank p are the consumer CTAs in p's unit. The empty targets of
+consumer rank c are the producer CTAs p for which `reach(p)` intersects c's unit. In a
+`CtaPair`, mixed placement therefore targets the union of consumer or producer CTAs.
+For each target and slot, `Threads` counts `32 * role.num_warps` for each signaling
+(instance, CTA); TMA/UMMA count one arrival per signaling CTA. Nontarget ranks have placeholder
+count 1 and no promised waiter. Masks contain one bit per target and are a single integer
+when all signaling CTAs agree, otherwise a per-rank mapping.
+
+UMMA signalers in a cluster with pairs must run only on pair leaders and use group TWO.
+The UMMA side must include the leader of every pair the other side uses: each CTA's operands
+and accumulator belong to its own leader's MMAs. Without pairs, a UMMA producer must include
+every consumer CTA; a UMMA consumer may release other CTAs' storage.
+
+Ordinary mixed-placement TMA has one supported shape: producers in every CTA feed exactly
+the pair leaders. Only leaders arm full barriers, each for `2 * Tma.tx_bytes`; each CTA's
+copies deliver its declared per-CTA bytes with group TWO, multicast or not. These leader-only
+arming targets replace the general full targets above. All other mixed-placement TMA shapes
+are rejected. Same-placement TMA, multicast or not, arms each participating CTA's own barrier
+with unscaled bytes. All/all requires group ONE; with pairs, leader/leader accepts either
+group in the channel's group check (descriptor legality remains yours).
+
+Multicast cannot have a `rank0` participant. Its byte count is still what lands in each CTA's
+SMEM per stage; a copy delivers its box to every CTA in its mask. The declaration derives the
+release targets, not the copy itself. The internal scheduler is separate: rank 0 explicitly
+fills each target's payload and uses unscaled payload bytes, not ordinary multicast TMA.
 
 ## Work and exit
 
@@ -55,11 +99,14 @@ the same sequence in every CTA. `AtomicPersistent` and `ClusterLaunchControl` cl
 In a cluster, TMEM allocation happens in `run_roles()` after the cluster synchronization (a
 pair's two CTAs allocate together). At least one TMEM-using role must run in every CTA; the
 first such role allocates. All declared
-TMEM users join teardown before free, including raw roles.
+TMEM users join teardown before free, including raw roles. Pair allocation/free uses the
+two-CTA handshake with each CTA's own peer, `rank XOR 1`.
 
 Producers automatically tail when a channel's UMMA consumer in another CTA can still read
-their storage. Return their final endpoint state so the tail uses the right phases. A retired
-acquire cannot be tailed and is rejected on these channels. All threads reach the exit
+their storage, including a multicast partner outside its pair. Return their final endpoint
+state so the tail uses the right phases: Ring tails drain from that returned state; Slots
+tails wait only on that end's acquired slots with their final phase bits. A retired acquire
+cannot be tailed and is rejected on these channels. All threads reach the exit
 cluster barrier after dispatch and TMEM teardown. This does not wait for arbitrary async work
 that your role started.
 
@@ -136,7 +183,7 @@ past the edge; TMA loads zeros there and clips the stores.
 The scheduler warp runs on rank 0 and publishes each item to all four CTAs. Its ring's empty
 barrier on rank 0 counts every stream user of every CTA. `launch_args()` caps a persistent grid
 at the clusters that fit at once (`HardwareInfo().get_max_active_clusters(4)` is 36 on a 152-SM
-GB300, not 38), so the grid runs in one wave.
+GB300, not 38). This capacity estimate is not a guarantee that all work units are co-resident.
 
 ### What the 2x2 GEMM derives
 

@@ -1,6 +1,6 @@
 """Seeded host-only declaration probes, with an oracle independent of scope derivation.
 
-Each case changes one declaration property. E identifiers refer to warpdrive/GUARANTEES.md;
+Each case changes one declaration property. E identifiers refer to CASES.md beside this file;
 G identifiers are explicit domain-hardening targets, never runtime-valid kernels.
 """
 

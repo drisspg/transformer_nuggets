@@ -15,11 +15,13 @@ def load(self, params: GemmParams, *, ab: Producer):
 Put `@role` directly above `@cute.jit`. `warps=4` means warp index 4;
 `warps=range(4)` means warps 0–3. `warps=[range(4), range(4, 8)]` creates two instances of
 the same method. The ranges for each instance must be contiguous and cannot overlap other roles.
+Each instance runs on exactly those warps; holes run no user role.
 
 `regs=40` sets that warpgroup's `setmaxnreg` budget. The default `None` leaves it unchanged.
 All roles in a warpgroup must agree, including `None` versus a number. Numeric budgets must
-be multiples of 8 from 24 to 256. Padding warps get the group's budget too; the adjustment
-happens in a warpgroup-uniform branch before role dispatch.
+be multiples of 8 from 24 to 256. Any numeric budget pads the launch to full warpgroups.
+Padding warps get the group's budget too; entirely idle groups get 24. The adjustment
+happens in a warpgroup-uniform branch before role dispatch, including in a pair's peer CTA.
 
 The budgets have to fit in the registers the launch starts with. Every warp starts with
 65536 / threads, rounded down to a multiple of 8 and capped at 256 (168 for 12 warps), and
@@ -29,7 +31,13 @@ raises `ValueError`. `None` counts as the starting budget.
 
 `cta="leader"` restricts the role to the leader of each MMA pair of a
 [cluster](clusters.md), rank 0 of a CTA pair. `cta="rank0"` runs it once per cluster. The default
-is `"all"`. They are equivalent for one CTA.
+is `"all"`. They are equivalent for one CTA; without MMA pairs, every CTA is a leader.
+
+Call `begin_roles()` and `run_roles()` from converged CTA/cluster code using the declared
+launch shape. Elected barrier initialization and the common initialization fence/sync
+precede dispatch. Every participating thread must reach initialization and exit, including
+threads in warp holes. For manually initialized barriers, see
+[raw barriers and roles](dropping_down.md#raw-barriers-and-roles).
 
 ## Arguments
 
@@ -67,7 +75,9 @@ class GemmParams:
 
 Build it in the kernel prologue from the atoms, partitions, layouts and loop counts the roles
 need. Frozen fields cannot be rebound, but the tensors they point to can still be written.
-A `SimpleNamespace` also works; leave the role's one context parameter unannotated.
+This is shallow immutability: referenced lists and other objects remain mutable too.
+A `SimpleNamespace` also works; leave the role's one context parameter unannotated. The layer
+does not make the namespace immutable.
 
 An annotation matching the params type, or a base class of it, receives that object. An
 unresolvable annotation, a missing dependency, two context parameters or incompatible context
@@ -131,7 +141,9 @@ class Attention(WarpSpecialized):
 
 The selector is a host callable returning a `RoleConfig`. A named function works too.
 `describe()`, tracing or a compile-cache lookup can trigger the first collection; the result
-is then fixed for that kernel instance. Construct another instance to change it.
+is then fixed for that kernel instance. Construct another instance to change it; mutating
+or recollecting declarations after the first collection is unsupported. Selectors are host
+code and must not depend on runtime tensor contents.
 
 `RoleConfig` is frozen and copies lists of ranges into tuples. It has the same `warps`,
 `regs`, `cta` and `raw` fields as the decorator. Don't mix `config=` with explicit placement

@@ -11,7 +11,7 @@ are the API authority; do not substitute another checkout's newer API.
 
 Use this for a new warpdrive kernel or a port to managed roles. A standalone CuTeDSL kernel
 that doesn't use warpdrive needs the usual CuTeDSL guidance, not this workflow. Layer-internal
-changes also need the maintainer contract and the repository's layer validation tiers.
+changes also need the relevant topic contracts and the repository's layer validation tiers.
 
 ## Read the authoring path
 
@@ -25,9 +25,9 @@ Then read the closest complete example, including its host wrapper, launch and c
   persistent template.
 - [Packed work](examples/packed_work.py): mapping a device-built list, not a complete kernel.
 
-Read the linked topic guide when using that feature. The
-[numbered catalog](docs/contract-reference.md) is for a specific rejection or layer change,
-not a checklist of error codes to reproduce.
+Read the linked topic guide when using that feature. If investigating a fuzz report, resolve
+its labels in the [test case index](../../../test/warpdrive_fuzz/CASES.md). They are not library
+error codes or an authoring checklist.
 
 ## Establish the protocol before implementing
 

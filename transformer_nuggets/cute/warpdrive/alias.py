@@ -85,7 +85,8 @@ RULES = {
         "A managed signal (commit/release) followed by the matching wait/acquire of the same "
         "channel, slot and epoch orders what the signaller completed before it; the consumers "
         "of one fan-out epoch (and the producers of one fan-in epoch) are mutually unordered.",
-        "warpdrive GUARANTEES.md R2-R5; PTX ISA 9.5 9.7.15.16.16 mbarrier.arrive "
+        "warpdrive docs/channels.md (Stages and phases; Counts come from the roles); "
+        "PTX ISA 9.5 9.7.15.16.16 mbarrier.arrive "
         f"({PTX}#parallel-synchronization-and-communication-instructions-mbarrier-arrive)",
     ),
     "barrier": Rule(
@@ -99,7 +100,7 @@ RULES = {
     "stages": Rule(
         "A ring hands over one stage at a time: overlapping buffers bound to one channel must "
         "overlap only in the same stage.",
-        "warpdrive GUARANTEES.md R2",
+        "warpdrive docs/channels.md (Stages and phases)",
     ),
 }
 

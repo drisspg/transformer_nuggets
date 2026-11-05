@@ -81,7 +81,11 @@ warpgroup and broadcasts each CLC claim through `work_ring` to every role in bot
 `describe()` returns a string with roles, warp placement, register budgets, channels,
 per-CTA counts and TMEM regions. Before compilation it checks declarations. After a fresh
 compile it also has the recognized TMA copies and any traced diagnostics. It is not a runtime
-history or a deadlock check.
+history or a deadlock check. There is no combined cross-role epoch-balance or wait-for-graph
+verifier: balanced declarations can still form an unseeded wait cycle. Runtime synchronization
+relies on a finite, live abstract execution with enough storage for overlapping lifetimes;
+compilation does not establish it. A timeout needs attribution, not an assumption that either
+the layer or the role body is correct.
 
 For a stream named `work`, the inserted scheduler is `work.scheduler`, its broadcast ring is
 `work_ring`, and CLC's response slot is `work_clc`. Print the current kernel instead of relying
@@ -110,15 +114,24 @@ come back with a cached kernel ([compile keys](roles.md#compile-keys)).
 
 ### TMA checks
 
-Compilation inspects recognizable copies using channel barriers. A known wrong CTA group or
-a complete byte-count mismatch raises `ProtocolError`. Recognized copies report their group,
-bytes per stage per CTA and source locations.
+Compilation follows recognizable direct SSA uses of channel barriers and counts static copy
+boxes in the handle's opening region. A known wrong CTA group, undeclared multicast mode or
+complete byte-count mismatch raises `ProtocolError`. Recognized copies report their group,
+bytes per stage per CTA and source locations. For multicast, the counted bytes are the SMEM
+destination box; in a symmetric `Cluster.multicast` partition this equals the issuing CTA's
+delivery across its mask's CTAs.
 
-Unknown atoms, multicast, opaque pointers, nested/dynamic copies or unsupported IR can leave
-this check incomplete. Compilation continues with a warning and `unverified` reasons in
-`describe()`. `verified` means the recognized group and byte accounting match; it does not
-certify descriptor legality, disjoint writes or all async ordering. You still supply
-`Tma(tx_bytes)` yourself.
+Unknown atoms, opaque pointers, nested/dynamic copies, multicast masks not obtained from
+`Cluster.multicast`, or unsupported IR can leave this check incomplete. Incomplete inspection
+alone does not reject; compilation continues with a warning and `unverified` reasons in
+`describe()`. Positive wrong-group or undeclared-multicast evidence still rejects even when
+byte accounting is incomplete. Validate raw, unverified and opted-out uses independently.
+`verified` means the recognized group and byte accounting match; it does not certify descriptor
+legality, disjoint writes or all async ordering. You still supply `Tma(tx_bytes)` yourself.
+
+Context atom checks inspect direct fields for MMA CTA span and unsupported group-TWO or
+multicast G2S atoms. They do not recursively inspect nested objects and are not disabled by a
+per-use `unchecked("tma")` opt-out.
 
 ## IKET
 
@@ -177,7 +190,8 @@ The plan is per CTA. `cta=1` excludes leader-only roles in a pair; any rank excl
 that don't run there. Its regions are work-item
 granular, so ring occupancy and reuse estimates for an inner K loop are coarse, not
 measurements of individual stages. Traced reuse counts come from the compile that built the
-kernel; a cached kernel restores them.
+kernel; a cached kernel restores them. The exported plan is not a proof of liveness or
+race freedom, and neither a plan nor an accepted kernel promises a performance threshold.
 
 See the [pipeline profiler README](../../profiler/README.md#declarative-pipeline-analysis)
 for critical-path analysis, measured timelines and capture tooling.

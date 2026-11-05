@@ -88,7 +88,7 @@ user code.
 
 Invalid configurations generally raise `ValueError`; invalid bindings and traced protocols
 raise `ProtocolError`. Read the message and any nested compiler cause. **There is no public
-numbered error-code API.** The E/R/U/G labels in the maintainer reference identify test cases
+numbered error-code API.** The E/R/U/G labels in fuzz reports identify test cases
 and contract clauses, not exception attributes or message prefixes.
 
 ## Dropping down
@@ -98,48 +98,50 @@ endpoint/cursor checks. `signal=False` omits both the signal and its fence. Over
 `unchecked(...)` leave the corresponding reasoning to you; suppress only the specific check
 and document the reason. See [Dropping down](docs/dropping_down.md) for the APIs and boundaries.
 
-## Detailed reference
+## Further reading
 
-The [maintainer reference](docs/contract-reference.md) retains the precise placement rules,
-numbered checks, limitations and validation evidence. It is useful when extending the layer
-or investigating a rejection; it is not required reading before writing your first kernel.
+Exact semantics live with their APIs: [roles](docs/roles.md), [channels](docs/channels.md),
+[storage](docs/storage.md), [scheduling](docs/scheduling.md), [clusters](docs/clusters.md)
+and [tracing](docs/tracing.md). For layer changes, see the
+[fuzz harness and its coverage boundaries](../../../test/warpdrive_fuzz/README.md) and
+[findings that protect future changes](../../../test/warpdrive_fuzz/FINDINGS.md).
 
 <details>
-<summary>Links to sections moved from this page</summary>
+<summary>Older section links</summary>
 
 <a id="the-supported-program"></a>
-- [The supported program](docs/contract-reference.md#the-supported-program)
+- [The supported program](#the-authoring-rules-that-matter)
 <a id="runtime-guarantees"></a>
-- [Runtime guarantees](docs/contract-reference.md#runtime-guarantees)
+- [Runtime guarantees](#what-the-layer-handles)
 <a id="round-robin-and-named-channels-r22-r23"></a>
-- [Round-robin and named channels (R22, R23)](docs/contract-reference.md#round-robin-and-named-channels-r22-r23)
+- [Round-robin and named channels (R22, R23)](docs/channels.md#round-robin-instances)
 <a id="constructor-selected-role-configurations"></a>
-- [Constructor-selected role configurations](docs/contract-reference.md#constructor-selected-role-configurations)
+- [Constructor-selected role configurations](docs/roles.md#choose-placement-in-the-constructor)
 <a id="alias-diagnostic-a-bug-finder"></a>
-- [Alias diagnostic: a bug finder](docs/contract-reference.md#alias-diagnostic-a-bug-finder)
+- [Alias diagnostic: a bug finder](docs/storage.md#check-declared-aliases)
 <a id="cluster-placement-rules-r11"></a>
-- [Cluster placement rules (R11)](docs/contract-reference.md#cluster-placement-rules-r11)
+- [Cluster placement rules (R11)](docs/clusters.md#placement-rules)
 <a id="work-assignment-r12"></a>
-- [Work assignment (R12)](docs/contract-reference.md#work-assignment-r12)
+- [Work assignment (R12)](docs/scheduling.md#choose-a-schedule)
 <a id="custom-schedules-r19"></a>
-- [Custom schedules (R19)](docs/contract-reference.md#custom-schedules-r19)
+- [Custom schedules (R19)](docs/scheduling.md#custom-index-schedules)
 <a id="rejection-catalogue"></a>
-- [Rejection catalogue](docs/contract-reference.md#rejection-catalogue)
+- [Rejection catalogue](../../../test/warpdrive_fuzz/CASES.md#required-rejections)
 <a id="roles-and-injection--kernelpy"></a>
-- [Roles and injection — `kernel.py`](docs/contract-reference.md#roles-and-injection--kernelpy)
+- [Roles and injection — `kernel.py`](docs/roles.md)
 <a id="channels-raw-barriers-pair-scope-and-tmem--channelspy-clusterpy-tmempy"></a>
-- [Channels, raw barriers, pair scope and TMEM — `channels.py`, `cluster.py`, `tmem.py`](docs/contract-reference.md#channels-raw-barriers-pair-scope-and-tmem--channelspy-clusterpy-tmempy)
+- [Channels, raw barriers, pair scope and TMEM — `channels.py`, `cluster.py`, `tmem.py`](docs/channels.md)
 <a id="bodies-and-calls--channelspy-protocolpy-kernelpy-schedulingpy"></a>
-- [Bodies and calls — `channels.py`, `protocol.py`, `kernel.py`, `scheduling.py`](docs/contract-reference.md#bodies-and-calls--channelspy-protocolpy-kernelpy-schedulingpy)
+- [Bodies and calls — `channels.py`, `protocol.py`, `kernel.py`, `scheduling.py`](docs/roles.md#return-the-updated-state)
 <a id="tma-and-scheduling--clusterpy-tmapy-schedulingpy-kernelpy"></a>
-- [TMA and scheduling — `cluster.py`, `tma.py`, `scheduling.py`, `kernel.py`](docs/contract-reference.md#tma-and-scheduling--clusterpy-tmapy-schedulingpy-kernelpy)
+- [TMA and scheduling — `cluster.py`, `tma.py`, `scheduling.py`, `kernel.py`](docs/scheduling.md)
 <a id="domain-hardening-added-by-fuzzing"></a>
-- [Domain hardening added by fuzzing](docs/contract-reference.md#domain-hardening-added-by-fuzzing)
+- [Domain hardening added by fuzzing](../../../test/warpdrive_fuzz/CASES.md#required-rejections)
 <a id="what-remains-your-responsibility"></a>
-- [What remains your responsibility](docs/contract-reference.md#what-remains-your-responsibility)
+- [What remains your responsibility](#the-authoring-rules-that-matter)
 <a id="known-gaps"></a>
-- [Known gaps](docs/contract-reference.md#known-gaps)
+- [Known gaps](../../../test/warpdrive_fuzz/README.md#coverage-boundaries)
 <a id="fuzzing-and-evidence"></a>
-- [Fuzzing and evidence](docs/contract-reference.md#fuzzing-and-evidence)
+- [Fuzzing and evidence](../../../test/warpdrive_fuzz/README.md)
 
 </details>

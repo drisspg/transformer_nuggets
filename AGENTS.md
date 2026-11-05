@@ -13,8 +13,8 @@
 - Read `transformer_nuggets/cute/warpdrive/SKILL.md` when authoring or porting a kernel.
   The skill, authoring guide, safety contract and examples live with the library and must
   match the checkout being used.
-- The numbered E/R/U/G catalog lives in `transformer_nuggets/cute/warpdrive/docs/contract-reference.md`.
-  It is a maintainer/test reference, not an error-code API or the authoring guide.
+- Protocol semantics live in the topic guides under `transformer_nuggets/cute/warpdrive/docs/`.
+  Fuzz report labels live in `test/warpdrive_fuzz/CASES.md`, not a public error-code API.
 
 # CuTeDSL Conventions
 

@@ -7,9 +7,20 @@ self.ab = Ring(3, Tma(stage_bytes), Umma)
 self.acc = Ring(2, Umma, Threads)
 ```
 
+## Stages and phases
+
 A `Ring` cycles through stages `0..n-1`. The producer acquires an empty stage, fills it and
-commits; the consumer waits for it, reads it and releases. Each endpoint carries the next
-stage and phase. A handle keeps the stage and phase it acquired even after the endpoint moves on.
+commits; the consumer waits for it, reads it and releases. For zero-based operation k on an
+n-stage end without round-robin rotation:
+
+- Stage: `k % n`.
+- Consumer phase: `(k // n) % 2`.
+- Producer phase: `1 XOR ((k // n) % 2)`.
+
+Acquire/wait advances the endpoint, not commit/release. A handle keeps the stage and phase
+it acquired even after the endpoint moves on. Matching epochs preserve publication order and
+prevent reuse until the declared consumers release. For mbarrier channels, full barriers
+occupy offsets `[0, n)` and empty barriers `[n, 2*n)` from the channel's base in each CTA.
 
 ```python
 with ab.produce() as h:
@@ -22,7 +33,9 @@ with ab.consume() as h:
 `Tma(tx_bytes)` completes the full barrier through TMA. Supply the bytes per stage per
 producing CTA. `Tma(tx_bytes, multicast="n")` declares copies multicast along a cluster mode;
 see [clusters](clusters.md#multicast). `Umma` signals with an elected `tcgen05.commit`; `Threads` has every thread
-of every bound role arrive. A TMA or UMMA side must bind to exactly one single-warp role.
+of every bound role arrive. A TMA or UMMA side must bind to exactly one single-warp role
+(or the one instance whose turn it is on a round-robin side). TMA acquire arms the expected
+bytes; commit emits no arrival because the copies complete the full barrier.
 TMA is a producer mechanism, not a consumer mechanism.
 
 ## Counts come from the roles
@@ -30,6 +43,9 @@ TMA is a producer mechanism, not a consumer mechanism.
 For `Ring(2, Umma, Threads)`, an MMA producer on one warp contributes one UMMA completion to
 the full barrier. A consumer on warps 0–3 contributes 128 arrivals to the empty barrier.
 The producer cannot reuse the stage until all 128 arrive. Multiple consumers form a join.
+In general, CTA-local counts sum the bound contributions for each slot: `Threads` contributes
+`32 * role.num_warps`, and TMA/UMMA one. Cross-CTA contributions follow the
+[placement rules](clusters.md#placement-rules).
 
 For `Threads`, predicate the work, not the handoff:
 
@@ -62,8 +78,10 @@ def softmax(self, params, *, s: Consumer[Instance], stage: Instance):
 ```
 
 `Slots` lets you choose the slot; each has an independent phase bit. Indices must be Python
-ints in `[0, n)`, with at most 31 slots. An instance-bound end contributes only to its own slot
-and must still pass it explicitly. Passing another instance's slot is an error.
+ints in `[0, n)`, with at most 31 slots. Producers start every slot at phase 1, consumers at
+phase 0; acquire/wait flips only the named slot's bit. Slots need not be visited in numeric
+order. An instance-bound end contributes only to its own slot and must still pass it
+explicitly. Passing another instance's slot is an error.
 
 An unbound end can visit any slot. This is useful for one MMA warp producing two slots that
 two softmax instances consume independently. The [FA4 example](../examples/fa4_fwd.py) uses
@@ -85,11 +103,16 @@ def softmax(self, params, *, stage: Instance, s: Consumer):
 ```
 
 With `round_robin=True`, the instances on a side take the epochs in turn. Instance j of k
-handles epochs j, j + k, j + 2k, ..., so softmax[1] above starts at the second stage and skips
-softmax[0]'s. Each epoch's count is one instance's arrivals: 128 here, not the 256 of a join.
+handles epochs j, j + k, j + 2k, ..., in instance-binding order. Its zero-based operation m
+uses stage `(j + m*k) % n` and that epoch's [phase](#stages-and-phases), so softmax[1] above
+starts at the second stage and skips softmax[0]'s. Either or both sides can rotate; a side
+with one instance is unchanged. Each epoch's count is one instance's arrivals: 128 here,
+not the 256 of a join.
 `describe()` prints the rotation and the per-epoch count. The instances must be one role with
 the same width, and their loops must visit their own epochs; nothing checks that the trip counts
-add up. On an mbarrier ring the stage count must be a multiple of k. A parity wait is exact only
+add up. Epochs continue across work items; entering a new work iteration does not reset an
+end's rotation. Round-robin rings are CTA-local and cannot multicast. On an mbarrier ring the
+stage count must be a multiple of k, and the layer adds no turn-taking. A parity wait is exact only
 when the waiter saw the stage's previous epoch itself; with 3 instances on 2 stages, instance 2's
 first wait would pass on a barrier nobody has filled.
 The [decode example](../examples/fa4_decode_swapab.py) alternates KV blocks this way.
@@ -113,21 +136,29 @@ with mufu.turn():
 barrier has no phase. It completes once the slot's producer and consumer threads have all
 arrived, so the count is their sum. Both sides must be `Threads` and in one CTA, and overrides
 don't apply. Each consumer instance arrives once on its slots' empty barriers when its role
-starts; that is the named version of a ring starting empty. Consumers therefore can't write
-anything the producer's first acquire depends on before that arrival.
+starts: its bound slot, every slot for an unbound nonrotating end, or slots s with `s % k == j`
+for round-robin instance j of k. That is the named version of a ring starting empty.
+Consumers therefore can't write anything the producer's first acquire depends on before that
+arrival. The final release is left unmatched at exit. Keep per-epoch participation balanced:
+named barriers count threads, not phases, so a fast side must not arrive twice in one generation.
 
 `commit(wait=True)` makes the producer wait on the full barrier too. When it returns, every
 thread of the exchange has arrived, so the producers also see each other's writes. FA4's decode
-uses it for the shared running max.
+uses it for the shared running max. It applies the same `commit_fence` as an ordinary commit;
+it cannot be combined with `signal=False` or used on an mbarrier channel.
 
 Because a named barrier can't tell instances apart, two round-robin instances that share a
-stage's barriers (`n % k != 0`) could complete it between themselves. Name a turnstile over
-them; their acquires (or waits) must run inside its turn, which is checked while tracing.
+stage's barriers (`n % k != 0`) could complete it between themselves. Name an enabled
+turnstile over exactly those instances; their acquires (or waits) must run inside its turn,
+which is checked while tracing.
 
-IDs are allocated from 15 downward; `op.named_barrier_ids` and `describe()` list them. IDs 1
-and 2 belong to the layer, so 13 are free. Hand-picked IDs in raw code should stay low and
-clear of these. Calls through `alias.named_barrier` are checked against them. Raw
-`cute.arch.barrier` calls are not.
+IDs are allocated per channel in declaration order from 15 downward, in consecutive blocks
+of n full IDs followed by n empty IDs. `channel.named_ids[0][s]` and
+`channel.named_ids[1][s]` name slot s's full and empty barriers; `op.named_barrier_ids` and
+`describe()` list them. ID 0 is for CTA synchronization, and 1 and 2 belong to the layer,
+leaving 13 IDs for channels. Hand-picked IDs must avoid the allocated IDs even if they are
+small. Calls through `alias.named_barrier` are checked against them; raw `cute.arch.barrier`
+and `barrier_arrive` calls are not. Named channels have no mbarrier pointer accessors.
 
 ## Overlapping handles
 
@@ -153,7 +184,7 @@ Return the updated endpoint at role exit, not the handles.
 
 `h.retire()` closes a producer handle without publishing it. Use it only for a final unused
 acquire whose stage will never be consumed. It is rejected on automatically tailed pair channels.
-Post-close pointer use is still your responsibility; the checker is not an ownership system.
+Post-close payload or pointer use is still your responsibility; the checker is not an ownership system.
 
 ## Storage and fences
 
@@ -164,8 +195,8 @@ For a small CTA-local payload:
 self.stats = Ring(2, Threads, Threads, payload=(cutlass.Float32, (32,)))
 ```
 
-This allocates uninitialized, 16-byte-aligned SMEM with full shape `(32, 2)`. `h.data` selects
-that handle's stage. User pair-scoped channels cannot have these layer-owned payloads.
+This allocates uninitialized, 16-byte-aligned SMEM with full shape `(32, 2)`; in general the
+shape is `(*shape, n)`. `h.data` selects that handle's stage. User pair-scoped channels cannot have these layer-owned payloads.
 
 For swizzled tiles, several buffers per channel or overlapping allocations, use
 [`SmemPlan` and `buffer=`](storage.md). Those buffers are also selected through the handle;
@@ -174,7 +205,8 @@ binding them does not add fences or change remote memory scope.
 `commit_fence` and `release_fence` accept `"tmem_store"` or `"smem_async"`. They run before
 the corresponding managed signal. TMA producers cannot have a commit fence.
 `commit(signal=False)` and `release(signal=False)` omit both the signal and its fence.
-Your other async operations still need their own completion waits.
+Your other async operations still need their own completion waits and proxy fences,
+including the lifecycles of TMA stores and TMEM alias accesses.
 
 ## TMEM
 
@@ -198,11 +230,14 @@ column offset. `stage` here is a Python int naming a plan slot. To index a ring 
 dynamically, build a tensor covering the region's slots and index it with `h.index`, as the
 GEMM examples do. Reinterpret packed BF16 yourself.
 
-Allocations round up to a power of two from 32 to 512 columns. Capacity, duplicate names and
-alias bounds are checked. Every role using TMEM must take `tmem: Tmem`, including raw roles,
-so it participates in teardown. Without any annotated users, no TMEM allocation is made.
-Single-CTA allocation happens in `begin_roles()`; clusters allocate after the cluster sync in
-`run_roles()`.
+Nonalias regions occupy declaration-order intervals of `cols * slots` columns; aliases stay
+inside their parent in each slot. Allocations round up to a power of two from 32 to 512
+columns. Capacity, duplicate names and alias bounds are checked. Every role using TMEM must
+take `tmem: Tmem`, including raw roles, so it participates in teardown. Without any annotated users, no TMEM allocation is made.
+Single-CTA allocation happens in `begin_roles()` from the first declared TMEM-using role;
+clusters allocate after the cluster sync in `run_roles()` as described in
+[work and exit](clusters.md#work-and-exit). All declared users join an unaligned teardown
+barrier before the allocator frees TMEM.
 
 Aliasing shares columns, not lifetimes. Order accesses to S and P yourself.
 
@@ -224,6 +259,8 @@ def softmax(self, params, *, mufu: Turn):
 ```
 
 A turnstile gives instances of one method a round-robin critical section. It needs at least
-two instances, with matching CTA placement. All threads of each seat participate.
+two instances, with matching CTA placement. With p seats, it orders a finite prefix of
+`0, 1, ..., p-1, 0, ...`; each seat's barrier counts the previous seat's threads. All threads
+of each seat participate.
 `Turnstile(enabled=False)` emits no synchronization and provides no exclusion; the declaration
 still has to be valid. FA4 uses it to alternate the two softmax instances around exp2.

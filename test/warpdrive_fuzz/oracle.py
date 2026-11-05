@@ -1,6 +1,6 @@
 """Host model of a generated kernel and the checks against what the device logged.
 
-Everything here is derived from the contract (GUARANTEES_draft.md R1-R14) and the spec, not
+Everything here is derived from the topic contracts (CASES.md maps R1-R14) and the spec, not
 from warpdrive's helpers: the launch grid (R12/R13), each work unit's item sequence (R12), the
 Raster order (an explicit enumeration, independent of ``Raster.decode``'s closed form), and each
 consumer's expected epoch stream (R2/R3/R4) from the role's own handle program.

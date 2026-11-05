@@ -103,8 +103,9 @@ length must be a positive multiple of 128. Query length can be ragged. There is 
 GQA or other head dimension. The example imports `flash_attn.cute` and `quack` helpers.
 
 O has Q's shape. LSE is fp32 `(batch, heads, seqlen_q)` in natural-log units. The input checks
-are not a complete validator of all these requirements; see the example-wrapper gap in
-[maintainer reference](contract-reference.md#known-gaps).
+are not a complete validator of all these requirements. A wrapper accepting an input does not
+establish the advertised rank, head-dimension or device contract; enforce those requirements
+when building another wrapper around this teaching kernel.
 
 `fa4_fwd(..., schedule=..., mapping=...)` lets you change index assignment and work order.
 See [scheduling](scheduling.md) for `Raster` and the FA4 mappings. `roles=Fa4Roles(...)`
@@ -390,4 +391,4 @@ analysis and completion-aware epoch checks. Its current limits are in
 [storage](storage.md#read-the-result).
 
 For the normal and quick-fuzz commands, see [Tests](../README.md#tests). Long campaigns and
-what their oracles cover are in the [maintainer reference](contract-reference.md#fuzzing-and-evidence).
+what their oracles cover are in the [fuzz harness guide](../../../../test/warpdrive_fuzz/README.md).

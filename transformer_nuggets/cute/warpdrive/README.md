@@ -147,7 +147,7 @@ The first pytest command runs the normal suite; fuzz tests are skipped by defaul
 opts into quick fuzzing. Compiled kernels stay in the [compile cache](../jit_cache/README.md#the-disk-cache),
 so a second run mostly loads them: on a GB300 the normal suite took 43 s cold and 22 s warm
 (48 s before the cache). FA4 tests skip without `flash_attn.cute`. Long campaigns, sanitizer and
-CUTracer runs are described in the [maintainer reference](docs/contract-reference.md#fuzzing-and-evidence).
+CUTracer work follows the [fuzz harness guide](../../../test/warpdrive_fuzz/README.md).
 
 The suite covers numerical correctness and determinism, shape reuse, schedules, CTA pairs and
 larger clusters, protocol errors, raw/managed synchronization, TMA and alias diagnostics, and
