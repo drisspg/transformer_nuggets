@@ -1040,11 +1040,9 @@ a FA4 default schedule and a matched single-CTA schedule answer different questi
 
 ## Still missing
 
-cp.async producer mechanisms are not supported. A ring read by several consumer cursors (FA4
-decode's shared K/V ring) is not either; the decode example splits it into two rings. Clusters
-cannot fill other CTAs' stages from a leader-only TMA producer or multicast to a `rank0` role.
-Using CUTLASS pipeline objects where their semantics match remains a possible implementation
-cleanup, not a reason to change the role bodies.
+cp.async producer mechanisms are not supported. The shared K/V ring (`SharedKVDecode`,
+[above](#shared-kv-ring)) is OneShot-only. Using CUTLASS pipeline objects where their semantics
+match remains a possible implementation cleanup, not a reason to change the role bodies.
 
 The alias diagnostic still needs IR-inferred accesses, partial K-block footprints, cluster
 analysis and completion-aware epoch checks. Its current limits are in

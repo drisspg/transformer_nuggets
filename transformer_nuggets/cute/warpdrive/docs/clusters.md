@@ -275,6 +275,9 @@ inside a pair: rank 0 commits to ranks 0-1, rank 2 to ranks 2-3. The work ring e
 
 ## One CTA loads for others
 
+`Tma(fills=)` is experimental: no example uses it, its only users are tests, and its one
+measured use was slower (below). It stays as is until a real kernel needs it.
+
 ```python
 self.ld = Ring(2, Tma(stage_bytes, fills="pair"), Threads)  # load on cta="leader"
 

@@ -101,8 +101,9 @@ every endpoint, work cursor and turnstile seat you take as an argument. Helpers 
 updated state too. See [roles](docs/roles.md) for placement and binding.
 
 Channels describe handoffs, not the math. A `Ring` cycles through stages; `Slots` lets you name
-the slot. `Tma`, `Umma` and `Threads` say how each side signals. For `Threads`, all threads of
-the bound role participate, even when only some lanes have data to write.
+the slot. `Tma`, `Umma`, `Threads` and `Warps` say how each side signals. For `Threads`, all
+threads of the bound role participate, even when only some lanes have data to write; `Warps`
+counts one elected lane per warp.
 
 `WorkStream` decides which work each CTA runs. `mapping=` turns a linear index into an item;
 `schedule=` chooses the indices. Change `OneShot()` to `StaticPersistent()`,
