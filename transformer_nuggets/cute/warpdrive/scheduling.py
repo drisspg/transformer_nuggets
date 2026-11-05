@@ -800,8 +800,9 @@ class BoundWork:
         if _tile_grid(self.stream):
             bidx, bidy, bidz = cute.arch.block_idx()
             unit = Int32(self._in_units(bidx))
-            item = _grid_item(self.stream.mapping, self.space, unit, Int32(bidy), Int32(bidz))
-            self.first_words = list(item)
+            self.first_words = _grid_item(
+                self.stream.mapping, self.space, unit, Int32(bidy), Int32(bidz)
+            )
 
     def _uses_workspace(self) -> bool:
         return self.stream.schedule.uses_workspace or bool(self.stream.record)
@@ -910,7 +911,7 @@ def _keep_words(mapping, index, space, state):
     if not isinstance(result, tuple) or len(result) != 3:
         raise ProtocolError(f"{name}.decode must return (keep, words, state)")
     keep, words, next_state = result
-    words = [Int32(w) for w in words]
+    words = tuple(Int32(w) for w in words)
     if len(words) != mapping.words:
         raise ProtocolError(
             f"{name}.decode returned {len(words)} words; its words is {mapping.words}"
@@ -936,9 +937,9 @@ def _decode(stream, index, problem, state):
     mapping = stream.mapping
     if mapping.decodes_any_index:
         _, words, state = _keep_words(mapping, index, problem.space, state)
-        return words, state
-    _, words, state = _decode_kept(mapping, index, problem.total, problem.space, state)
-    return list(words), state
+    else:
+        _, words, state = _decode_kept(mapping, index, problem.total, problem.space, state)
+    return words, state
 
 
 @cute.jit
@@ -948,9 +949,11 @@ def _decode_kept(mapping, index, total, space, state):
     dropped = cutlass.Boolean(False)
     words = tuple(Int32(0) for _ in range(mapping.words))
     if index < total:
-        keep, kept_words, state = _keep_words(mapping, index, space, state)
+        keep, kept, state = _keep_words(mapping, index, space, state)
         dropped = ~cutlass.Boolean(keep)
-        words = tuple(kept_words)
+        # Keep words a plain assignment target: CuTeDSL instruments tuple-unpack targets
+        # differently, changing the SASS of kernels whose mapping skips items.
+        words = kept
     return dropped, words, state
 
 
@@ -965,7 +968,7 @@ def _skip_local(stream, index, problem, state):
     while dropped:
         index = Int32(step(index, problem))
         dropped, words, state = _decode_kept(mapping, index, total, space, state)
-    return index, list(words), state
+    return index, words, state
 
 
 def _local_item(stream, index, problem, state):
@@ -985,7 +988,7 @@ def _local_start(stream, first, problem):
         stream.ready.wait()
     state = _start(stream.mapping, problem.space)
     if _tile_grid(stream):
-        return first, list(problem.first_words), state
+        return first, problem.first_words, state
     return _local_item(stream, first, problem, state)
 
 
@@ -1162,7 +1165,7 @@ class WorkCursor:
         count = Int32(0) if stream.record else None
         iket = trace.role_name if trace.iket else None
         first = Int32(stream.schedule.first_index(problem))
-        cur = WorkCursor(stream, problem, end, first, [], rec, count, slot, iket)
+        cur = WorkCursor(stream, problem, end, first, (), rec, count, slot, iket)
         if end is None:
             cur.index, cur._words, cur._state = _local_start(stream, first, problem)
         elif not _publishes_first(stream):
@@ -1174,7 +1177,7 @@ class WorkCursor:
         elif scheduler:
             # scheduler_role runs the hooks and start(), then publishes and receives the first item
             # (and opens its range through _first_item()).
-            cur._words = [Int32(0)] * stream.mapping.words
+            cur._words = (Int32(0),) * stream.mapping.words
             return cur
         else:
             cur._receive()
@@ -1210,7 +1213,7 @@ class WorkCursor:
 
     def __new_from_mlir_values__(self, values):
         n = 1 + len(self._words)
-        words = [Int32(v) for v in values[1:n]]
+        words = tuple(Int32(v) for v in values[1:n])
         count = None
         if self._count is not None:
             count, n = Int32(values[n]), n + 1
@@ -1287,7 +1290,7 @@ class WorkCursor:
     def _receive(self):
         h = self._end.wait()
         self.index = Int32(h.data[0])
-        self._words = [Int32(h.data[1 + i]) for i in range(self._stream.mapping.words)]
+        self._words = tuple(Int32(h.data[1 + i]) for i in range(self._stream.mapping.words))
         h.release()
 
 
@@ -1363,7 +1366,6 @@ def _publish_kept(h, fetch, stream, problem, index, state):
             dropped, words, state = _decode_kept(
                 mapping, index, problem.total, problem.space, state
             )
-        words = list(words)
     else:
         words, state = _decode(stream, index, problem, state)
     _publish(h, index, words, problem.total)
