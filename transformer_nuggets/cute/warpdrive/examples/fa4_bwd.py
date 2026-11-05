@@ -121,7 +121,8 @@ DQ_COLS = 32  # dQ columns per TMA reduce-add (FA4's dQ_reduce_ncol at 1-CTA)
 DQ_T2R_COLS = 32  # dQ columns per TMEM load in the reduce warps
 # FA4's 2-CTA dQ reduce: 8 columns per reduce-add (dQ_reduce_ncol), 4 staging buffers.
 PAIR_DQ_COLS, PAIR_DQ_STAGES = 8, 4
-XCHG_BYTES = TILE_N * (TILE_M // 2) * 2  # the exchanged dS half: 128 keys x 64 queries, bf16
+XCHG_ELEMS = TILE_N * (TILE_M // 2)  # the exchanged dS half: 128 keys x 64 queries
+XCHG_BYTES = XCHG_ELEMS * 2  # bf16
 EPI_COLS = 64  # dK/dV columns per compute warpgroup (one 128-byte-row TMA store box)
 LOG2_E = math.log2(math.e)
 
@@ -170,14 +171,13 @@ class BwdParams:
     seqlen_q: Int32
     seqlen_k: Int32
     m_blocks: Int32
-    # CTA pair only: the separately loaded Qt / dOt / Kt operands and the dS exchange tile.
+    # CTA pair only: the separately loaded Qt / dOt / Kt operands.
     tma_qt: cute.CopyAtom | None = None
     tma_dot: cute.CopyAtom | None = None
     tma_kt: cute.CopyAtom | None = None
     mQt: cute.Tensor | None = None  # (d, s, h, b); dOt is (s, d, h, b), Kt (d, s_k, h, b)
     mdOt: cute.Tensor | None = None
     mKt: cute.Tensor | None = None
-    sdSx: cute.Tensor | None = None
 
 
 def cols(warp: int, st: int, width: int) -> range:
@@ -544,7 +544,7 @@ class FlashAttentionBackward(WarpSpecialized):
         while work.valid:
             n_block, head, batch = work.item
             m_lo, m_hi = self.m_block_range(params, n_block)
-            key_oob = c.key >= params.seqlen_k - n_block * TILE_N
+            key_oob = c.key >= params.seqlen_k - n_block * TILE_N * self.cluster.size
             for m in cutlass.range(m_lo, m_hi, unroll=1):
                 rS = cute.make_rmem_tensor(c.tScS_t2r.shape, Float32)
                 lse, s, lh, sh = self.load_s(c, lse, s, tmem, rS)
@@ -707,6 +707,8 @@ class FlashAttentionBackward(WarpSpecialized):
                     cute.autovec_copy(rdS, rdS_peer)
         dph.release()  # layer fences the tcgen05.st of dS
         if cutlass.const_expr(pair):
+            # The (key, query) tile's layout over the half-tile sdSx: only its first 64-query
+            # block, the peer block's layout in sdS, is written.
             sdSx = cute.make_tensor(dsh.view("dSx", write=True).iterator, c.sdS_epi)
             cute.autovec_copy(rdS_peer, c.thr_r2s.partition_D(sdSx)[None, 0])
             # Every thread's sdS / sdSx stores reach the async proxy before the exchange copy
@@ -881,7 +883,7 @@ class FlashAttentionBackward(WarpSpecialized):
         pair = {}
         if cutlass.const_expr(self.cluster.size > 1):
             names = ("tma_qt", "tma_dot", "tma_kt", "mQt", "mdOt", "mKt")
-            pair = dict(zip(names, pair_args), sdSx=b("dSx"))
+            pair = dict(zip(names, pair_args))
         params = BwdParams(
             mma_s=mma_s,
             mma_dp=mma_dp,
@@ -1112,9 +1114,9 @@ class FlashAttentionBackward2Cta(FlashAttentionBackward):
     so the compute warps signal ds for dS_t only once they have read S_{t+1}: in the next
     iteration, through a raw arrival (``signal_ds``), since the handle closes in its own.
 
-    SMEM: Q, Qt, dO, dOt (16 KB each), K, Kt, V, dS (32 KB each), sdSx, the dQ staging buffers
-    (16 KB each), LSE/dPsum rows; the dK/dV epilogue tiles go over K and V, which the item's
-    last S and dP MMAs read before dK and dV are published. 226 KB of the 227 KB limit.
+    SMEM: Q, Qt, dO, dOt (16 KiB each), K, Kt, V, dS (32 KiB each), sdSx (16 KiB), four 4 KiB
+    dQ staging buffers, LSE/dPsum rows; the dK/dV epilogue tiles go over K and V, which the
+    item's last S and dP MMAs read before dK and dV are published. About 225 of the 227 KiB.
     """
 
     cluster = CtaPair()
@@ -1159,7 +1161,9 @@ class FlashAttentionBackward2Cta(FlashAttentionBackward):
         self.qt = Ring(1, Tma(q_bytes), Umma, buffer=qt_buf)
         self.do = Ring(1, Tma(2 * q_bytes), Umma, buffer={"dO": do_buf, "dOt": dot_buf})
         self.lse = Ring(1, Tma(TILE_M * 4), Warps, buffer=lse_buf, release_fence="smem_async")
-        self.dpsum = Ring(1, Tma(TILE_M * 4), Warps, buffer=dpsum_buf, release_fence="smem_async")
+        # No release fence: make_ds already fences (fence.proxy.async) and syncs every compute
+        # thread after its last dPsum read, before the release.
+        self.dpsum = Ring(1, Tma(TILE_M * 4), Warps, buffer=dpsum_buf)
         self.s = Ring(1, Umma, Warps, release_fence="tmem_store")  # P stored over S
         self.dp = Ring(1, Umma, Warps, release_fence="tmem_store")  # dS stored over dP
         # dS in TMEM goes to the dK MMA through dp; ds hands over sdS. Its commits need no
@@ -1452,7 +1456,8 @@ class FlashAttentionBackward2Cta(FlashAttentionBackward):
                 dpsum, dp, ds, dsh = self.make_ds(c, params, rS, dpsum, dp, ds, tmem)
                 # Dropped down: the commit is deferred to the next tile's signal_ds. A handle
                 # must close in the iteration that opened it, and rotating the loop instead
-                # keeps P_m in registers across the back edge (+2-3% causal, measured).
+                # keeps P_m in registers across the back edge (causal main kernel 1.5-2.4%
+                # slower on GB300, November 2026; docs/examples.md#attention-backward).
                 dsh.commit(signal=False)
             self.signal_ds(ds)
             dkv = self.epilogue(params, dkv, tmem, c.tidx, n_block, head, batch)
@@ -1462,8 +1467,9 @@ class FlashAttentionBackward2Cta(FlashAttentionBackward):
     def signal_ds(self, ds):
         """The raw signal of a ds commit closed with ``signal=False``: the channel's ``Warps``
         count (every lane is done, then one elected arrival per warp) on the leader's full
-        barrier, its only target. Needs no fence: make_ds fenced the sdS stores, and the caller
-        waits for its S loads (plain Python: inlined)."""
+        barrier, its only target (rank 0: the kernel runs on one CTA pair). Needs no fence:
+        make_ds fenced the sdS stores, and the caller waits for its S loads (plain Python:
+        inlined)."""
         cute.arch.sync_warp()
         with cute.arch.elect_one():
             cute.arch.mbarrier_arrive(ds.full_barrier(0), peer_cta_rank_in_cluster=Int32(0))
@@ -1477,7 +1483,7 @@ class FlashAttentionBackward2Cta(FlashAttentionBackward):
             peer = c.rank ^ 1
             xchg = self.barrier_ptr("xchg")
             src = dsh.view("dSx", read=True, by="tma").iterator
-            dst = dsh.view("dS").iterator + c.rank * (XCHG_BYTES // 2)  # the peer's copy of sdS
+            dst = dsh.view("dS").iterator + c.rank * XCHG_ELEMS  # in the peer's copy of sdS
             cute.arch.mbarrier_arrive_and_expect_tx(
                 xchg, XCHG_BYTES, peer_cta_rank_in_cluster=peer
             )
@@ -1511,8 +1517,9 @@ class FlashAttentionBackward2Cta(FlashAttentionBackward):
 def compile_fa4_bwd(op: FlashAttentionBackward):
     """Compile once with dynamic batch, heads and sequence lengths."""
     if op.work.schedule.persistent:
-        # The retired last S acquire and the epilogue tiles over Q/dO hold for one item.
-        raise ValueError("FlashAttentionBackward runs one work item per CTA (OneShot)")
+        # The retired last acquires and the epilogue tiles over Q/dO (K/V in the pair) hold for
+        # one item.
+        raise ValueError(f"{type(op).__name__} runs one work item per CTA (OneShot)")
     b, h = cute.sym_int(), cute.sym_int()
     sq, sk, sq_pad = cute.sym_int(), cute.sym_int(), cute.sym_int(divisibility=TILE_M)
     bf16 = cutlass.BFloat16
@@ -1541,17 +1548,24 @@ _OPS: dict = {}
 
 def _op(causal, roles, dq_stages, cluster) -> tuple:
     pair = is_pair(cluster)
-    if pair and dq_stages is not None:
-        raise ValueError("dq_stages is a 1-CTA option; the CTA pair uses FA4's 4 x 8 columns")
+    dq_stages = check_dq_stages(dq_stages, pair)
     key = (causal, None if roles is None else tuple(sorted(roles.items())), dq_stages, pair)
     op = _OPS.get(key)
     if op is None:
         if pair:
             op = FlashAttentionBackward2Cta(causal, roles)
         else:
-            op = FlashAttentionBackward(causal, roles, 2 if dq_stages is None else dq_stages)
+            op = FlashAttentionBackward(causal, roles, dq_stages)
         _OPS[key] = op
     return op, key
+
+
+def check_dq_stages(dq_stages, pair: bool):
+    """The 1-CTA kernel's dQ staging buffers (default 2); ``None`` for the pair, which has
+    FA4's fixed 4 x 8 columns."""
+    if pair and dq_stages is not None:
+        raise ValueError("dq_stages is a 1-CTA option; the CTA pair uses FA4's 4 x 8 columns")
+    return None if pair else (2 if dq_stages is None else dq_stages)
 
 
 def is_pair(cluster) -> bool:
@@ -1619,6 +1633,8 @@ def fa4_bwd(
     )
 
     check_fa4_bwd_args(q, k, v, out, dout, lse)
+    pair = is_pair(cluster)
+    check_dq_stages(dq_stages, pair)
     b, sq, h, d = q.shape
     scale = softmax_scale if softmax_scale is not None else d**-0.5
     dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
@@ -1649,7 +1665,6 @@ def fa4_bwd(
         dq_stages=dq_stages,
         cluster=cluster,
     )
-    pair = is_pair(cluster)
     order = AccumTileOrder.TMEM_FRAG_2CTA if pair else AccumTileOrder.TMEM_FRAG_1CTA
     _bwd_postprocess_convert(
         dq_accum, dq, scale, None, None, _get_device_arch(), dtype, d, TILE_M, 128, 1, False,

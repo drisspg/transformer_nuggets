@@ -52,7 +52,8 @@ SHAPES = [
     (1, 2, 384, 256),  # Q ring wraps; two key tiles
     (2, 3, 200, 330),  # ragged Q and K tails
     (1, 2, 1000, 64),  # one partial key tile, eight Q tiles
-    (1, 2, 640, 520),  # three CTA pairs, the last one's peer key tile partial
+    (1, 2, 640, 520),  # three CTA pairs; the last one's peer has no keys
+    (1, 2, 640, 450),  # two CTA pairs; the last one's peer key tile is partial
 ]
 CLUSTERS = [None, CtaPair()]
 
