@@ -409,9 +409,9 @@ Dropped down, each documented at its site:
   epilogue tiles over Q and dO, and `Q_STAGE = 2` (one Q stage deadlocks: S_{t+1} waits for
   a load that needs Q_t's release) are protocol facts the layer cannot check; the kernel stays
   `OneShot`, as FA4's 1-CTA kernel does.
-- dQ reduce and dK/dV epilogues order their SMEM staging with hand-picked named barriers (IDs
-  3-6, recorded with `named_barrier`) and `bulk_commit_group`/`bulk_wait_group`, as in the
-  persistent GEMM epilogue.
+- dQ reduce and dK/dV epilogues order their SMEM staging with declared `NamedBarrier`s (allocated
+  IDs 3-6, the hand-picked IDs they replaced) and `bulk_commit_group`/`bulk_wait_group`, as in
+  the persistent GEMM epilogue.
 
 Diagnostics that stay noisy:
 
@@ -464,8 +464,8 @@ correction warpgroup. What it needed from the layer:
 - `round_robin` rings for S, P and the row-max/row-sum mailboxes, so softmax[i] takes blocks
   i, i+2, ... with one warpgroup's counts. The schedule stays `OneShot`: with an odd block
   count a second item would start on softmax[1]'s epochs.
-- Named-barrier channels for the thread mailboxes and done flags, with a turnstile around the
-  shared row-max exchange.
+- Named-barrier channels for the thread mailboxes, with a turnstile around the shared row-max
+  exchange, and three one-shot `NamedBarrier` done flags for the split statistics.
 - P in a 4-stage SMEM ring read as the PV MMA's B operand; no TMEM alias.
 
 The KV block (`tile_n`, 256), K step (`tile_k`, 64), S and P ring depths (4 and 4), head
@@ -476,8 +476,7 @@ defaults, which match FA4; see [configuration](configuration.md) for the valid r
 FA4 reads one K/V ring with two MMA cursors, keeping K two blocks ahead of V with two extra named
 barriers. Here K and V have their own rings, 7 and 5 stages at FA4's total of 12 (8-head tiles).
 The other changes: the first PV into each O slot overwrites it instead of the correction
-warpgroup zero-filling TMEM first, done flags also sync on a pre-seeded empty barrier, and an
-empty split runs the normal tail with zero sums.
+warpgroup zero-filling TMEM first, and an empty split runs the normal tail with zero sums.
 
 Split partials match FA4's bit for bit on every shape below, with FA4's own split count and
 per-sequence table (captured at its combine call); the combined outputs are identical too.
@@ -761,6 +760,13 @@ contract. The 32-head small case improves from 7.616 to 7.360 us, while other ca
 by up to 5.4%. All seven shapes pass the partial-bitwise assertions in every process. These
 wrapper measurements and the isolated-kernel table are different contracts, not one pooled
 sample set.
+
+The example now declares those three flags as one-shot `NamedBarrier`s (correction arrives,
+the load warp syncs, or the reverse for `stats_ready`), cutting its named-barrier IDs from 12
+to 9 of 13. With the committed benchmark in A/B/A/B processes on one GB300 (seven rounds of
+200 replays each), the port's decode kernel moved by -0.43% to +0.04% across the seven shapes
+(mean of two processes per side; ragged 8x65536: 27.392 -> 27.361 us). Partials stayed
+bitwise equal to FA4's in every process.
 
 The missing layer capability is a shared TMA ring with multiple independent, exclusive MMA
 cursors, including explicit skipped epochs and a bootstrap/skew contract preventing parity

@@ -25,7 +25,8 @@ Roles (16 warps, FA4's placement):
     warps 12-15   correction rescales O, merges the two O slots, stages O
 
 Channels. mbarrier rings carry the async handoffs; named-barrier channels (``sync="named"``) carry
-the thread-to-thread mailboxes FA4 builds from ``bar.sync``/``bar.arrive``:
+the thread-to-thread mailboxes FA4 builds from ``bar.sync``/``bar.arrive``, and three declared
+``NamedBarrier`` flags the split statistics' handshakes:
 
     q        Ring(1)  q_store -TMA-> mma_qk
     k, v     Ring     load -TMA-> mma_qk / mma_pv; FA4 shares one ring (K two blocks ahead of V,
@@ -36,7 +37,7 @@ the thread-to-thread mailboxes FA4 builds from ``bar.sync``/``bar.arrive``:
     o        Ring(2)  mma_pv -UMMA-> correction; slot j % 2 accumulates blocks j, j+2, ...
     row_max  named    softmax[0|1] -> correction, round-robin; the running max M(j) in sRowMax
     row_sum  named    softmax[0|1] -> correction, round-robin; per-thread sums in TMEM L
-    max_done, sum_done, stats_ready  named, one epoch per item: correction <-> load's stats
+    max_done, sum_done, stats_ready  one-shot NamedBarrier flags: correction <-> load's stats
     epi      Ring(1)  correction -> q_store (sO)
     mufu     Turnstile  softmax[0] <-> softmax[1] around the row_max exchange (FA4's MaxTurn)
 
@@ -51,8 +52,9 @@ Differences from FA4 (see docs/examples.md for the measured effect):
 * The first PV into each O slot overwrites it (``ACCUMULATE = False``) instead of the correction
   warpgroup zero-filling both O slots, and the correction tail reads O and L slot 1 as zero when
   a split has one block, so no TMEM zero-fill must be ordered before the first MMA.
-* The done flags and mailboxes also wait on their (pre-seeded) empty barrier before signalling;
-  FA4 arrives without it, relying on one item per CTA.
+* The mailboxes also wait on their (pre-seeded) empty barrier before signalling. The done flags
+  are one-shot, as FA4's: the signalling side arrives without waiting, which is sound because a
+  ``OneShot`` CTA completes each flag at most once.
 * An empty split (no KV blocks) runs the normal tail with zero sums and O, so its O and LSE go
   through the same staging, TMA store and stats as other splits.
 * Dropped work items (splits past a sequence's split count) still initialize barriers and TMEM
@@ -78,6 +80,7 @@ from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_te
 from transformer_nuggets.cute.warpdrive import (
     Consumer,
     Instance,
+    NamedBarrier,
     OneShot,
     PdlWait,
     Producer,
@@ -175,6 +178,7 @@ class DecodeParams:
     sV: cute.Tensor
     sP: cute.Tensor
     sRowMax: cute.Tensor  # running max per head; 1/L at the end
+    sRowSums: cute.Tensor  # (warp, head): the correction warps' row sums for the stats warp
     scale_log2: Float32
     num_heads_kv: Int32
     qhead_per_kvhead: Int32
@@ -299,11 +303,13 @@ class SwapABDecode(WarpSpecialized):
         self.row_sum = Ring(
             O_STAGES, Threads, Threads, sync="named", round_robin=True, commit_fence="tmem_store"
         )
-        self.max_done = Ring(1, Threads, Threads, sync="named")
-        self.sum_done = Ring(
-            1, Threads, Threads, sync="named", payload=(Float32, (WARPS_PER_WG, tile_hq))
-        )
-        self.stats_ready = Ring(1, Threads, Threads, sync="named")
+        # One-shot flags between the correction warpgroup and the load warp: the signalling
+        # side arrives, the other syncs. Each completes once per work item and a OneShot CTA
+        # runs at most one, so no signaller can reach a flag's next generation early.
+        stats_threads = WG_SIZE + 32
+        self.max_done = NamedBarrier(threads=stats_threads)  # M is final in sRowMax
+        self.sum_done = NamedBarrier(threads=stats_threads)  # row sums are in sRowSums
+        self.stats_ready = NamedBarrier(threads=stats_threads)  # 1/L is in sRowMax
         self.epi = Ring(1, Threads, Threads, commit_fence="smem_async", buffer=o_buf)
         self.mufu = Turnstile()
         self.tmem_plan = (
@@ -444,9 +450,6 @@ class SwapABDecode(WarpSpecialized):
         *,
         k: Producer,
         v: Producer,
-        max_done: Consumer,
-        sum_done: Consumer,
-        stats_ready: Producer,
         work: WorkCursor,
     ):
         for atom in (params.tma_q, params.tma_k, params.tma_v, params.tma_o):
@@ -524,26 +527,23 @@ class SwapABDecode(WarpSpecialized):
                                     h.view("V"),
                                     tma_bar_ptr=h.barrier,
                                 )
-            max_done, sum_done, stats_ready = self.split_stats(
-                params, r, max_done, sum_done, stats_ready
-            )
+            self.split_stats(params, r)
             work.advance()
-        return k, v, max_done, sum_done, stats_ready, work
+        return k, v, work
 
     @cute.jit
-    def split_stats(self, params: DecodeParams, r: SplitRange, max_done, sum_done, stats_ready):
+    def split_stats(self, params: DecodeParams, r: SplitRange):
         """This split's LSE and 1/L from the final max and the correction's per-warp row sums
         (FA4's ``store_split_stats``); 1/L goes back to the correction through sRowMax."""
         lane = cute.arch.lane_idx()
         owns_head = lane < self.tile_hq
         row_max = -Float32.inf
-        with max_done.consume():
-            if owns_head:
-                row_max = params.sRowMax[lane]
-        sh = sum_done.wait()
-        rh = stats_ready.acquire()
+        self.max_done.sync()
         if owns_head:
-            sums = sh.data
+            row_max = params.sRowMax[lane]
+        self.sum_done.sync()
+        if owns_head:
+            sums = params.sRowSums
             row_sum = (sums[0, lane] + sums[1, lane]) + (sums[2, lane] + sums[3, lane])
             inv_sum = Float32(0.0)
             if row_sum > Float32(0.0):
@@ -555,9 +555,7 @@ class SwapABDecode(WarpSpecialized):
                     lse = (row_max + cute.math.log2(row_sum, fastmath=True)) * LN2
                 head = r.kv_head * params.qhead_per_kvhead + lane
                 params.mLSE[r.split, r.batch, head] = lse
-        rh.commit()
-        sh.release()
-        return max_done, sum_done, stats_ready
+        self.stats_ready.arrive()
 
     @role(warps=0)
     @cute.jit
@@ -778,9 +776,6 @@ class SwapABDecode(WarpSpecialized):
         o: Consumer,
         row_max: Consumer,
         row_sum: Consumer,
-        max_done: Producer,
-        sum_done: Producer,
-        stats_ready: Consumer,
         epi: Producer,
         work: WorkCursor,
         tmem: Tmem,
@@ -837,8 +832,7 @@ class SwapABDecode(WarpSpecialized):
                         cute.arch.fence_view_async_tmem_load()
                     mh = row_max.wait()
                     if s == n_blocks - O_STAGES - 1:
-                        with max_done.produce():
-                            pass
+                        self.max_done.arrive()
                     row_max_cur = Float32(0.0)
                     if owns_head:
                         row_max_cur = params.sRowMax[lane]
@@ -863,8 +857,7 @@ class SwapABDecode(WarpSpecialized):
                     row_max_prev2, row_max_prev = row_max_prev, row_max_cur
                     phase ^= 1
                 if n_blocks <= O_STAGES:
-                    with max_done.produce():
-                        pass
+                    self.max_done.arrive()
 
                 # Tail: blocks n-2 and n-1 are relative to M(n-2) and M(n-1). Bring slot
                 # (n-2) % 2 up to the final max and add the slots. A one-block split has no
@@ -894,19 +887,18 @@ class SwapABDecode(WarpSpecialized):
                             + acc_scale.load() * tLrL.load()
                         )
             else:
-                with max_done.produce():
-                    pass
+                self.max_done.arrive()
 
             # Row sums across lanes, then per warp to the stats warp. The sums and 1/L need only
             # the row sums, so this round trip runs while the last PV MMAs finish (FA4's order).
-            with sum_done.produce() as sh:
-                for h in cutlass.range_constexpr(tile_hq):
-                    row_sum_final[h] = cute.arch.warp_reduction_sum(row_sum_final[h])
-                    if lane == 0:
-                        sh.data[warp, h] = row_sum_final[h]
+            for h in cutlass.range_constexpr(tile_hq):
+                row_sum_final[h] = cute.arch.warp_reduction_sum(row_sum_final[h])
+                if lane == 0:
+                    params.sRowSums[warp, h] = row_sum_final[h]
+            self.sum_done.arrive()
             # 1/L comes back through sRowMax.
-            with stats_ready.consume():
-                cute.autovec_copy(params.sRowMax, tLrL)
+            self.stats_ready.sync()
+            cute.autovec_copy(params.sRowMax, tLrL)
 
             # Then the last two O slots. A one-block split skips slot (n-2) % 2, whose register
             # tile stays zero.
@@ -940,7 +932,7 @@ class SwapABDecode(WarpSpecialized):
                 tOsO = thr_r2s_o.partition_D(eh.data)
                 tOsO.store(o_final.to(Float32).reshape(tOsO.shape))
             work.advance()
-        return o, row_max, row_sum, max_done, sum_done, stats_ready, epi, work
+        return o, row_max, row_sum, epi, work
 
     # ----------------------------------------------------------------- kernel
 
@@ -979,6 +971,9 @@ class SwapABDecode(WarpSpecialized):
         )
         vec_layout = t2r.get_slice(0).partition_D(acc[(None, None), 0, 0]).layout
         sRowMax = smem.allocate_tensor(Float32, vec_layout, 128)
+        sRowSums = smem.allocate_tensor(
+            Float32, cute.make_layout((WARPS_PER_WG, self.tile_hq)), 16
+        )
         # Every role starts after run_roles' CTA sync, so this needs no other edge.
         tidx = cute.arch.thread_idx()[0]
         if tidx < self.tile_hq:
@@ -1001,6 +996,7 @@ class SwapABDecode(WarpSpecialized):
             sV=self.buffer("V"),
             sP=self.buffer("P"),
             sRowMax=sRowMax,
+            sRowSums=sRowSums,
             scale_log2=scale_log2,
             num_heads_kv=num_heads_kv,
             qhead_per_kvhead=mLSE.shape[2] // num_heads_kv,
