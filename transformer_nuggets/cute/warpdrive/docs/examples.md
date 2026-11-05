@@ -21,6 +21,9 @@
 - [fa4_decode_swapab.py](../examples/fa4_decode_swapab.py): FA4's swap-AB single-token decode:
   split-KV work items with per-sequence split counts, round-robin softmax warpgroups,
   named-barrier mailboxes and P staged through SMEM.
+- [raw_interop.py](../examples/raw_interop.py): a managed producer, a consumer that drives
+  the same ring's barriers by pointer under an overridden count, and a raw role waiting
+  natively on a `NamedBarrier`'s ID ([dropping down](dropping_down.md)).
 - [bench_overhead.py](../examples/bench_overhead.py): handoff and fixed-cost microbenchmarks
   against hand-written twins ([results](#warpdrive-fixed-costs)).
 - [bench_persistent_gemm.py](../examples/bench_persistent_gemm.py): the persistent GEMM's

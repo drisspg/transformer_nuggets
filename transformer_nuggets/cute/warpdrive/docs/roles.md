@@ -37,7 +37,7 @@ Call `begin_roles()` and `run_roles()` from converged CTA/cluster code using the
 launch shape. Warp 0 initializes each barrier from one lane; the common initialization
 fence/sync precedes dispatch. Every participating thread must reach initialization and exit, including
 threads in warp holes. For manually initialized barriers, see
-[raw barriers and roles](dropping_down.md#raw-barriers-and-roles).
+[raw barriers and roles](dropping_down.md#escape-hatches-by-feature).
 
 ## Arguments
 

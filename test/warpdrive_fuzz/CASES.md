@@ -185,11 +185,11 @@ Accepted negative controls use these labels; acceptance does not make them safe 
 | U5 | [Peer memory scope and addressing](../../transformer_nuggets/cute/warpdrive/docs/clusters.md#memory-scope) |
 | U6 | [Independently validate unverified TMA](../../transformer_nuggets/cute/warpdrive/GUARANTEES.md#what-a-successful-check-means) |
 | U7–U8 | [Raw signals, overrides and scoped opt-outs](../../transformer_nuggets/cute/warpdrive/docs/dropping_down.md) |
-| U9 | [Raw-role limits](../../transformer_nuggets/cute/warpdrive/docs/dropping_down.md#raw-barriers-and-roles) |
+| U9 | [Raw-role limits](../../transformer_nuggets/cute/warpdrive/docs/dropping_down.md#escape-hatches-by-feature) |
 | U10 | [Carry state](../../transformer_nuggets/cute/warpdrive/docs/roles.md#return-the-updated-state); [mapping, workspace and index obligations](../../transformer_nuggets/cute/warpdrive/docs/scheduling.md) |
 | U11 | [Frozen params are shallow](../../transformer_nuggets/cute/warpdrive/docs/roles.md#arguments) |
 | U12 | [Declaration snapshots and compile keys](../../transformer_nuggets/cute/warpdrive/docs/roles.md#compile-keys) |
-| U13 | [Post-close access and raw accessor limits](../../transformer_nuggets/cute/warpdrive/docs/dropping_down.md#raw-state-in-a-managed-role) |
+| U13 | [Post-close access and raw accessor limits](../../transformer_nuggets/cute/warpdrive/docs/dropping_down.md#rules-that-still-apply) |
 | U14 | [No performance, race-freedom or liveness proof](../../transformer_nuggets/cute/warpdrive/GUARANTEES.md#what-a-successful-check-means) |
 | U15 | [Custom schedule/map correctness](../../transformer_nuggets/cute/warpdrive/docs/scheduling.md#custom-index-schedules) |
 | U16 | [Storage identity, partitions and overlapping lifetimes](../../transformer_nuggets/cute/warpdrive/docs/storage.md) |

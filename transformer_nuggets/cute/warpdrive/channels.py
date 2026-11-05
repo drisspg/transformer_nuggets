@@ -202,8 +202,9 @@ class Channel:
     wins and ``describe()`` prints it next to the derived one, flagging differences. Keys:
     ``full_counts``/``empty_counts`` (an int, a per-slot list, or ``{cta rank: list}``),
     ``tx`` (bytes armed per full barrier), ``full_mask``/``empty_mask`` (``tcgen05.commit``
-    multicast masks). Example: per-warp elected releases need ``empty_counts=4`` for a
-    four-warp consumer, with the role signalling via ``handle.release(signal=False)``.
+    multicast masks). Example: a consumer releasing each stage with one raw arrival needs
+    ``empty_counts=1``, with the role closing via ``handle.release(signal=False)`` (per-warp
+    elected releases are the ``Warps`` mechanism; ``docs/dropping_down.md``).
 
     ``round_robin``, ``sync`` and ``consumer_mode`` are described in the module docstring. A
     named channel takes no override and must stay CTA-local; ``named_ids`` holds its ``(full,
