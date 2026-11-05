@@ -39,7 +39,7 @@ from transformer_nuggets.cute.warpdrive import (
     role,
     unchecked,
 )
-from transformer_nuggets.cute.warpdrive.examples.gemm import TILE, Gemm, GemmParams
+from transformer_nuggets.cute.warpdrive.examples.gemm import Gemm, GemmParams
 
 TILE_ROWS = 64  # one 64x64 bf16 TMA tile per stage
 TILE_BYTES = TILE_ROWS * 64 * 2
@@ -569,7 +569,7 @@ class MixedGemm(Gemm):
         del self.acc  # replaced by a user-driven edge
         self.ab = Ring(
             3,
-            Tma((TILE[0] + TILE[1]) * TILE[2] * 2),
+            Tma(sum(self.tile[:2]) * self.tile[2] * 2),
             Umma,
             override={"empty_counts": 1},
             buffer=self.ab.buffer,

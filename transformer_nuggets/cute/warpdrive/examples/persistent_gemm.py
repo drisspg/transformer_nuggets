@@ -32,6 +32,7 @@ One compile serves every M, N, K: tile counts, the persistent grid cap, and the 
 are runtime values; schedule, mapping, cluster, and stage counts are compile-time.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import cutlass
@@ -54,6 +55,7 @@ from transformer_nuggets.cute.warpdrive import (
     Producer,
     Raster,
     Ring,
+    RoleConfig,
     SingleCta,
     SmemPlan,
     StageView,
@@ -72,8 +74,7 @@ from transformer_nuggets.cute.warpdrive import (
 from transformer_nuggets.cute.warpdrive.examples.gemm import check_gemm_args
 
 CTA_TILE_M, TILE_K = 128, 64  # per-CTA output rows and K step; tile N is a constructor argument
-EPI_TILE = (128, 32)  # one TMA store box; tile_n // 32 per CTA output tile
-C_STAGES = 2  # SMEM staging buffers for the TMA-store epilogue
+EPI_TILE_NS = (16, 32, 64)  # TMA store box widths: 32 B to 128 B bf16 rows, up to the SW128 atom
 EPI_BARRIER_ID = 3  # named barrier for the 4 epilogue warps (layer owns 1 and 2)
 
 
@@ -117,16 +118,31 @@ class PersistentGemm(WarpSpecialized):
         trace: bool = False,
         cluster=None,
         tile_n: int | None = None,
+        c_stages: int = 2,
+        epi_tile_n: int = 32,
+        roles: Mapping[str, RoleConfig] | None = None,
     ):
+        """``ab_stages``: A/B ring depth (default: what fills ~192 KB). ``acc_stages``: TMEM
+        accumulators (2 overlaps a tile's epilogue with the next mainloop). ``tile_n``: output
+        tile width (``default_tile_n``). ``c_stages`` SMEM buffers of ``128 x epi_tile_n`` stage
+        the TMA-store epilogue. ``roles``: placement and register budgets by role name over the
+        ``@role`` defaults (40/40/160)."""
         self.cluster = cluster or SingleCta()
         cs = self.cluster.pair_size  # CTAs per MMA
         if tile_n is None:
             tile_n = default_tile_n(self.cluster)
-        if tile_n % EPI_TILE[1] or not 0 < tile_n <= 256 or tile_n // cs % 8:
+        if epi_tile_n not in EPI_TILE_NS:
+            raise ValueError(f"epi_tile_n must be one of {EPI_TILE_NS}, got {epi_tile_n}")
+        if tile_n % epi_tile_n or not 0 < tile_n <= 256 or tile_n // cs % 8:
             raise ValueError(
-                f"tile_n must be a multiple of {EPI_TILE[1]} in (0, 256], got {tile_n}"
+                f"tile_n must be a multiple of epi_tile_n={epi_tile_n} in (0, 256], got {tile_n}"
             )
+        if c_stages < 1:
+            raise ValueError(f"c_stages must be positive, got {c_stages}")
         self.tile_n = tile_n
+        self.epi_tile = (CTA_TILE_M, epi_tile_n)
+        self.c_stages = c_stages
+        self.roles = roles
         cta_tile = (CTA_TILE_M, tile_n, TILE_K)
         # The MMA tile spans the cluster along M; each CTA holds 128 rows of A and N / cs rows
         # of B per stage (2-CTA MMAs read B from both CTAs).
@@ -167,9 +183,11 @@ class PersistentGemm(WarpSpecialized):
         self.trace_protocol = trace
 
     def get_name(self) -> str:
+        epi = (self.c_stages, self.epi_tile[1])
+        epi = "" if epi == (2, 32) else f"c{epi[0]}x{epi[1]}_"
         return (
             f"warpdrive_pgemm_{self.cluster.get_key()}_n{self.tile_n}_ab{self.ab.n}_"
-            f"acc{self.acc_stages}_"
+            f"acc{self.acc_stages}_{epi}"
             f"{self.work.get_key()}{self.iket_key()}{self.trace_key()}"
         )
 
@@ -229,8 +247,9 @@ class PersistentGemm(WarpSpecialized):
     def epilogue(
         self, params: PersistentGemmParams, *, acc: Consumer, work: WorkCursor, tmem: Tmem
     ):
-        """TMEM -> registers -> swizzled SMEM -> TMA store, one 128x32 subtile at a time through
-        ``C_STAGES`` SMEM buffers. TMA clips the ragged edges, so partial tiles cost the same."""
+        """TMEM -> registers -> swizzled SMEM -> TMA store, one ``epi_tile`` subtile at a time
+        through ``c_stages`` SMEM buffers. TMA clips the ragged edges, so partial tiles cost the
+        same."""
         tidx, _, _ = cute.arch.thread_idx()
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         # This CTA's rows of the tile.
@@ -262,15 +281,15 @@ class PersistentGemm(WarpSpecialized):
         tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc) - 1)  # (..., SUB, STAGE)
         subtiles = cute.size(tTR_tAcc, mode=[3])
         # Buffers rotate across tiles too: with a subtile count that is not a multiple of
-        # C_STAGES (tile_n=224: 7), a tile's first subtile alternates buffers.
-        rotate = subtiles % C_STAGES != 0
+        # c_stages (tile_n=224: 7), a tile's first subtile alternates buffers.
+        rotate = subtiles % self.c_stages != 0
         first = Int32(0)  # the buffer of this tile's first subtile
         while work.valid:
             m, n = self.mma_tile_mn(params, work.item)
             dst = cute.group_modes(bSG_gC[None, None, None, m, n], 1, 3)  # (TMA, SUB)
             with acc.consume() as a:
                 for i in cutlass.range_constexpr(subtiles):
-                    buf = (first + i) % C_STAGES if rotate else i % C_STAGES
+                    buf = (first + i) % self.c_stages if rotate else i % self.c_stages
                     cute.copy(t2r, tTR_tAcc[None, None, None, i, a.index], tTR_rAcc)
                     tRS_rC.store(r2s.retile(tTR_rAcc).load().to(self.dtype))
                     cute.copy(r2s, tRS_rC, tRS_sC[None, None, None, buf])
@@ -279,12 +298,12 @@ class PersistentGemm(WarpSpecialized):
                     if warp == 0:
                         cute.copy(params.tma_c, bSG_sC[None, buf], dst[None, i])
                         cute.arch.cp_async_bulk_commit_group()
-                        # Buffer `buf` is rewritten C_STAGES subtiles later; keep at most
-                        # C_STAGES - 1 stores still reading SMEM.
-                        cute.arch.cp_async_bulk_wait_group(C_STAGES - 1, read=True)
+                        # Buffer `buf` is rewritten c_stages subtiles later; keep at most
+                        # c_stages - 1 stores still reading SMEM.
+                        cute.arch.cp_async_bulk_wait_group(self.c_stages - 1, read=True)
                     cute.arch.barrier(barrier_id=EPI_BARRIER_ID, number_of_threads=128)
             if cutlass.const_expr(rotate):
-                first = (first + subtiles) % C_STAGES
+                first = (first + subtiles) % self.c_stages
             work.advance()
         if warp == 0:
             cute.arch.cp_async_bulk_wait_group(0, read=True)
@@ -326,7 +345,7 @@ class PersistentGemm(WarpSpecialized):
             tCrB=StageView(tiled_mma.make_fragment_B(sB), axis=3),
             num_k_tiles=cute.size(gA, mode=[3]),
             acc_layout=acc_staged.layout,
-            epi_tile=EPI_TILE,
+            epi_tile=self.epi_tile,
             tma_c=tma_c,
             mC_tma=mC_tma,
             sC=sC,
@@ -414,9 +433,11 @@ class PersistentGemm(WarpSpecialized):
             tiled_mma,
             vmnk,
         )
-        c_layout = sm100_utils.make_smem_layout_epi(self.dtype, self.c_layout, EPI_TILE, C_STAGES)
+        c_layout = sm100_utils.make_smem_layout_epi(
+            self.dtype, self.c_layout, self.epi_tile, self.c_stages
+        )
         tma_c, mC_tma = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileS2GOp(), c, cute.select(c_layout, mode=[0, 1]), EPI_TILE
+            cpasync.CopyBulkTensorTileS2GOp(), c, cute.select(c_layout, mode=[0, 1]), self.epi_tile
         )
         # One work item per cluster tile; a ragged last cluster tile's extra MMA tiles fall past
         # the edge, where TMA loads zeros and clips the stores.
@@ -450,6 +471,10 @@ def compile_persistent_gemm(op: PersistentGemm):
 _OPS: dict = {}
 
 
+def _frozen_roles(roles):
+    return None if roles is None else tuple(sorted(roles.items()))
+
+
 def persistent_gemm(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -459,12 +484,15 @@ def persistent_gemm(
     max_ctas: int | None = None,
     cluster=None,
     tile_n: int | None = None,
+    **config,
 ) -> torch.Tensor:
     """``a @ b.T`` for row-major bf16 ``a: (M, K)``, ``b: (N, K)``. ``schedule`` defaults to
     ``StaticPersistent()``; ``max_ctas`` caps the persistent grid in CTAs (default: the CTAs of
     the clusters that fit at once, the SM count for one CTA or a pair); ``cluster=CtaPair()``
     runs 2-CTA 256 x ``tile_n`` tiles, ``Cluster(2, 2, pair=True)`` two such pairs sharing A.
-    ``tile_n`` defaults to ``default_tile_n(cluster)``: 224 for a pair, 256 otherwise."""
+    ``tile_n`` defaults to ``default_tile_n(cluster)``: 224 for a pair, 256 otherwise.
+    ``config``: ``PersistentGemm``'s other keyword options (``ab_stages``, ``acc_stages``,
+    ``c_stages``, ``epi_tile_n``, ``roles``)."""
     out = check_gemm_args(a, b, out)
     if out.numel() == 0:
         return out
@@ -472,11 +500,12 @@ def persistent_gemm(
         return out.zero_()
     if tile_n is None:
         tile_n = default_tile_n(cluster or SingleCta())
-    key = (schedule, mapping, cluster, tile_n)
+    frozen = {k: _frozen_roles(v) if k == "roles" else v for k, v in config.items()}
+    key = (schedule, mapping, cluster, tile_n, *sorted(frozen.items()))
     op = _OPS.get(key)
     if op is None:
         op = _OPS[key] = PersistentGemm(
-            schedule=schedule, mapping=mapping, cluster=cluster, tile_n=tile_n
+            schedule=schedule, mapping=mapping, cluster=cluster, tile_n=tile_n, **config
         )
     fn = compile_persistent_gemm.by_static_key(key, lambda: compile_persistent_gemm(op))
     workspace, sms = op.work.launch_args(a.device)
