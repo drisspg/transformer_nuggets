@@ -41,10 +41,10 @@ thread signals, one elected lane per warp arrives, as FA4's pipelines count:
 Every ring starts empty, so the MMA's first acquires of s, dp, dq and dkv pass, and the load
 runs ahead by the q/do stage counts. Per tile t the MMA warp issues dP_t, dV_t, S_{t+1}, dK_t,
 dQ_t, FA4's order. Q_t is read by S_t (issued during tile t-1) and by dK_t, so S_{t+1} reads
-the q ring's next stage after a raw wait on its full barrier, without consuming it: carrying a
-handle from one loop iteration to the next is not checkable (see docs/examples.md). With one
-Q stage that read would wait for the release of Q_t, which comes after S_{t+1}: a deadlock,
-so ``Q_STAGE`` is fixed at 2. The last tile's s acquire is retired (there is no S_{t+1}),
+the q ring's next stage through ``q.peek()``, a read-only preview that the next tile's
+``q.wait()`` handle owns and releases (the last tile is peeled, so the loop's final preview
+has a wait after it). With one Q stage that peek would wait for the release of Q_t, which
+comes after S_{t+1}: a deadlock, so ``Q_STAGE`` is fixed at 2. The last tile's s acquire is retired (there is no S_{t+1}),
 which is why the kernel runs one item per CTA, as FA4's 1-CTA kernel does.
 
 TMEM (512 columns): S [0,128), dV [128,256), dP [256,384), dK [384,512). P (bf16 pairs) aliases
@@ -453,13 +453,12 @@ class FlashAttentionBackward(WarpSpecialized):
         fa_mma.gemm_ptx_w_idx(tiled_mma, acc, rA, rB, sA=sA, sB=b, zero_init=zero_init, tA_addr=ta)
 
     def issue_s(self, params: BwdParams, q, kh, t, tmem):
-        """S^T = K Q^T for the q ring's next stage, which this does not consume: Q_t is read by
-        S_t, issued during tile t-1, and by dK_t, whose ``q.wait()`` handle releases it. A raw
-        wait on that stage's full barrier stands in for a non-consuming wait; the handle's wait
-        later passes on the same, still unreleased, phase (plain Python: inlined)."""
-        cute.arch.mbarrier_wait(q.full_barrier(q.index), q.phase())
+        """S^T = K Q^T for the q ring's next stage, which this previews without consuming: Q_t
+        is read by S_t, issued during tile t-1, and by dK_t, whose ``q.wait()`` handle (the
+        next wait on the end) owns and releases it (plain Python: inlined)."""
+        preview = q.peek()
         tmem.access("S", write=True, by="umma")
-        sK, sQ = kh.view("K", read=True, by="umma"), params.sQ[None, None, None, q.index]
+        sK, sQ = kh.view("K", read=True, by="umma"), preview.view("Q", read=True, by="umma")
         self.smem_mma(params.mma_s, t.thr.s, t.tS, sK, sQ, True)
 
     def mma_tile(

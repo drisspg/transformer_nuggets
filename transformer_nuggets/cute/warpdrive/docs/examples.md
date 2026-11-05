@@ -396,15 +396,17 @@ moved them by -0.8% to +2.3% (outputs bitwise equal), so `Threads` stays their d
   the recorder's parameter. Fixed.
 - `launch_args()` zeroed a per-stream workspace even for `OneShot`, so graphs captured on a new
   stream replayed a memset. Fixed: one untouched placeholder per device.
+- [Previews](channels.md#previews): S_{t+1} needs Q_{t+1} while Q_t's handle stays open for
+  dK_t. FA4 rotates `handle_Q = handle_Q_next`; a handle carried into the next loop iteration
+  would keep the pre-loop handle's trace record, so the checker would report it closed twice.
+  The port first waited on the next stage's full barrier itself (`q.full_barrier(q.index)`,
+  `q.phase()`) and read it through `params.sQ`, outside any handle. It now takes
+  `q.peek()` and reads `preview.view("Q", read=True, by="umma")`; the next tile's `q.wait()`
+  (the peeled tile's, for the loop's last preview) owns that epoch. Both modes' SASS is
+  identical to the raw wait's, so the timings above stand, and the alias report is unchanged.
 
 Dropped down, each documented at its site:
 
-- S_{t+1} needs Q_{t+1} while Q_t's handle stays open for dK_t. FA4 rotates
-  `handle_Q = handle_Q_next`; a handle carried into the next loop iteration keeps the
-  pre-loop handle's trace record, so the checker reports it closed twice. The MMA warp waits on
-  the next stage's full barrier itself (`q.full_barrier(q.index)`, `q.phase()`) and reads the
-  stage through `params.sQ`, outside any handle. Proposal: track carried handles per loop
-  iteration, or a non-consuming `end.peek()` that returns a read-only, uncounted handle.
 - The last tile's S acquire has no S_{t+1} to publish and is retired. That, the dK/dV
   epilogue tiles over Q and dO, and `Q_STAGE = 2` (one Q stage deadlocks: S_{t+1} waits for
   a load that needs Q_t's release) are protocol facts the layer cannot check; the kernel stays
