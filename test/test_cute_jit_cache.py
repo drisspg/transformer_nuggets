@@ -240,6 +240,53 @@ def test_uncached_calls_bypass_both_caches(isolated_cache):
     assert len(list(isolated_cache.rglob("*.o"))) == 1
 
 
+class TracedConfig:
+    """A compile argument that keeps what its trace found, like a warpdrive kernel."""
+
+    def __init__(self, variant: str):
+        self.variant = variant
+        self.found = None
+
+    def __cute_cache_key__(self) -> str:
+        return self.variant
+
+    def __cute_trace_record__(self) -> str:
+        return self.found
+
+    def __cute_restore_trace__(self, record: str) -> None:
+        self.found = record
+
+
+def test_cached_calls_restore_the_trace_record(isolated_cache):
+    compile_count = 0
+
+    @cute_cache.jit_cache
+    def compile_kernel(config: TracedConfig) -> FakeCompiled:
+        nonlocal compile_count
+        compile_count += 1
+        config.found = f"traced {config.variant}"
+        return FakeCompiled(config.variant)
+
+    first = TracedConfig("a")
+    assert compile_kernel(first)() == "a" and first.found == "traced a"
+    again = TracedConfig("a")  # memory hit, another instance
+    assert compile_kernel(again)() == "a" and again.found == "traced a"
+    compile_kernel.cache_clear()
+    warm = TracedConfig("a")  # disk hit
+    assert compile_kernel(warm)() == "a" and warm.found == "traced a"
+    assert compile_count == 1
+    assert compile_kernel.cache_info() == cute_cache.CacheInfo(hits=1, misses=0, currsize=1)
+
+    next(isolated_cache.rglob("*.trace")).write_bytes(b"truncated")
+    compile_kernel.cache_clear()
+    rebuilt = TracedConfig("a")
+    assert compile_kernel(rebuilt)() == "a" and rebuilt.found == "traced a"
+    assert compile_count == 2  # an unreadable record recompiles and republishes it
+    assert compile_kernel.is_cached(TracedConfig("a"))
+    next(isolated_cache.rglob("*.trace")).unlink()
+    assert not compile_kernel.is_cached(TracedConfig("a"))
+
+
 def test_runtime_cache_includes_compile_target(isolated_cache, monkeypatch):
     compile_count = 0
     target = cute_target.CompileTarget("first")
