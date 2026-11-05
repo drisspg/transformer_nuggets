@@ -26,6 +26,7 @@ from transformer_nuggets.cute.warpdrive import (
     Slots,
     Threads,
     Tma,
+    Tmem,
     TmemPlan,
     Turn,
     Turnstile,
@@ -294,6 +295,99 @@ def test_register_holes_run(requires_blackwell, n):
     torch.cuda.synchronize()
     lane = torch.arange(32, dtype=torch.int32)
     assert torch.equal(out.cpu(), 32 * n * (n - 1) // 2 + n * lane)
+
+
+# --------------------------------------------------------------------------- #
+# TMEM allocator placement: one CTA allocates from a warp other than warp 0 (which
+# initializes the barriers) when a TMEM role has one. Every toy takes all 512 columns, so a
+# CTA that did not free them would block the next CTA on its SM in tcgen05.alloc.
+# --------------------------------------------------------------------------- #
+
+
+class TmemPlacementToy(WarpSpecialized):
+    """Each warp of a TMEM role marks ``out[cta, warp]``."""
+
+    def __init__(self):
+        self.tmem_plan = TmemPlan().region("acc", 512)
+
+    @cute.kernel
+    def kernel(self, out: cute.Tensor, n: cutlass.Int32):
+        self.begin_roles()
+        self.run_roles(SimpleNamespace(out=out, n=n))
+
+    @cute.jit
+    def __call__(self, out: cute.Tensor, n: cutlass.Int32, stream: cuda.CUstream):
+        self.kernel.set_name_prefix(f"warpdrive_{type(self).__name__.lower()}")
+        self.kernel(out, n).launch(grid=(n, 1, 1), block=(self.num_threads, 1, 1), stream=stream)
+
+
+@cute.jit
+def mark_warp(ctx):
+    """``out[cta, warp] = 1`` for the calling warp."""
+    if cute.arch.lane_idx() == 0:
+        ctx.out[cute.arch.block_idx()[0] * 4 + cute.arch.warp_idx()] = cutlass.Int32(1)
+
+
+class TmemOnWarpZero(TmemPlacementToy):
+    """Only warp 0 uses TMEM: it allocates (the fallback)."""
+
+    @role(warps=0)
+    @cute.jit
+    def mma(self, ctx, *, tmem: Tmem):
+        mark_warp(ctx)
+
+    @role(warps=1)
+    @cute.jit
+    def other(self, ctx):
+        pass
+
+
+class TmemOnWarpgroup(TmemPlacementToy):
+    """One TMEM role on warps 0-3: its warp 1 allocates."""
+
+    @role(warps=range(4))
+    @cute.jit
+    def epilogue(self, ctx, *, tmem: Tmem):
+        mark_warp(ctx)
+
+
+class TmemOnTwoRoles(TmemPlacementToy):
+    """TMEM roles on warps 0 and 2: the second role's warp 2 allocates and frees."""
+
+    @role(warps=0)
+    @cute.jit
+    def mma(self, ctx, *, tmem: Tmem):
+        mark_warp(ctx)
+
+    @role(warps=1)
+    @cute.jit
+    def other(self, ctx):
+        pass
+
+    @role(warps=2)
+    @cute.jit
+    def epilogue(self, ctx, *, tmem: Tmem):
+        mark_warp(ctx)
+
+
+@pytest.mark.parametrize(
+    "toy, allocator, warps",
+    [
+        (TmemOnWarpZero, ("mma", 0), [1, 0, 0, 0]),
+        (TmemOnWarpgroup, ("epilogue", 1), [1, 1, 1, 1]),
+        (TmemOnTwoRoles, ("epilogue", 2), [1, 0, 1, 0]),
+    ],
+)
+def test_tmem_allocator_avoids_the_barrier_warp(requires_blackwell, toy, allocator, warps):
+    op = toy()
+    op._collect()
+    r, warp = op._tmem_allocator()
+    assert (r.name, warp) == allocator
+    ctas = 4 * torch.cuda.get_device_properties(0).multi_processor_count  # several per SM
+    out = torch.zeros(ctas * 4, device="cuda", dtype=torch.int32)
+    compile_toy(op)(out, ctas)
+    torch.cuda.synchronize()
+    assert out.view(ctas, 4).tolist() == [warps] * ctas
 
 
 def test_register_budgets_fit_the_registers_the_launch_starts_with(requires_blackwell):

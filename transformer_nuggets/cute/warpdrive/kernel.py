@@ -1063,11 +1063,7 @@ class WarpSpecialized(metaclass=_KernelType):
         clustered, two_cta = self.cluster.size > 1, self.cluster.pair
         tmem_roles = [r for r in self._ws_roles if r.uses_tmem]
         if tmem_roles:
-            # Every CTA of a cluster allocates (a pair's CTAs together, with
-            # tcgen05.alloc.cta_group::2), so the allocator is the first TMEM role that runs in
-            # every CTA.
-            everywhere = tuple(range(self.cluster.size))
-            alloc_role = next(r for r in tmem_roles if self.cluster.ctas(r.cta) == everywhere)
+            alloc_role, alloc_warp = self._tmem_allocator()
             holder = smem.allocate_array(cutlass.Int32, 1)
             dealloc_bar = smem.allocate_array(cutlass.Int64, 1) if two_cta else None
             tmem = memory.TmemAllocator(
@@ -1075,7 +1071,7 @@ class WarpSpecialized(metaclass=_KernelType):
                 barrier_for_retrieve=pipeline.NamedBarrier(
                     barrier_id=TMEM_PTR_BARRIER_ID, num_threads=self.num_threads
                 ),
-                allocator_warp_id=alloc_role.first_warp,
+                allocator_warp_id=alloc_warp,
                 is_two_cta=two_cta,
                 two_cta_tmem_dealloc_mbar_ptr=dealloc_bar,
             )
@@ -1087,6 +1083,25 @@ class WarpSpecialized(metaclass=_KernelType):
                 tmem.relinquish_alloc_permit()
         self._allocate_plan(smem, layouts or {})
         return smem
+
+    def _tmem_allocator(self) -> tuple[RoleInstance, int]:
+        """The TMEM role and the warp of it that allocates, relinquishes and frees TMEM.
+
+        Every CTA of a cluster allocates (a pair's CTAs together, with
+        tcgen05.alloc.cta_group::2), so the role runs in every CTA. One CTA allocates before
+        the CTA sync while warp 0 initializes the barriers, so it takes the lowest other warp
+        of such a role (FA4 allocates from warp 1) and falls back to warp 0. A cluster
+        allocates after the cluster sync, where the warp makes no difference: the first warp.
+        """
+        everywhere = tuple(range(self.cluster.size))
+        roles = [
+            r for r in self._ws_roles if r.uses_tmem and self.cluster.ctas(r.cta) == everywhere
+        ]
+        if self.cluster.size == 1:
+            others = [(r, w) for r in roles for w in r.warps if w != 0]
+            if others:
+                return min(others, key=lambda rw: rw[1])
+        return roles[0], roles[0].first_warp
 
     def _allocate_plan(self, smem, layouts: dict):
         """Allocate every ``smem_plan`` buffer and check each channel binding's stage count."""
