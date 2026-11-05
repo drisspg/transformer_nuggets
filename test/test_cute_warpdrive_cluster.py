@@ -260,16 +260,26 @@ class _PairPayload(WarpSpecialized):
 def test_pair_placement_errors():
     with pytest.raises(ProtocolError, match=r"pin it with @role\(\.\.\., cta='leader'\)"):
         _Unpinned()._collect()
-    with pytest.raises(ProtocolError, match="would need multicast TMA"):
+    with pytest.raises(ProtocolError, match=r"CTAs \[1\] wait on stages no TMA copy fills"):
         _LeaderTmaToBoth()._collect()
-    with pytest.raises(ProtocolError, match="can only feed leader-only consumers"):
-        _BothTmaToMixed()._collect()
     with pytest.raises(ProtocolError, match="layer-owned payload is per-CTA SMEM"):
         _PairPayload()._collect()
     with pytest.raises(ProtocolError, match="every Tmem role .* is leader-only"):
         _LeaderOnlyTmem()._collect()
     with pytest.raises(ValueError, match="role cta must be one of"):
         role(warps=0, cta="peer")
+
+
+def test_extra_leader_consumer_of_local_tma():
+    """Each CTA's copies land in its own stage (CtaGroup.ONE), where consumers wait. Mixed
+    placement makes the channel pair-scoped, so consumers release both CTAs' producers, as every
+    pair-scoped channel's signals reach the pair."""
+    op = _BothTmaToMixed()
+    op._collect()
+    sc = op.ch.scope
+    assert sc.tx == 1024 and sc.tx_ctas == 1
+    assert sc.full_targets == {0: (0,), 1: (1,)} and sc.empty_targets == {0: (0, 1), 1: (0, 1)}
+    assert sc.empty_counts == {0: [160], 1: [160]}
 
 
 def test_leader_placement_is_a_noop_for_one_cta():

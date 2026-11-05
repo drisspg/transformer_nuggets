@@ -140,9 +140,14 @@ def required_group(chan, cluster) -> str | None:
 
 def expected_stage_bytes(chan) -> int:
     """Bytes one producing CTA's copies must deliver per stage for the armed transaction count
-    (a multicast copy delivers its box to every CTA of its mask)."""
+    (a multicast copy delivers its box to every CTA of its mask): one CTA's bytes for each CTA
+    it fills."""
     sc = chan.scope
-    return sc.tx // chan.derived_scope.tx_ctas
+    return sc.tx // chan.derived_scope.tx_ctas * _fill_count(chan)
+
+
+def _fill_count(chan) -> int:
+    return len(chan.cluster.filled(0, chan.producer.fills))
 
 
 def stage_closed(trace, handle) -> None:
@@ -188,16 +193,22 @@ def check_role(trace, cluster, reports: dict) -> None:
                 partial_chans.setdefault(use.chan.name, problem)
             continue
         need = required_group(use.chan, cluster)
-        modes = use.chan.producer.multicast
+        tma = use.chan.producer
+        # Masks a channel admits: its multicast modes, and with fills the single-CTA fill mask.
+        modes = (*tma.multicast, "fill") if tma.fills else tma.multicast
         for cp in copies:
             if need is not None and cp.group != need:
                 raise ProtocolError(_group_message(trace.role_name, use, cp, need, cluster))
             if cp.multicast is not None and (not modes or cp.multicast not in (*modes, "?")):
                 raise ProtocolError(_multicast_message(trace.role_name, use, cp))
             if cp.multicast == "?":
+                what = "Cluster.fill" if tma.fills else "Cluster.multicast"
                 report.unverified.append(
-                    f"multicast copy at {cp.site} takes a mask not from Cluster.multicast"
+                    f"multicast copy at {cp.site} takes a mask not from {what}"
                 )
+                if tma.fills and stage is not None:
+                    # Its CTAs are unknown, so the bytes it delivers are too.
+                    stage.incomplete.append(f"multicast copy at {cp.site} has an unknown mask")
             report.groups.add(cp.group)
             report.copies.add(cp.site)
         if stage is not None:
@@ -222,7 +233,7 @@ def check_role(trace, cluster, reports: dict) -> None:
         got, want = sum(cp.nbytes for cp in stage.copies), expected_stage_bytes(use.chan)
         if got != want:
             raise ProtocolError(_bytes_message(trace.role_name, use, stage.copies, got, want))
-        report.stage_bytes.add(got)
+        report.stage_bytes.add(got // _fill_count(use.chan))  # per CTA, like Tma.tx_bytes
 
 
 def _copies(use: TmaUse) -> tuple[list[_Copy], list, str | None]:
@@ -400,6 +411,12 @@ def _group_message(role: str, use: TmaUse, cp: _Copy, need: str, cluster) -> str
 def _multicast_message(role: str, use: TmaUse, cp: _Copy) -> str:
     chan = use.chan
     modes = chan.producer.multicast
+    if cp.multicast == "fill":
+        return (
+            f"{role}: the TMA copy at {cp.site} into channel {chan.name} takes a Cluster.fill "
+            "mask, but its Tma declares no fills: the CTA the copy lands in would not release "
+            "this CTA's stage, and nobody arms its barrier; declare Tma(..., fills=...)"
+        )
     along = "" if cp.multicast == "?" else f" along {cp.multicast}"
     declared = f"declares multicast={modes}" if modes else "declares no multicast"
     return (
@@ -414,10 +431,13 @@ def _bytes_message(role: str, use: TmaUse, copies: list, got: int, want: int) ->
     chan, rec = use.chan, use.handle
     sites = ", ".join(dict.fromkeys(cp.site for cp in copies))
     effect = "never completes (hang)" if got < want else "completes before every copy lands"
+    filled = _fill_count(chan)
     per_cta = " per CTA" if chan.scope.pair else ""
+    if filled > 1:
+        per_cta = f" for the {filled} CTAs it fills"
     return (
         f"{role}: {rec.what} opened at {rec.site}: the TMA copies at {sites} deliver {got} "
         f"bytes{per_cta}, but the layer arms {want}{per_cta} (channel {chan.name}, "
         f"Tma({chan.producer.tx_bytes})), so the stage's full barrier {effect}; declare "
-        f"Tma({got}) or fix the copies"
+        f"Tma({got // filled}) or fix the copies"
     )

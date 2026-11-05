@@ -246,7 +246,8 @@ def test_device_rank_helpers_on_host_ranks():
 
 
 def test_cluster_placement_errors():
-    with pytest.raises(ProtocolError, match="multicast TMA channel cannot have a rank0 role"):
+    # A rank0 consumer alone leaves the other pair's multicast copies with no waiter.
+    with pytest.raises(ProtocolError, match=r"complete on leaders \[2\], where no consumer"):
         _MulticastWithRank0()._collect()
     # 2-CTA copies of the second pair would complete on rank 2's barrier, which nobody waits on.
     with pytest.raises(ProtocolError, match="can only feed leader-only consumers"):

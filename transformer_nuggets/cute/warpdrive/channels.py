@@ -47,6 +47,7 @@ from cutlass._mlir.dialects import nvvm as _nvvm
 
 from transformer_nuggets.cute.warpdrive.cluster import (
     ALL,
+    FILLS,
     MULTICAST_MODES,
     SCOPE_OVERRIDES,
     rank_in,
@@ -66,10 +67,16 @@ class Tma:
     ``multicast``: the cluster modes ("m", "n", or both, as a string or tuple) along which the
     copies are multicast (``Cluster.multicast``). A copy multicast along N lands in every CTA
     with this CTA's coordinates except along N; the consumers there must release this CTA's
-    stage too, which the layer derives from the declaration."""
+    stage too, which the layer derives from the declaration.
+
+    ``fills``: ``"pair"`` or ``"cluster"`` when one CTA issues the copies of others: a producer
+    on each pair leader fills both CTAs of its MMA pair, or a ``rank0`` producer every CTA of the
+    cluster (``Cluster.fill``). The producing CTA arms the full barrier of every CTA it fills,
+    and the consumers there release it. ``tx_bytes`` stays what lands in each CTA."""
 
     tx_bytes: int
     multicast: tuple[str, ...] | str = ()
+    fills: str | None = None
 
     def __post_init__(self):
         if type(self.tx_bytes) is not int or self.tx_bytes <= 0:
@@ -82,6 +89,8 @@ class Tma:
                 f"Tma.multicast must name cluster modes from {MULTICAST_MODES}, got {modes!r}"
             )
         object.__setattr__(self, "multicast", tuple(sorted(set(modes))))
+        if self.fills not in FILLS:
+            raise ValueError(f"Tma.fills must be one of {FILLS}, got {self.fills!r}")
 
 
 class Umma:
@@ -885,10 +894,19 @@ class ProducerEnd(_End):
         arms = {r: cs for r, cs in self.targets.items() if cs}
         if all(cs == (r,) for r, cs in arms.items()):
             targets = (None,)  # each arming CTA arms its own barrier
-        else:
-            assert len(arms) == 1, arms  # one CTA arms the barriers of its targets
+        elif len(arms) == 1:  # one CTA arms the barriers of its targets
             ((rank, targets),) = arms.items()
             targets = tuple(None if c == rank else c for c in targets)
+        else:  # each arming CTA arms its own group (Tma(fills="pair")): targets by rank
+            order = {r: sorted(cs, key=lambda c: c != r) for r, cs in arms.items()}
+            widths = {len(cs) for cs in order.values()}
+            assert len(widths) == 1, arms
+            targets = tuple(
+                None
+                if all(order[r][k] == r for r in order)
+                else tuple((r, order[r][k]) for r in order)
+                for k in range(widths.pop())
+            )
         if len(arms) == len(self.ctas):
             _arm_targets(full, scope.tx, targets)
         else:
@@ -962,11 +980,15 @@ def cluster_rank():
     return cute.arch.block_idx_in_cluster()
 
 
-def _arm_one(full, tx: int, cta: int | None):
+def _arm_one(full, tx: int, cta):
+    """Arm ``cta``'s barrier: this CTA's own (None), a rank, or ``((arming rank, target),
+    ...)`` for targets that depend on the arming CTA's rank."""
     if cta is None:  # this CTA's own barrier
         cute.arch.mbarrier_arrive_and_expect_tx(full, tx)
-    else:
-        cute.arch.mbarrier_arrive_and_expect_tx(full, tx, cta)
+        return
+    if isinstance(cta, tuple):
+        cta = rank_value(dict(cta), cluster_rank)
+    cute.arch.mbarrier_arrive_and_expect_tx(full, tx, cta)
 
 
 def _arm_targets(full, tx: int, targets):

@@ -178,7 +178,16 @@ def _channels(kernel) -> str:
         full_ranks = sc.full_ctas if sc.pair else range(cs)
         empty_ranks = sc.empty_ctas if sc.pair else range(cs)
         full = fmt_per_cta(sc.full_counts, full_ranks, by_rank=sc.pair, pair=pair)
-        if sc.tx is not None:
+        if sc.tx is not None and isinstance(ch.producer, Tma) and ch.producer.fills:
+            # The filling CTA arms the barriers of the CTAs it fills.
+            copies = f" ({sc.tx_ctas} CTAs' copies)" if sc.tx_ctas > 1 else ""
+            arms = ", ".join(
+                f"rank {r} arms {'+'.join(map(str, targets))}"
+                for r, targets in sc.full_targets.items()
+                if targets
+            )
+            full += f", tx {sc.tx} B{copies}, {arms}"
+        elif sc.tx is not None:
             # Leaders arm for both CTAs of their pair, or rank 0's scheduler for every CTA.
             armers = [r for r, targets in sc.full_targets.items() if targets]
             armed = sc.pair and (sc.tx_ctas > 1 or armers == [0])
@@ -209,6 +218,8 @@ def _channels(kernel) -> str:
             scope = ["CTA-local"]
             if sc.pair:
                 scope = ["pair-scoped" if pair else "cross-CTA"]
+                if isinstance(ch.producer, Tma) and ch.producer.fills:
+                    scope.append(f"fills {ch.producer.fills}")
                 if isinstance(ch.producer, Tma) and ch.producer.multicast:
                     scope.append(f"multicast {'+'.join(ch.producer.multicast)}")
                 if ch.producer is Umma:
