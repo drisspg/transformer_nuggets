@@ -120,18 +120,38 @@ def arrivals(mech, threads: int) -> int:
     return threads // 32 if mech is Warps else 1
 
 
-def _fence(kind: str | None):
-    if kind is None:
-        return
-    if kind == "tmem_store":  # tcgen05.st -> tcgen05.mma reads TMEM
-        cute.arch.fence_view_async_tmem_store()
-    elif kind == "smem_async":  # st.shared -> TMA store / UMMA reads SMEM (async proxy)
-        cute.arch.fence_view_async_shared()
-    else:
-        raise ValueError(f"unknown fence kind {kind!r}")
+def _fence(kinds: tuple[str, ...]):
+    """Emit the side's fences, in declaration order, before its managed signal."""
+    for kind in kinds:
+        if kind == "tmem_store":  # tcgen05.st -> tcgen05.mma reads TMEM
+            cute.arch.fence_view_async_tmem_store()
+        elif kind == "smem_async":  # st.shared -> TMA store / UMMA reads SMEM (async proxy)
+            cute.arch.fence_view_async_shared()
+        else:
+            raise ValueError(f"unknown fence kind {kind!r}")
 
 
-FENCE_KINDS = (None, "tmem_store", "smem_async")
+FENCE_KINDS = ("tmem_store", "smem_async")
+
+
+def _fences(side: str, value) -> tuple[str, ...]:
+    """``commit_fence``/``release_fence`` normalized: None -> (), a kind -> (kind,), an ordered
+    tuple of distinct kinds (possibly empty) unchanged."""
+    if value is None:
+        return ()
+    kinds = (value,) if isinstance(value, str) else value
+    if (
+        not isinstance(kinds, tuple)
+        or any(k not in FENCE_KINDS for k in kinds)
+        or len(set(kinds)) != len(kinds)
+    ):
+        raise ValueError(
+            f"{side} must be None, one of {FENCE_KINDS}, or an ordered tuple of distinct kinds, "
+            f"got {value!r}"
+        )
+    return kinds
+
+
 SYNC_KINDS = ("mbarrier", "named")
 
 
@@ -146,8 +166,9 @@ class Channel:
     then the stage's canonical view and ``handle.view(name)`` a registered partition
     (``storage.py``). A buffer, unlike a payload, changes neither ``remote_scope`` nor fences
     and is allowed on pair-scoped channels. ``commit_fence``/``release_fence`` say
-    what the producer/consumer wrote before signalling ("tmem_store" or "smem_async"); the
-    layer emits the matching fence before every arrive on that side.
+    what the producer/consumer wrote before signalling: ``"tmem_store"``, ``"smem_async"``, or
+    an ordered tuple of both when a side hands over TMEM stores and SMEM stores at once; the
+    layer emits exactly those fences, in that order, before every managed arrive on that side.
 
     ``remote_scope``: memory scope of thread arrivals on a pair-scoped channel's barriers in the
     other CTA. ``"cta"`` (default without a payload; what CUTLASS and FA4 pipelines use) only
@@ -177,8 +198,8 @@ class Channel:
     consumer_roles: tuple[str, ...] | None = None
     payload: tuple | None = None
     buffer: SmemBuffer | dict | None = None
-    commit_fence: str | None = None
-    release_fence: str | None = None
+    commit_fence: str | tuple[str, ...] | None = None
+    release_fence: str | tuple[str, ...] | None = None
     remote_scope: str | None = None
     override: dict | None = None
     round_robin: bool = False
@@ -215,9 +236,9 @@ class Channel:
                 )
         if isinstance(self.consumer, Tma):
             raise ValueError("TMA is a producer mechanism")  # noqa: TRY004
-        if self.commit_fence not in FENCE_KINDS or self.release_fence not in FENCE_KINDS:
-            raise ValueError(f"fence kinds must be one of {FENCE_KINDS}")
-        if isinstance(self.producer, Tma) and self.commit_fence is not None:
+        self.commit_fence = _fences("commit_fence", self.commit_fence)
+        self.release_fence = _fences("release_fence", self.release_fence)
+        if isinstance(self.producer, Tma) and self.commit_fence:
             raise ValueError("TMA producers do not arrive, so they have no commit to fence")
         if self.remote_scope not in (None, "cta", "cluster"):
             raise ValueError(f"remote_scope must be 'cta' or 'cluster', got {self.remote_scope!r}")

@@ -415,9 +415,6 @@ Dropped down, each documented at its site:
 
 Diagnostics that stay noisy:
 
-- The `ds` commit needs both a `tmem_store` fence (dS in TMEM) and an `smem_async` fence (dS in
-  SMEM); a side takes one fence kind, so the `tmem_store` one comes from the `dp` release just
-  before it, which the alias diagnostic does not credit (one `unverified`).
 - The alias diagnostic reports potential hazards on P~S, dS~dP, dQ~dP and dQ~dS that the
   channel round trips do order. Its graph matches epochs only when the traced per-item counts
   agree; the MMA role peels its last tile, so its s/dp/dq counts (prologue, two unrolled

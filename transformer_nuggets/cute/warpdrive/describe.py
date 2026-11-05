@@ -240,9 +240,9 @@ def _channels(kernel) -> str:
             names = [k if k == b.name else f"{k}={b.name}" for k, b in ch.buffers.items()]
             extra.append(f"buffer {', '.join(names)}")
         if ch.commit_fence:
-            extra.append(f"commit_fence {ch.commit_fence}")
+            extra.append(f"commit_fence {'+'.join(ch.commit_fence)}")
         if ch.release_fence:
-            extra.append(f"release_fence {ch.release_fence}")
+            extra.append(f"release_fence {'+'.join(ch.release_fence)}")
         if extra:
             storage = ch.payload is not None or ch.buffers
             details.append(("storage" if storage else "fences", ", ".join(extra)))

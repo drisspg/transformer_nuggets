@@ -162,8 +162,20 @@ def declaration_cases(seed: int) -> list[DeclarationCase]:
     for value in ([1.5], [True], [0], [1, 2], "x", 1.5):
         add(f"counts={value!r}", "E36/G3", lambda v=value: Barriers(1, counts=v))
     for kind in ("commit_fence", "release_fence"):
-        add(f"bad {kind}", "E30", lambda k=kind: Ring(1, **{k: "wrong"}), message="fence kinds")
-    add("TMA commit fence", "E31", lambda: Ring(1, Tma(16), commit_fence="smem_async"))
+        for value in (
+            "wrong",
+            ("smem_async", "wrong"),
+            ("smem_async", "smem_async"),
+            ["smem_async"],
+        ):
+            add(
+                f"bad {kind}={value!r}",
+                "E30",
+                lambda k=kind, v=value: Ring(1, **{k: v}),
+                message=kind,
+            )
+    for value in ("smem_async", ("tmem_store", "smem_async")):
+        add(f"TMA commit fence {value!r}", "E31", lambda v=value: Ring(1, Tma(16), commit_fence=v))
     add("bad remote scope", "E32", lambda: Ring(1, remote_scope="gpu"))
     add("unknown override", "E33", lambda: Ring(1, override={"typo": 1}))
     add("too many slots", "E34", lambda: Slots(32))

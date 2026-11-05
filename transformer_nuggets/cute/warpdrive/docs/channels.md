@@ -299,9 +299,15 @@ For swizzled tiles, several buffers per channel or overlapping allocations, use
 [`SmemPlan` and `buffer=`](storage.md). Those buffers are also selected through the handle;
 binding them does not add fences or change remote memory scope.
 
-`commit_fence` and `release_fence` accept `"tmem_store"` or `"smem_async"`. They run before
-the corresponding managed signal. TMA producers cannot have a commit fence.
-`commit(signal=False)` and `release(signal=False)` omit both the signal and its fence.
+`commit_fence` and `release_fence` accept `"tmem_store"` (`tcgen05.wait::st`), `"smem_async"`
+(`fence.proxy.async`), or an ordered tuple of both for a side that hands over TMEM stores and
+SMEM stores at once (FA4 backward's dS: `commit_fence=("tmem_store", "smem_async")`). A string
+is the one-element tuple. The layer emits exactly the declared fences, in that order, before the
+corresponding managed signal; unknown or repeated kinds and a commit fence on a TMA producer
+are rejected at declaration. `commit(signal=False)` and `release(signal=False)` omit the signal
+and all of its fences. The alias diagnostic credits a side's fences by membership: a TMEM
+store handed over by a side without `"tmem_store"`, or an SMEM store read by the async proxy
+after a side without `"smem_async"`, stays unverified.
 Your other async operations still need their own completion waits and proxy fences,
 including the lifecycles of TMA stores and TMEM alias accesses.
 

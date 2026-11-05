@@ -302,6 +302,105 @@ def test_fence_async_shared_supplies_the_proxy_fence(fence):
     assert ("[proxy]" in alias_section(op)) != fence
 
 
+class StoresToTmemAndSmemForUmma(Model):
+    """One commit hands over both a TMEM store (dS over dP) and an SMEM store (X under Y) to an
+    MMA, as FA4 backward's dS commit does: the side needs both fence kinds, in order."""
+
+    def __init__(self, fences):
+        self.fences = fences
+        self.smem_plan = SmemPlan()
+        x = self.smem_plan.buffer("X", cutlass.Int32, align=128)
+        y = self.smem_plan.buffer("Y", cutlass.Int32, overlaps=x)
+        self.tmem_plan = TmemPlan().region("dP", 64).alias("dS", of="dP", offset=0, cols=64)
+        # Two slots so the buffers have static stage spans; only slot 0 is used.
+        self.ds = Slots(2, Threads, Umma, buffer={"X": x, "Y": y}, commit_fence=fences)
+
+    def layouts(self):
+        return {"X": cute.make_layout((32, 2)), "Y": cute.make_layout((32, 2))}
+
+    @role(warps=range(4))
+    @cute.jit
+    def compute(self, ctx, *, ds: Producer, tmem: Tmem):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            with ds.produce(0) as h:
+                tmem.access("dS", write=True)  # tcgen05.st
+                h.access("X", write=True)  # st.shared
+        return ds
+
+    @role(warps=4)
+    @cute.jit
+    def mma(self, ctx, *, ds: Consumer, tmem: Tmem):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            with ds.consume(0) as h:
+                tmem.access("dP", read=True, by="umma")  # the dS columns as an A operand
+                h.access("Y", read=True, by="umma")
+        return ds
+
+
+@pytest.mark.parametrize(
+    "fences, tmem_ok, smem_ok",
+    [
+        (("tmem_store", "smem_async"), True, True),
+        (("smem_async", "tmem_store"), True, True),
+        ("smem_async", False, True),
+        ("tmem_store", True, False),
+        (None, False, False),
+    ],
+    ids=["both", "both_reversed", "smem_only", "tmem_only", "none"],
+)
+def test_commit_fence_tuple_covers_both_stores(fences, tmem_ok, smem_ok):
+    op = StoresToTmemAndSmemForUmma(fences)
+    tag = "_".join(fences) if isinstance(fences, tuple) else str(fences).lower()
+    compile_quietly(op, f"fence_tuple_{tag}")
+    text = alias_section(op)
+    assert status(op, "dS ~ dP") == ("no hazard found" if tmem_ok else "unverified"), text
+    assert status(op, "Y ~ X") == ("no hazard found" if smem_ok else "unverified"), text
+    assert ("[tmem_store]" in text) != tmem_ok and ("[proxy]" in text) != smem_ok
+
+
+@pytest.mark.parametrize(
+    "fences, signal",
+    [
+        (("tmem_store", "smem_async"), True),
+        (("smem_async", "tmem_store"), True),
+        ("smem_async", True),
+        (("tmem_store", "smem_async"), False),
+    ],
+    ids=["both", "both_reversed", "single", "raw_signal"],
+)
+def test_commit_fences_are_emitted_in_declaration_order(monkeypatch, fences, signal):
+    """The layer emits exactly the declared fences, in order, once per managed commit, and none
+    for ``commit(signal=False)``; the only fences in this kernel are the commit's."""
+    emitted = []
+    for kind, name in (
+        ("tmem_store", "fence_view_async_tmem_store"),
+        ("smem_async", "fence_view_async_shared"),
+    ):
+        original = getattr(cute.arch, name)
+
+        def record(*args, _kind=kind, _original=original, **kwargs):
+            emitted.append(_kind)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(cute.arch, name, record)
+
+    class Op(StoresToTmemAndSmemForUmma):
+        @role(warps=range(4))
+        @cute.jit
+        def compute(self, ctx, *, ds: Producer, tmem: Tmem):
+            for _ in cutlass.range(ctx.n, unroll=1):
+                h = ds.acquire(0)
+                tmem.access("dS", write=True)
+                h.access("X", write=True)
+                h.commit(signal=signal)
+            return ds
+
+    tag = ("_".join(fences) if isinstance(fences, tuple) else fences) + f"_{int(signal)}"
+    compile_toy.__wrapped__(Op(fences), f"fence_order_{tag}")  # traced, not a cached artifact
+    expected = list(fences if isinstance(fences, tuple) else (fences,)) if signal else []
+    assert emitted == expected
+
+
 class LoopInsideHandle(LoopCarriedMma):
     """The same loop inside one handle: the handle must not hide the loop-carried pair."""
 

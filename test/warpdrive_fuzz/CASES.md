@@ -45,7 +45,7 @@ inside a compiled entry point.
 | E27 | Turnstile has <2 parties or parties are not instances of one method (disabled too) | ProtocolError |
 | E28 | A role takes Tmem but no tmem_plan exists | ProtocolError |
 | E29 | Channel stage count not a positive Python int (bool excluded) | ValueError |
-| E30 | Fence not None/tmem_store/smem_async | ValueError |
+| E30 | Fence not None, tmem_store, smem_async or an ordered tuple of distinct kinds | ValueError |
 | E31 | TMA producer has a commit fence | ValueError |
 | E32 | remote_scope not None/cta/cluster | ValueError |
 | E33 | Unknown scope-override key | ValueError |

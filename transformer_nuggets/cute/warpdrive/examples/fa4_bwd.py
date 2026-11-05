@@ -234,7 +234,8 @@ class FlashAttentionBackward(WarpSpecialized):
         self.dpsum = Ring(1, Tma(TILE_M * 4), Warps, buffer=dpsum_buf, release_fence="smem_async")
         self.s = Ring(1, Umma, Warps, release_fence="tmem_store")  # P stored over S
         self.dp = Ring(1, Umma, Warps, release_fence="tmem_store")  # dS stored over dP
-        self.ds = Ring(1, Warps, Umma, buffer=ds_buf, commit_fence="smem_async")
+        # dS is handed over both in TMEM (tcgen05.st over dP) and in SMEM (sdS): both fences.
+        self.ds = Ring(1, Warps, Umma, buffer=ds_buf, commit_fence=("tmem_store", "smem_async"))
         self.dq = Ring(1, Umma, Warps)
         self.dkv = Slots(2, Umma, Warps)  # slot 0: dV, slot 1: dK
         # Syncs inside a role: the 8 compute warps (P over S, dS over dP), the 4 reduce warps
@@ -649,7 +650,7 @@ class FlashAttentionBackward(WarpSpecialized):
                     cute.autovec_copy(rdS, tRS_sdS[None, st])
                 dph.release()  # layer fences the tcgen05.st of dS
                 dh.release()
-                dsh.commit()  # layer fences the sdS stores for the dQ MMA
+                dsh.commit()  # layer fences the dS tcgen05.st and sdS stores for the dQ MMA
             dkv = self.epilogue(params, dkv, tmem, tidx, n_block, head, batch)
             work.advance()
         return lse, dpsum, s, dp, ds, dkv, work

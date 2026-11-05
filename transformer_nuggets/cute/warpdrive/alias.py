@@ -410,7 +410,7 @@ def _completion(
             f"{where}: a {mech_name} {side} signal does not publish this thread's accesses",
             "commit" if mech_name == "Umma" else "complete_tx",
         )
-    if a.storage[0] == "tmem" and a.write and fence != "tmem_store":
+    if a.storage[0] == "tmem" and a.write and "tmem_store" not in fence:
         return Finding(
             UNVERIFIED,
             f"{where}: tcgen05.st is not waited (channel tmem_store fence) before the signal "
@@ -419,7 +419,7 @@ def _completion(
         )
     if other in ("tma", "umma") and a.storage[0] == "smem":
         fences = {e.data["kind"] for e in _between(a.role, seq, pos_a, pos_e) if e.kind == "fence"}
-        if fence != "smem_async" and "smem_async" not in fences:
+        if "smem_async" not in fence and "smem_async" not in fences:
             return Finding(
                 UNVERIFIED,
                 f"{where}: no fence.proxy.async between a generic access and a later {other} "
