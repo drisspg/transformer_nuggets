@@ -142,6 +142,8 @@ inside a compiled entry point.
 | E124 | `Cluster` with a non-positive-int extent, non-bool `pair`, odd `m` with pairs, or more than 8 CTAs; `Tma.multicast` naming anything but "m"/"n"; `Tma.fills` other than None/"pair"/"cluster" | ValueError / cluster.py, channels.py |
 | E125 | `Tma(fills="pair")` without MMA pairs or with a producer not exactly on the pair leaders; `fills="cluster"` with a producer not exactly on rank 0 | ProtocolError / cluster.py |
 | E126 | Recognized multicast TMA copy into a channel whose `Tma` declares no multicast, or whose mask (from `Cluster.multicast`/`Cluster.fill`) has an undeclared mode; a `Cluster.fill` mask into a channel without `fills` | ProtocolError (trace time) / tma.py |
+| E127 | `token=` that is not this end's own `try_wait`/`try_acquire` result, names another slot, is stale (an acquire/wait or `end.state` assignment on the end since the probe) or was probed in another dynamic region; a probe or `token=` on a named channel | ProtocolError (trace time) / channels.py |
+| E128 | A preview written, committed, released or retired; used after its owning wait's handle closed or in another dynamic region; left with no later wait in its role; `peek()` on a named channel | ProtocolError (trace time) / channels.py |
 
 ## Runtime labels
 

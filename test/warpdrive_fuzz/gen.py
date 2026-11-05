@@ -185,6 +185,9 @@ class ChannelSpec:
     # "buffer" (an SmemPlan buffer with a StageView of the TMA partition).
     storage: str = ""
     alias_opt_out: bool = False  # the consumer's read annotation sits in unchecked("alias")
+    # How handles open: "" a plain acquire/wait; "try" probe each side first (try_acquire/
+    # try_wait) and pass the token; "peek" the consumer previews the epoch before its wait.
+    wait: str = ""
 
     @property
     def tma_tiles(self) -> int:
@@ -899,6 +902,7 @@ def generate(
     ext = random.Random(f"wdfuzz-ext-{seed}")
     fill_rng = random.Random(f"wdfuzz-fill-{seed}")  # Tma(fills=...), added after ext
     warps_rng = random.Random(f"wdfuzz-warps-{seed}")  # Warps sides, added after fills
+    wait_rng = random.Random(f"wdfuzz-wait-{seed}")  # try tokens and previews, added after Warps
     cluster = tuple(cluster) if cluster is not None else ()
     if cluster:
         pair = cluster[2]
@@ -1257,6 +1261,8 @@ def generate(
         ]
         if ch["kind"] != "raw" and sides and warps_rng.random() < 0.1:
             ch["warps"] = "".join(x for x in sides if warps_rng.random() < 0.7) or sides[0]
+        if ch["kind"] != "raw" and not ch.get("mma") and wait_rng.random() < 0.2:
+            ch["wait"] = wait_rng.choice(["try", "peek"])
     spec = KernelSpec(
         seed=seed,
         pair=pair,
@@ -1637,13 +1643,26 @@ def _emit_body(src: _Src, spec: KernelSpec, r: RoleSpec, extra: bool):
                     f"{c.tma_tiles}, tid, {c.tma_rows}, {TMA_COLS}, {r.threads}, {c.salt})"
                 )
 
+    def open_args(key) -> str:
+        """The acquire/wait arguments, after emitting the channel's probe or preview."""
+        ch, side, k = key
+        c = chans[ch]
+        arg = "" if c.kind == "ring" else ("stage" if k == BOUND else str(k))
+        if c.wait == "try":
+            probe = "try_acquire" if side == "p" else "try_wait"
+            src(f"tok_{_hvar(key)} = {ch}.{probe}({arg})")
+            return f"{arg}, token=tok_{_hvar(key)}" if arg else f"token=tok_{_hvar(key)}"
+        if c.wait == "peek" and side == "c":
+            src(f"{ch}.peek({arg})")
+        return arg
+
     def open_stmt(key):
         ch, side, k = key
         c = chans[ch]
         if c.kind == "raw":
             return
         op = "acquire" if side == "p" else "wait"
-        arg = "" if c.kind == "ring" else ("stage" if k == BOUND else str(k))
+        arg = open_args(key)
         if unchecked_here(key, "unclosed"):
             src('with unchecked("unclosed", reason="fuzz: signalled through the raw barrier"):')
             src(f"    {_hvar(key)} = {ch}.{op}({arg})")
@@ -1696,8 +1715,7 @@ def _emit_body(src: _Src, spec: KernelSpec, r: RoleSpec, extra: bool):
         if op == "o":
             if key in withs:
                 verb = "produce" if side == "p" else "consume"
-                arg = "" if chans[ch].kind == "ring" else ("stage" if k == BOUND else str(k))
-                src.block(f"with {ch}.{verb}({arg}) as {_hvar(key)}:")
+                src.block(f"with {ch}.{verb}({open_args(key)}) as {_hvar(key)}:")
                 stack.append(key)
                 on_open(key)
             else:
@@ -2406,4 +2424,6 @@ def features(spec: KernelSpec) -> set[str]:
             out.add(f"storage_{ch.storage}_{'tma' if ch.producer == 'tma' else 'threads'}")
         if ch.alias_opt_out:
             out.add("unchecked_alias")
+        if ch.wait:
+            out.add(f"wait_{ch.wait}")
     return out

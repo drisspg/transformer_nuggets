@@ -53,14 +53,17 @@ is not a stable program across generator changes.
 Runtime oracles check progress, values, per-handle epochs, role placement, per-unit work
 sequences and coverage, plus bitwise repeatability where the generated program requires it.
 Generator cases include Rings/Slots, joins, turns, raw barriers/roles, overrides, storage
-bindings and overlaps, built-in/custom schedules, ready device lists and concurrent launches
-with separate workspaces. See `gen.py` for the enabled combinations rather than assuming their
+bindings and overlaps, try-token and preview waits, built-in/custom schedules, ready device
+lists and concurrent launches with separate workspaces. See `gen.py` for the enabled combinations rather than assuming their
 full Cartesian product is covered.
 
 Current gaps to consider when extending a kernel or the generator:
 
 - The generated MMA data path is single-CTA; example tests cover two-CTA MMA data.
 - Round-robin/named channels and IKET captures are not generated. IKET compile/run is covered.
+- Try tokens are probed immediately before their wait and previews read nothing, so the
+  generator exercises both probe outcomes and the non-advancing wait, not preview reads or
+  work between the probe and the wait (the unit toys in `test_cute_warpdrive_tokens.py` do).
 - Multicast generation does not combine both modes in one channel. Manual signals, overrides
   and unclosed handles skip multicast and `fills` because the local-only manual protocol is
   invalid there. `Tma(fills=...)` channels copy the same tile into every CTA they fill (a

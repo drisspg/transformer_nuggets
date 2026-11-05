@@ -175,6 +175,53 @@ def mutations() -> list[Mutation]:
             "out_of_range_slot", "E61", valid.replace("SLOT", "31"), kind="slots", message="got 31"
         ),
         Mutation(
+            "valid_token",
+            "R2",
+            loop
+            + "    t = ch.try_acquire(SLOT)\n    h = ch.acquire(SLOT, token=t)\n    h.commit()",
+            kind="slots",
+            error=None,
+        ),
+        Mutation(
+            "token_across_loop",
+            "E127",
+            "t = ch.try_acquire(SLOT)\n"
+            + loop
+            + "    h = ch.acquire(SLOT, token=t)\n    h.commit()",
+            kind="slots",
+            message="different dynamic region",
+        ),
+        Mutation(
+            "token_reused",
+            "E127",
+            loop
+            + "    t = ch.try_acquire(SLOT)\n"
+            + "    h = ch.acquire(SLOT, token=t)\n    h.commit()\n" * 2,
+            kind="slots",
+            message="stale token",
+        ),
+        Mutation(
+            "valid_peek",
+            "R2",
+            loop + "    ch.peek(SLOT)\n    h = ch.wait(SLOT)\n    h.release()",
+            kind="consumer",
+            error=None,
+        ),
+        Mutation(
+            "preview_write",
+            "E128",
+            loop + "    ch.peek(SLOT).view(write=True)\n    h = ch.wait(SLOT)\n    h.release()",
+            kind="consumer",
+            message="read-only borrow",
+        ),
+        Mutation(
+            "preview_unconsumed",
+            "E128",
+            loop + "    h = ch.wait(SLOT)\n    h.release()\n    ch.peek(SLOT)",
+            kind="consumer",
+            message="previews no later wait consumes",
+        ),
+        Mutation(
             "helper_discards_end", "U10", loop + "    self.step(ch)", error=None, obligation=True
         ),
         Mutation(
