@@ -136,16 +136,11 @@ def current_block():
 
 
 def _block_depth(block, root) -> int | None:
-    depth = 0
     try:
-        while block is not None:
-            if block == root:
-                return depth
-            block = block.owner.operation.block
-            depth += 1
+        blocks = _ancestors(block, root)
+        return len(blocks) - 1 if blocks and blocks[-1] == root else None
     except (AttributeError, ValueError, RuntimeError):
         return None
-    return None
 
 
 def _ancestors(block, root) -> list:

@@ -62,15 +62,18 @@ def record_multicast_mask(mask, mode: str, ctas: int, target=None) -> None:
     """Record a mask; ``target``: the rank (a Python int or a device value) of the CTA a
     ``Cluster.fill`` copy is for. Fills of different CTAs can share a constant mask (two CTAs on
     one multicast line), so a mask keeps every target it was built for."""
-    value = mask.ir_value()
+    _, _, targets = _MASKS.setdefault(_mask_key(mask.ir_value()), (mode, ctas, set()))
+    if target is not None:
+        targets.add(target if isinstance(target, int) else ("rank", hash(target.ir_value())))
+
+
+def _mask_key(value) -> int | tuple[str, int | None]:
     owner = value.owner
     key = hash(value)
     if getattr(owner, "name", None) == "arith.constant":
         # A constant mask is rematerialized at each use, so it is known by its bits.
         key = ("const", _constant_bits(owner))
-    _, _, targets = _MASKS.setdefault(key, (mode, ctas, set()))
-    if target is not None:
-        targets.add(target if isinstance(target, int) else ("rank", hash(target.ir_value())))
+    return key
 
 
 def _constant_bits(op) -> int | None:
@@ -375,11 +378,7 @@ def _mask_mode(copy_op) -> tuple[str, object]:
     op = copy_op.operands[0].owner.operation
     while op.name == SET_VALUE:
         if "<mcast_mask>" in str(op.attributes["field"]):
-            mask = op.operands[1]
-            owner = mask.owner
-            key = hash(mask)
-            if getattr(owner, "name", None) == "arith.constant":
-                key = ("const", _constant_bits(owner))
+            key = _mask_key(op.operands[1])
             return _MASKS.get(key, ("?",))[0], key
         op = op.operands[0].owner.operation
     return "?", None
