@@ -32,6 +32,7 @@ from transformer_nuggets.cute.warpdrive import (
     Umma,
     WarpSpecialized,
     role,
+    unchecked,
 )
 
 N = 32  # payload words per stage: one per consumer lane
@@ -127,6 +128,22 @@ class Misuse(Toy):
             token = ch.try_wait()
             for _ in cutlass.range(ctx.n, unroll=1):
                 ch.wait(token=token).release()
+        elif cutlass.const_expr(mode.startswith("carry_")):
+            token = ch.try_wait()
+            if cutlass.const_expr(mode == "carry_entry"):
+                ch.wait().release()  # the token entering the loop names a consumed epoch
+            for _ in cutlass.range(ctx.n, unroll=1):
+                if cutlass.const_expr(mode == "carry_not_first"):
+                    ch.wait().release()
+                ch.wait(token=token).release()
+                token = ch.try_wait()
+                if cutlass.const_expr(mode == "carry_back_edge"):
+                    ch.wait().release()  # the token passed on names a consumed epoch
+        elif cutlass.const_expr(mode == "branch_merged"):
+            token = ch.try_wait()
+            if ctx.n > 1:
+                token = ch.try_wait()
+            ch.wait(token=token).release()
         elif cutlass.const_expr(mode == "preview_region"):
             preview = ch.peek()
             for _ in cutlass.range(ctx.n, unroll=1):
@@ -198,7 +215,7 @@ class Misuse(Toy):
     [
         (
             "boolean",
-            r"ch\.wait\(token=\.\.\.\) at .* takes the Token returned by ch\.try_wait\(\), got Boolean",
+            r"ch\.wait\(token=\.\.\.\) at .* takes the Token returned by ch\.try_wait\(\), got Boolean \(a raw readiness Boolean needs",
         ),
         ("forged", r"this token was not returned by ch\.try_wait\(\)"),
         ("other_end", r"got a token of the other consumer end of cons"),
@@ -209,6 +226,17 @@ class Misuse(Toy):
         ("state", r"stale token"),
         ("state_read", r"stale token"),
         ("region", r"used in a different dynamic region"),
+        (
+            "carry_entry",
+            r"carried through a loop or branch, and the value entering at .* is stale",
+        ),
+        ("carry_not_first", r"stale token probed at"),
+        (
+            "carry_back_edge",
+            r"token carried by the loop: the value one iteration passes to the next \(probed at "
+            r"test_cute_warpdrive_tokens\.py:\d+\) is stale",
+        ),
+        ("branch_merged", r"carried through a loop or branch, and a branch merged it"),
         ("slot", r"the token probed slot 0 .*, not 1"),
         ("named_try_wait", r"named\.try_wait\(\) at .*cannot be probed or previewed"),
         ("named_try_acquire", r"named\.try_acquire\(\) at .*cannot be probed or previewed"),
@@ -281,6 +309,12 @@ class Accepted(Toy):
                         pass
                     if cutlass.const_expr(k == 0):
                         token = ch.try_wait()
+            if cutlass.const_expr(self.mode == "carried"):
+                token = ch.try_wait()
+                for _ in cutlass.range(2, unroll=1):
+                    ch.wait(token=token).release()
+                    token = ch.try_wait()
+                ch.wait(token=token).release()  # the loop's last probe, after the loop
             token = rr.try_wait()  # this instance's own epoch of the round-robin ring
             rr.peek()
             rr.wait(token=token).release()
@@ -291,7 +325,7 @@ def pass_through(end):
     return end
 
 
-@pytest.mark.parametrize("mode", ["unrolled", "slots", "helper", "token_then_peek"])
+@pytest.mark.parametrize("mode", ["unrolled", "slots", "helper", "token_then_peek", "carried"])
 def test_valid_uses_compile(mode):
     compile_toy(Accepted(mode), f"accepted_{mode}")
 
@@ -413,6 +447,83 @@ def test_token_probe_outcomes(requires_blackwell, late):
             assert cons == [0] * n and prod == [1] * n
         else:  # every consumer probe succeeds; the producer runs two stages ahead, then waits
             assert cons == [1] * n and prod == [1, 1] + [0] * (n - 2)
+
+
+class CarriedToy(Toy):
+    """CUTLASS's mainloop idiom: the consumer probes the next epoch after each release (and
+    once before the loop) and its next iteration's wait consumes that readiness. ``carry``:
+    "raw" carries ``token.ready`` as a Boolean, trusted under ``unchecked("token")``; "token"
+    carries the checked ``Token`` itself. ``late``
+    as in ``TokenToy``. ``out``: consumer probe results, then wrong words."""
+
+    def __init__(self, carry: str, late: str):
+        self.carry, self.late = carry, late
+        self.label = f"carried_{carry}_{late}"
+        self.ch = Ring(2, Threads, Threads, payload=(cutlass.Int32, (N,)))
+
+    @role(warps=0)
+    @cute.jit
+    def prod(self, ctx, *, ch: Producer):
+        lane = cute.arch.lane_idx()
+        for i in cutlass.range(ctx.n, unroll=1):
+            if cutlass.const_expr(self.late == "producer"):
+                spin(ctx.delay)
+            with ch.produce() as h:
+                h.data[lane] = i * N + lane
+        return ch
+
+    @role(warps=1)
+    @cute.jit
+    def cons(self, ctx, *, ch: Consumer):
+        lane = cute.arch.lane_idx()
+        bad = cutlass.Int32(0)
+        if cutlass.const_expr(self.late == "consumer"):
+            spin(ctx.delay)
+        if cutlass.const_expr(self.carry == "raw"):
+            ready = ch.try_wait().ready
+            for i in cutlass.range(ctx.n, unroll=1):
+                if lane == 0:
+                    ctx.out[i] = cutlass.Int32(ready)
+                with unchecked("token", reason="probed at the end of the previous iteration"):
+                    h = ch.wait(token=ready)
+                bad = bad + (h.data[lane] != i * N + lane)
+                h.release()
+                if cutlass.const_expr(self.late == "consumer"):
+                    spin(ctx.delay)
+                ready = ch.try_wait().ready  # the next iteration's epoch
+        else:
+            token = ch.try_wait()
+            for i in cutlass.range(ctx.n, unroll=1):
+                if lane == 0:
+                    ctx.out[i] = cutlass.Int32(token.ready)
+                h = ch.wait(token=token)
+                bad = bad + (h.data[lane] != i * N + lane)
+                h.release()
+                if cutlass.const_expr(self.late == "consumer"):
+                    spin(ctx.delay)
+                token = ch.try_wait()  # the next iteration's epoch
+        ctx.out[ctx.n + lane] = bad
+        return ch
+
+
+@pytest.mark.parametrize("carry", ["raw", "token"])
+@pytest.mark.parametrize("late", ["producer", "consumer"])
+def test_readiness_carried_across_iterations(requires_blackwell, carry, late):
+    n = 6
+    op = CarriedToy(carry, late)
+    fn = compile_toy(op, op.label)
+    if carry == "raw":
+        assert re.search(
+            r"unchecked token @ .*'probed at the end of the previous iteration' -> "
+            r"ch\.wait\(token=Boolean\)",
+            op.describe(),
+        ), op.describe()
+    for _ in range(3):
+        out = torch.full((n + N,), -1, device="cuda", dtype=torch.int32)
+        fn(out, n, DELAY)
+        torch.cuda.synchronize()
+        assert out[n:].tolist() == [0] * N
+        assert out[:n].tolist() == [int(late == "consumer")] * n
 
 
 # --------------------------------------------------------------------------- #

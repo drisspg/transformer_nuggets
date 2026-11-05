@@ -134,8 +134,11 @@ The [decode example](../examples/fa4_decode_swapab.py) alternates KV blocks this
 
 ```python
 self.kv = Ring(
-    12, Tma(stage_bytes), Umma,
-    consumer_roles=("mma_qk", "mma_pv"), consumer_mode="exclusive",
+    12,
+    Tma(stage_bytes),
+    Umma,
+    consumer_roles=("mma_qk", "mma_pv"),
+    consumer_mode="exclusive",
     buffer={"K": k_buf, "V": v_buf},
 )
 
@@ -439,10 +442,36 @@ raise `ProtocolError` when the token:
   which covers reuse of the token and an epoch n stages later with the same stage and parity,
   or raw code read or assigned `end.state` (reading hands out the live state, which may be
   advanced in place);
-- was probed in another dynamic region (loop or branch). The trace sees a loop body once,
-  so a token taken before a loop could be consumed by the first iteration and then reused as
-  stale. Probe in the region that consumes the token, as FA4 does inside an unrolled K-step
-  loop. Tokens can't be carried across loop iterations.
+- was probed in another dynamic region (loop or branch) and not carried into it. The trace
+  sees a loop body once, so a token taken before a loop and used inside it without being
+  reassigned would be consumed by the first iteration and then reused as stale. Probe in the
+  region that consumes the token, as FA4 does inside an unrolled K-step loop, or carry it.
+
+A token is a DSL value, so a loop can carry it. CUTLASS's mainloops probe the next epoch at
+the end of each iteration and consume it in the next one:
+
+```python
+token = ab.try_wait()
+for k in cutlass.range(k_tiles, unroll=1):
+    h = ab.wait(token=token)
+    ...
+    h.release()
+    token = ab.try_wait()  # the next iteration's epoch
+```
+
+The checks follow the carry. The token entering the loop and the one each iteration passes
+on must still name the end's next epoch: no acquire/wait on the end, and no `end.state`
+access, between the probe and the loop entry or the end of the body. The body must consume the
+carried token at its top level before any other acquire/wait on the end. A violation raises
+`ProtocolError` naming the probe; the back-edge is checked at role exit, since the trace reaches
+the end of the body after the use. After the loop the token is the last iteration's probe
+(the entering one for zero trips) and stays usable. A token merged by a branch (reassigned in
+an `if`) is not: probe after the branch.
+
+For a protocol the checks can't follow, pass a raw readiness `Boolean` (an
+`mbarrier_try_wait` result, or `token.ready` carried by hand) inside
+`with unchecked("token", reason=...)`. The wait or acquire there trusts any Token or
+Boolean it is given, and `describe()` lists the opt-out with its sites.
 
 Named-barrier channels have no probe: waiting on a named barrier (`bar.sync`) is itself an
 arrival, so `try_wait`, `try_acquire` and `token=` raise there. The checks don't establish

@@ -84,7 +84,8 @@ user code.
   protocol-traced builds compile uncached.
 - **Compilation:** also checks local handle lifetimes, required returned state, recognizable
   work-loop structure, attributable TMA operations, and that try tokens and previews are used
-  by their own end, epoch and dynamic region, and an exclusive ring's epoch ownership when
+  by their own end, epoch and dynamic region (or a loop carry whose entry and back-edge
+  still name that epoch), and an exclusive ring's epoch ownership when
   every acquire, wait and skip on it is static. It does not compare arbitrary role
   bodies to prove balanced epochs or a live dependency graph.
 - **TMA `verified`:** recognized group and byte accounting. Not proof of descriptor legality,

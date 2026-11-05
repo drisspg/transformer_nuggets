@@ -28,7 +28,9 @@ class ProtocolError(Exception):
 #   cross_region  closes inside the block may sit in a different loop/branch than their open
 #   tma           TMA copies into barriers taken inside the block skip the atom and byte checks
 #   alias         accesses annotated inside the block are left out of the alias diagnostic
-CHECKS = ("unclosed", "cross_region", "tma", "alias")
+#   token         wait/acquire(token=...) inside the block trust the readiness they are given: a
+#                 Token of any epoch or region, or a raw Boolean (an mbarrier try_wait result)
+CHECKS = ("unclosed", "cross_region", "tma", "alias", "token")
 
 
 @dataclass

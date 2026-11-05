@@ -775,8 +775,15 @@ class Token:
     one end: ``ready`` is the probe's dynamic Boolean. Pass it back as ``token=`` to that end's
     next ``wait()``/``acquire()``, which then skips its blocking wait when ``ready`` holds. A
     token is readiness, not ownership: it cannot release, commit or index a stage. Only the end
-    that probed it can use it, for that epoch, in the same dynamic region, before any other
-    acquire/wait on the end (or slot) and before ``end.state`` is read or assigned."""
+    that probed it can use it, for that epoch, before any other acquire/wait on the end (or
+    slot) and before ``end.state`` is read or assigned.
+
+    A token is a DSL value, so a loop may carry it: probe before the loop and again at the end
+    of each iteration, and consume it in the next iteration (CUTLASS's mainloop idiom). Such a
+    token is checked at both ends of the carry: the value entering the loop and the one each
+    iteration passes on must still name the end's next epoch, and the body must consume it at
+    its top level before any other acquire/wait on the end. A token merged by a branch is not
+    usable after it; probe in the region that consumes it."""
 
     def __init__(self, end, key, ready):
         self.ready = ready
@@ -790,6 +797,48 @@ class Token:
         self._block = current_block()
         self._site = user_site()
         self._minted = False  # set by the end's probe; a token built elsewhere stays False
+        self._stale = None  # a carried copy: why a value flowing into it is stale, if one is
+        self._bodies = []  # (loop body, why the entering value is stale) of each loop carry
+        self._carried_in = None  # a body copy: the loop body it was carried into
+        self._crossed = []  # blocks this value left a region from (entering a loop or branch)
+
+    def _fresh(self) -> bool:
+        """Does this token still name its end's next epoch (of its slot)?"""
+        current = (self._rec.resets, self._rec.advances.get(self._key, 0))
+        return self._minted and self._stale is None and self._epoch == current
+
+    def __extract_mlir_values__(self):
+        # A region boundary: record whether the value crossing it is still fresh.
+        block = current_block()
+        self._crossed.append(block)
+        self._rec.token_exports.append((block, self._key, self._fresh(), self._site))
+        return [self.ready.ir_value()]
+
+    def __new_from_mlir_values__(self, values):
+        """A copy of this token carried into a loop body or branch, or out of either."""
+        block = current_block()
+        copy = object.__new__(Token)
+        copy.__dict__.update(self.__dict__)
+        copy.ready = cutlass.Boolean(values[0])
+        copy._block = block
+        copy._epoch = (self._rec.resets, self._rec.advances.get(self._key, 0))
+        copy._bodies, copy._carried_in, copy._crossed = [], None, []
+        loops = [(b, entry) for b, entry in self._bodies if _parent_block(b) == block]
+        if loops:  # out of a loop: the last iteration's value, or (no trips) the entering one
+            for body, entry in loops:
+                copy._stale = entry or _stale_back_edge(self._rec, self._key, body)
+            return copy
+        if block in self._crossed:  # out of a branch, which merges values of unknown freshness
+            copy._stale = "a branch merged it"
+            return copy
+        if not self._fresh():
+            copy._stale = self._stale or (
+                f"the value entering at {user_site()} (probed at {self._site}) is stale"
+            )
+        if _region_op(block) in ("scf.for", "scf.while"):  # into a loop body: the back-edge
+            self._bodies.append((block, copy._stale))  # is checked when the body uses it
+            copy._carried_in = block
+        return copy
 
 
 @dataclass
@@ -803,6 +852,8 @@ class _EndRecord:
     advances: dict = field(default_factory=dict)
     resets: int = 0
     previews: list = field(default_factory=list)
+    # (block, slot, fresh, probe site) of each token crossing a region boundary (loop carry).
+    token_exports: list = field(default_factory=list)
     checked: bool = False  # the role-exit check of unadopted previews is registered
     lineage: Lineage = field(default_factory=Lineage)
 
@@ -1149,16 +1200,24 @@ class _End:
         return token
 
     def _take_token(self, token, slot, op: str):
-        """Check that ``token`` is this end's probe of the epoch ``op`` is about to take."""
+        """Check that ``token`` is this end's probe of the epoch ``op`` is about to take, and
+        return its readiness. Inside ``unchecked("token")`` any Token or raw Boolean is
+        trusted instead."""
         chan, who, site = self._chan, self._trace.role_name, user_site()
         probe = "try_acquire" if isinstance(self, ProducerEnd) else "try_wait"
         where = f"{who}: {chan.name}.{op}(token=...) at {site}"
         if chan.named:
             raise ProtocolError(f"{where}: a named-barrier channel has no tokens")
+        trusted = isinstance(token, (Token, cutlass.Boolean)) and self._trace.opt_out(
+            "token", f"{chan.name}.{op}(token={type(token).__name__}) at {site}"
+        )
+        if trusted:
+            return token.ready if isinstance(token, Token) else token
         if not isinstance(token, Token):
             raise ProtocolError(
                 f"{where} takes the Token returned by {chan.name}.{probe}(), got "
-                f"{type(token).__name__}"
+                f"{type(token).__name__} (a raw readiness Boolean needs "
+                '`with unchecked("token", reason=...)`)'
             )
         if token._rec is not self._rec:
             raise ProtocolError(
@@ -1172,6 +1231,12 @@ class _End:
             raise ProtocolError(
                 f"{where}: the token probed slot {token._key} (at {token._site}), not {slot}"
             )
+        if token._stale is not None:
+            raise ProtocolError(
+                f"{where}: the token probed at {token._site} was carried through a loop or "
+                f"branch, and {token._stale}; carry a token only from a probe after the "
+                "end's last acquire/wait, or probe in the region that consumes it"
+            )
         if token._epoch != self._epoch(slot):
             raise ProtocolError(
                 f"{where}: stale token probed at {token._site}; an acquire/wait on this end (or "
@@ -1183,13 +1248,23 @@ class _End:
                 "region (loop or branch), where it may not name the epoch this wait takes; "
                 "probe in the region that consumes it"
             )
+        body = token._carried_in
+        if body is not None:  # the next iteration's value is traced after this use
+            rec, key = self._rec, slot
+
+            def check_back_edge():
+                stale = _stale_back_edge(rec, key, body)
+                if stale is not None:
+                    raise ProtocolError(f"{where}: the token carried by the loop: {stale}")
+
+            self._trace.checks.append(check_back_edge)
+        return token.ready
 
     def _take(self, slot, token, op: str):
         """Take the next stage for ``acquire``/``wait``: check ``token`` before advancing, then
         wait for empty (producer) or full (consumer). Only an mbarrier wait may be skipped when
         the token's probe found it ready. Returns (index, phase, label)."""
-        if token is not None:
-            self._take_token(token, slot, op)
+        ready = None if token is None else self._take_token(token, slot, op)
         index, phase, label = self._next(slot, op)
         chan, producer = self._chan, isinstance(self, ProducerEnd)
         self._trace.record(chan.name, op, label)
@@ -1198,7 +1273,7 @@ class _End:
             self._named_wait(chan.named_ids[1 if producer else 0], index, op)
         else:
             with wait_range(self._trace, f"{chan.name}.{op}"):
-                _wait(self._empty(index) if producer else self._full(index), phase, token)
+                _wait(self._empty(index) if producer else self._full(index), phase, ready)
         return index, phase, label
 
 
@@ -1372,12 +1447,42 @@ class ConsumerEnd(_End):
         self._arrive(chan.consumer, self._empty(index), chan.release_fence, chan.scope.empty_mask)
 
 
-def _wait(bar, phase, token):
-    """Blocking parity wait on ``bar``; with a token, only if its probe failed."""
-    if token is None:
+def _region_op(block) -> str | None:
+    try:
+        return block.owner.operation.name
+    except (AttributeError, ValueError, RuntimeError):
+        return None
+
+
+def _parent_block(block):
+    try:
+        return block.owner.operation.block
+    except (AttributeError, ValueError, RuntimeError):
+        return None
+
+
+def _stale_back_edge(rec: _EndRecord, key, body) -> str | None:
+    """Why a token a loop ``body`` passes to its next iteration (or out of the loop) may not
+    name the end's next epoch: an acquire/wait on the end after its probe. None if fresh."""
+    stale = [
+        site
+        for block, k, fresh, site in rec.token_exports
+        if block == body and k == key and not fresh
+    ]
+    if stale:
+        return (
+            f"the value one iteration passes to the next (probed at {stale[0]}) is stale: an "
+            "acquire/wait on this end (or raw end.state access) follows the probe"
+        )
+    return None
+
+
+def _wait(bar, phase, ready):
+    """Blocking parity wait on ``bar``; with a probe's ``ready``, only if the probe failed."""
+    if ready is None:
         cute.arch.mbarrier_wait(bar, phase)
     else:
-        if_generate(token.ready == 0, lambda: cute.arch.mbarrier_wait(bar, phase))
+        if_generate(ready == 0, lambda: cute.arch.mbarrier_wait(bar, phase))
 
 
 def _named_sync(barrier_id, threads: int):
