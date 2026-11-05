@@ -2,111 +2,135 @@
 
 [Back to warpdrive](../README.md) · [Safety contract](../GUARANTEES.md)
 
-Start from a complete kernel, then change its math and data movement. warpdrive owns the
-role dispatch and declared handoffs; the code inside each role is ordinary CuTeDSL. You do
-not need the numbered rejection catalog to use it.
+Start with a complete kernel. warpdrive connects the roles and manages declared handoffs;
+you write the CuTeDSL math, layouts and data movement inside them.
+
+```text
+work item       what output does this CTA/cluster own?
+    |
+roles + edges   who produces each value, who reads it, when can storage be reused?
+    |
+role bodies     exchange handles, do the math, return current state
+    |
+launch + tests  enforce the input contract, then check the actual lifetimes
+```
+
+You do not need the numbered fuzz rejection catalog to author a kernel. You do need the
+[safety contract](../GUARANTEES.md): successful compilation is not a proof of correctness.
 
 ## Run a complete example
 
-[gemm.py](../examples/gemm.py) is the smallest complete GEMM: declarations, three roles,
-SMEM partitions, TMEM views, launch setup, cached compilation and a PyTorch wrapper in one
-file. It computes BF16 `D = A @ B.T` with FP32 accumulation on Blackwell SM100/SM103.
-Use CuTeDSL 4.8 and the repository's [environment setup](../README.md#tests).
+[gemm.py](../examples/gemm.py) is the smallest complete GEMM: three roles, SMEM partitions,
+TMEM views, launch setup, cached compilation and a PyTorch wrapper. It computes BF16
+`D = A @ B.T` with FP32 accumulation on Blackwell SM100/SM103. Use CuTeDSL 4.8 and the
+repository's [environment setup](../README.md#tests).
 
-From the checkout root, with that environment selected:
+From the checkout root, in that environment:
 
 ```bash
 python -m transformer_nuggets.cute.warpdrive.examples.gemm
 pytest -q test/test_cute_warpdrive.py -k test_gemm
 ```
 
-On a shared GPU host, run each command through the host's GPU reservation tool with a
-process timeout. The module prints numerical errors; the tests assert correctness and the
-wrapper's boundary behavior. CUDA compilation must read kernel definitions from a source
-file, not a REPL or notebook cell.
+On a shared GPU host, run each command through its GPU reservation tool with a process
+timeout. The module prints numerical errors; the tests assert correctness and wrapper
+boundaries. Keep kernel definitions in a source file: the CuTeDSL compiler re-reads the
+Python source, so a REPL or notebook cell is not enough.
 
-Read the file in this order:
+Read the example in this order:
 
-| Part | What to adapt |
+| Part | What to learn or adapt |
 |---|---|
-| `Gemm.__init__` | Channels, stage counts, storage and work assignment |
-| `load / mma / epilogue` | Math and handoffs for one work item |
-| `Gemm.kernel` and `GemmParams` | Initialization, layouts and per-role tensor partitions |
+| `Gemm.__init__` | Channels, stages, storage and work assignment |
+| `load / mma / epilogue` | The math and handoffs for one item |
+| `Gemm.kernel` and `GemmParams` | Initialization, layouts and role-specific partitions |
 | `Gemm.__call__` | Atoms, TMA descriptors, bound work and launch |
-| `compile_gemm / check_gemm_args / gemm` | Compile-time choices, runtime ABI and input contract |
+| `compile_gemm / check_gemm_args / gemm` | Static choices, runtime ABI and input checks |
 
-For an operation without MMA, keep the same role/channel structure and omit TMEM. Don't
-copy the GEMM's MMA-specific layouts or register split just to get a skeleton.
+For an operation without MMA, keep the role/channel structure and omit TMEM. Do not copy
+MMA-specific layouts or the GEMM's register split merely to get a skeleton.
 
 ## Define one work item
 
-Write down the output a CTA or cluster owns and the inputs needed to compute it. For this
-GEMM, one item is `(m_tile, n_tile, 0)` and owns a 128 x 256 output tile. It reduces K in
-chunks of 64. All three roles visit the same output tiles; the load and MMA roles also agree
-on the number of K chunks per item.
+In the default GEMM, item `(m_tile, n_tile, 0)` owns one 128 × 256 output tile. All three
+roles visit that item. Load and MMA exchange `ceil(K / 64)` input tiles; epilogue stores one
+result.
 
-Use distinct items for split reductions, such as `(tile, split)`, and reduce their partials
-separately. A scheduler choosing the last item does not mean every earlier item is finished.
+Write the equivalent sentence for your operation before choosing a schedule:
 
-Start with `OneShot()` unless the algorithm requires a persistent protocol. Move to the
-[persistent GEMM](../examples/persistent_gemm.py) when you need reusable roles across items,
-CTA pairs, or another schedule. It keeps the launch ABI suitable for schedule changes.
+- Which output does one CTA or cluster own?
+- Which inputs and reduction steps produce it?
+- Do all roles agree on those steps?
+
+Start with `OneShot()` unless the algorithm needs persistence. The
+[persistent GEMM](../examples/persistent_gemm.py) shows roles reused across items, CTA pairs
+and alternate schedules, with an ABI that supports changing the schedule.
+
+For split reductions, give each partial a distinct item such as `(tile, split)` and reduce
+partials separately. Claiming the last item does **not** mean earlier items have finished.
 
 ## Draw the handoffs
 
-The GEMM's dataflow is:
+The default GEMM uses two channels:
 
 ```text
-warp 4: load A/B -- ab (3 SMEM stages) --> warp 5: MMA
-                                              |
-                                     acc (1 TMEM stage)
-                                              |
-                                              v
-                                      warps 0–3: store D
+warp 4: load A/B -- ab: 3 SMEM stages --> warp 5: MMA
+                                               |
+                                      acc: 1 TMEM stage
+                                               |
+                                               v
+                                       warps 0–3: store D
 ```
 
-Before writing the bodies, account for each channel per work item:
-
-| Channel | Producer → consumer | Epochs per item | Reuse becomes legal after… |
+| Channel | Producer → consumer | Epochs per item | Storage can be reused after… |
 |---|---|---|---|
-| `ab` | TMA load → MMA | ceil(K / 64) | MMA completion releases the input stage |
-| `acc` | MMA → epilogue threads | 1 | All epilogue threads release the accumulator stage |
+| `ab` | TMA load → MMA | `ceil(K / 64)` | MMA completion releases the input stage |
+| `acc` | MMA → epilogue threads | 1 | Every epilogue thread releases the accumulator stage |
 
-An epoch is one produced/consumed value, not a stage index: three stages are reused as
-0, 1, 2, 0, … across successive epochs. Changing stage count does not change how many values
-each role must exchange. Multiple consumers of one value all release before reuse.
+An **epoch** is one exchanged value. A **stage** is a reusable storage slot:
 
-For your kernel, add any feedback edges and identify what lets the first iteration run.
-Balanced counts are insufficient if everyone starts by waiting for someone else.
+```text
+epoch:  0  1  2  3  4  5 ...
+stage:  0  1  2  0  1  2 ...    (three-stage ring)
+```
+
+Adding stages adds capacity, not values: producer and consumer epoch counts must still
+match. With joined consumers, all readers release before reuse. Other ownership policies
+have their own [channel contracts](channels.md).
+
+Draw feedback edges too. Identify the initial value or free capacity that lets something
+run first; balanced counts do not help if every role starts by waiting for another.
 
 ## Declare storage and connect the roles
 
-The GEMM declares:
+The GEMM constructor contains these declarations (an excerpt, not a standalone kernel):
 
 ```python
 self.ab = Ring(ab_stages, Tma(stage_bytes), Umma, buffer={"A": a, "B": b})
 self.acc = Ring(acc_stages, Umma, Threads)
-self.tmem_plan = TmemPlan().region("acc", TILE[1], acc_stages)
+self.tmem_plan = TmemPlan().region("acc", tile_n, acc_stages)
 self.work = WorkStream(schedule=OneShot())
 ```
 
-These are excerpts from the linked source, not a standalone kernel. `a` and `b` are
-`SmemPlan` buffers. In this single-CTA GEMM, `stage_bytes` is the combined A/B bytes written
-by TMA per stage: `(128 + 256) * 64 * 2` for BF16. Don't multiply by ring depth.
+- `a` and `b` are buffers declared in `SmemPlan`. They hold the A/B payload; the channel
+  separately owns barrier state that controls publication and reuse.
+- `stage_bytes` counts TMA's A and B writes for **one stage**. At the default tile size it is
+  `(128 + 256) * 64 * 2` bytes for BF16. Do not multiply by ring depth.
+- `self.acc` controls the accumulator lifetime; `TmemPlan` allocates its TMEM columns.
+- Parameter names connect roles: `ab: Producer` and `ab: Consumer` both bind to `self.ab`.
 
-Parameter names bind the ends: `ab: Producer` and `ab: Consumer` both refer to `self.ab`.
-`@role(warps=4)` means warp index 4, not four warps. Use `warps=range(4)` for warps 0–3.
-TMA and UMMA sides bind to a single-warp role; a `Threads` side counts every bound thread.
-See [roles](roles.md) for bindings and valid warpgroup register budgets.
+`@role(warps=4)` names warp **index 4**, not four warps. Use `warps=range(4)` for warps 0–3.
+TMA and UMMA ends require a single-warp role; `Threads` counts every bound thread. See
+[roles](roles.md) for bindings and register-budget rules.
 
-Begin with separate buffers for overlapping lifetimes. Use `SmemPlan` for allocation and
-`StageView` for your TMA/MMA partitions; `h.view(...)` then chooses the handle's stage.
-You still construct the layouts and must ensure each view actually refers to the named buffer.
-See [storage](storage.md) before adding aliases or using buffers outside handles.
+Start with separate buffers for overlapping lifetimes. Allocate with `SmemPlan`, build
+TMA/MMA partitions with CuTe, then wrap them in `StageView`. `h.view(...)` selects the handle's stage.
+You still own the layouts and must ensure each view refers to its named buffer. Read
+[storage](storage.md) before adding aliases or accessing buffers outside handles.
 
 ## Implement the lifecycle, then the math
 
-The load role's structure is:
+The load role follows this structure:
 
 ```python
 @role(warps=4, regs=40)
@@ -127,82 +151,81 @@ def load(self, params: GemmParams, *, ab: Producer, work: WorkCursor):
     return ab, work
 ```
 
-The consumer uses `with ab.consume() as h:`. Entering waits for the value; exiting releases
-it through the declared mechanism. On this channel the MMA consumer's release uses an UMMA
-completion, so issuing asynchronous MMA is not mistaken for finished input reads. The MMA
-role holds an `acc.produce()` handle around the entire K reduction and publishes once. The
-epilogue holds `acc.consume()` until it finishes using that accumulator stage.
+Follow one input stage through the consumer:
 
-Keep handoffs outside lane-dependent predicates. For a ragged output, every epilogue thread
-enters and releases the handle, while only in-bounds lanes store. A predicate around the
-whole exchange can strand a barrier whose declared count still includes those lanes.
+1. `with ab.consume() as h:` waits for the TMA writes to complete.
+2. MMA reads that stage through `h.view(...)`.
+3. Exiting the handle requests its declared UMMA completion signal. Reuse waits for that
+   completion, not merely for the Python body to finish issuing asynchronous MMA.
 
-Return every endpoint, cursor and turnstile seat from each role. When a helper advances one,
-return and reassign it there too. Don't return handles, params or TMEM views. Close handles
-once, within their opening dynamic region; don't keep using their pointers after release.
-For non-nested lifetimes, explicit `acquire/wait/commit/release` are available: see
-[overlapping handles](channels.md#overlapping-handles).
+The MMA role holds `acc.produce()` around the **whole K reduction**, publishing once.
+Epilogue holds `acc.consume()` until it has finished reading that accumulator stage.
+
+Keep participation outside lane-dependent predicates. For a ragged output, every epilogue
+thread enters and releases its handle; only in-bounds lanes store. Guarding the whole
+exchange can strand a barrier whose count still includes the absent lanes.
+
+Carry state and respect handle lifetimes:
+
+- Return every endpoint, cursor and turnstile seat from each role. An advancing helper must
+  also return its updated state, and its caller must reassign it.
+- Do not return handles, params or TMEM views.
+- Close a handle exactly once, within its opening dynamic region. Do not keep using its
+  pointers after release.
+- For non-nested lifetimes, use explicit `acquire/wait/commit/release`; see
+  [overlapping handles](channels.md#overlapping-handles).
 
 ## Wire the prologue, launch and cache
 
-Keep these boundaries visible in your source:
+Keep four boundaries visible:
 
-1. **Entry point:** create atoms/descriptors and bind the runtime work space. Name the inner
-   kernel with `set_name_prefix(...)`, and launch with `self.launch_config(bound)`. For a
-   persistent schedule, pass `launch_args()` through the entry point as shown in
-   [Bind and launch](scheduling.md#bind-and-launch).
-2. **Kernel prologue:** call `begin_roles(work=bound, layouts=...)` in converged code, get
-   buffers, build partitions and frozen params, then call `run_roles(params)`. Declare every
-   TMEM-using role with `tmem: Tmem` so it participates in teardown.
-3. **Compile helper:** follow the current example and [compile-key contract](roles.md#compile-keys).
-   Use fake compact tensors for a compact runtime ABI. Every static choice that changes code
-   belongs in the key; runtime dimensions can stay dynamic within their declared constraints.
-4. **Python wrapper:** validate dtype, device, rank, shape relationships, compactness,
-   alignment and output overlap before relying on the fake ABI. Define empty-output and
-   empty-reduction behavior. A shape with no K work must not publish an uninitialized sum.
+| Boundary | Your responsibilities |
+|---|---|
+| **Entry point** | Build atoms/descriptors and bind runtime work. Name the inner kernel with `set_name_prefix(...)`; launch with `self.launch_config(bound)`. Persistent schedules pass `launch_args()` through the entry point ([Bind and launch](scheduling.md#bind-and-launch)). |
+| **Kernel prologue** | Call `begin_roles(work=bound, layouts=...)` in converged code. Get buffers, build partitions and frozen params, then call `run_roles(params)`. Annotate every TMEM-using role with `tmem: Tmem` for teardown. |
+| **Compile helper** | Follow the example's [compile-key contract](roles.md#compile-keys). Use fake compact tensors for a compact ABI. Key every static code choice; runtime dimensions may stay dynamic within their constraints. |
+| **Python wrapper** | Validate dtype, device, rank, related shapes, compactness, alignment and output overlap before relying on that ABI. Define empty-output and empty-reduction behavior. |
 
-Do not replace those checks with a successful compile. The wrapper enforces the input
-contract, and the role bodies implement it; the layer does neither on your behalf.
+In particular, zero K work must not publish an uninitialized sum. A successful compile does
+not replace these checks: the wrapper enforces the input contract and the role bodies
+implement it.
 
 ## Check the kernel before tuning
 
-Compare with a reference using nonuniform inputs and an explicit numerical tolerance.
-For this GEMM, tests compare FP32-reference error against the BF16 PyTorch baseline. A different
-reduction or approximation needs its own acceptance criterion.
+Compare nonuniform inputs against a reference with an explicit tolerance. GEMM's tests
+compare FP32-reference error against the BF16 PyTorch baseline; another reduction or
+approximation needs its own criterion.
 
-Choose cases that exercise your actual lifetimes:
+Exercise the lifetimes your kernel claims to support:
 
-- One work item, then enough epochs to wrap every ring's stages and phases.
-- Ragged tails and any supported empty work/reduction.
-- Multiple items per unit if persistent; uneven work across units.
-- Repeated launches and changed runtime shapes through the same compiled entry point.
-- Every advertised cluster/schedule path; disjoint workspaces for concurrent launches.
+- One item, then enough epochs to wrap every ring's stages **and phases**.
+- Ragged tails and supported empty work/reductions.
+- Persistent multi-item units and uneven work between units.
+- Repeated launches and changed runtime shapes through one compiled entry point.
+- Every advertised cluster/schedule path; separate workspaces for concurrent launches.
 
-Read `op.describe()` before compiling for declaration errors, then inspect it after tracing
-for TMA/alias findings. Resolve each `unverified` site with explicit reasoning and tests;
-`no hazard found` is not a proof. For a new raw async handoff or storage overlap, validate
-completion and ordering independently, including sanitizer checks appropriate to that path.
-A timeout is a failure to investigate, not a reason to extend the run until it passes.
+Use `op.describe()` before compilation for declaration checks, then after tracing for
+TMA/alias findings. Explain and test every `unverified` site. `no hazard found` is not a
+proof. For a new raw async handoff or overlapping storage, independently validate completion
+and ordering, including appropriate sanitizer checks. Investigate a timeout as a failure;
+do not extend the run until it passes.
 
-Run the [repository testing tiers](../../../../AGENTS.md#warpdrive-testing-tiers). Only then
-measure and tune stages, warps, register budgets, layouts or schedules. Keep the workload and
-numerical checks fixed across comparisons. More stages or fewer instructions are not a
-performance result by themselves.
+Run the [repository testing tiers](../../../../AGENTS.md#warpdrive-testing-tiers) before
+tuning stages, warps, registers, layouts or schedules. Hold workload and numerical checks
+fixed across measurements. More stages or fewer instructions alone do not establish speed.
 
 ## Where to go next
 
-- [Persistent GEMM](../examples/persistent_gemm.py): multiple work items, pairs and multicast.
-- [FA4 forward](../examples/fa4_fwd.py): multi-consumer handoffs, slots and overlapping storage.
-- [Swap-AB decode](../examples/fa4_decode_swapab.py): round-robin instances and named channels;
-  `SharedKVDecode` (`shared_kv=True` in the wrappers) adds exclusive consumers with FA4's
-  rendezvous. Currently OneShot-only, not a persistent template.
-- [Packed work](../examples/packed_work.py): a device-built list and readiness before decoding.
-- [Dropping down](dropping_down.md): raw barriers and targeted opt-outs when a managed pattern
-  does not express the algorithm. Explain the replacement ordering; don't suppress a check
-  merely to make compilation pass.
+- [Persistent GEMM](../examples/persistent_gemm.py): multiple items, pairs and multicast.
+- [FA4 forward](../examples/fa4_fwd.py): multiple consumers, slots and overlapping storage.
+- [Swap-AB decode](../examples/fa4_decode_swapab.py): round-robin instances and named channels.
+  `SharedKVDecode` (`shared_kv=True` in wrappers) adds exclusive consumers and FA4's
+  rendezvous. It is currently OneShot-only, not a persistent template.
+- [Packed work](../examples/packed_work.py): device-built lists and readiness before decoding.
+- [Dropping down](dropping_down.md): raw barriers and targeted opt-outs. Explain the
+  replacement ordering; do not suppress a check simply to make compilation pass.
 
-For agent-assisted authoring, ask the agent to read this guide and the safety contract, then
-show the work item, role/channel diagram and per-channel epoch counts before implementing.
-The repository-local [authoring skill](../SKILL.md) follows that procedure and routes to the
-same references. Finish with the runnable kernel, its tests and any remaining raw/unverified
-sites—not just a declaration sketch or a profiler screenshot.
+For agent-assisted authoring, ask for the work item, role/channel diagram and epoch counts
+before implementation. The local [authoring skill](../SKILL.md) follows this guide and the
+safety contract. Finish with a runnable kernel, tests and remaining raw/unverified sites—not
+just declarations or a profiler screenshot.

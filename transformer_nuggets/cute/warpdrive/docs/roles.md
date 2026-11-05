@@ -2,6 +2,12 @@
 
 [Back to warpdrive](../README.md)
 
+A role is a CuTeDSL method assigned to specific warps. The dispatcher gives it channel ends,
+a work cursor and other declared dependencies; the method does the math and returns its
+updated protocol state.
+
+This partial load role runs on **warp 4**:
+
 ```python
 @role(warps=4, regs=40)
 @cute.jit
@@ -12,55 +18,90 @@ def load(self, params: GemmParams, *, ab: Producer):
     return ab
 ```
 
-Put `@role` directly above `@cute.jit`. `warps=4` means warp index 4;
-`warps=range(4)` means warps 0–3. `warps=[range(4), range(4, 8)]` creates two instances of
-the same method. The ranges for each instance must be contiguous and cannot overlap other roles.
-Each instance runs on exactly those warps; holes run no user role.
+Put `@role` directly above `@cute.jit`. Placement means:
 
-`regs=40` sets that warpgroup's `setmaxnreg` budget. The default `None` leaves it unchanged.
-All roles in a warpgroup must agree, including `None` versus a number. Numeric budgets must
-be multiples of 8 from 24 to 256. Any numeric budget pads the launch to full warpgroups.
-Padding warps get the group's budget too; entirely idle groups get 24. The adjustment
-happens in a warpgroup-uniform branch before role dispatch, including in a pair's peer CTA.
+```text
+warps=4                       one instance: warp 4
+warps=range(4)                 one instance: warps 0–3
+warps=[range(4), range(4, 8)]   instance 0: warps 0–3
+                              instance 1: warps 4–7
+```
 
-The budgets have to fit in the registers the launch starts with. Every warp starts with
-65536 / threads, rounded down to a multiple of 8 and capped at 256 (168 for 12 warps), and
-`setmaxnreg` only moves registers between warps. So 12 warps can split 232/232/40 but not
-232/232/48: that totals 65536, more than 168 x 384, and the increase would wait forever. It
-raises `ValueError`. `None` counts as the starting budget.
+Each instance occupies a nonempty contiguous range. Ranges cannot overlap other roles;
+warp holes run no user role.
 
-`cta="leader"` restricts the role to the leader of each MMA pair of a
-[cluster](clusters.md), rank 0 of a CTA pair. `cta="rank0"` runs it once per cluster. The default
-is `"all"`. They are equivalent for one CTA; without MMA pairs, every CTA is a leader.
+### Registers belong to warpgroups
 
-Call `begin_roles()` and `run_roles()` from converged CTA/cluster code using the declared
-launch shape. Warp 0 initializes each barrier from one lane; the common initialization
-fence/sync precedes dispatch. Every participating thread must reach initialization and exit, including
-threads in warp holes. For manually initialized barriers, see
-[raw barriers and roles](dropping_down.md#escape-hatches-by-feature).
+`regs=40` requests a per-thread `setmaxnreg` budget for the role's warpgroup (four warps).
+`None`, the default, leaves the budget unchanged—it does not request automatic tuning.
+
+- All roles in one warpgroup must agree, including `None` versus a number.
+- Numeric budgets are multiples of 8 in `[24, 256]`.
+- Any numeric budget pads the launch to complete warpgroups. Padding warps take their
+  group's budget; a wholly idle group takes 24.
+- Budget adjustment runs in a warpgroup-uniform branch before dispatch, including in a
+  pair's peer CTA.
+
+Redistribution cannot create registers. Every launched thread starts with
+`min(256, floor((65536 / threads) / 8) * 8)` registers; `None` counts as that budget.
+For a 12-warp launch, this is 168 registers per thread:
+
+```text
+available:       168 × 384 = 64512 registers
+232 / 232 / 40:  (232 + 232 + 40) × 128 = 64512    fits
+232 / 232 / 48:  (232 + 232 + 48) × 128 = 65536    rejected
+```
+
+The three numbers are warpgroup budgets. The second split raises `ValueError`: although it
+fits 65536, it exceeds the launch's starting pool and its increase would wait forever.
+
+### CTA placement and common entry
+
+| `cta=` | Where this role runs |
+|---|---|
+| `"all"` (default) | Every CTA |
+| `"leader"` | Rank 0 of each MMA pair in the [cluster](clusters.md) |
+| `"rank0"` | Once per cluster, on cluster rank 0 |
+
+All three are equivalent for one CTA. Without MMA pairs, every CTA is a leader.
+
+Call `begin_roles()` and `run_roles()` in converged CTA/cluster code with the declared launch
+shape. One lane of warp 0 initializes each managed mbarrier; the common initialization
+fence/sync precedes dispatch. **Every participating thread reaches initialization and exit,
+including warp holes.** See [raw barriers and roles](dropping_down.md#escape-hatches-by-feature)
+for manually initialized barriers.
 
 ## Arguments
 
-The dispatcher binds arguments by annotation and name. `*` makes the dependencies
-keyword-only; positional signatures also work. Declare each argument explicitly, without
-`*args` or `**kwargs`.
+The dispatcher binds by annotation and, for named dependencies, parameter name:
 
-| Parameter | What it receives |
+```text
+self.ab = Ring(...)  <---  ab: Producer in load
+                    <---  ab: Consumer in mma
+run_roles(params)    --->  params: GemmParams in both
+```
+
+Declare parameters explicitly: no `*args` or `**kwargs`. `*` makes dependencies keyword-only;
+positional signatures also work.
+
+| Parameter | Receives |
 |---|---|
 | `ab: Producer` / `ab: Consumer` | An end of `self.ab` |
 | `s: Producer[Instance]` / `s: Consumer[Instance]` | An end of `self.s`, bound to this instance's slot |
-| `stage: Instance` | The instance index, a Python int |
-| `tmem: Tmem` | The kernel's TMEM view |
-| `work: WorkCursor` | The cursor for `self.work` |
-| `mufu: Turn` | A seat in `self.mufu`, a `Turnstile` |
-| `bars: Barriers` | The base pointer of `self.bars` |
-| `params: GemmParams` | The object passed to `run_roles(params)` |
+| `stage: Instance` | Instance index as a Python int |
+| `tmem: Tmem` | Kernel's TMEM view |
+| `work: WorkCursor` | Cursor for `self.work` |
+| `mufu: Turn` | A seat in the `self.mufu` turnstile |
+| `bars: Barriers` | Base pointer of `self.bars` |
+| `params: GemmParams` | Object passed to `run_roles(params)` |
 
-Names matter for channels, streams, turnstiles and raw barriers. `ab: Consumer` requires a
-channel named `ab` on the kernel. An instance-bound channel must be `Slots`, not `Ring`.
-You still pass the slot explicitly, for example `s.wait(stage)`.
+Names matter for channels, streams, turnstiles and raw barriers. An instance-bound channel
+must be `Slots`, not `Ring`; you still pass the slot explicitly, as in `s.wait(stage)`.
 
-Use a frozen dataclass for typed params:
+### Pass shared setup as params
+
+Build a frozen dataclass in the kernel prologue from the atoms, partitions, layouts and loop
+counts the roles need:
 
 ```python
 from dataclasses import dataclass
@@ -73,20 +114,22 @@ class GemmParams:
     num_k_tiles: cutlass.Int32
 ```
 
-Build it in the kernel prologue from the atoms, partitions, layouts and loop counts the roles
-need. Frozen fields cannot be rebound, but the tensors they point to can still be written.
-This is shallow immutability: referenced lists and other objects remain mutable too.
-A `SimpleNamespace` also works; leave the role's one context parameter unannotated. The layer
-does not make the namespace immutable.
+Frozen means fields cannot be rebound; tensor contents and referenced lists can still change.
+It is shallow immutability, not read-only memory.
 
-An annotation matching the params type, or a base class of it, receives that object. An
-unresolvable annotation, a missing dependency, two context parameters or incompatible context
-types raises `ProtocolError`. String annotations (every annotation under
-`from __future__ import annotations`) resolve in the role's module globals, so define the
-params type at module level. `run_roles(params)` checks the object against the annotated
-type. Mutable dataclasses are rejected, even without a type annotation.
+An annotation matching the params type or a base class receives that object.
+`run_roles(params)` checks the type. Alternatively, pass a `SimpleNamespace` and leave the
+role's single context parameter unannotated; the layer does not make it immutable.
+
+`ProtocolError` covers missing dependencies, unresolved annotations, multiple context
+parameters and incompatible context types. Mutable dataclasses are rejected even when
+unannotated. String annotations—including all annotations under
+`from __future__ import annotations`—resolve in the role's module globals, so define params
+types at module level.
 
 ## Return the updated state
+
+A role returns the current endpoints, work cursor and turnstile seats it received:
 
 ```python
 @role(warps=5, regs=40)
@@ -98,31 +141,30 @@ def mma(self, params: GemmParams, *, ab: Consumer, acc: Producer, work: WorkCurs
     return ab, acc, work
 ```
 
-Return every endpoint, work cursor and turnstile seat you take as an argument. Return one
-object or a tuple; tuple order doesn't matter. Missing, duplicate or foreign state is an
-error. This applies with tracing on or off, and with one or two CTAs.
+Return one object or a tuple; tuple order does not matter. Missing, duplicate or foreign
+state is an error with tracing on or off, for one or two CTAs.
 
-Do not return `self`, `params`, the instance index, TMEM view or raw barrier pointers. Close
-stage handles inside the role; a handle is not endpoint state to hand back at exit.
+- Return **all** endpoints, cursors and seats—not `self`, params, instance indices, TMEM
+  views or raw barrier pointers.
+- Close stage handles inside the role. They are temporary lifetimes, not state to return.
+- Helpers must return updated state too; reassign it at the call site:
 
-Helpers need the same state carry:
+  ```python
+  ab = load_next(ab, params)
+  ```
 
-```python
-ab = load_next(ab, params)
-```
+Returning an old pre-loop snapshot is wrong. Checks catch ownership/return errors and
+channel-end or cursor state superseded by an advancing helper, including discarded helper
+results inside loops. They do **not** prove freshness of reconstructed/laundered snapshots,
+manually supplied raw state or turnstile seats.
 
-Return the current value, not a snapshot saved before a loop. The checks reject ownership
-and return errors, and channel-end/work-cursor state superseded by an advancing helper,
-including a discarded helper result inside a loop: assign it, as in `ab = load_next(ab, params)`.
-They do not prove freshness of reconstructed/laundered snapshots, manually supplied raw state
-or turnstile seats. Returned ends supply the final phases for producer tails; returned cursors
-also let tracing close any remaining work range.
+The returned endpoints supply final phases for producer tails. Returned cursors also let
+tracing close any remaining work range.
 
 ## Choose placement in the constructor
 
-The decorator declares the default. A kernel instance replaces any role's placement or
-budget through `self.roles`, a dict from the method name to a `RoleConfig`, set in
-`__init__` from a constructor argument:
+The decorator is the readable default. Set `self.roles` in `__init__` to replace defaults by
+method name, using frozen `RoleConfig` values:
 
 ```python
 from transformer_nuggets.cute.warpdrive import RoleConfig
@@ -130,7 +172,7 @@ from transformer_nuggets.cute.warpdrive import RoleConfig
 
 class Attention(WarpSpecialized):
     def __init__(self, tile_hq: int, roles: dict[str, RoleConfig] | None = None):
-        defaults = {}  # computed from the other arguments
+        defaults = {}
         if tile_hq > 16:
             defaults["softmax"] = RoleConfig([range(4), range(4, 8)], regs=120)
         self.roles = {**defaults, **(roles or {})}
@@ -141,20 +183,8 @@ class Attention(WarpSpecialized):
     def softmax(self, params, *, stage: Instance): ...
 ```
 
-A name that is not a role, or a value that is not a `RoleConfig`, raises `ProtocolError` at
-collection. The merged configuration then goes through the same checks as the declarations:
-claimed warps, contiguous instances, one budget per warpgroup and the register pool. Set
-`self.roles` only in `__init__`: assigning it later makes the compile key raise, because the
-constructor call no longer describes the kernel ([compile keys](#compile-keys)).
-`describe()` shows the resolved budgets.
-
-`RoleConfig` is frozen and copies lists of ranges into tuples. It has the same `warps`,
-`regs`, `cta` and `raw` fields as the decorator. Changing placement does not change your
-tensor partitions; update those yourself. `dataclasses.replace` derives a variant of a
-declared configuration.
-
-The examples take `roles=` this way: the decode kernel computes FA4's 32-head register split
-as its defaults, and `fa4_fwd` passes the mapping through:
+This is a placement sketch, not a complete kernel. The decode example computes its 32-head
+FA4 register split this way; `fa4_fwd` accepts overrides too:
 
 ```python
 from transformer_nuggets.cute.warpdrive import RoleConfig
@@ -167,40 +197,59 @@ roles = {
 out, lse = fa4_fwd(q, k, v, roles=roles)
 ```
 
-When the placement itself is computed, build `self.roles` in `__init__` and keep the
-decorator as the readable default. `describe()`, tracing or a compile-cache lookup triggers
-the first collection; the result is then fixed for that kernel instance. Construct another
-instance to change it; mutating or recollecting declarations after the first collection is
-unsupported.
+`RoleConfig` has the decorator's `warps`, `regs`, `cta` and `raw` fields. It copies lists of
+ranges into tuples; `dataclasses.replace` can derive a variant.
+
+The resolved placement gets the same checks as decorators: nonoverlapping contiguous warps,
+one budget per warpgroup, and a fitting register pool. Unknown names or non-`RoleConfig`
+values raise `ProtocolError` at collection. `describe()` shows the resolved budgets.
+
+Two boundaries matter:
+
+1. **Placement does not repartition tensors.** Update your partitions when moving work.
+2. **Collection freezes declarations.** The first `describe()`, trace or compile-cache lookup
+   collects the kernel. Construct a new instance to change it; mutation or recollection is
+   unsupported. Assigning `self.roles` after construction also makes the compile key raise,
+   because the constructor no longer describes the kernel.
 
 ## Compile keys
 
-The examples compile through [`jit_cache`](../../jit_cache/README.md), which keeps compiled
-kernels on disk across processes. Make your compile helper a module-level `@jit_cache`
-function of the kernel:
+Use a module-level [`jit_cache`](../../jit_cache/README.md) helper. It reuses compiled kernels
+in memory and on disk across processes. Schematic helper (define `MyKernel` and `fake_args`
+for your ABI):
 
 ```python
-@jit_cache(uncached=lambda op: op.trace_protocol)  # a protocol trace needs a real trace
+@jit_cache(uncached=lambda op: op.trace_protocol)  # protocol logs require a real trace
 def compile_kernel(op: MyKernel):
     return compile_tvm_ffi(op, *fake_args, name=op.get_name())
 ```
 
-The kernel's key is `op.__cute_cache_key__()`: its constructor call (defaults filled in,
-frozen when the constructor returns), the cluster, each work stream,
-`iket`/`iket_waits`/`trace_protocol`/`alias_check`, the resolved roles, and the source of the
-modules defining the kernel's classes. So `Gemm()` and
-`Gemm(ab_stages=3)` share an entry, a changed budget or placement does not, and editing a
-kernel subclass in your own file recompiles it. Pass static choices to the constructor:
-assigning another public attribute after construction (`op.tile_n = 128`) makes the key raise
-`TypeError`, because the constructor call no longer describes the kernel. The cluster, work
-streams and those four settings may be reassigned before the first collection; after it,
-assigning the cluster, a work stream or `trace_protocol` raises `ProtocolError`, because the
-collected channels were derived from them. Changes inside objects the constructor built
-(`op.ab.n = 4`) are not seen at all, so don't make them.
+`op.__cute_cache_key__()` includes:
 
-A cached kernel was not traced, but `describe()` still shows the trace's findings: `jit_cache`
-restores the TMA, SMEM and alias reports and the opt-outs saved with the build, and repeats
-their warnings. Kernels pickle as their constructor call, so `compile_many` can build several
-in parallel.
+- The constructor call, with defaults filled in and its arguments copied/frozen for the key.
+- Cluster and each work stream's schedule, mapping, readiness, recording and scheduler warp.
+- `iket`, `iket_waits`, `trace_protocol`, `alias_check`, and resolved roles.
+- Source of the modules defining the kernel, cluster and stream-component classes, including
+  their base classes.
 
-Define kernels in source files: CuTeDSL reads the source again for AST preprocessing.
+Thus `Gemm()` and `Gemm(ab_stages=3)` share an entry. A different role budget does not.
+Editing a kernel subclass in your own source file recompiles it, even when the compile helper
+does not import that file.
+
+Put static algorithm choices in constructor arguments. Mutation rules are deliberately
+narrow:
+
+| Change | Contract |
+|---|---|
+| `op.tile_n = 128` after construction | Key raises `TypeError`; pass it to the constructor |
+| Reassign cluster, work stream or `trace_protocol` before collection | Allowed and keyed |
+| Reassign those after collection | Raises `ProtocolError`; channels already depend on them |
+| Change `iket`, `iket_waits` or `alias_check` | Allowed and keyed |
+| Mutate a constructed object, e.g. `op.ab.n = 4` | Not tracked; do not do it |
+
+A cache hit performs no new trace. `jit_cache` restores saved TMA, SMEM and alias reports,
+opt-outs and associated warnings so `describe()` still reports the build's findings.
+Protocol-traced builds are uncached. Kernels pickle as their constructor call, allowing
+`compile_many` to build several in parallel.
+
+Keep kernel definitions in source files: CuTeDSL re-reads them for AST preprocessing.

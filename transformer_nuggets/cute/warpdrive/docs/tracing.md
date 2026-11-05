@@ -2,6 +2,17 @@
 
 [Back to warpdrive](../README.md)
 
+Use the view that answers your question:
+
+| Question | View | What it records |
+|---|---|---|
+| Who runs, signals and owns storage? | [`describe()`](#inspect-the-kernel) | Declarations and available compile diagnostics |
+| Where does a handle open and close? | [Protocol trace](#trace-the-protocol) | Traced code sites, not runtime iterations |
+| When does a role work or wait? | [IKET](#iket) | Instrumented runtime ranges |
+| How do those ranges relate to channels? | [Pipeline plan](#join-a-capture-to-the-pipeline-plan) | A per-CTA, work-item model |
+
+None of these proves balanced runtime epochs, race freedom, liveness or a performance bound.
+
 ## Inspect the kernel
 
 ```python
@@ -17,10 +28,11 @@ compile_persistent_gemm(op)
 print(op.describe())
 ```
 
-For the 2-CTA persistent GEMM with CLC (its default `tile_n=224`), after the compile (print yours
-for the current version):
+The first print checks declarations; the second adds available compile results. Here is a
+representative post-compile excerpt for the pair GEMM with CLC and default `tile_n=224`.
+Print your build for current placement, stages and source lines:
 
-```
+```text
 PersistentGemm: 8 warps, 256 threads
   cluster  CTA pair (2, 1, 1), tcgen05 CtaGroup.TWO, leader = rank 0
   params   PersistentGemmParams
@@ -73,27 +85,26 @@ SMEM plan: 200704 B per CTA in 3 buffer(s), plus alignment padding
   C  BFloat16  16384 B                      align 128
 ```
 
-Reading it: `ab` is pair-scoped, so the leader arms 60 KiB for both CTAs' TMA halves and the
-MMA's release multicasts to both (`release_mask 0b11`). `acc`'s empty barrier lives on the
-leader and expects 256 epilogue threads from the two CTAs. The scheduler warp sits in the padding
-warpgroup and broadcasts each CLC claim through `work_ring` to every role in both CTAs.
+Read one channel at a time:
 
-`describe()` returns a string with roles, warp placement, register budgets, channels,
-per-CTA counts and TMEM regions. Before compilation it checks declarations. After a fresh
-compile it also has the recognized TMA copies and any traced diagnostics. It is not a runtime
-history or a deadlock check. There is no combined cross-role epoch-balance or wait-for-graph
-verifier: balanced declarations can still form an unseeded wait cycle. Runtime synchronization
-relies on a finite, live abstract execution with enough storage for overlapping lifetimes;
-compilation does not establish it. A timeout needs attribution, not an assumption that either
-the layer or the role body is correct.
+- **`ab`:** each CTA receives 30 KiB of A/B per stage. The leader arms 60 KiB for the pair;
+  `1 x6` means one arrival at each of six FULL barriers. After reading, the MMA releases
+  both CTAs (`release_mask 0b11`).
+- **`acc`:** UMMA completion publishes to both CTAs. Its leader-owned EMPTY barrier waits
+  for `2 * 128 = 256` epilogue threads before reuse.
+- **`work_ring`:** the scheduler in the padding warpgroup broadcasts each CLC claim to all
+  roles in both CTAs. `work_clc` is its response slot. These names derive from stream `work`:
+  `work.scheduler`, `work_ring`, `work_clc`.
+- **Storage:** SMEM buffers hold data; barriers track readiness. `SmemPlan` adds sizes,
+  stage modes, overlaps and channel bindings after layouts are traced, plus the
+  [alias diagnostic](storage.md#check-declared-aliases) for declared overlaps.
 
-For a stream named `work`, the inserted scheduler is `work.scheduler`, its broadcast ring is
-`work_ring`, and CLC's response slot is `work_clc`. Print the current kernel instead of relying
-on a saved dump: stage counts and placement change with the configuration.
-
-With `SmemPlan`, the description includes buffer sizes, stage modes, overlaps and channel
-bindings once their layouts have been traced. It also includes the
-[alias diagnostic](storage.md#check-declared-aliases) for declared overlaps.
+`describe()` returns a string. A fresh compile adds recognized TMA copies and traced
+checks; a `jit_cache` load restores the saved reports. It is **not a runtime history**.
+Two roles can still wait for each other's first publication: declaration counts alone do
+not establish progress. Runtime safety needs terminating work, matching epochs, a live
+dependency graph and storage for overlapping lifetimes. A timeout needs attribution, not
+an assumption that either the layer or the role body is correct.
 
 ## Trace the protocol
 
@@ -104,42 +115,52 @@ compile_persistent_gemm(op)
 print(op.describe())
 ```
 
-This adds the traced acquire/commit/wait/release sites and source lines. A loop has a traced
-site, not one record per runtime iteration. Use it to check which handle closes where, not
-to determine when a warp stalled.
+This adds acquire/commit/wait/release **sites and source lines**. For example, a wait inside
+a runtime loop appears as a traced site, not a log entry for every iteration. Follow a handle
+from its open to its close; use IKET, not this log, to locate runtime stalls.
 
-A cached kernel was never traced, so the examples' `compile_*` functions compile a
-`trace_protocol` kernel without the cache (`jit_cache(uncached=...)`). Other trace results
-come back with a cached kernel ([compile keys](roles.md#compile-keys)).
+A cache hit does not retrace the body. The examples therefore compile `trace_protocol`
+builds uncached via `jit_cache(uncached=...)`. Other saved trace results are restored on a
+cache hit; see [compile keys](roles.md#compile-keys).
 
 ### TMA checks
 
-Compilation follows recognizable direct SSA uses of channel barriers and counts static copy
-boxes in the handle's opening region. It recognizes tensor TMA loads (`tma_bar_ptr=`) and bulk
-`cp.async.bulk` loads (`CopyBulkG2SOp`, and `CopyBulkG2SMulticastOp` by atom type, whose mask
-takes the tensor multicast check); a bulk load completes on the issuing CTA's barrier, like a
-`CtaGroup.ONE` tensor load, and is counted only directly inside an `elect_one()` block of the
-handle's region: bulk copies do not elect a lane themselves, so one written directly in the
-region (every lane issues it) leaves the stage unverified. A known wrong CTA group (a bulk load into a pair-scoped channel
-included), undeclared multicast mode or complete byte-count mismatch raises `ProtocolError`.
-Recognized copies report their group (`cp.async.bulk` for bulk loads), bytes per stage per CTA
-and source locations. For multicast, the counted bytes are the SMEM destination box; in a
-symmetric `Cluster.multicast` partition this equals the issuing CTA's delivery across its mask's
-CTAs.
+The check asks: **do recognized copies complete on the barrier and byte count you declared?**
+It follows direct SSA uses of channel barrier pointers and counts static copy boxes in the
+handle's opening region. You still supply `Tma(tx_bytes)`.
 
-Unknown atoms, opaque pointers, nested/dynamic/conditional copies (other than `elect_one()`),
-multicast masks not obtained from `Cluster.multicast`, or unsupported IR can leave this check
-incomplete. Incomplete inspection alone does not reject; compilation continues with a warning
-and `unverified` reasons in `describe()`. Positive wrong-group or undeclared-multicast evidence
-still rejects even when byte accounting is incomplete. Validate raw, unverified and opted-out
-uses independently. `verified` means the recognized group and byte accounting match; it does not
-certify descriptor legality, the per-instruction size a bulk copy's layout lowers to (a bulk
-copy moves whole contiguous vectors; give it flat views), disjoint writes or all async ordering.
-You still supply `Tma(tx_bytes)` yourself.
+| Recognized operation | Accounting requirement |
+|---|---|
+| Tensor TMA load, `tma_bar_ptr=` | Directly in the handle's region, or its `elect_one()` block |
+| Bulk `cp.async.bulk` load, `mbar_ptr=` | Directly inside an `elect_one()` block of that region |
+| Multicast | Recognized `Cluster.multicast` mask, or `Cluster.fill` for fills |
 
-Context atom checks inspect direct fields for MMA CTA span and unsupported group-TWO or
-multicast G2S atoms. They do not recursively inspect nested objects and are not disabled by a
-per-use `unchecked("tma")` opt-out.
+Bulk atoms `CopyBulkG2SOp` and `CopyBulkG2SMulticastOp` are recognized by type; multicast
+masks get the tensor-multicast check. Bulk loads complete on the issuing CTA's barrier,
+like group ONE, and **do not elect a lane themselves**. A direct, unelected bulk copy is
+issued by every active lane and leaves byte accounting `unverified`.
+
+Read the result literally:
+
+- **`ProtocolError`:** positively wrong CTA group, undeclared multicast, or a complete
+  byte-count mismatch. A bulk copy cannot satisfy a channel requiring group TWO. Wrong-group
+  and undeclared-multicast evidence rejects even if the byte total is incomplete.
+- **`verified`:** recognized group, bytes per stage per CTA, and source sites match.
+  Bulk reports say `cp.async.bulk`. Multicast counts the SMEM destination box; in a symmetric
+  partition this equals the issuer's delivery across its mask's CTAs.
+- **`unverified`:** inspection was incomplete; compilation continues with a warning and
+  reasons. Causes include unknown atoms, opaque pointers, nested/dynamic/conditional copies
+  other than `elect_one()`, unrecognized masks and unsupported IR. Fills also need enough
+  distinct target masks; see [fills](clusters.md#one-cta-loads-for-others).
+
+`verified` does **not** prove descriptor legality, disjoint writes or all async ordering.
+Nor does it certify a bulk copy's per-instruction transfer size: bulk copies move whole
+contiguous vectors, so give them flat views. Validate raw, unverified and opted-out uses
+independently.
+
+A separate context check inspects **direct fields** for MMA CTA span and unsupported
+group-TWO/multicast G2S atoms. It neither walks nested objects nor turns off for a per-use
+`unchecked("tma")`.
 
 ## IKET
 
@@ -150,14 +171,28 @@ op = PersistentGemm(schedule=StaticPersistent()).enable_iket(waits=False)
 fn = compile_persistent_gemm(op)
 ```
 
-Enable IKET before compiling. `waits=False` records role ranges without the finer wait ranges.
-Start there: instrumentation around short waits can distort the timing you are trying to read.
+Enable IKET before compiling. Start with `waits=False`: short-wait instrumentation can
+change the timing you want to understand.
 
-Roles taking `WorkCursor` get one range per work item. Other roles get one range over their
-body. With the default `waits=True`, blocking operations also get names such as `ab.acquire`,
-`ab.wait`, `ab.tail`, `q.peek`, `mufu.turn` and a `NamedBarrier`'s `compute_sync.sync`. A
-wait given a try token keeps its range, which is empty when the probe succeeded; the probe
-itself has no range.
+- Roles taking `WorkCursor`: one range per work item, ending at `advance()`.
+- Other roles: one range over the body. Instance names remain distinct, e.g. `softmax[0]`.
+- Default `waits=True`: nested ranges such as `ab.acquire`, `ab.wait`, `ab.tail`, `q.peek`,
+  `mufu.turn` and `compute_sync.sync` for a `NamedBarrier`.
+- Try-token probes have no range. The subsequent wait keeps its range, empty if the probe
+  already succeeded.
+
+Conceptual timeline (not a measured capture):
+
+```text
+load item 0: [ab.acquire][issue copies] ...
+mma  item 0:       [----- ab.wait -----][MMA] ...
+                          waiting for FULL
+```
+
+A wide `ab.wait` says the consumer waited for data; a wide `ab.acquire` says the producer
+waited for storage reuse. Neither alone identifies the bottleneck. Match the CTA, role and
+epoch to the other side before attributing the delay; overlapping waits are not additive
+kernel time.
 
 Add a region in a role:
 
@@ -196,12 +231,23 @@ write_pipeline_perfetto("gemm.pftrace", timeline, measured, analysis=analysis)
 Use the JSON capture path produced by your IKET run in place of `capture.trace.json`.
 Open the resulting trace in [Perfetto](https://ui.perfetto.dev/).
 
-The plan is per CTA. `cta=1` excludes leader-only roles in a pair; any rank excludes the roles
-that don't run there. Its regions are work-item
-granular, so ring occupancy and reuse estimates for an inner K loop are coarse, not
-measurements of individual stages. Traced reuse counts come from the compile that built the
-kernel; a cached kernel restores them. The exported plan is not a proof of liveness or
-race freedom, and neither a plan nor an accepted kernel promises a performance threshold.
+The two `cta` arguments use different coordinates: `plan_from_warpdrive(cta=0)` selects a
+**cluster rank**; `load_iket_capture(cta=(0, 0, 0))` selects a **captured logical CTA**. Match
+them. In a pair, a rank-1 plan excludes leader-only roles; every rank excludes absent roles.
+
+The plan joins names and dependencies, not individual inner-loop stages:
+
+```text
+producer region -- data --> consumer region
+producer region <-- reuse -- consumer region
+                   one iteration = one work item
+```
+
+Reuse distances use traced per-item counts (restored by `jit_cache`); before compilation,
+each channel is assumed used once per item. Inner K-loop occupancy is therefore coarse.
+Within-item feedback that would form a cycle is modeled as next-item feedback, not a
+per-stage causal model. Use explicit epochs and runtime waits for that finer question.
+The plan is not a liveness/race proof or a promised performance threshold.
 
 See the [pipeline profiler README](../../profiler/README.md#declarative-pipeline-analysis)
 for critical-path analysis, measured timelines and capture tooling.

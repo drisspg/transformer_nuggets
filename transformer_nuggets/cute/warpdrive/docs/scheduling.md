@@ -2,6 +2,66 @@
 
 [Back to warpdrive](../README.md)
 
+A `WorkStream` gives the roles of one work unit the same sequence of items. A **work unit**
+is one CTA, or one whole cluster with `CtaPair()` or `Cluster(...)`.
+
+```text
+schedule                    mapping                   role
+choose linear index 5  ---> decode 5 as (m, n, l) ---> work.item
+                                ^
+                         optional ready wait
+                         before decoding starts
+```
+
+Declare at most one stream per kernel. `WorkStream()` defaults to `Raster()` and `OneShot()`:
+
+```python
+self.work = WorkStream()
+```
+
+For `space=(3, 2, 1)`, plain Raster maps indices 0–5 to
+`(0,0,0), (1,0,0), (2,0,0), (0,1,0), (1,1,0), (2,1,0)`. The schedule decides which unit gets
+each index; changing the schedule need not change these items.
+
+Raster options:
+
+- `along="m"` chooses the raster axis; `"n"` chooses the other one.
+- `swizzle=8` groups the other axis into eight-tile bands, visiting the band's tiles
+  innermost. The final band may be narrower.
+- `reverse="m"` visits m high-to-low. l is always the slowest axis.
+
+For positive extents Raster is a bijection. Its decode intermediates stay within
+`max(index, item_count)`, avoiding overflow for admitted indices.
+
+## Choose a schedule
+
+| Schedule | After unit b's first index b… | Distribution |
+|---|---|---|
+| `OneShot()` | Return terminal index `total`; no local reassignment of dropped items | Local |
+| `StaticPersistent()` | Add U, the number of launched units | Local |
+| `AtomicPersistent(stages=2)` | Claim from a global atomic counter | Scheduler warp |
+| `ClusterLaunchControl(stages=2)` | Cancel an unlaunched unit and take its work | Scheduler warp |
+
+With eight items and three static-persistent units:
+
+```text
+unit 0:  0 -> 3 -> 6 -> terminal
+unit 1:  1 -> 4 -> 7 -> terminal
+unit 2:  2 -> 5      -> terminal
+```
+
+Atomic claims are unique but have no fixed inter-unit order. CLC recovers the canceled
+work index from its CTA x coordinate divided by cluster size. It waits for every cancellation
+response and never queries again after failure.
+
+A correctly launched and drained stream assigns each kept index to exactly one unit. Its
+roles see the same ordered sequence in the CTAs where they run: every CTA for `all`, pair
+leaders for `leader`, rank 0 for `rank0`. This does not mean every CTA sees every item.
+
+### The role loop
+
+This role fragment works with either local or broadcast distribution:
+
 ```python
 self.work = WorkStream(mapping=Raster(swizzle=8), schedule=ClusterLaunchControl(stages=2))
 
@@ -16,59 +76,41 @@ def load(self, params: PersistentGemmParams, *, ab: Producer, work: WorkCursor):
     return ab, work
 ```
 
-A work unit is one CTA, or one cluster with `CtaPair()` or `Cluster(...)`. `schedule=` chooses its linear
-indices; `mapping=` turns an index into the item returned by `work.item`. `ready=` is an
-optional wait before decoding starts. There can be one `WorkStream` per kernel.
+Every managed role must drain a persistent stream, even a role with no per-item work.
+Use exactly `while work.valid:`, read the item before advancing, call `work.advance()` once
+directly at the end of the loop body, and return the cursor.
 
-`WorkStream()` defaults to `Raster()` and `OneShot()`. `Raster` maps `(m_tiles, n_tiles, l)`
-to `(m, n, l)` coordinates. `along="m"` selects the raster axis, `swizzle=8` groups the other
-axis into eight-tile bands, and `reverse="m"` visits m in reverse order. l is the slowest axis.
-For positive extents this is a bijection; decode intermediates stay within
-`max(index, item_count)`, so admitted indices do not overflow.
+The checker rejects item reads after advance, including lookahead reads of the next item
+inside the same iteration. It does not prove advance is lexically last, detect every cursor
+rebind/stale restore, or prove useful and matching work happened before it.
 
-## Choose a schedule
+### What the scheduler warp buffers
 
-| Schedule | How a unit gets work after its first item |
-|---|---|
-| `OneShot()` | Terminal `total`; dropped items are not reassigned locally |
-| `StaticPersistent()` | Add the number of launched units to its index |
-| `AtomicPersistent(stages=2)` | Claim an index from a global atomic counter |
-| `ClusterLaunchControl(stages=2)` | Cancel an unlaunched unit and run its work |
+Local schedules compute and decode indices in each role. Atomic and CLC schedules add a
+scheduler warp that claims, decodes and broadcasts items through a work ring. In a cluster,
+rank 0 sends to every CTA. The warp is the lowest free warp unless selected with
+`WorkStream(scheduler_warp=...)`.
 
-With U launched work units, unit b starts at index b. Static persistence then visits
-`b + U, b + 2*U, ...`; atomic claims are unique but have no fixed order between units.
-CLC divides a canceled cluster's CTA x coordinate by the cluster size to recover the work
-index. It waits for every cancellation response and issues no query after failure.
+```text
+scheduler: acquire free slot -> claim/decode -> publish item
+role:      receive item      -> release slot -> compute item
+```
 
-For a correctly launched and drained stream, each kept index belongs to exactly one work
-unit. All its participating roles observe the same ordered sequence, in the CTAs where
-those roles run: all CTAs for `all`, pair leaders for `leader`, and rank 0 for `rank0`.
-This does not mean every CTA sees every work item.
+`stages` is **work-ring depth**, not A/B buffering. A role releases its work slot on receipt,
+not when computation finishes. All ring consumers also receive a terminal marker, which is
+not work.
 
-One-shot and static schedules run locally in each role. Atomic and cluster launch control
-add a scheduler warp. The scheduler warp claims and decodes an item, then sends it to the
-other roles through a ring. In a cluster, rank 0 sends it to every CTA.
-
-`stages` is the work ring's depth, not the number of A/B stages. A free work-ring slot is
-acquired before claiming more work. Roles release the slot when they receive the item, not
-when they finish computing it. In a cluster the leader fills every CTA's slot with `st.async`,
-which completes the receiving CTA's full barrier by bytes, and the receivers' releases are
-CTA-scope arrivals (`remote_scope cta`): they hand the slot back and publish nothing. A
-cluster-scope release there cost the 2-CTA persistent GEMM 0.7-1.2 us per work item in every
-role, comparable to a short-K tile's mainloop ([examples](examples.md#tile-boundaries)).
-Every ring consumer also receives the terminal marker, which is not work. The scheduler uses
-the lowest free warp unless you set `WorkStream(scheduler_warp=...)`.
-
-Use `while work.valid:` and one `work.advance()` directly at the end of that loop's body.
-Read the item before advancing, and return the cursor. Every managed role must drain the
-stream with a persistent schedule. The checker requires the exact `work.valid` condition and
-rejects item reads after advance, including lookahead reads of the next item in the same
-iteration. It does not prove advance is lexically last, detect every cursor rebind or stale
-state restore, or prove useful and matching work happened before it.
+For cluster broadcasts, the leader uses `st.async` to fill every CTA's slot; the bytes
+complete that CTA's FULL barrier. Receivers return the slot with CTA-scope arrivals
+(`remote_scope="cta"`), publishing no data. The historical 2-CTA persistent GEMM measurement
+found cluster-scope releases cost 0.7–1.2 µs **per item in every role**, comparable to its
+short-K mainloop ([measurement context](examples.md#tile-boundaries)). This is reference
+evidence, not a new timing or a general bound.
 
 ## Bind and launch
 
-From [persistent_gemm.py](../examples/persistent_gemm.py):
+Keep scheduling choices static and problem dimensions runtime. From
+[persistent_gemm.py](../examples/persistent_gemm.py), these excerpts run at three boundaries:
 
 ```python
 # Python, outside the compiled entry point:
@@ -82,99 +124,134 @@ self.kernel(..., bound).launch(**self.launch_config(bound), stream=stream)
 smem = self.begin_roles(work=bound, layouts={"A": a_layout, "B": b_layout, "C": c_layout})
 ```
 
-Pass the layouts for this kernel's `SmemPlan`; omit `layouts` if you allocate storage yourself.
-The keyword in `begin_roles(work=bound)` matches the `self.work` attribute. `bind()` returns
-`BoundWork`, the runtime problem passed to the kernel. Shapes, counts and the persistent grid
-cap are runtime values, not per-shape compile keys.
+`bind()` returns `BoundWork`, the runtime problem passed to the kernel. Shapes, counts and
+the persistent grid cap are not per-shape compile keys. The keyword `work=bound` matches
+`self.work`. Supply layouts for every `SmemPlan` buffer; omit `layouts` when allocating
+storage yourself.
 
-`StaticPersistent` and `AtomicPersistent` need `max_ctas`. It caps CTAs, not clusters; a
-cluster of `cs` CTAs uses at most `max_ctas // cs` clusters, with a minimum of one. Both
-schedules also cap the number of units by the item count, again with a minimum of one.
-`launch_args()` returns the CTAs of every cluster that fits at once: the SM count for one CTA
-or a pair, fewer for 4-CTA clusters (36 clusters on a 152-SM GB300). This is a capacity
-estimate, not a co-residency guarantee. Keep both launch arguments in the entry point's
-signature even for schedules that don't read them, so changing the schedule
-leaves the ABI alone.
+Keep both launch arguments in the entry point's signature even for schedules that ignore
+them, so switching schedules preserves the ABI.
 
-`AtomicPersistent` uses two zeroed Int32 words, `[claims, finished]`. After the first item,
-a claim returns `launched_units + atomicAdd(claims, 1)`. The last scheduler to report completion
-fences and zeros both words for the next launch, including ordered CUDA-graph replays.
-`launch_args()` caches workspace by device and current stream: launches on one stream share it because they
-run in order, and launches made with it on different streams get different workspaces, so
-they can run concurrently. Never pass the same workspace to concurrent launches yourself.
-They would claim from one counter, taking some of each other's items, and the first launch
-to finish could zero it while the other is still claiming.
-Schedules that read no workspace (`OneShot`, `StaticPersistent`, `ClusterLaunchControl`) without
-`record` get one placeholder per device instead, never read or written by the kernel, so a
-CUDA graph captured on a new stream records no fill.
+### Grid cap
+
+Static and atomic persistence require `max_ctas`. It caps **CTAs**, not clusters. With
+cluster size `cs`, the cap becomes `max_ctas // cs` units, at least one; both schedules also
+cap units by item count, again at least one.
+
+`launch_args()` estimates how many CTAs fit in resident clusters: the SM count for single
+CTAs or pairs, fewer for four-CTA clusters (36 clusters on a 152-SM GB300). This is a capacity
+estimate, not a co-residency guarantee.
+
+### Workspace lifetime
+
+Atomic persistence uses two zeroed Int32 words, `[claims, finished]`:
+
+```text
+first item:       unit b gets index b
+later claim:      launched_units + atomicAdd(claims, 1)
+last report:      fence, then reset both words to zero
+```
+
+The last scheduler report resets claim state for the next ordered launch, including CUDA
+graph replay. It is not a statement that all earlier item computations have finished.
+
+`launch_args()` caches workspace by device and **current stream**. Ordered launches on one
+stream can share it; calls on different streams obtain different workspaces. Never manually
+share one between concurrent launches: they would steal each other's indices and one could
+reset the counter while the other still claims.
+
+Without `record`, schedules that use no workspace (`OneShot`, `StaticPersistent`, CLC) receive
+one placeholder per device. The kernel never accesses it; graph capture on a new stream
+therefore records no fill.
 
 ### The grid and empty work
 
-`OneShot()` with plain `Raster()` launches `(m_tiles * cluster_size, n_tiles, l)` and normally
-reads the coordinates from `blockIdx`. If y or z would exceed 65535, it uses a 1-D grid and
-decodes the index. A hand-built `(total * cluster_size, 1, 1)` grid is also supported for this
-one-shot path. Other built-in combinations use a 1-D grid.
+Plain `Raster()` with `OneShot()` normally launches
+`(m_tiles * cluster_size, n_tiles, l)` and reads `blockIdx` coordinates. If y or z exceeds
+65535, it switches to a decoded 1-D grid. A hand-built `(total * cluster_size, 1, 1)` grid is
+also supported for this path. Other built-in combinations use 1-D grids.
 
-An extent <= 0 makes a Raster space empty. Its bound space becomes `(1, 1, 0)`, each built-in
-schedule launches one work unit, and every role starts with `work.valid == False`. There is
-no division by zero and the atomic workspace remains zeroed. No guarded mapping is decoded;
-any-index decoders may evaluate and discard an item. Normalization happens on the host in
-the JIT entry point. Direct `Raster.decode` calls must use the bound space too: raw extents
-such as `(0, 1, 1)` are not safe divisors.
+If any Raster extent is `<= 0`:
 
-Counts are computed once on the host side of the JIT entry point with `mapping.count64()`.
-The kernel receives the narrowed Int32 `BoundWork.total`. The launch check must admit that
-count before any kernel runs:
+- Host-side binding normalizes space to `(1, 1, 0)`.
+- Every built-in schedule launches one unit, with `work.valid == False` in every role.
+- No guarded decode runs; any-index decoders may evaluate and discard a result.
+- No divisor is zero and the atomic workspace remains zeroed.
 
-- One-shot and cluster launch control require `total * cluster_size <= 2**31 - 1`.
-- Static and atomic persistence require `total + launched_units - 1 <= 2**31 - 1`, including
-  the last unit's terminal index.
+Direct `Raster.decode` calls must also use **bound** space. Raw `(0, 1, 1)` is not safe.
 
-A failing check makes `bound.grid()` zero-wide; CUDA rejects the launch rather than running
-a wrapped space. Use `launch_config(bound)` or `bound.grid()` to get this check. A hand-built
-grid is your responsibility. Raster's runtime extents are converted to Int32 before binding;
-passing a wider value is not a way to request a larger index space. The failed launch leaves
-no sticky CUDA error, but invalidates an active CUDA-graph capture. Custom mapping arithmetic,
-`record` log offsets and other launch resources must independently fit Int32 and CUDA limits.
+The entry point calls `mapping.count64()` once and passes narrowed Int32 `BoundWork.total`
+to the kernel. Before launch, the count must satisfy:
+
+| Schedule | Required bound |
+|---|---|
+| One-shot or CLC | `total * cluster_size <= 2**31 - 1` |
+| Static or atomic persistent | `total + launched_units - 1 <= 2**31 - 1`, including terminal indices |
+
+Use `launch_config(bound)` or `bound.grid()` for this check. Failure gives a zero-width grid,
+which CUDA rejects instead of running wrapped work. A hand-built grid is your responsibility.
+The failed launch leaves no sticky CUDA error, but invalidates active CUDA-graph capture.
+
+Raster runtime extents become Int32 before binding; passing wider values cannot enlarge the
+supported space. Custom mapping arithmetic, `record` offsets and other launch resources must
+independently fit Int32 and CUDA limits.
 
 ## Custom mappings
 
-Subclass `WorkMap`. The complete contract is in [scheduling.py](../scheduling.py).
+A `WorkMap` turns an index into an item; it does not choose the next index. For example, a
+table-backed map can return table row `index`, dropping unused rows. Subclass `WorkMap`;
+[scheduling.py](../scheduling.py) defines the full protocol.
 
-`words` is the number of Int32 words in an item. `bind(space)` runs once to normalize the
-runtime input in the entry point; it can return tuples, tensors or another DSL value.
-`count64(bound_space)` returns a nonnegative host-visible count, exact through `2**31` or saturating at that value,
-never wrapping. Both run before the kernel; neither can read a device-built length.
+| Method or field | Contract |
+|---|---|
+| `words` | Positive number of Int32 words in each item |
+| `bind(space)` | Once in the host entry point; normalize runtime inputs into a DSL-compatible tuple, tensor or other value |
+| `count64(bound_space)` | Host-visible nonnegative count, exact through `2**31` or saturated there; never wrap |
+| `decode(index, space, state)` | On device, return `(keep, words, next_state)` |
+| `unpack(words)` | Public `work.item`; defaults to a tuple |
+| `get_key()` | Every static choice, not runtime extents; lowercase letters, digits and underscores |
 
-On the device, `decode(index, bound_space, state)` returns `(keep, words, state)`. A stateless
-mapping passes `state` (`None`) through; see [Decode state](#decode-state). Set `skips = True` if
-`keep` can be false. Otherwise `keep` must be the constant Python `True`, which is checked
-while tracing. Dropping an index permanently removes it from every role's sequence. `unpack(words)`
-returns the public `work.item`; its default is a tuple.
+Host `bind` and `count64` cannot read a device-built length. Bind a capacity instead
+([device-built list](#a-device-built-list)). A stateless decoder passes `state=None` through;
+see [Decode state](#decode-state) for a carried cache.
+Set `skips=True` if `keep` can be false; otherwise it must be the Python constant `True`,
+checked while tracing. Dropping an index permanently removes it from every role's sequence.
 
-Normally, decode only runs for `0 <= index < total`. A table-backed mapping can therefore
-read row `index` without handling terminal indices. `decodes_any_index = True` opts out of
-that guard: use it only for a pure decoder defined for every nonnegative Int32 index,
-including empty spaces and indices past the end. It may also run before readiness in the
-tile-grid prologue. Raster and the external adapters opt in; a decoder that reads an item
-table must not. A subclass that overrides `decode` must opt in again. A skipping mapping's
-`keep` is still used only for valid indices. A skipping mapping is decoded once per visited
-index at each decoding site.
+Correctness obligations:
 
-Mapping results must agree across roles and CTAs. Tables must be ready before decoding and
-stay unchanged while the stream uses them. `get_key()` names every compile-time choice,
-not runtime extents, using lowercase letters, digits and underscores. Every kept index must
-represent a distinct work item, and every needed item must be reachable among `[0, count)`;
-the layer does not check either property.
+- All roles and CTAs must decode the same answer. Tables must be ready before decoding and
+  unchanged while the stream uses them.
+- Kept indices must represent distinct items, and `[0, count)` must reach every needed item.
+  The layer does not prove either property.
+- Each skipping decoder runs once per visited index at each decoding site.
+
+### Guarded versus speculative decode
+
+Normally decode runs only for `0 <= index < total`, after readiness. A table map may safely
+read row `index` without handling terminal indices.
+
+`decodes_any_index=True` removes that guard. Opt in only for a **pure launch-data decoder**
+defined for every nonnegative Int32 index, including empty spaces and indices beyond the
+end. It may run before readiness in the tile-grid prologue. Speculative results are discarded,
+but any updated state must remain valid. A skipping map's `keep` is still used only for
+valid indices.
+
+Raster and the external adapters opt in; an item-table reader must not. A subclass replacing
+`decode` must explicitly opt in again.
 
 ### Decode state
 
-Some decodes are cheap only incrementally. The grouped GEMM numbers its groups' m-tiles back to
-back, so finding a tile's group takes a prefix sum of the groups' tile counts over device
-offsets. A unit's indices increase under static and atomic persistence (and in practice under
-cluster launch control), so the prefix reached for one item is where the walk for the next one
-starts. `start(space)` returns that
-carried state, and `decode` receives and returns it:
+State avoids repeating expensive lookup work. In grouped GEMM, group m-tiles are numbered
+back-to-back. A small cached window says which group contains the previous tile:
+
+```text
+cached group window:  [tile_lo ........ tile_hi)
+next tile inside?     reuse the window, no offset load
+next tile ahead?      walk forward through group offsets
+next tile behind?     restart from group 0
+```
+
+A shortened grouped-map excerpt (with `_seek` supplied by the example):
 
 ```python
 class Window(NamedTuple):
@@ -192,42 +269,41 @@ class GroupedTiles(WorkMap):
     def decode(self, index, space, state):
         offsets, total_m, n_tiles = space
         mt = index // n_tiles
-        w = _seek(state, mt, offsets, total_m, self.tile_m)  # no load while mt stays in w
+        w = _seek(state, mt, offsets, total_m, self.tile_m)
         row0 = w.row_lo + (mt - w.tile_lo) * self.tile_m
         rows = cutlass.min(w.row_hi - row0, self.tile_m)
         return row0 < w.row_hi, (w.group, row0, rows, index % n_tiles), w
 ```
 
-Each decoding site owns one state: every role of a local schedule, the scheduler warp of a
-broadcast one, and `single_item`. The site calls `start` once, after the readiness hook, even
-when the stream is empty, and then passes each decode the state the previous one returned,
-dropped items included. Ring receivers hold no state. The one exception is a
-`decodes_any_index` mapping without hooks: every role decodes its first item from a fresh
-`start` state.
+Each decoding site owns its state: every role in a local schedule, the scheduler warp in a
+broadcast schedule, or `single_item`. Ring receivers carry no decode state.
 
-The state is a cache, never an input to the answer. From any state reachable from `start`,
-`decode` must return the `keep`, and for a kept index the words, that `start`'s own state would.
-Indices can arrive in any order: strided by the unit count, claimed by other units in between,
-or backwards under a custom schedule. Make the common increasing case fast and the rest correct;
-the grouped GEMM walks forward from its window and restarts from group 0 when an index goes
-backwards.
+- `start(space)` runs once after readiness, **even for an empty stream**. It must be safe
+  for every bound space. It may read readiness-published data, but put item-table reads in
+  guarded `decode`.
+- Each decode receives the previous returned state, including after dropped items. The
+  first uses `start`'s state. Exception: with `decodes_any_index` and no skip/readiness hooks,
+  every role decodes its first item from a fresh `start` state.
+- Use DSL values (`Int32(0)`, not `0`) in tuples or `NamedTuple`s. Plain dataclass fields do
+  not carry. Return the same structure and types; tracing checks this.
 
-`start` must be safe for every bound space, because it also runs for empty streams. It may read
-what readiness made visible, but item-table reads belong in the guarded `decode`. Build the
-state from DSL values (`Int32(0)`, not `0`) in tuples or a `NamedTuple`; a plain dataclass's
-fields are not carried. `decode` must return the same structure and types it received. These
-rules are checked while tracing. The state lives in registers of every decoding warp, so keep it
-to a few words and name it in `describe()`: the grouped GEMM's 5-word window is
-`GroupedTiles(tile_m=128, state=Window: 5 x Int32)`.
+**State is a cache, never an input to the answer.** From any reachable state, decode must
+return the same `keep` and kept words as from a fresh start. Static and atomic indices
+increase within a unit; CLC and custom schedules may go backwards. Optimize forward walks,
+but make every order correct.
 
-Prefer a broadcast schedule when the decode stays expensive even with a state. The scheduler
-warp then decodes once per item, ahead of the roles, instead of every role decoding between
-items. Choose a local schedule when the carried state makes the decode cheap; it needs no
-scheduler warp or workspace. The grouped GEMM's static and atomic schedules perform the same.
+State lives in each decoding warp's registers; keep it small and name it in `describe()`.
+The grouped example reports `GroupedTiles(tile_m=128, state=Window: 5 x Int32)`.
+
+If decoding remains expensive, a broadcast scheduler decodes once per item ahead of the
+roles. If state makes decoding cheap, a local schedule avoids the scheduler warp/workspace.
+The grouped GEMM's reported static and atomic performance was the same; that observation is
+not a guarantee for other workloads.
 
 ### A device-built list
 
-[PackedWork](../examples/packed_work.py) is a small table-backed mapping:
+[PackedWork](../examples/packed_work.py) binds a host-visible capacity and reads the actual
+length only after readiness:
 
 ```python
 from transformer_nuggets.cute.warpdrive import AtomicPersistent, PdlWait, WorkStream
@@ -238,26 +314,26 @@ self.work = WorkStream(mapping=PackedWork(words=3), schedule=AtomicPersistent(),
 bound = self.work.bind((table, length), workspace, max_ctas)
 ```
 
-`count64()` returns the table capacity. `decode()` reads the row and keeps it when
-`index < length[0]`; its state stays `None`. The schedule still visits the unused capacity, so don't oversize it
-needlessly. The row read is within capacity even for a dropped item; its words are ignored.
+`count64()` returns capacity. `decode()` reads row `index`, keeps it if `index < length[0]`,
+and passes `state=None` through. Even a dropped row read stays within capacity; its words
+are ignored. The schedule visits all capacity, so avoid excessive padding.
 
-`PdlWait()` issues `griddepcontrol.wait` once before decoding, in each local role or in the
-broadcast scheduler. It supplies the wait for a programmatic dependent launch, not the
-producer or the rest of the launch setup. See the PDL tests in
-[test_cute_warpdrive_scheduler_interface.py](../../../../test/test_cute_warpdrive_scheduler_interface.py)
-for the producer/consumer launch. A custom hook subclasses `Readiness` and supplies `wait()`
-and `get_key()`. Its wait must terminate in every warp that calls it.
+`PdlWait()` issues `griddepcontrol.wait` once per decoding site: each local role, or the
+broadcast scheduler. It supplies only the wait, not the producer or dependent-launch setup.
+See the PDL tests in
+[test_cute_warpdrive_scheduler_interface.py](../../../../test/test_cute_warpdrive_scheduler_interface.py).
+A custom `Readiness` supplies `wait()` and `get_key()`; the wait must terminate in every
+calling warp.
 
-Split work uses distinct indices too: a split-K mapping returns `(tile, split)` and the split's
-K range, dropping empty ranges. Reduce the partials in a later kernel, not in the schedule.
-The decode example's `SplitKV` mapping returns `(split, kv_head, batch, splits)` and, with
-per-sequence split counts from a preceding kernel, drops splits past a sequence's count after
-`PdlWait()`. The FA4 adapter below doesn't provide split-KV.
+Split work also needs distinct indices. A split-K map can return `(tile, split)` and its K
+range, dropping empty splits; a later kernel reduces partials. The decode example's
+`SplitKV` returns `(split, kv_head, batch, splits)`. With per-sequence counts from a preceding
+kernel, it drops excess splits after `PdlWait()`. The FA4 adapter below does not support split-KV.
 
 ## Custom index schedules
 
-A local `IndexSchedule` implements `next_index` and can replace `first_index`:
+An `IndexSchedule` selects indices, not items. This local example visits each static
+sequence backwards:
 
 ```python
 from dataclasses import dataclass
@@ -281,38 +357,49 @@ class ReverseStatic(IndexSchedule):
 self.work = WorkStream(mapping=Raster(swizzle=8), schedule=ReverseStatic())
 ```
 
-Every result must be a valid index or a terminal index `>= total`, never negative.
-`first_index` depends only on launch values and the bound problem; `next_index` must compute
-the same sequence in every role. Both are pure functions, and these properties are caller
-obligations, not trace-time proofs. The schedule must terminate and assign each kept index to
-exactly one work unit if you want once-only coverage. Each local stream user calls
-`first_index` at initialization, then `next_index` on each advance; skip loops also call
-`next_index` for every dropped valid index. A nonpersistent schedule must return a terminal
-index from `next_index`.
+Local schedule rules:
 
-A broadcast schedule sets `broadcast = True` and a positive `stages`, then defines
-`claim_next(fetch, problem, index)`. The previous index is supplied, so the claim sequence can
-carry state without another buffer. `fetch_channels()` declares any extra scheduler channels;
-`close_claims(fetch, problem)` runs once after its last claim. Earlier items may still be
-computing: this closes claim state, not work. Do not use it for teardown, fixups or reductions.
+- Return a valid index or terminal index `>= total`, never a negative index.
+- `first_index` depends only on launch values and the bound problem. `next_index` is a pure
+  function giving every role the same sequence.
+- Every local stream user calls `first_index` at initialization and `next_index` on advance,
+  including once per dropped valid index in skip loops.
+- Terminate and assign each kept index to exactly one unit for once-only coverage. These are
+  caller obligations, not trace-time proofs.
+- A nonpersistent schedule must return a terminal index from `next_index`.
 
-Only the rank-0 scheduler warp calls `claim_next`, after acquiring a free work-ring slot and
-while the previous claim is valid. The layer publishes `[index, *words]` to all stream users
-and owns the ring's counts, payload, fences, tails and drain; extra `fetch_channels` use the
-same channel derivation. The scheduler decodes and broadcasts the first item too, so roles
-never decode, unless the mapping sets `decodes_any_index` and the stream neither skips nor
-waits for readiness. Then every role decodes `first_index` locally from launch-time data and
-only later items come from the ring.
+### Broadcast schedules
 
-The host methods are `launch_units(total, max_units)` and `index_limit(total, units, cs)`.
-The former receives the cap in work units when `uses_max_ctas`, otherwise `None`.
-The latter bounds every computed index and grid x extent for the Int32 launch check. Its
-default is `total + units - 1`, the terminal-index bound for strided schedules; override it
-if that doesn't bound your sequence. Declare `uses_max_ctas` and `uses_workspace` truthfully
-and include all static fields in `get_key()`.
-See `IndexSchedule` in [scheduling.py](../scheduling.py) for the full method contract.
+Set `broadcast=True`, choose positive `stages`, and implement
+`claim_next(fetch, problem, index)`. The previous index permits a stateful claim sequence
+without another buffer. Only the rank-0 scheduler calls it, after acquiring a free work slot
+and while the previous claim is valid.
+
+The layer broadcasts `[index, *words]` and owns the work ring's payload, counts, fences,
+tails and drain. `fetch_channels()` may declare extra scheduler channels using the same
+channel derivation. `close_claims(fetch, problem)` runs once after the last claim; earlier
+items can still be computing. **Close claim state there, not work:** no teardown, fixups or
+reductions.
+
+Normally the scheduler decodes/broadcasts the first item too, so roles never decode.
+Exception: if `decodes_any_index=True` and the stream neither skips nor waits for readiness,
+each role decodes `first_index` locally from launch-time data; later items arrive via the ring.
+
+Host-side contracts:
+
+| Method/field | Responsibility |
+|---|---|
+| `launch_units(total, max_units)` | Return at least one launched unit; cap is in work units when `uses_max_ctas`, otherwise `None` |
+| `index_limit(total, units, cs)` | Bound computed indices and grid x extent for the Int32 launch check; default `total + units - 1` fits strided terminal indices |
+| `uses_max_ctas`, `uses_workspace` | Declare resource use truthfully |
+| `get_key()` | Include all static choices |
+
+Override `index_limit` if the default does not bound your sequence. See `IndexSchedule` in
+[scheduling.py](../scheduling.py) for the full method contract.
 
 ## CUTLASS and FA4 mappings
+
+Adapters reuse **index-to-tile mapping**, not an external scheduler's launch or pipeline:
 
 ```python
 from flash_attn.cute.tile_scheduler import StaticPersistentTileScheduler
@@ -332,32 +419,36 @@ self.work = WorkStream(
 )
 ```
 
-These reuse an index-to-tile mapping, not the external scheduler's launch or pipeline.
-`CutlassRaster` plus `StaticPersistent` reproduces CUTLASS's per-unit sequence with padded
-swizzle tiles removed. To reproduce FA4's index sequence, pair
-`Fa4Mapping(StaticPersistentTileScheduler)` with `StaticPersistent()`, or
-`Fa4Mapping(SingleTileLPTScheduler)` with `OneShot()`. Either mapping also works with other
-warpdrive schedules.
+To reproduce an external per-unit sequence:
+
+| Mapping | warpdrive schedule |
+|---|---|
+| `CutlassRaster` | `StaticPersistent()`; padded swizzle tiles removed |
+| `Fa4Mapping(StaticPersistentTileScheduler)` | `StaticPersistent()` |
+| `Fa4Mapping(SingleTileLPTScheduler)` | `OneShot()` |
+
+Both adapters also work with other warpdrive schedules. They normalize empty spaces and
+provide Int64 counts. In clusters, each tile is a **work-unit tile**, one item per cluster;
+FA4 params use a `(1, 1)` cluster shape.
 
 `CutlassRaster` is a native implementation of the BSD-3 CUTLASS CuTeDSL helper at `e13f5cd`,
-not an import of the deprecated `cutlass.utils` scheduler. Its padded-space count includes
-indices that decode with `keep=False`. The test oracle is
+not an import of deprecated `cutlass.utils` scheduling. Its padded-space count includes
+indices dropped with `keep=False`. The test oracle is
 [cutlass_static_persistent_tile_scheduler.py](../../../../test/cutlass_static_persistent_tile_scheduler.py).
 
-`Fa4Mapping` imports `flash_attn.cute` when constructed. The static-persistent mapping binds
-`(num_block, num_head, num_batch)`. `SingleTileLPTScheduler` also needs `seqlen_k` as a fourth
-entry to size L2 sections; `lpt`, `lpt_global`, `head_dim`, `head_dim_v` and `element_size`
-are constructor fields. No split-KV is supported.
+`Fa4Mapping` imports `flash_attn.cute` at construction:
 
-Only the two named FA4 schedulers are supported. `SingleTileScheduler` depends on a 3-D
-`blockIdx` rather than one index and is rejected. External dynamic/CLC schedulers that own
-SMEM and barriers cannot be dropped in as mappings. The adapter does not call their advance,
-prefetch, tail or grid methods.
-
-Both adapters normalize empty spaces and provide Int64 counts. In a cluster, their tiles
-are work-unit tiles: one item per cluster, with FA4 params built using a `(1, 1)` cluster shape.
+- Static-persistent mapping binds `(num_block, num_head, num_batch)`.
+- `SingleTileLPTScheduler` adds `seqlen_k` as a fourth entry for L2 sections; `lpt`,
+  `lpt_global`, `head_dim`, `head_dim_v` and `element_size` are constructor choices.
+- No split-KV. Only these two FA4 schedulers are supported.
+- `SingleTileScheduler` needs 3-D `blockIdx`, not one index, and is rejected. External
+  dynamic/CLC schedulers owning SMEM and barriers are not drop-in mappings. The adapter
+  calls none of their advance, prefetch, tail or grid methods.
 
 ## One item in a raw role
+
+Use `single_item()` instead of reading `blockIdx` yourself:
 
 ```python
 @role(warps=range(4), regs=160, raw=True)
@@ -368,7 +459,7 @@ def epilogue(self, params, *, tmem: Tmem):
         ...
 ```
 
-Use this instead of reading `blockIdx` yourself. It handles the fallback grid, clusters, custom
-mappings, readiness and dropped items like a managed cursor. It requires a non-persistent,
-local schedule such as `OneShot()` and must run after `begin_roles()`. Persistent and broadcast
-schedules reject it; their managed roles take a `WorkCursor` and loop.
+It handles the fallback grid, clusters, mappings, readiness and dropped items like a managed
+cursor. Call it after `begin_roles()`, only with a nonpersistent local schedule such as
+`OneShot()`. Persistent and broadcast schedules reject it; managed roles instead take a
+`WorkCursor` and loop.

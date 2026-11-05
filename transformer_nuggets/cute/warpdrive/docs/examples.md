@@ -2,33 +2,26 @@
 
 [Back to warpdrive](../README.md)
 
-- [gemm.py](../examples/gemm.py): three roles and two rings, one CTA per output tile with
-  `WorkStream(schedule=OneShot())`.
-- [persistent_gemm.py](../examples/persistent_gemm.py): all four schedules, double-buffered
-  accumulators, TMA stores, CTA pairs, larger clusters with TMA multicast and configurable
-  `tile_n`.
-- [grouped_gemm.py](../examples/grouped_gemm.py): MoE grouped GEMM with group sizes read on
-  the device: a `WorkMap` that decodes `(group, rows, n_tile)` from the offsets, one TMA
-  descriptor per operand across all groups and a ragged TMA store
-  ([details](#grouped-gemm)).
-- [fa4_fwd.py](../examples/fa4_fwd.py): two softmax instances, a correction role, slots,
-  fan-out/join, turnstiles, S/P aliasing, split-P, persistence and CTA pairs.
-- [fa4_bwd.py](../examples/fa4_bwd.py): FA4's SM100 1-CTA attention backward: 14 warps in
-  four roles, eleven channels (seven with `Warps` sides), five MMAs per tile software-pipelined
-  across overlapping handles, three TMEM aliases and two SMEM epilogue overlaps.
-- [packed_work.py](../examples/packed_work.py): a mapping for a device-built work table with
-  a host-visible capacity and device-side length.
-- [fa4_decode_swapab.py](../examples/fa4_decode_swapab.py): FA4's swap-AB single-token decode:
-  split-KV work items with per-sequence split counts, round-robin softmax warpgroups,
-  named-barrier mailboxes and P staged through SMEM.
-- [raw_interop.py](../examples/raw_interop.py): a managed producer, a consumer that drives
-  the same ring's barriers by pointer under an overridden count, and a raw role waiting
-  natively on a `NamedBarrier`'s ID ([dropping down](dropping_down.md)).
-- [bench_overhead.py](../examples/bench_overhead.py): handoff and fixed-cost microbenchmarks
-  against hand-written twins ([results](#warpdrive-fixed-costs)).
-- [bench_persistent_gemm.py](../examples/bench_persistent_gemm.py): the persistent GEMM's
-  schedules, clusters, tile widths and accumulator handoff against `torch.mm`
-  ([results](#tile-boundaries)).
+Start with GEMM for the basic handoff; use the other examples for the feature you need.
+These are teaching kernels with the input limits below, not drop-in replacements for every
+PyTorch or FA4 feature.
+
+| Learn | Source | Guide |
+|---|---|---|
+| Three roles, two rings, one CTA per tile; `WorkStream(schedule=OneShot())` | [gemm.py](../examples/gemm.py) | [GEMM](#gemm) |
+| Four schedules, double-buffered accumulators, TMA stores, pairs, multicast clusters, `tile_n` | [persistent_gemm.py](../examples/persistent_gemm.py) | [GEMM](#gemm), [tile boundaries](#tile-boundaries) |
+| Device offsets, stateful `WorkMap`, one descriptor per operand, ragged stores | [grouped_gemm.py](../examples/grouped_gemm.py) | [Grouped GEMM](#grouped-gemm) |
+| Two softmax instances, correction, slots, fan-out/join, turnstiles, S/P alias, split-P, persistence and pairs | [fa4_fwd.py](../examples/fa4_fwd.py) | [Forward](#attention-forward) |
+| Overlapping handles, `Warps` arrivals, TMEM/SMEM aliases | [fa4_bwd.py](../examples/fa4_bwd.py) | [Backward](#attention-backward) |
+| Device-built work table: host capacity, device length | [packed_work.py](../examples/packed_work.py) | [Scheduling](scheduling.md) |
+| Split-KV items, per-sequence counts, round-robin softmax, named mailboxes, SMEM P | [fa4_decode_swapab.py](../examples/fa4_decode_swapab.py) | [Decode](#single-token-decode), [shared KV](#shared-kv-ring) |
+| Managed producer, raw `external="consumer"` with overridden count, native wait on a `NamedBarrier.id` | [raw_interop.py](../examples/raw_interop.py) | [Dropping down](dropping_down.md) |
+| Handoffs/fixed costs against raw twins | [bench_overhead.py](../examples/bench_overhead.py) | [Fixed costs](#warpdrive-fixed-costs) |
+| Schedules, clusters, widths and accumulator handoff against `torch.mm` | [bench_persistent_gemm.py](../examples/bench_persistent_gemm.py) | [Tile boundaries](#tile-boundaries) |
+
+**Measurements are historical reference, not new evidence for this checkout.** Expand the
+experiment sections for shapes, versions, methods, failed attempts and reproduction commands.
+Compare columns from the same run; different replay/cache/clock contracts are not one dataset.
 
 ## GEMM
 
@@ -50,17 +43,27 @@ from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import persiste
 d = persistent_gemm(a, b, schedule=ClusterLaunchControl(), cluster=CtaPair())
 ```
 
-Both wrappers take BF16 `a: (M, K)` and `b: (N, K)` on one CUDA device. Inputs must be
-contiguous and 16-byte aligned, with K and N multiples of 8. `out`, if supplied, must be
-BF16 `(M, N)` on the same device, contiguous, aligned and disjoint from both inputs.
-Empty outputs return early; K=0 writes zeros.
+```text
+load A/B -- ab ring --> MMA -- acc ring --> epilogue writes A @ B.T
+```
 
-`PersistentGemm` uses two accumulator stages by default so one tile's epilogue can overlap
-the next tile's mainloop. Changing stage counts still has to fit SMEM and TMEM.
+Both wrappers require:
 
-`cluster=Cluster(2, 2, pair=True)` runs two pairs side by side along N that multicast A
-([clusters](clusters.md#larger-clusters)). With `tile_n=224` that is cuBLAS's 256x224 2x2
-configuration for 3000x5000x4096.
+- BF16 `a: (M, K)`, `b: (N, K)` on one CUDA device; contiguous and 16-byte aligned.
+- K and N multiples of 8.
+- Optional `out`: BF16 `(M, N)`, same device, contiguous, 16-byte aligned, disjoint from
+  both inputs. Empty outputs return early; K=0 writes zeros.
+
+`PersistentGemm` defaults to two accumulator stages: the next mainloop can use one while
+the epilogue drains the other. All stage choices must fit SMEM and TMEM.
+
+For two pairs sharing A along N, pass `cluster=Cluster(2, 2, pair=True)`; see
+[clusters](clusters.md#larger-clusters). At `tile_n=224`, this matches the cuBLAS 256x224 2x2
+configuration observed for 3000x5000x4096.
+
+<details>
+<summary>Tile-width experiments and default choices (GB300, November 2026)</summary>
+
 
 `tile_n` defaults to 224 for `CtaPair()` and 256 otherwise. The width that wins is mostly
 wave quantization: how the tile count divides into the resident CTAs (152 CTAs, 76 pairs or 36
@@ -83,36 +86,52 @@ November 2026, `StaticPersistent`, min of five interleaved rounds' medians of 60
 | 1234 x 4096 x 4096 | 30.1 | 38.7 | 42.7 | 34.3 | 39.3 | 42.8 | 34.9 | 39.9 | 43.2 |
 | 1024 x 1024 x 8192 | 18.4 | 38.0 | 42.0 | 33.9 | 38.0 | 42.0 | 34.0 | 38.1 | 42.2 |
 
-Two sweeps (3 and 5 rounds, also with `tile_n=128` and `ClusterLaunchControl`) agree within
-5% on most table shapes (8% on the two smallest) and rank the widths the same way under CLC; the shapes with
-400 us and more (8192 x 11008 and the two left out of the table, 8192^3 and
-16384 x 4096 x 14336) moved up to 10% between sweeps and up to 19% between rounds on the shared
-GPU, so their single-digit differences mean little. Over the twelve shapes the pair at 224 is
-1-3% faster than at 256 in geomean in each of the four sweep x schedule combinations (2.2%
-pooled) and a repeatable 7-11% at the 4096-class shapes; 192 is 0.5-3.5% faster than 256
-(1.7% pooled), with its gains on the noisy large shapes. One CTA ties between 224 and 256
-(within 0.6%), so it keeps 256. For the 2x2 cluster 224 is the worst default (a 448-wide
-cluster tile gives a 4096-wide N a fifth wave) and 192 beats 256 by only 1-3%, within that
-noise, so it keeps 256. 128 only wins the 32-tile 1024 x 1024 x 8192 shape, by 24% over 192.
-A rule on the tile count picks the winner for one- and two-wave problems but is 10-15% off at
-many-wave ones, where the full tile's efficiency wins, so there is no shape-based selector:
-pass `tile_n` for a shape you care about.
+Two sweeps (3 and 5 rounds, also testing 128 and `ClusterLaunchControl`) supported these
+choices:
+
+- **Pair: 224.** Versus 256, geomean speedup was 1–3% in each of four sweep/schedule
+  combinations (2.2% pooled), and repeatably 7–11% on 4096-class shapes. Width 192 gained
+  0.5–3.5% (1.7% pooled), mostly on noisy large shapes.
+- **Single CTA: 256.** Widths 224 and 256 tied within 0.6%.
+- **2x2: 256.** Width 224 was the worst default: its 448-wide cluster tile gives N=4096 a
+  fifth wave. Width 192 gained only 1–3%, within noise.
+- **128:** won only the 32-tile 1024 x 1024 x 8192 case, by 24% over 192.
+
+Most table shapes agreed within 5% between sweeps (8% for the two smallest), with the same
+width ranking under CLC. Shapes taking at least 400 us—8192 x 11008 plus the omitted 8192^3
+and 16384 x 4096 x 14336—moved up to 10% between sweeps and 19% between rounds on the shared
+GPU; single-digit differences there are inconclusive.
+
+A tile-count rule picked one-/two-wave winners but missed many-wave winners by 10–15%.
+There is no shape-based selector; set `tile_n` for the shapes you measure.
 
 The harness is a CUDA-graph A/B: one graph per configuration, captured once, replayed in
 round-robin rounds (`torch.mm` first, then the widths in order) with default clocks and warm
 L2, reporting each configuration's best round median. Rerun it at your shapes before trusting
 a difference under 5%.
 
+</details>
+
 ### Tile boundaries
 
-Three things decide how much of a tile's epilogue hides behind the next tile's mainloop: the
-MMA warp's `tcgen05.commit` publishes the accumulator asynchronously (the layer's `Umma`
-side), two TMEM stages let it start the next tile in the other buffer, and the epilogue hands
-a stage back as soon as its last subtile's `tcgen05.ld` has completed (`tcgen05.wait::ld`,
-`early_release=True`, the default) rather than after that subtile's SMEM staging and TMA store
-(`early_release=False`). In SASS the early release only moves the accumulator's arrive up to
-the last `LDTM`; a single CTA's epilogue (`cp.async.bulk.wait_group` pacing included) is well
-shorter than its mainloop at every shape below, so it mostly matters for CTA pairs at short K.
+Two accumulator buffers let MMA and epilogue overlap. `Umma` publishes asynchronously;
+the epilogue can return TMEM as soon as its final read completes:
+
+```text
+early_release=True:   last tcgen05.ld -> wait::ld -> release TMEM -> SMEM/TMA store
+ early_release=False: last tcgen05.ld -> wait::ld -> SMEM/TMA store -> release TMEM
+```
+
+`early_release=True` is the default. It changes **when TMEM is reusable**, not when the
+output store finishes. Historically it helped mainly for short-K pairs, where epilogue time
+is large relative to mainloop time.
+
+<details>
+<summary>Accumulator overlap and work-ring scope measurements</summary>
+
+In the measured SASS, early release moved the arrive up to the last `LDTM`. Single-CTA
+epilogues, including `cp.async.bulk.wait_group` pacing, were shorter than their mainloops
+on every shape below.
 
 `bench_persistent_gemm.py --variants mm single single_late single_clc single_acc1 pair
 pair_late pair_clc pair_clc_late pair_atomic pair_acc1 pair_n256 pair_n256_late pair_n256_clc`,
@@ -139,21 +158,23 @@ vs late, against cuBLAS's 128x256 2-CTA kernel at 19.4). The short-K shapes trai
 by 10-25% for wave quantization (1024 x 12800: 400 single tiles or 200 pair tiles over 148 SMs
 are 2.7 waves) and the store-bound 4096 x 4096 x 512 (32 MB out), not for tile-boundary gaps.
 
-Before this measurement `ClusterLaunchControl` and `AtomicPersistent` pairs ran 8-20% behind
-`StaticPersistent` at short K (24.2-24.4 vs 22.4-22.6, 23.1 vs 21.2, 15.2-15.4 vs 12.7-12.8 us
-on the first three shapes), and deeper work rings did not help. Per-role `%globaltimer` probes
-at 4096 x 4096 x 512 (pair, CLC) found every role waiting 0.7-1.2 us per item not for the
-scheduler (its ring slot was already full) but inside its own ring *release*: the pair ring
-derived a cluster-scope `mbarrier.arrive`, a `MEMBAR.ALL.GPU` per receiving thread, while the
-scheduler's claim took 0.26-0.29 us (CLC) or 0.32 us (atomic) and decode plus `st.async`
-publication 0.32 us. The ring's payload is completed by bytes and its releases publish
-nothing, so the layer now derives `remote_scope="cta"` for it ([scheduling](scheduling.md));
-the probes then show releases of 0.03-0.13 us and the MMA's item period equal to static's.
-With that, CLC ties static on the three short-K shapes and trails it by 0-6% at K = 4096 across
-runs (the table's 86.2 vs 81.2 was the largest; earlier sweeps had 82.8 vs 81.8), which is
-unexplained: neither the first-item path (the roles start within 0.1 us of static's) nor the
-claim chain is on the critical path there. The CLC path's remaining per-item cost is the
-0.6 us scheduler chain above, one work ring slot ahead of the slowest role.
+A separate work-ring scope fix removed a short-K scheduling gap:
+
+1. **Before:** CLC/atomic pairs were 8–20% slower than static. First three shapes:
+   24.2–24.4 vs 22.4–22.6, 23.1 vs 21.2, and 15.2–15.4 vs 12.7–12.8 us. Deeper rings did
+   not help.
+2. **Attribution:** `%globaltimer` probes at 4096 x 4096 x 512 found 0.7–1.2 us per item
+   inside each role's ring **release**, although the slot was already full. Cluster-scope
+   arrival emitted `MEMBAR.ALL.GPU` per receiving thread. Scheduler claim cost was only
+   0.26–0.29 us CLC / 0.32 us atomic, plus 0.32 us decode and `st.async` publication.
+3. **Fix:** payload readiness comes from completed bytes; releases publish nothing. Deriving
+   `remote_scope="cta"` ([scheduling](scheduling.md)) reduced probed releases to 0.03–0.13 us
+   and matched static's MMA item period.
+4. **Remaining:** CLC tied static at short K but trailed by 0–6% at K=4096 (largest: 86.2 vs
+   81.2 us; earlier: 82.8 vs 81.8). Unexplained: role starts were within 0.1 us of static,
+   and the 0.6 us scheduler chain ran one work slot ahead, off the critical path.
+
+</details>
 
 ## Grouped GEMM
 
@@ -166,34 +187,47 @@ offsets = torch.tensor([700, 700, 1500, 2100, 2100, 3000, 4000, 4096], device="c
 out = grouped_gemm(a, b, offsets)  # out[s_g:e_g] = a[s_g:e_g] @ b[g].T
 ```
 
-`offsets` holds each group's end row (`torch._grouped_mm`'s `offs`) and is read only on the
-device, so one compiled kernel serves every `G`, `total_M`, `N`, `K` and routing; groups may be
-empty or any size. Rows past `offsets[-1]` are left untouched. Operand limits are those of
-the GEMMs above. Keyword options: `schedule` (default `StaticPersistent()`), `cluster`
-(`SingleCta()` or `CtaPair()`), `max_ctas`, `tile_n`, `ab_stages`, `acc_stages`, `c_stages`,
-`epi_tile_n` and `roles`.
+`offsets` contains **end rows**, not sizes (`torch._grouped_mm` calls it `offs`):
 
-The host cannot count the groups' tiles, so `GroupedTiles` declares
-`ceil(total_M / tile_m) + G` m-tiles, an upper bound (each group's ragged tail adds at most
-one). The decode numbers the groups' real m-tiles back to back and drops only the indices
-past the last one. Finding a tile's group then takes a prefix sum of the groups' tile counts,
-which the mapping's [decode state](scheduling.md#decode-state) carries from item to item: each
-decode resumes the walk where the previous one stopped, testing eight groups per round trip.
+```text
+offsets = [700, 700, 1500, ...]
+group 0: rows [0, 700)      group 1: empty      group 2: rows [700, 1500)
+```
 
-The state made exact tile numbering affordable, and that is what fixed static persistence.
-The earlier stateless decode found a group by binary search over a padded space with one
-unused slot per group. Those dropped slots were scattered through each unit's strided
-sequence, so static units got unequal work (up to 40 items against an even 36 at G=128) and
-drifted apart; static ran 10-27% slower than the broadcast schedules. Carrying the search's
-group in a state alone changed nothing, because a unit's next index is usually several groups
-on. With exact numbering every tile costs the same and static ties `AtomicPersistent` and
-`ClusterLaunchControl` within 2%. It needs no scheduler warp or workspace, hence the default.
+Contract:
 
-A and `out` use one TMA descriptor each, addressed at the item's row with
-`cute.domain_offset`; B is a 3-D `(N, K, G)` view so the group is a TMA coordinate. The output
-is stored through a ragged TMA view (a `(2^30, N, 2^31 - 1)` tensor whose row mode ends where
-TMA clips and whose third mode selects the group's end row), so a tile that ends inside a
-group is clipped by the TMA store like a tile at the tensor's edge.
+- `a: (total_M, K)`, `b: (G, N, K)`, BF16; GEMM's device, contiguity, alignment and
+  K/N-multiple-of-8 limits apply.
+- `offsets: (G,)`, contiguous int32 on the same device; nonnegative, nondecreasing,
+  at most `total_M`, and unchanged during execution. Values are read only on-device.
+- `total_M + (G + 1) * 256` must fit int32. `out` must not overlap `a`, `b` or `offsets`.
+- Empty/arbitrary-size groups are allowed; rows past `offsets[-1]` stay untouched. Invalid
+  offset values are clamped to the previous end and A's end: wrong rows, but in bounds.
+
+One compiled kernel handles dynamic `G`, `total_M`, `N`, `K` and routing. Options are
+`schedule` (default `StaticPersistent()`), `cluster` (`SingleCta()` or `CtaPair()`),
+`max_ctas`, `tile_n`, `ab_stages`, `acc_stages`, `c_stages`, `epi_tile_n` and `roles`.
+
+**How work is found:** the host reserves an upper bound of
+`ceil(total_M / tile_m) + G` m-tiles, since each ragged group adds at most one. `GroupedTiles`
+numbers real tiles back to back, dropping only indices after the last tile. Its
+[decode state](scheduling.md#decode-state) carries the prefix-sum walk between items,
+testing eight groups per round trip instead of restarting.
+
+**How stores stop at a group boundary:** A/out each use one descriptor plus
+`cute.domain_offset`; B is `(N, K, G)`, with group as a TMA coordinate. The output's ragged
+view has shape `(2^30, N, 2^31 - 1)`: its row mode ends at TMA's clipping boundary, and its
+third coordinate selects the group's end row. A partial group tile is clipped like a tensor edge.
+
+<details>
+<summary>Grouped scheduling and backend comparisons (historical)</summary>
+
+Exact tile numbering fixed an earlier imbalance. Binary search over a padded space left
+one dropped slot per group, scattered through static units' strided sequences: some units
+got 40 items instead of 36 at G=128, and static was 10–27% slower than broadcast schedules.
+Caching only the search group did not help; the next index often lay several groups ahead.
+With exact numbering, static tied atomic/CLC within 2% without a scheduler warp or workspace,
+hence the default.
 
 CUDA-graph replay on a shared GB300 (`bench_grouped_gemm.py`, 20 calls per graph, min of
 five interleaved rounds' medians, PyTorch 2.15 nightly cu132), skewed routing with 1/8 of the
@@ -218,21 +252,19 @@ Small skewed groups waste rows in 128-row tiles for every kernel (1.5x the real 
 G=64 with 8192 tokens and G=128 with 16384, 1.13-1.25x at 32768); a pair's 256-row tiles
 waste about twice that, so `CtaPair()` leads only on the G=8 shape with N=7168.
 
-The untuned QUACK kernel leads only at G=64 with 8192 tokens (by 1-2%), where its
-64-row-per-CTA tiles waste the fewest rows, and trails 1 CTA static by 7-16% on the other
-five. Tuning helps QUACK on the G=8 shape with N=7168 (a 256 x 256 tile on a 2-CTA MMA with a
-2 x 2 cluster, so A is multicast across the two n-neighbours; it ties `pair` there) but hurts
-on the smallest: Inductor benchmarks the shortlist with evenly spaced offsets, so the winner
-is picked for balanced routing. FlexGEMM's TRITON backend without `max_autotune` lowers to
-the extern `_grouped_mm`, and its NVGEMM backend has no grouped GEMM choice
-(`NoValidChoicesError`). Like ours, QUACK's varlen scheduler numbers the groups' tiles
-exactly with a prefix sum it caches across tiles (a warp prefix sum over the offsets). It
-also rasters a group's tiles in swizzled bands for L2 reuse, which shows up as no gap in
-these timings.
+Interpretation of this run:
 
-`offsets` must be nonnegative, nondecreasing and at most `total_M`, and must not change while
-the kernel runs; the kernel clamps each group's end to the previous end and to `A`, so other
-values compute wrong rows but stay in bounds. `out` must not overlap `a`, `b` or `offsets`.
+- Untuned QUACK led only at G=64 / 8192 tokens, by 1–2%: its 64 rows per CTA waste fewer
+  rows. It trailed one-CTA static by 7–16% on the other five shapes.
+- Tuning helped G=8 / N=7168: a 256 x 256 two-CTA MMA tile in a 2x2 cluster multicasts A
+  along N and tied `pair`. It hurt the smallest case: Inductor chose its winner using
+  evenly spaced offsets, not this skewed routing.
+- FlexGEMM TRITON without `max_autotune` used extern `_grouped_mm`; NVGEMM had no grouped
+  choice (`NoValidChoicesError`).
+- QUACK also numbers tiles exactly using a cached warp prefix sum over offsets. Its
+  swizzled bands aim for L2 reuse; these timings did not isolate a gain from that raster.
+
+</details>
 
 ## Attention forward
 
@@ -242,31 +274,31 @@ from transformer_nuggets.cute.warpdrive.examples.fa4_fwd import fa4_fwd
 out, lse = fa4_fwd(q, k, v)
 ```
 
-This is a teaching kernel for unmasked attention, not a replacement for the full FA4 API.
-Inputs are contiguous, 16-byte-aligned BF16 `(batch, seqlen, heads, head_dim)` tensors on one
-CUDA device, head dimension 64 or 128 (the default tiling; 2 x (`tile_n` + `head_dim`) TMEM
-columns must fit in 512). K and V have matching shapes; all inputs have matching batch and
-head counts. Key length must be a positive multiple of `tile_n` (128, or 64). Query length can
-be ragged. There is no varlen or GQA. The example imports `flash_attn.cute` and `quack`
-helpers.
+This teaching kernel computes **unmasked attention** using `flash_attn.cute` and `quack`
+helpers. It does not implement the full FA4 API.
 
-O has Q's shape. LSE is fp32 `(batch, heads, seqlen_q)` in natural-log units. The input checks
-are not a complete validator of all these requirements. A wrapper accepting an input does not
-establish the advertised rank, head-dimension or device contract; enforce those requirements
-when building another wrapper around this teaching kernel.
+| Input/output | Contract |
+|---|---|
+| Q/K/V | BF16 `(batch, seqlen, heads, head_dim)`, contiguous, 16-byte aligned, one CUDA device |
+| Dimensions | Head dimension 64 or 128; matching batch/head counts; K and V shapes match |
+| Sequence lengths | Positive key length divisible by `tile_n` (128 or 64); ragged Q allowed |
+| O / LSE | O has Q's shape; LSE is fp32 `(batch, heads, seqlen_q)`, natural-log units |
+| Not supported | Varlen or GQA |
 
-`fa4_fwd(..., schedule=..., mapping=...)` lets you change index assignment and work order.
-See [scheduling](scheduling.md) for `Raster` and the FA4 mappings. `roles={...}` changes
-placement and register budgets by role name; see
-[roles](roles.md#choose-placement-in-the-constructor). `tile_n=64` halves the K/V tile,
-`rescale_threshold` sets FA4's lazy-rescale threshold, and head dimension 64 or 128 follows
-the tensors; [configuration](configuration.md) lists every knob and what stays fixed.
+The tiling needs `2 * (tile_n + head_dim) <= 512` TMEM columns. Wrapper checks are not a
+complete validator of rank, head dimension or device requirements; enforce the full contract
+in another wrapper.
 
-K and V share channel-bound SMEM. The `FlashAttentionForward` constructor also accepts
-`overlap_o_q=True` to reuse Q's bytes for epilogue SMEM; the `fa4_fwd` wrapper does not expose
-this option. It requires a non-persistent schedule (`OneShot()` among the built-ins).
-Reusing it across persistent work items needs an additional epilogue-to-load ordering edge;
-sharing an address does not create that edge.
+Choose [schedule and mapping](scheduling.md) with `schedule=`/`mapping=` (`Raster` or FA4
+mappings), and [role placement/register budgets](roles.md#choose-placement-in-the-constructor)
+with `roles={...}`. `tile_n=64` halves the K/V tile; `rescale_threshold` controls FA4's
+lazy rescale; head dimension follows the tensors. See [configuration](configuration.md)
+for all knobs and fixed choices.
+
+K/V share channel-bound SMEM. The constructor-only `overlap_o_q=True` also reuses Q's bytes
+for epilogue SMEM; `fa4_fwd` does not expose it. This requires a non-persistent schedule
+(`OneShot()` among built-ins). Persistence would need an epilogue-to-load ordering edge:
+**sharing an address does not create a handoff**.
 
 ### Hardware row max on SM103
 
@@ -284,16 +316,22 @@ out, lse = fa4_fwd(
 )
 ```
 
-`use_ldred_rowmax=True` uses `tcgen05.ld.red` to load scores and reduce each 32-column
-fragment's maximum together. Four fragment maxima replace the software reduction of 128
-scores. This is SM103-only; requesting it for an SM100 target raises `ValueError`. The
-option defaults to false, so the existing software path and its codegen are unchanged on
-both targets. The rescale threshold, exponentials, BF16 P conversion and row-sum arithmetic
-are unchanged. The four hardware maxima feed the existing software updater, preserving its
-fast-exp2 flush-to-zero rescale behavior. Tests compare O and LSE bitwise with the software
-path, including ragged Q, nonuniform scales, repeated launches, static-persistent channel
-wraps and a subnormal rescale amplified by large finite V. A generated-SASS check and a
-public-wrapper kernel-name trace ensure that the hardware path actually runs.
+`use_ldred_rowmax=True` combines score loading and maximum reduction with `tcgen05.ld.red`:
+
+```text
+128 scores -> four 32-column hardware maxima -> existing software row-max updater
+```
+
+- SM103 only; an SM100 target raises `ValueError`. Default is false, retaining the software path.
+- Rescale threshold, exponentials, BF16 P conversion and row sums are unchanged, including
+  fast-exp2's flush-to-zero rescale behavior.
+- Tests compare O/LSE bitwise: ragged Q, nonuniform scales, repeated launches, persistent
+  wraps, and subnormal rescale amplified by large finite V. SASS and wrapper kernel-name
+  checks verify that the hardware path runs.
+
+<details>
+<summary>Hardware row-max, scheduling and rejected tuning experiments</summary>
+
 
 Run the fixed-buffer, interleaved CUDA-graph comparison against FA4's default:
 
@@ -357,8 +395,11 @@ measurements do not identify either as the remaining bottleneck.
 
 For NCU, use `--profile` with `--profile-from-start off`: the script warms all variants,
 then profiles one complete forward per variant between CUDA profiler start/stop. All
-seven standard example configurations keep identical normalized SASS versus `origin/main`
-on SM100 and SM103; only the opt-in hardware-max variant intentionally changes it.
+seven standard example configurations kept identical normalized SASS versus the then-current
+`origin/main` on SM100 and SM103; only the opt-in hardware-max variant intentionally changed it.
+This is a historical check, not a comparison against today's remote branch.
+
+</details>
 
 ## Attention backward
 
@@ -368,21 +409,30 @@ from transformer_nuggets.cute.warpdrive.examples.fa4_bwd import fa4_bwd
 dq, dk, dv = fa4_bwd(q, k, v, out, dout, lse, causal=False)
 ```
 
-A port of the main kernel of FA4's `flash_bwd_sm100.py` at its 1-CTA configuration for head
-dimension 128 (FA4 selects it with `disable_2cta`; its default on SM100 is the 2-CTA kernel).
-FA4's own preprocess (`dPsum = rowsum(dO * O)`, `LSE * log2(e)`, zeroing the fp32 dQ
-accumulator) and dQ postprocess kernels run around it unchanged. Inputs are contiguous,
-16-byte-aligned BF16 `(batch, seqlen, heads, 128)` tensors on one CUDA device, with matching
-batch and head counts (no GQA), and the forward's fp32 `(batch, heads, seqlen_q)` LSE.
-Sequence lengths are arbitrary: TMA zero-fills partial tiles, keys past `seqlen_k` are masked
-and the dK/dV stores are clipped. `causal=True` is FA4's bottom-right-aligned mask. No varlen,
-paging, block sparsity, score mods, softcap or deterministic mode.
+This ports FA4's `flash_bwd_sm100.py` **1-CTA, head-dimension-128** main kernel. FA4 selects
+it with `disable_2cta`; its SM100 default is a different, unported 2-CTA kernel.
 
-A work item is one 128-key tile, in FA4's `SingleTileScheduler` order, which `Raster()` over
-`(n_blocks, heads, batch)` under `OneShot()` reproduces. The roles keep FA4's warp layout:
-dQ reduce on warps 0-3, two compute warpgroups sharing each tile on 4-11, MMA on 12 and load
-on 13. The [module docstring](../examples/fa4_bwd.py) has the channel table, the TMEM map and
-the per-tile MMA order.
+```text
+FA4 preprocess -> warpdrive main kernel -> FA4 dQ postprocess
+  dPsum = rowsum(dO * O)
+  LSE_log2 = LSE * log2(e)
+  zero fp32 dQ accumulator
+```
+
+Contract:
+
+- BF16 `(batch, seqlen, heads, 128)` inputs, contiguous, 16-byte aligned, one CUDA device;
+  matching batch/head counts, no GQA. Forward LSE: fp32 `(batch, heads, seqlen_q)`.
+- Arbitrary sequence lengths: TMA zero-fills partial loads, keys past `seqlen_k` are masked,
+  and dK/dV stores are clipped. `causal=True` is bottom-right aligned.
+- No varlen, paging, block sparsity, score mods, softcap or deterministic mode.
+
+Each `OneShot()` item is a 128-key tile. `Raster()` over `(n_blocks, heads, batch)` matches
+FA4's `SingleTileScheduler` order. Four roles use 14 warps: reduce 0–3, two compute
+warpgroups 4–11 sharing each tile, MMA 12, load 13. Eleven channels (seven with `Warps`
+sides) pipeline five MMAs per tile through overlapping handles, three TMEM aliases and two
+SMEM epilogue overlaps. The [module docstring](../examples/fa4_bwd.py) maps channels,
+TMEM and MMA order.
 
 ### Correctness
 
@@ -395,12 +445,15 @@ FA4's own error. dK/dV are deterministic across launches; dQ is not, as in FA4.
 
 ### Timings
 
+<details>
+<summary>Matched 1-CTA comparison, different 2-CTA baseline, and tuning evidence</summary>
+
 Fixed-buffer CUDA-graph replays of one whole backward call (preprocess, main kernel,
 postprocess) per variant, seven interleaved rounds of 30 replays after three seconds of
 warmup; CUPTI gives the main kernel. Minimum round medians in microseconds, lower is better.
 GB300, CuTeDSL 4.8.0, PyTorch `2.15.0.dev20260922+cu132`, FA4 `00807a02`, normal DVFS,
 shared GPUs, November 2026; `fa4_bwd.py` SHA-256 prefix `ceb4035159cd5e55` (this commit's
-kernel, measured before the rebase that only moved its base):
+historical kernel, measured before a rebase that only moved its base):
 
 ```bash
 gpu-run --timeout 600 auto -- timeout --signal=TERM --kill-after=10s 3000s \
@@ -447,6 +500,8 @@ lines both kernels' waits are attributed to), not in issued work; which wait car
 attributed. Swapping `Threads` for `Warps` in the forward, decode and persistent GEMM examples
 moved them by -0.8% to +2.3% (outputs bitwise equal), so `Threads` stays their default.
 
+</details>
+
 ### What it needed from the layer
 
 - `Warps` channel sides, added for this port (above).
@@ -454,14 +509,14 @@ moved them by -0.8% to +2.3% (outputs bitwise equal), so `Threads` stays their d
   the recorder's parameter. Fixed.
 - `launch_args()` zeroed a per-stream workspace even for `OneShot`, so graphs captured on a new
   stream replayed a memset. Fixed: one untouched placeholder per device.
-- [Previews](channels.md#previews): S_{t+1} needs Q_{t+1} while Q_t's handle stays open for
-  dK_t. FA4 rotates `handle_Q = handle_Q_next`; a handle carried into the next loop iteration
-  would keep the pre-loop handle's trace record, so the checker would report it closed twice.
-  The port first waited on the next stage's full barrier itself (`q.full_barrier(q.index)`,
-  `q.phase()`) and read it through `params.sQ`, outside any handle. It now takes
-  `q.peek()` and reads `preview.view("Q", read=True, by="umma")`; the next tile's `q.wait()`
-  (the peeled tile's, for the loop's last preview) owns that epoch. Both modes' SASS is
-  identical to the raw wait's, so the timings above stand, and the alias report is unchanged.
+- [Previews](channels.md#previews) separate **reading the next Q** from **owning its epoch**:
+  S_{t+1} needs Q_{t+1} while dK_t still holds Q_t. The port uses `q.peek()` and
+  `preview.view("Q", read=True, by="umma")`; the next `q.wait()` owns that epoch (the peeled
+  tile's wait for the last preview). FA4 instead rotates `handle_Q = handle_Q_next`; carrying
+  that handle here would retain the pre-loop trace record and look like a double close.
+  The former raw implementation used `q.full_barrier(q.index)`, `q.phase()` and `params.sQ`.
+  Both causal modes kept identical SASS and alias reports after switching to previews;
+  the historical timings therefore still applied.
 
 Dropped down, each documented at its site:
 
@@ -475,23 +530,26 @@ Dropped down, each documented at its site:
 
 Diagnostics that stay incomplete:
 
-- The alias diagnostic reports P~S, dS~dP, dQ~dP and dQ~dS as `unverified` (unknown epoch
-  correspondence), not as potential hazards: the channel round trips do order them, but the
-  graph matches epochs only when the traced per-item counts agree, and the MMA role peels its
-  last tile, so its s/dp/dq/ds counts (two unrolled iterations and the peeled tile) differ from
-  the compute and reduce roles' (two iterations). The report names the channels and counts;
-  no warning is emitted. Matching those epochs needs loop bounds and peeled iterations in the
-  model (not loop counts chosen to balance the channels, which could hide a missing
-  publication or release). The compute role's TMEM accesses declare their exact columns, so its
-  cross-warpgroup ordering is checked.
+- P~S, dS~dP, dQ~dP and dQ~dS are `unverified`: unknown epoch correspondence, not reported
+  hazards. Channel round trips order them, but the checker needs matching per-item counts.
+  MMA traces two iterations **plus a peeled tile**; compute/reduce trace two iterations.
+  The report names those channels/counts without a warning.
+- Modeling this needs loop bounds and peeled iterations—not artificial counts that could
+  hide a missing publication/release. Compute's exact TMEM column annotations do allow its
+  cross-warpgroup ordering to be checked.
 
 ### Size
 
-Counting lines that are neither blank, comments nor docstrings: `fa4_bwd.py` is 924 lines,
-including its tensor wrapper, compile helper and input checks; compiling it executes 864 of
-them. Compiling FA4's 1-CTA causal backward executes 2,679 of `flash_bwd_sm100.py`'s 4,448 code
-lines (the rest are the 2-CTA, varlen, GQA, block-sparse, score-mod, deterministic and folded
-paths), not counting the pipeline, mask and copy helpers both use.
+Historical counts, excluding blank lines, comments and docstrings:
+
+| Source | Code lines | Executed while compiling |
+|---|---:|---:|
+| Port, including wrapper/compile helper/checks | 924 | 864 |
+| FA4 `flash_bwd_sm100.py` | 4,448 | 2,679 for 1-CTA causal backward |
+
+FA4's remaining paths include 2-CTA, varlen, GQA, block-sparse, score-mod, deterministic and
+folded variants. Shared pipeline/mask/copy helpers are excluded; this is not an equal-feature
+size comparison.
 
 ## Single-token decode
 
@@ -501,42 +559,55 @@ from transformer_nuggets.cute.warpdrive.examples.fa4_decode_swapab import fa4_de
 out, lse = fa4_decode(q, k, v, num_splits=8, seqused_k=lengths, splits_per_seq=counts)
 ```
 
-A port of FA4's `flash_fwd_decode_sm100.py`: S^T = K Q^T and O^T = V^T P^T, so 128 KV tokens
-fill the MMA's M and the query heads of one KV head fill N. Q is `(batch, 1, heads, d)`, K
-`(batch, kv_len, kv_heads, d)` and V `(batch, kv_len, kv_heads, d_v)`, all BF16 and contiguous,
-with up to 32 query heads per KV head; `d` is a multiple of the K step (64 by default) and
-`d_v` of 128 (128/128 by default; 256 works for either).
-`seqused_k` (int32 per sequence) shortens sequences; KV rows past it must be finite, since
-FA4's bounded V descriptor isn't ported. `splits_per_seq` caps each sequence's splits, as FA4's
-prepare kernel does. `decode_partials` returns the fp32 split partials in FA4's combine layout;
-`fa4_decode` combines them with FA4's combine kernel. No paging, varlen Q, masks or score mods.
+This ports FA4's `flash_fwd_decode_sm100.py`. Swapping the MMA operands puts 128 KV tokens
+along M and one KV head's query heads along N:
 
-The roles match FA4's placement: a QK and a PV MMA warp, a K/V load warp that also writes the
-split's LSE, a Q-load/O-store warp, two softmax warpgroups alternating KV blocks and a
-correction warpgroup. What it needed from the layer:
+```text
+S^T = K Q^T -> softmax -> P^T -> O^T = V^T P^T
+```
 
-- Work items `(split, kv_head, batch)` from a `SplitKV` mapping. With per-sequence counts it
-  reads the table after `PdlWait()` and drops the splits past each count.
-- Round-robin sides (`Sharing.ROUND_ROBIN`) on S, P and the row-max/row-sum mailboxes, so softmax[i] takes blocks
-  i, i+2, ... with one warpgroup's counts. The schedule stays `OneShot`: with an odd block
-  count a second item would start on softmax[1]'s epochs.
-- Named-barrier channels for the thread mailboxes, with a turnstile around the shared row-max
-  exchange, and three one-shot `NamedBarrier` done flags for the split statistics.
-- P in a 4-stage SMEM ring read as the PV MMA's B operand; no TMEM alias.
+| Input | Contract |
+|---|---|
+| Q | BF16, contiguous `(batch, 1, heads, d)` |
+| K / V | BF16, contiguous `(batch, kv_len, kv_heads, d or d_v)` |
+| Heads | Query heads divisible by KV heads, at most 32 per KV head |
+| Dimensions | `d` divisible by K step (default 64); `d_v` divisible by 128. Defaults 128/128; 256 works for either |
+| `seqused_k` | int32 per-sequence lengths; rows past the length must be finite—FA4's bounded V descriptor is not ported |
+| `splits_per_seq` | int32 per-sequence counts, at most `num_splits`; caps splits as FA4's prepare kernel does |
+| Not supported | Paging, varlen Q, masks, score mods |
 
-The KV block (`tile_n`, 256), K step (`tile_k`, 64), S and P ring depths (4 and 4), head
-dimensions and the roles' register budgets are constructor arguments of `SwapABDecode`;
-`decode_partials` and `fa4_decode` forward them as keywords. The measurements below are at the
-defaults, which match FA4; see [configuration](configuration.md) for the valid ranges.
+`decode_partials` returns fp32 O `(splits, batch, 1, heads, d_v)` and LSE
+`(splits, batch, heads, 1)` in FA4's combine layout. Splits past a sequence's count are
+unwritten; kept splits with no KV blocks write O=0, LSE=-inf. `fa4_decode` uses FA4's combine
+kernel and returns BF16 O `(batch, 1, heads, d_v)` and fp32 LSE `(batch, heads, 1)`.
 
-FA4 reads one K/V ring with two MMA cursors, keeping K two blocks ahead of V with two extra named
-barriers. By default K and V have their own rings here, 7 and 5 stages at FA4's total of 12 (8-head
-tiles); `shared_kv=True` selects FA4's shared ring (see [below](#shared-kv-ring)).
-The other changes: the first PV into each O slot overwrites it instead of the correction
-warpgroup zero-filling TMEM first, and an empty split runs the normal tail with zero sums.
+The roles keep FA4's placement: QK and PV MMA warps, K/V-load plus split-LSE warp,
+Q-load/O-store warp, two alternating softmax warpgroups, and correction warpgroup.
 
-Split partials match FA4's bit for bit on every shape below, with FA4's own split count and
-per-sequence table (captured at its combine call); the combined outputs are identical too.
+- `SplitKV` supplies `(split, kv_head, batch)` items. Per-sequence counts are read after
+  `PdlWait()`; indices past the count are dropped.
+- `Sharing.ROUND_ROBIN` on S, P and row-max/row-sum mailboxes gives softmax[i] blocks
+  i, i+2, … with one warpgroup's counts. **OneShot only:** after an odd block count, another
+  item would start on softmax[1]'s epochs.
+- Thread mailboxes use NamedBarrier-backed channels and a turnstile for the shared row-max
+  exchange. Three one-shot `NamedBarrier` flags finish split statistics.
+- P occupies a 4-stage SMEM ring as PV's B operand, with no TMEM alias.
+
+`SwapABDecode` configures `tile_n` (default 256), `tile_k` (64), S/P depths (4/4), head
+dimensions and role registers; wrappers forward these keywords. See
+[configuration](configuration.md) for valid ranges. Measurements use FA4-matching defaults.
+
+Default K/V storage is **split rings**, 7/5 stages for 8-head tiles. `shared_kv=True` selects
+[FA4's shared ring](#shared-kv-ring), with two MMA cursors and two-block K lookahead. Other
+port differences: the first PV overwrites its O slot instead of zero-filling TMEM first;
+empty splits use the normal tail with zero sums.
+
+Tests/recorded comparisons match FA4 partials and combined outputs bitwise on the shapes
+below, using FA4's actual split counts and table captured at its combine call.
+
+<details>
+<summary>Initial decode comparison and split-ring try-token experiments</summary>
+
 The initial timings below are CUPTI medians of CUDA-graph replays, in microseconds; the better
 of two interleaved rounds of 200 replays. Graph times also include FA4's prepare kernel (per-sequence
 rows) and the shared combine. Buffers are reused, so short shapes run from L2. These initial
@@ -551,7 +622,7 @@ gpu-run --timeout 1800 auto -- timeout --signal=TERM --kill-after=5s 900s \
 GB300, CuTeDSL 4.8.0, PyTorch `2.15.0.dev20260922+cu132`, FA4 `00807a02`, November 2026,
 shared GPUs.
 
-| batch x kv_len, heads/kv_heads | splits | FA4 decode | port | ratio | graph FA4 / port |
+| batch x kv_len, heads/kv_heads | splits | FA4 decode | port | port / FA4 | graph FA4 / port |
 |---|---|---:|---:|---:|---:|
 | 1x8192, 8/1 | 16 | 4.22 | 4.70 | 1.114 | 16.40 / 16.69 |
 | 1x32768, 32/1 | 32 | 7.04 | 7.90 | 1.123 | 19.39 / 19.18 |
@@ -573,11 +644,14 @@ prefetching the TMA descriptors (kept, as FA4 does).
 
 [Try tokens](channels.md#try-tokens) were measured on the split rings as FA4 uses them, in
 `fa4_decode_swapab.py` as of `5c8db04` (SHA-256 prefix `5aac3058290b9a8f`) behind a temporary
-constructor option, not kept: the PV
-warp probes V before its P wait and O acquire, consumes the token at the first V wait and
-re-probes after each V release; the QK warp probes K before its S acquire and likewise. An
-"all" variant also probed P, O and S as FA4 does. Partials stayed bitwise equal to FA4's in
-every variant. Decode-kernel CUPTI medians of graph-replayed `decode_partials` (nine or eleven
+constructor option, not kept:
+
+- PV probed V before waiting for P/acquiring O, consumed the token at its first V wait,
+  then reprobed after each release.
+- QK likewise probed K before acquiring S.
+- An "all" variant also probed P, O and S, as FA4 does.
+
+Every variant kept partials bitwise equal to FA4's. Decode-kernel CUPTI medians of graph-replayed `decode_partials` (nine or eleven
 rotating rounds of 200 replays after three seconds of warmup, three processes on one GB300,
 CuTeDSL 4.8.0, PyTorch `2.15.0.dev20260922+cu132`, FA4 `00807a02`, November 5, 2026), in
 microseconds, median over the processes; lower is better:
@@ -592,22 +666,29 @@ microseconds, median over the processes; lower is better:
 | 1x32768, 32/1 | 7.360 | 7.328 | -0.4% |
 | 2x131072 ragged, 16/1 | 8.928 | 8.928 | 0.0% |
 
-The K/V tokens measured 4.352 us at 1x8192 in all three processes, while the baseline's
-process medians ranged over 4.288-4.416 us. 4x16384 and 8x32768 were 0.01-0.3% slower in
-every process; the remaining shapes moved by at most one 32 ns CUPTI tick, in both
-directions. The "all" variant, measured in two of the processes, moved within 0.4% of the baseline
-except at 1x8192 (+1.5% in one process, -3.6% in the other). The ragged case, where the shared-ring
-prototype below gained 0.06 us from its K/V prechecks, gained nothing on split rings. Not
-neutral-or-better on the smallest shape, so the example keeps blocking waits. The consumer
-tokens never cross a loop iteration (FA4's loader carries its producer token across blocks;
-that was not tried).
+Split-ring tokens were not consistently neutral-or-better, so blocking waits stayed:
+
+- 1x8192: K/V tokens were 4.352 us in all three processes; baseline medians were 4.288–4.416.
+- 4x16384 and 8x32768: 0.01–0.3% slower in every process. Other shapes moved at most one
+  32 ns CUPTI tick, in either direction.
+- "All" variant, two processes: within 0.4%, except 1x8192 (+1.5% and -3.6%).
+- Ragged split rings gained nothing, unlike the shared prototype's 0.06 us precheck gain.
+
+Consumer tokens did not cross loop iterations. Carrying a producer token across blocks,
+as FA4's loader does, was not tried.
+
+</details>
 
 ### Decode setup costs
 
-`SplitKV.bind()` now builds `FastDivmodDivisorV2` values for the launch's split/head mapping,
-as FA4's scheduler does. The roles use them instead of repeating general integer division.
-These depend only on shapes; the per-sequence split counts are still read after `PdlWait()`.
-Batch, head counts and splits remain dynamic, and partials are still bitwise equal to FA4.
+<details>
+<summary>Fast-divmod change, setup timeline and rejected alternatives</summary>
+
+
+`SplitKV.bind()` builds shape-dependent `FastDivmodDivisorV2` values once on the host.
+Roles use them instead of repeating general integer division, as in FA4's scheduler. Batch,
+heads and splits remain dynamic; per-sequence counts are still read after `PdlWait()`.
+Partials remained bitwise equal to FA4.
 
 Matched before/after, GB300, same versions as above and Triton `3.8.0`, November 4, 2026.
 The benchmark source SHA-256 prefix was `78d54f3cf2c58af0`, against the mapping at `c205c64`
@@ -646,17 +727,22 @@ instances lose 14 `MUFU.RCP`, 14 `F2I` and 28 `IABS` sites. Both port builds sti
 report's DRAM reads are nearly zero. Source-level PC sampling has too few samples to assign
 hundreds of nanoseconds to one particular load or wait.
 
-Sparse IKET ranges on all 16 CTAs and 16 warps localize the original port's delay. Both kernels
-have a kernel-entry marker and four marker pairs per warp. The port reaches its post-prologue
-CTA synchronization around 480 ns, versus FA4's 672 ns, relative to each CTA's first marker.
-Its role bodies start at 736-928 ns: item decoding, TMEM pointer retrieval and role setup
-happen after that synchronization. FA4 starts its dispatched work at 672 ns. The critical
-O-store warp finishes around 3,904 ns in the port and 3,200 ns in FA4; the correction and
-statistics also finish later. These are instrumented phase boundaries, not production latency
-estimates. With body markers, median CTA lifetime envelopes are FA4/port 3,936/4,512 ns;
-trampoline-only IKET (`--warp-trace`) gives 3,904/4,512 ns on the same GPU. Both outputs match
-bitwise. This supports a post-sync setup and body/tail delay, not a slower
-barrier-init/TMEM-allocation phase or a full critical-cycle model.
+Sparse IKET (all 16 CTAs and 16 warps, entry marker plus four pairs per warp) localized
+setup/body delay. Times are ns from each CTA's first marker, **instrumented boundaries,
+not production latency**:
+
+| Boundary | FA4 | Port |
+|---|---:|---:|
+| Post-prologue CTA sync | 672 | 480 |
+| Dispatched body start | 672 | 736–928 |
+| Critical O-store finish | 3,200 | 3,904 |
+| Median CTA lifetime, body markers | 3,936 | 4,512 |
+| Median CTA lifetime, trampoline-only `--warp-trace` | 3,904 | 4,512 |
+
+Outputs matched bitwise. The port decodes items, retrieves TMEM pointers and sets up roles
+**after** sync; correction/statistics also finish later. This points to post-sync setup and
+body/tail delay, not slower barrier initialization/TMEM allocation. It is not a complete
+critical-cycle model.
 
 | Suspected cause | Evidence | Change tested | Time delta / decision |
 |---|---|---|---|
@@ -692,20 +778,28 @@ For matched NCU source attribution, add `--profile --shapes 0` and run with
 The script compiles and warms both paths before profiling one complete call each, including
 prepare/combine where present; filter the reports to `attn_kernel|warpdrive_fa4_decode`.
 
-Original code size, counting lines that are neither blank, comments nor docstrings: FA4's file
-had 1,496, of which 1,347 were the kernel without the interface adapter, including paging,
-masks, score mods and varlen Q. The initial port had 993, including its wrappers and mapping.
+Original code size (no blank/comment/docstring lines): FA4 had 1,496 lines, 1,347 excluding
+its interface adapter, with paging/masks/score mods/varlen Q. The initial port had 993,
+including wrappers and mapping. These are not equal feature sets.
+
+</details>
 
 ### Where the remaining gap was
 
-`clock64` stamps from lane 0 of every warp, in instrumented copies of both kernels (1x8192,
-8/1, 16 splits, partials still bitwise equal), put the port's Q-store finish about 970 cycles
-behind FA4's. About 550 cycles came at the head: the port reads `seqused_k` after the CTA
-sync and issues Q's TMA after that, while FA4 has a static length and issues Q before its
-sync. The other ~450 came in the correction tail: the port waited for both final O slots
-before its row-sum/1/L round trip with the stats warp, FA4 does the round trip first. The
-stamps perturb the port more than FA4 (+384 ns versus +128 ns uninstrumented), so they
-locate phases but do not price them; the kernel times below do.
+<details>
+<summary>Head versus correction-tail attribution and the tail reorder</summary>
+
+
+Lane-0 `clock64` stamps in every warp located a roughly 970-cycle Q-store finish gap
+(1x8192, 8/1, 16 splits; instrumented copies still bitwise equal):
+
+- **Head, about 550 cycles:** port reads `seqused_k` after CTA sync, then issues Q TMA;
+  FA4 used a static length and issued Q before sync.
+- **Correction tail, about 450 cycles:** port waited for both final O slots before the
+  row-sum/1/L stats round trip; FA4 did the round trip first.
+
+Stamps perturbed the port by +384 ns versus FA4's +128 ns. They locate phases, not
+production latency; use the uninstrumented kernel times below.
 
 The correction now runs the round trip first, and one CTA allocates TMEM off the
 barrier-init warp (see [fixed costs](#warpdrive-fixed-costs)). Decode-kernel CUPTI medians,
@@ -730,12 +824,18 @@ CUPTI tick (-31 ns) and 1x32768 by +31 ns; computing the split range in the kern
 added nothing on top. Before the allocator change, both had been worth about 2%. Try-wait-
 first channel waits, patched in for every wait of the port, changed nothing.
 
+</details>
+
 ### Per-instruction attribution of the ragged gap
 
-The remaining `8x65536`, `8/1` ragged gap is mostly the K/V stage-ownership and forward-progress
-protocol, not barrier initialization or correction arithmetic. A scratch port using FA4's shared
-K/V ring and two skipping MMA cursors closes most of it. It is not the example's default: the
-same change regresses other shapes, and currently needs raw synchronization.
+<details>
+<summary>Why shared KV helped one ragged case, and why it is not the default</summary>
+
+The recorded `8x65536`, `8/1` gap mainly came from K/V stage ownership and progress, not
+barrier initialization or correction arithmetic. A raw prototype using FA4's shared ring
+and two skipping MMA cursors closed most of it but regressed other shapes. The later
+[managed shared-KV option](#shared-kv-ring) replaces that prototype's raw synchronization;
+split rings remain the default.
 
 Matched November 4, 2026 captures used GB300, CuTeDSL 4.8.0, PyTorch
 `2.15.0.dev20260922+cu132`, Triton 3.8.0, FA4 `00807a02`, and the port source SHA-256 prefix
@@ -776,10 +876,12 @@ body between warpgroups; the port's counts combine its two copies.
 | Correction final O wait/load | 37 / 93 | 41 / 106 | long scoreboard |
 | Epilogue wait/store | 58 / 63 | 875 / 884 | FA4 named barrier; port mbarrier |
 
-The source view does not export every sampled PC: the repeat leaves 1381/1630 equivalent
-samples uncorrelated. The full phase accounting retains that residual. Source-instrumented
-instruction counts also differ from hardware counts collected in another pass. Neither is
-an additive model of kernel latency, and parked epilogue warps are not a new critical path.
+Attribution limits:
+
+- Source view omitted 1381/1630 equivalent samples; full accounting retained that residual.
+- Source-instrumented instructions and hardware counts came from different passes.
+- Neither sample totals nor parked epilogue warps establish an additive latency model or
+  a new critical path.
 
 Native `enable_iket(waits=True)` captures, joined by logical CTA, warp and channel epoch, show
 the dependency behind the V stalls. All 76 kept CTAs have 16 blocks; both kernels' wait
@@ -790,21 +892,27 @@ Those waits partly relocate the same dependency, so their widths cannot be subtr
 extra work. The port's last V-ready observation is about 0.8 us later and its correction and
 O-store finishes about 0.9 us later, relative to each CTA's first warp entry.
 
-The stage-lifetime join explains the difference: a split V-ring acquisition often starts
-before the prior PV reader is ready. In the warmed capture this occurs for 22.5% of reused
-V stages, versus 4.3% in FA4, whose V loads mostly reuse K stages released by QK. The port's
-feedback path is PV -> V-stage reuse -> loader -> subsequent K/QK -> V/PV. FA4's shared
-capacity and QKIssued/PVIssued rendezvous change that path. The median V consumer-read-ready
-to empty-barrier reply interval is similar in both, about 0.2 us; this is not a different
-mbarrier implementation.
+Stage lifetimes explain the dependency. In the warmed capture, split-ring V acquisition
+started before the prior PV reader was ready for 22.5% of reused stages, versus 4.3% in FA4.
+FA4's V loads mostly reuse K stages already released by QK:
 
-IKET widths remain perturbed. Seven alternating warmed eager captures, excluding initial
-correctness launches, give minimal/native-waits kernel warp-lifetime envelopes of
-28.096/28.992 us for the port and 26.368/27.904 us for FA4 on the same GPU. These are separate
-from stabilized CUPTI graph timing. `plan_from_warpdrive` joins the seven role ranges, but its
-work-item-granular plan promotes the within-item stats/epilogue feedback to the next work
-item; its RecMII is not a per-block model of this OneShot decode. The raw per-warp wait
-timelines and explicit stage epochs supply the causal evidence instead.
+```text
+split rings: PV -> V-stage reuse -> loader -> subsequent K/QK -> V/PV
+shared ring: QK releases K capacity -> V can reuse it
+             QKIssued/PVIssued rendezvous bounds cursor skew
+```
+
+The median V read-ready to EMPTY-reply interval was about 0.2 us in both. Shared capacity
+and progress ordering changed the path, not the mbarrier implementation.
+
+IKET perturbed the widths: seven alternating warmed eager captures (excluding correctness
+launches) gave minimal/native-waits warp-lifetime envelopes of 28.096/28.992 us port versus
+26.368/27.904 us FA4. Do not pool these with stabilized CUPTI graph times.
+
+`plan_from_warpdrive` joins seven role ranges but promotes within-item stats/epilogue
+feedback to the next work item. Its RecMII (recurrence-constrained initiation interval) is
+**not a per-block model** of OneShot decode. The causal evidence here is per-warp wait
+tracks joined to explicit stage epochs.
 
 Two ablations rule out tempting alternatives. Moving the PDL wait and validity test before
 setup really reduces TMEM allocations from 256 to 76 and hardware warp instructions from
@@ -861,13 +969,21 @@ cursors, explicit skipped epochs and a bootstrap/skew contract preventing parity
 `Slots` requires Python-int slot IDs and only advances a reader's visited slots; it does not
 supply that dynamic ownership protocol. [Exclusive consumers](channels.md#exclusive-consumers)
 now provide the ring and the skips; the skew contract stays the author's, as the rendezvous
-recipe there shows. The raw prototype, source phase tables, matched Perfetto tracks, failed
-ablations and reproduction scripts are retained in `agent_space/decode_sass/`.
+recipe there shows. The original investigation retained its raw prototype, source phase
+tables, matched Perfetto tracks, failed ablations and scripts in git-ignored
+`agent_space/decode_sass/`; those local artifacts are not distributed with the example.
+
+</details>
 
 ### Decode racecheck
 
-The four reports from the split and shared-K/V decode are **false positives on the row-sum
-publication**, not four different races. Rechecked with source-line info on GB300,
+The audited reports below are **false positives on row-sum publication**, not four distinct
+races. This is specific to those access pairs/toolchain; new reports need a fresh audit.
+
+<details>
+<summary>Reported accesses, ordering proof, historical controls and reproduction test</summary>
+
+Rechecked with source-line info on GB300,
 compute-sanitizer 2025.4.1 (CUDA 13.1), driver 580.126.20, CuTeDSL 4.8.0 and torch
 2.15.0.dev20260922+cu132, using the example at `0535f67`:
 
@@ -938,22 +1054,35 @@ four errors plus one warning for FA4. All five four-launch runs also passed thei
 reference assertions; split/shared/FA4 pass synccheck on the isolated test. Hazard counts
 and grouping depend on launch count and codegen; new access pairs need a fresh audit.
 
+</details>
+
 ### Shared KV ring
 
 ```python
 out, lse = fa4_decode(q, k, v, num_splits, seqused_k=lengths, splits_per_seq=counts, shared_kv=True)
 ```
 
-`SharedKVDecode` (`shared_kv=True` in `fa4_decode`/`decode_partials`) ports the prototype onto
-the layer: one `Ring(sum(kv_stages), Tma(...), Umma, consumer_sharing=Sharing.EXCLUSIVE)` whose stages
-hold either a K tile or a V^T tile (the V buffer overlaps K), with the QK and PV warps as exclusive
-consumers that `skip()` each other's blocks, and FA4's QKIssued/PVIssued `NamedBarrier`s
-([recipe](channels.md#rendezvous-recipe-fa4s-qkissuedpvissued)). Both MMA warps probe their
-next stage with a try token after each release, as FA4 does; the loader probes its next stage
-after each commit within a block's K or V group (a token cannot cross the dynamic regions
-between groups, where FA4's loader carries its own). The default remains the split rings:
-the shared ring wins on ragged lengths and the 32-head single-sequence case and loses on the
-others. Partials stay bitwise equal to FA4's with either.
+`shared_kv=True` chooses `SharedKVDecode`: one ring of `sum(kv_stages)` stages containing
+**either K or V^T** (their buffers overlap), not two readers joining on every stage.
+
+```text
+one TMA producer -> mixed K / V^T epochs
+                   QK owns K epochs; skips V
+                   PV owns V epochs; skips K
+```
+
+The declaration uses `consumer_sharing=Sharing.EXCLUSIVE` with QK/PV consumer roles.
+FA4's QKIssued/PVIssued `NamedBarrier`s bound cursor skew; follow the
+[rendezvous recipe](channels.md#rendezvous-recipe-fa4s-qkissuedpvissued).
+
+Both MMA warps probe the next stage after releasing, using try tokens. The loader probes
+after each commit within a block's K or V group; its token cannot cross those dynamic
+regions, unlike FA4's loader token. Both variants preserve bitwise partials in the recorded
+comparisons. Split rings stay default: shared capacity helps some shapes and hurts others.
+
+<details>
+<summary>Shared versus split rings, try-token comparison and benchmark command</summary>
+
 
 Decode-kernel CUPTI medians in microseconds of the committed benchmark
 (`bench_fa4_decode.py`, FA4 prepare/decode/combine, port decode/combine; only the decode
@@ -973,14 +1102,14 @@ lower is better:
 | 1x32768, 32/1 | 7.088 | 7.168 | 6.976 | -2.68% |
 | 2x131072 ragged, 16/1 | 9.281 | 8.736 | 9.248 | +5.86% |
 
-The ragged case gains 1.06 us (the raw prototype's wrapper confirmation: 0.895 us, 27.487 to
-26.592 us), leaving 0.16 us to FA4. Each variant's three process medians agreed within
-0.16 us (0.1%). Levels move more than that between reservations: an earlier
-reservation on the same GPU measured the ragged case at 27.36 (split) and 26.37-26.40 us
-(shared) with FA4 at 26.18 us, so compare columns of one run only. Pick the protocol per
-shape: shared for ragged lengths with a single KV head and for long single sequences with
-many heads per KV head; split elsewhere, notably for the 2x131072 ragged case (+5.9%) and the
-8x32768 full case (+1.5%).
+The ragged case gained 1.06 us, leaving 0.16 us to FA4. The raw prototype's wrapper
+confirmation gained 0.895 us (27.487 -> 26.592). Each variant's three process medians agreed
+within 0.16 us, but absolute levels moved across reservations: an earlier run on the same
+GPU gave 27.36 split, 26.37–26.40 shared, and 26.18 us FA4. Compare columns of one run only.
+
+Use these results as candidates to remeasure, not a selector: shared helped the 8x65536
+ragged single-KV-head and 1x32768 many-query-head cases. It hurt 2x131072 ragged by 5.9% and
+8x32768 full by 1.5%; "ragged" alone does not predict a win.
 
 The try tokens are worth keeping on the shared ring, unlike on the split rings: removing them
 (blocking waits throughout), interleaved in three process pairs on shapes 1x8192, 8x65536
@@ -993,7 +1122,13 @@ gpu-run --timeout 1800 auto -- timeout --signal=TERM --kill-after=5s 900s \
   --output agent_space/decode_shared.json
 ```
 
+</details>
+
 ## warpdrive fixed costs
+
+<details>
+<summary>Handoff twins and decode-layout setup costs (historical GB300 measurements)</summary>
+
 
 [bench_overhead.py](../examples/bench_overhead.py) times the layer against hand-written
 `cute.arch` twins (GB300, same versions and date as above, seven interleaved rounds):
@@ -1004,13 +1139,21 @@ gpu-run --timeout 600 auto -- timeout --signal=TERM --kill-after=5s 900s \
   --output agent_space/overhead.json
 ```
 
-Per one-way handoff, in SM cycles on GB300 (warpdrive / raw with
-`cute.arch.mbarrier_wait` / raw with one hintless `try_wait` first): Threads 170 / 166 / 107,
-named 53 / 53 / 53, UMMA commit 164 / 164 / 105, TMA 317 / 317 / 257, round robin
-170 / 172 / 119; streams through 1- and 4-stage rings match as well. The channel code adds
-nothing; a try-wait first is about 60 cycles faster when the waiter is already parked
-(`mbarrier_wait` lowers to `TRYWAIT`, then `NANOSLEEP.SYNCS` with its 10 ms hint), but on
-the decode, GEMM and FA4 kernels it did not help (see above and the setup-cost section).
+Per one-way handoff, **SM cycles, lower is better**:
+
+| Mechanism | warpdrive | Raw `cute.arch.mbarrier_wait` | Raw hintless `try_wait` first |
+|---|---:|---:|---:|
+| Threads | 170 | 166 | 107 |
+| Named | 53 | 53 | 53 |
+| UMMA commit | 164 | 164 | 105 |
+| TMA | 317 | 317 | 257 |
+| Round robin | 170 | 172 | 119 |
+
+Streams through 1-/4-stage rings also matched. These twins found no material channel
+cost; they do not establish zero overhead for arbitrary kernels. Try-wait-first saved
+about 60 cycles with an already parked waiter (`mbarrier_wait` lowers to `TRYWAIT`, then
+`NANOSLEEP.SYNCS` with a 10 ms hint), but did not help decode/GEMM/FA4; see
+[decode setup costs](#decode-setup-costs).
 
 The fixed-cost suite runs the decode example's 16-warp layout, 48 mbarriers, TMEM and a
 OneShot stream with empty roles. On 148 CTAs, before the allocator change, it took 2.14 us against 1.95 us for a twin
@@ -1031,6 +1174,8 @@ role instruction took about 600 cycles longer than the warp-1 twin, for three re
    `decodes_any_index` drops the guard (role start about 925 -> 858 cycles). Decoding the first
    item once in `begin_roles` instead lengthened warp 0's path to the sync and cost 80 ns.
 
+</details>
+
 ## Historical timings
 
 The [original README at 49b9713](https://github.com/drisspg/transformer_nuggets/blob/49b9713/transformer_nuggets/cute/warp_roles/README.md)
@@ -1043,8 +1188,8 @@ a FA4 default schedule and a matched single-CTA schedule answer different questi
 
 ## Still missing
 
-cp.async producer mechanisms are not supported. The decode example (both variants) is
-OneShot-only. Using CUTLASS pipeline objects where their semantics match remains a possible
+Non-bulk `cp.async` producer mechanisms are not supported (`cp.async.bulk` loads can use
+`Tma`; see [TMA checks](tracing.md#tma-checks)). Both decode variants remain OneShot-only. Using CUTLASS pipeline objects where their semantics match remains a possible
 implementation cleanup, not a reason to change the role bodies.
 
 The alias diagnostic still needs IR-inferred accesses, partial K-block footprints, cluster
