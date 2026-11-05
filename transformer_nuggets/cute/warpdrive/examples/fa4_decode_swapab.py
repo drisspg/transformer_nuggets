@@ -105,6 +105,7 @@ from transformer_nuggets.cute.warpdrive import (
     bulk_wait_group,
     role,
 )
+from transformer_nuggets.cute.warpdrive.examples.tma_tiles import tma_partition_tiles
 
 TILE_M = 128  # MMA M: KV tokens of one S subtile, head dims of one O tile (one lane per row)
 MMA_N_MIN = 8
@@ -522,23 +523,11 @@ class SwapABDecode(WarpSpecialized):
         gK0 = cute.zipped_divide(
             cute.local_tile(params.mK, (TILE_M, self.head_dim), (0, 0, 0)), tiler
         )[(None, None), (0, None)]
-        tKsK, _ = cpasync.tma_partition(
-            params.tma_k,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(params.sK, 0, 3),
-            cute.group_modes(thr_qk.partition_A(gK0), 0, 3),
-        )
+        tKsK, _ = tma_partition_tiles(params.tma_k, params.sK, thr_qk.partition_A(gK0))
         gV0 = cute.zipped_divide(
             cute.local_tile(params.mV, (self.head_dim_v, TILE_M), (0, 0, 0)), tiler
         )[(None, None), (None, 0)]
-        tVsV, _ = cpasync.tma_partition(
-            params.tma_v,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(params.sV, 0, 3),
-            cute.group_modes(thr_pv.partition_A(gV0), 0, 3),
-        )
+        tVsV, _ = tma_partition_tiles(params.tma_v, params.sV, thr_pv.partition_A(gV0))
         return thr_qk, thr_pv, tKsK, tVsV
 
     def k_sources(self, params: DecodeParams, thr_qk, r: SplitRange, s):
@@ -548,13 +537,7 @@ class SwapABDecode(WarpSpecialized):
             unit = (s + r.n_block_min) * self.s_subtiles + sm
             gK = cute.local_tile(params.mK, (TILE_M, self.head_dim), (unit, 0, r.bh))
             gK_sub = cute.zipped_divide(gK, tiler)[(None, None), (0, None)]
-            _, tKgK = cpasync.tma_partition(
-                params.tma_k,
-                0,
-                cute.make_layout(1),
-                cute.group_modes(params.sK, 0, 3),
-                cute.group_modes(thr_qk.partition_A(gK_sub), 0, 3),
-            )
+            _, tKgK = tma_partition_tiles(params.tma_k, params.sK, thr_qk.partition_A(gK_sub))
             for dk in range(self.k_tiles):
                 yield tKgK[None, dk]
 
@@ -569,13 +552,7 @@ class SwapABDecode(WarpSpecialized):
                 tiler,
             )
             gVt_sub = gVt[(None, None), (None, sk % (TILE_M // self.tile_k))]
-            _, tVgV = cpasync.tma_partition(
-                params.tma_v,
-                0,
-                cute.make_layout(1),
-                cute.group_modes(params.sV, 0, 3),
-                cute.group_modes(thr_pv.partition_A(gVt_sub), 0, 3),
-            )
+            _, tVgV = tma_partition_tiles(params.tma_v, params.sV, thr_pv.partition_A(gVt_sub))
             for dm in range(self.d_tiles):
                 yield tVgV[None, dm]
 

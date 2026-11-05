@@ -36,6 +36,7 @@ from transformer_nuggets.cute.warpdrive import (
     WorkStream,
     role,
 )
+from transformer_nuggets.cute.warpdrive.examples.tma_tiles import tma_partition_tiles
 
 TILE_M, TILE_K = 128, 64  # one tcgen05.ld 32x32b lane per row; 128 B K-major rows (SW128)
 EPI_COLS = 32  # fp32 columns per tcgen05.ld 32x32b.x32 epilogue subtile
@@ -189,20 +190,8 @@ class Gemm(WarpSpecialized):
         # Whole-problem tile views: (BM, BK, m_tiles, k_tiles) and (BN, BK, n_tiles, k_tiles).
         gA = cute.local_tile(mA, self.tile, (None, None, None), proj=(1, None, 1))
         gB = cute.local_tile(mB, self.tile, (None, None, None), proj=(None, 1, 1))
-        tAsA, tAgA = cpasync.tma_partition(
-            tma_a,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sA, 0, 3),
-            cute.group_modes(thr_mma.partition_A(gA), 0, 3),
-        )
-        tBsB, tBgB = cpasync.tma_partition(
-            tma_b,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sB, 0, 3),
-            cute.group_modes(thr_mma.partition_B(gB), 0, 3),
-        )
+        tAsA, tAgA = tma_partition_tiles(tma_a, sA, thr_mma.partition_A(gA))
+        tBsB, tBgB = tma_partition_tiles(tma_b, sB, thr_mma.partition_B(gB))
         acc_shape = tiled_mma.partition_shape_C(self.tile[:2])
         acc_fake = tiled_mma.make_fragment_C(acc_shape)
         acc_staged = tiled_mma.make_fragment_C(cute.append(acc_shape, self.acc_stages))

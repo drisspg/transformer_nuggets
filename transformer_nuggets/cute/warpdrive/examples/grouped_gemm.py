@@ -66,6 +66,7 @@ from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import (
     MAX_C_STAGES,
     TILE_K,
 )
+from transformer_nuggets.cute.warpdrive.examples.tma_tiles import tma_partition_tiles
 
 RAGGED_ROWS = 2**30  # the row extent of the ragged output view; TMA clips there
 RAGGED_SELECT = 2**31 - 1  # extent of its row-selecting third mode
@@ -287,13 +288,7 @@ class GroupedGemm(WarpSpecialized):
                 (0, None, None),
                 proj=(1, None, 1),
             )
-            _, tAgA = cpasync.tma_partition(
-                params.tma_a,
-                0,
-                cute.make_layout(1),
-                cute.group_modes(params.sA, 0, 3),
-                cute.group_modes(thr_mma.partition_A(gA), 0, 3),
-            )
+            _, tAgA = tma_partition_tiles(params.tma_a, params.sA, thr_mma.partition_A(gA))
             tBgB = params.tBgB[None, nt, None, g]
             for k in cutlass.range(params.num_k_tiles, unroll=1):
                 with ab.produce() as s:
@@ -359,12 +354,8 @@ class GroupedGemm(WarpSpecialized):
         )
         tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.dtype)
         r2s, tRS_rC, tRS_sC = epilogue_smem_copy_and_partition(self, t2r, tTR_rC, tidx, params.sC)
-        bSG_sC, _ = cpasync.tma_partition(
-            params.tma_c,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(params.sC, 0, 2),
-            cute.group_modes(cute.flat_divide(gC_all, params.epi_tile), 0, 2),
+        bSG_sC, _ = tma_partition_tiles(
+            params.tma_c, params.sC, cute.flat_divide(gC_all, params.epi_tile), tile_rank=2
         )
         tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc) - 1)  # (..., SUB, STAGE)
         subtiles = cute.size(tTR_tAcc, mode=[3])
@@ -388,13 +379,7 @@ class GroupedGemm(WarpSpecialized):
                 ),
                 params.epi_tile,
             )
-            _, bSG_gC = cpasync.tma_partition(
-                params.tma_c,
-                0,
-                cute.make_layout(1),
-                cute.group_modes(params.sC, 0, 2),
-                cute.group_modes(gC_tma, 0, 2),
-            )
+            _, bSG_gC = tma_partition_tiles(params.tma_c, params.sC, gC_tma, tile_rank=2)
             with acc.consume() as a:
                 for i in cutlass.range_constexpr(subtiles):
                     buf = (first + i) % self.c_stages if rotate else i % self.c_stages
@@ -443,20 +428,8 @@ class GroupedGemm(WarpSpecialized):
         # Whole-problem B tiles (BN, BK, n_tiles, k_tiles, G); A tiles are built per item.
         gB = cute.local_tile(mB, self.mma_tile[1:], (None, None, None))
         gA0 = cute.local_tile(mA, self.mma_tile, (0, None, None), proj=(1, None, 1))
-        tAsA, _ = cpasync.tma_partition(
-            tma_a,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sA, 0, 3),
-            cute.group_modes(thr_mma.partition_A(gA0), 0, 3),
-        )
-        tBsB, tBgB = cpasync.tma_partition(
-            tma_b,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sB, 0, 3),
-            cute.group_modes(thr_mma.partition_B(gB), 0, 3),
-        )
+        tAsA, _ = tma_partition_tiles(tma_a, sA, thr_mma.partition_A(gA0))
+        tBsB, tBgB = tma_partition_tiles(tma_b, sB, thr_mma.partition_B(gB))
         acc_shape = tiled_mma.partition_shape_C(self.mma_tile[:2])
         acc_staged = tiled_mma.make_fragment_C(cute.append(acc_shape, self.acc_stages))
         params = GroupedGemmParams(

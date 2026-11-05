@@ -105,6 +105,7 @@ from transformer_nuggets.cute.warpdrive import (
     fence_async_shared,
     role,
 )
+from transformer_nuggets.cute.warpdrive.examples.tma_tiles import tma_partition_tiles
 
 TILE_M = 128  # Q rows per tile (the MMA N of S^T and dP^T)
 TILE_N = 128  # keys per work item (the MMA M; one compute thread pair per key row)
@@ -292,7 +293,6 @@ class FlashAttentionBackward(WarpSpecialized):
     ):
         thr_s, thr_dp = params.mma_s.get_slice(0), params.mma_dp.get_slice(0)
         thr_dv = params.mma_dv.get_slice(0)
-        one = cute.make_layout(1)
         copy_stats = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), Float32)
         while work.valid:
             n_block, head, batch = work.item
@@ -309,34 +309,10 @@ class FlashAttentionBackward(WarpSpecialized):
             )
             gLSE = cute.local_tile(params.mLSE[None, head, batch], (TILE_M,), (None,))
             gdPsum = cute.local_tile(params.mdPsum[None, head, batch], (TILE_M,), (None,))
-            tKsK, tKgK = cpasync.tma_partition(
-                params.tma_k,
-                0,
-                one,
-                cute.group_modes(params.sK, 0, 3),
-                cute.group_modes(thr_s.partition_A(gK), 0, 3),
-            )
-            tVsV, tVgV = cpasync.tma_partition(
-                params.tma_v,
-                0,
-                one,
-                cute.group_modes(params.sV, 0, 3),
-                cute.group_modes(thr_dp.partition_A(gV), 0, 3),
-            )
-            tQsQ, tQgQ = cpasync.tma_partition(
-                params.tma_q,
-                0,
-                one,
-                cute.group_modes(params.sQ, 0, 3),
-                cute.group_modes(thr_s.partition_B(gQ), 0, 3),
-            )
-            tOsO, tOgO = cpasync.tma_partition(
-                params.tma_do,
-                0,
-                one,
-                cute.group_modes(params.sdO, 0, 3),
-                cute.group_modes(thr_dv.partition_B(gdO), 0, 3),
-            )
+            tKsK, tKgK = tma_partition_tiles(params.tma_k, params.sK, thr_s.partition_A(gK))
+            tVsV, tVgV = tma_partition_tiles(params.tma_v, params.sV, thr_dp.partition_A(gV))
+            tQsQ, tQgQ = tma_partition_tiles(params.tma_q, params.sQ, thr_s.partition_B(gQ))
+            tOsO, tOgO = tma_partition_tiles(params.tma_do, params.sdO, thr_dv.partition_B(gdO))
             k, v = k.views(K=StageView(tKsK, axis=1)), v.views(V=StageView(tVsV, axis=1))
             q, do = q.views(Q=StageView(tQsQ, axis=1)), do.views(dO=StageView(tOsO, axis=1))
             # FA4's order: K, Q_0, LSE_0, V, dO_0, dPsum_0, then (Q, LSE, dO, dPsum) per tile.
@@ -718,13 +694,7 @@ class FlashAttentionBackward(WarpSpecialized):
             else:
                 self.epi_sync_wg1.sync(aligned=True)
             gD = cute.local_tile(mD[None, None, head, batch], (TILE_N, EPI_COLS), (n_block, wg))
-            tDsD, tDgD = cpasync.tma_partition(
-                tma,
-                0,
-                cute.make_layout(1),
-                cute.group_modes(sD_wg, 0, 2),
-                cute.group_modes(gD, 0, 2),
-            )
+            tDsD, tDgD = tma_partition_tiles(tma, sD_wg, gD, tile_rank=2)
             if leader:
                 cute.copy(tma, tDsD, tDgD)
                 bulk_commit_group()

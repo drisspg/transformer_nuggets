@@ -90,6 +90,7 @@ from transformer_nuggets.cute.warpdrive import (
     bulk_wait_group,
     role,
 )
+from transformer_nuggets.cute.warpdrive.examples.tma_tiles import tma_partition_tiles
 
 M_BLOCK = 128  # Q rows per CTA MMA tile: one softmax thread per row
 Q_STAGE = 2  # Q tiles per work item, one softmax warpgroup each
@@ -276,20 +277,8 @@ class FlashAttentionForward(WarpSpecialized):
         gV = cute.local_tile(
             params.mV[None, None, head, batch], (self.head_dim, self.tile_n), (0, None)
         )
-        tKsK, tKgK = cpasync.tma_partition(
-            params.tma_k,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(params.sK, 0, 3),
-            cute.group_modes(thr_qk.partition_B(gK), 0, 3),
-        )
-        tVsV, tVgV = cpasync.tma_partition(
-            params.tma_v,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(params.sV, 0, 3),
-            cute.group_modes(thr_pv.partition_B(gV), 0, 3),
-        )
+        tKsK, tKgK = tma_partition_tiles(params.tma_k, params.sK, thr_qk.partition_B(gK))
+        tVsV, tVgV = tma_partition_tiles(params.tma_v, params.sV, thr_pv.partition_B(gV))
         kv = kv.views(K=StageView(tKsK, axis=1), V=StageView(tVsV, axis=1))
         # FA4 order: K0, Q0, Q1, V0, then (K_i, V_i).
         with kv.produce() as h:
