@@ -1143,19 +1143,38 @@ class WarpSpecialized(metaclass=_KernelType):
             )
         return self._ws_smem[name].tensor
 
+    def _barrier_init_runs(self) -> list[tuple[int, int, dict[int, int]]]:
+        """Contiguous barriers with equal per-rank counts, at most one per warp-0 lane."""
+        per_rank = self._ws_bar_counts
+        runs = []
+        offset = 0
+        while offset < len(per_rank[0]):
+            counts = tuple(counts[offset] for counts in per_rank)
+            end = offset + 1
+            while (
+                end < len(per_rank[0])
+                and end - offset < WARP_SIZE
+                and tuple(counts[end] for counts in per_rank) == counts
+            ):
+                end += 1
+            if counts[0] is not None:  # user-initialized Barriers stay untouched
+                runs.append((offset, end - offset, dict(enumerate(counts))))
+            offset = end
+        return runs
+
     @cute.jit
     def _init_barriers(self, bars):
-        per_rank = self._ws_bar_counts
+        runs = self._barrier_init_runs()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         if warp_idx == 0:
             rank = self.cluster.rank()
-            with cute.arch.elect_one():
-                for i in cutlass.range_constexpr(len(per_rank[0])):
-                    if cutlass.const_expr(per_rank[0][i] is None):
-                        pass  # user-initialized Barriers
-                    else:
-                        counts = {c: counts[i] for c, counts in enumerate(per_rank)}
-                        cute.arch.mbarrier_init(bars + i, rank_value(counts, rank))
+            lane = cute.arch.lane_idx()
+            for i in cutlass.range_constexpr(len(runs)):
+                offset, count, arrivals = runs[i]
+                # Each barrier has exactly one initializing lane. The converged init fence
+                # and CTA/cluster sync in run_roles publish every lane's initialization.
+                if lane < count:
+                    cute.arch.mbarrier_init(bars + offset + lane, rank_value(arrivals, rank))
 
     @cute.jit
     def run_roles(self, params):
