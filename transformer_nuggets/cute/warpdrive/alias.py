@@ -143,7 +143,9 @@ def bulk_wait_group(n: int, *, read: bool = True):
 
 def named_barrier(barrier_id: int, number_of_threads: int):
     """``cute.arch.barrier(...)``, visible to the diagnostic. Only a barrier over every thread
-    of the calling role (``number_of_threads == 32 * warps``) orders the role's warps."""
+    of the calling role (``number_of_threads == 32 * warps``) orders the role's warps. A
+    declared ``NamedBarrier`` records the same event from its ``sync()`` and needs no hand-picked
+    ID; a hand-picked ID that the layer, a named channel or a ``NamedBarrier`` owns raises."""
     cute.arch.barrier(barrier_id=barrier_id, number_of_threads=number_of_threads)
     # A Python int id lets the kernel reject a collision with a named-barrier channel's IDs.
     _record(

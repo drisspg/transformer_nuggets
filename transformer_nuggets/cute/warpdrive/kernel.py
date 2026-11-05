@@ -45,6 +45,7 @@ from transformer_nuggets.cute.warpdrive.cluster import (
     rank_value,
 )
 from transformer_nuggets.cute.warpdrive.describe import describe_kernel
+from transformer_nuggets.cute.warpdrive.named import NamedBarrier
 from transformer_nuggets.cute.warpdrive.protocol import (
     ProtocolError,
     ProtocolLog,
@@ -76,8 +77,9 @@ MAX_WARPS = 32  # CUDA's 1024-thread block limit
 # Named barrier ids owned by the layer; user code must not reuse them.
 TMEM_PTR_BARRIER_ID = 1
 TMEM_TEARDOWN_BARRIER_ID = 2
-# Named-barrier channels take IDs from the top down, so hand-picked user IDs from 3 upward
-# (persistent_gemm's epilogue barrier) stay clear of them.
+# Named-barrier channels take IDs from the top down and declared NamedBarriers from the bottom
+# up, so adding a NamedBarrier leaves every channel's IDs where they were.
+FIRST_FREE_BARRIER_ID = 3
 MAX_NAMED_BARRIER_ID = 15
 
 
@@ -410,6 +412,9 @@ class WarpSpecialized(metaclass=_KernelType):
         raw_bars = {k: v for k, v in vars(self).items() if isinstance(v, Barriers)}
         for name, b in raw_bars.items():
             b.name = name
+        named_bars = {k: v for k, v in vars(self).items() if isinstance(v, NamedBarrier)}
+        for name, nb in named_bars.items():
+            nb.name = name
         streams = {k: v for k, v in vars(self).items() if isinstance(v, WorkStream)}
         if len(streams) > 1:
             raise ProtocolError(
@@ -417,11 +422,13 @@ class WarpSpecialized(metaclass=_KernelType):
                 f"{list(streams)}"
             )
         seen = {}
-        for name, obj in (*chans.items(), *turns.items(), *raw_bars.items(), *streams.items()):
+        declarations = (*chans.items(), *turns.items(), *raw_bars.items(), *named_bars.items())
+        for name, obj in (*declarations, *streams.items()):
             if id(obj) in seen:
                 raise ProtocolError(
                     f"attributes {seen[id(obj)]!r} and {name!r} use the same declaration; "
-                    "give each channel, turnstile, barrier set, and stream its own object"
+                    "give each channel, turnstile, barrier set, named barrier, and stream its "
+                    "own object"
                 )
             seen[id(obj)] = name
         cluster = self.cluster
@@ -549,9 +556,17 @@ class WarpSpecialized(metaclass=_KernelType):
         roles.sort(key=lambda r: r.first_warp)
         self._validate(chans, turns, roles)
         self._validate_placement(chans, turns, roles)
-        self._ws_named = _allocate_named(chans)
+        self._ws_named = _allocate_named(chans, named_bars)
+        for name, nb in named_bars.items():
+            if nb.threads > self.num_warps * WARP_SIZE:
+                raise ProtocolError(
+                    f"NamedBarrier {name} counts {nb.threads} threads, but the kernel launches "
+                    f"{self.num_warps * WARP_SIZE}; it can never complete"
+                )
         self._ws_chans, self._ws_turns, self._ws_roles = chans, turns, roles
         self._ws_raw_bars = raw_bars
+        self._ws_named_bars = named_bars
+        self._ws_named_users = {}  # NamedBarrier name -> {"sync"/"arrive": role names}, traced
         self._ws_streams = streams
         self._ws_tma = {}  # channel name -> tma.TmaReport, filled while tracing
         self._ws_smem = {}  # SmemPlan buffer name -> storage.ResolvedBuffer, after begin_roles
@@ -905,6 +920,7 @@ class WarpSpecialized(metaclass=_KernelType):
             "alias": self._ws_alias,
             "opt_outs": self._ws_opt_outs,
             "uses": self._ws_uses,
+            "named_users": self._ws_named_users,
         }
 
     def __cute_restore_trace__(self, record: dict) -> None:
@@ -923,6 +939,7 @@ class WarpSpecialized(metaclass=_KernelType):
         self._ws_alias = record["alias"]
         self._ws_opt_outs = record["opt_outs"]
         self._ws_uses = record["uses"]
+        self._ws_named_users = record["named_users"]
         self._ws_traced = True
         self._report_trace()
 
@@ -997,8 +1014,9 @@ class WarpSpecialized(metaclass=_KernelType):
     @property
     def named_barrier_ids(self) -> dict:
         """``{channel: ([full id per slot], [empty id per slot])}`` of the named-barrier channels.
-        They are allocated from 15 downward, after the layer's IDs 1 and 2; hand-picked IDs in
-        user code must avoid them (``alias.named_barrier`` calls are checked while tracing)."""
+        They are allocated from 15 downward, after the layer's IDs 1 and 2; declared
+        ``NamedBarrier``s take IDs from 3 upward (each has its own ``.id``). Hand-picked IDs in
+        user code must avoid both (``alias.named_barrier`` calls are checked while tracing)."""
         self._collect()
         return dict(self._ws_named)
 
@@ -1256,19 +1274,7 @@ class WarpSpecialized(metaclass=_KernelType):
         """Collect check opt-outs; warn once about TMA channels the check could not verify; run
         the alias diagnostic."""
         self._ws_opt_outs = take_opt_outs()
-        taken = {
-            i: f"channel {name}"
-            for name, ids in self._ws_named.items()
-            for i in (*ids[0], *ids[1])
-        }
-        taken.update({TMEM_PTR_BARRIER_ID: "the layer", TMEM_TEARDOWN_BARRIER_ID: "the layer"})
-        for role_events in self._ws_alias_roles:
-            for ev in role_events.events:
-                if ev.kind == "barrier" and ev.data.get("id") in taken:
-                    raise ProtocolError(
-                        f"{role_events.name}: named_barrier({ev.data['id']}) at {ev.site} uses a "
-                        f"barrier ID owned by {taken[ev.data['id']]}; pick an unused ID"
-                    )
+        self._check_named_barriers()
         self._ws_alias = None
         if self.alias_check not in alias.MODES:
             raise ValueError(f"alias_check must be one of {alias.MODES}, got {self.alias_check!r}")
@@ -1283,6 +1289,68 @@ class WarpSpecialized(metaclass=_KernelType):
                     )
         self._ws_traced = True
         self._report_trace()
+
+    def _check_named_barriers(self):
+        """Reject hand-picked ``alias.named_barrier`` IDs that are out of range or owned by the
+        layer, a named channel, or a ``NamedBarrier``; record each ``NamedBarrier``'s users and
+        reject one whose users cannot supply its count in some CTA."""
+        taken = {
+            i: f"channel {name}"
+            for name, ids in self._ws_named.items()
+            for i in (*ids[0], *ids[1])
+        }
+        taken.update({TMEM_PTR_BARRIER_ID: "the layer", TMEM_TEARDOWN_BARRIER_ID: "the layer"})
+        taken.update(
+            {
+                nb.id: f"NamedBarrier {name} (call {name}.sync() or {name}.arrive())"
+                for name, nb in self._ws_named_bars.items()
+            }
+        )
+        users = {name: {"sync": [], "arrive": []} for name in self._ws_named_bars}
+        for role_events in self._ws_alias_roles:
+            for ev in role_events.events:
+                if ev.kind not in ("barrier", "barrier_arrive"):
+                    continue
+                if "barrier" in ev.data:  # a NamedBarrier operation
+                    name = ev.data["barrier"].name
+                    if self._ws_named_bars.get(name) is not ev.data["barrier"]:
+                        raise ProtocolError(
+                            f"{role_events.name}: NamedBarrier {name} at {ev.site} belongs to "
+                            "another kernel; declare one on this kernel"
+                        )
+                    op = "sync" if ev.kind == "barrier" else "arrive"
+                    if role_events.name not in users[name][op]:
+                        users[name][op].append(role_events.name)
+                    continue
+                barrier_id = ev.data["id"]
+                if barrier_id is None:  # a dynamic ID: not checkable
+                    continue
+                if not 0 <= barrier_id <= MAX_NAMED_BARRIER_ID:
+                    raise ProtocolError(
+                        f"{role_events.name}: named_barrier({barrier_id}) at {ev.site}: barrier "
+                        f"IDs are 0-{MAX_NAMED_BARRIER_ID}"
+                    )
+                if barrier_id in taken:
+                    raise ProtocolError(
+                        f"{role_events.name}: named_barrier({barrier_id}) at {ev.site} uses a "
+                        f"barrier ID owned by {taken[barrier_id]}; pick an unused ID"
+                    )
+        roles = {r.name: r for r in self._ws_roles}
+        for name, nb in self._ws_named_bars.items():
+            used_by = [
+                roles[r] for r in dict.fromkeys(users[name]["sync"] + users[name]["arrive"])
+            ]
+            for rank in range(self.cluster.size):
+                here = [r for r in used_by if rank in self.cluster.ctas(r.cta)]
+                total = sum(r.num_threads for r in here)
+                if 0 < total < nb.threads:
+                    where = f" in CTA rank {rank}" if self.cluster.size > 1 else ""
+                    raise ProtocolError(
+                        f"NamedBarrier {name} counts {nb.threads} threads, but the roles using "
+                        f"it{where} ({', '.join(r.name for r in here)}) have only {total}; it "
+                        "can never complete"
+                    )
+        self._ws_named_users = users
 
     def _report_trace(self):
         """Raise (strict alias check) or warn about what a trace found, after the trace or when
@@ -1575,24 +1643,28 @@ def _role_overrides(roles, declared: dict) -> dict:
     return dict(roles)
 
 
-def _allocate_named(chans: dict) -> dict:
-    """Assign named barrier IDs to named channels, from ``MAX_NAMED_BARRIER_ID`` down: per
-    channel, ``n`` consecutive full IDs then ``n`` empty IDs (ring stages index them)."""
+def _allocate_named(chans: dict, named_bars: dict) -> dict:
+    """Assign named barrier IDs: named channels from ``MAX_NAMED_BARRIER_ID`` down (per channel,
+    ``n`` consecutive full IDs then ``n`` empty IDs, which ring stages index), then each
+    ``NamedBarrier`` one ID from ``FIRST_FREE_BARRIER_ID`` up, in declaration order. Returns the
+    channels' IDs."""
+    named_chans = {name: ch for name, ch in chans.items() if ch.named}
+    need = sum(2 * ch.n for ch in named_chans.values()) + len(named_bars)
+    free = MAX_NAMED_BARRIER_ID - FIRST_FREE_BARRIER_ID + 1
+    if need > free:
+        raise ProtocolError(
+            f"named-barrier channels (2 IDs per stage) and NamedBarriers (1 ID each) need {need} "
+            f"barrier IDs; {free} are free (0 is __syncthreads, 1 and 2 belong to the layer); "
+            "use mbarrier channels for some"
+        )
     out, top = {}, MAX_NAMED_BARRIER_ID
-    for name, ch in chans.items():
-        if not ch.named:
-            continue
+    for name, ch in named_chans.items():
         base = top - 2 * ch.n + 1
-        if base <= TMEM_TEARDOWN_BARRIER_ID:
-            need = sum(2 * c.n for c in chans.values() if c.named)
-            raise ProtocolError(
-                f"named-barrier channels need {need} barrier IDs; "
-                f"{MAX_NAMED_BARRIER_ID - TMEM_TEARDOWN_BARRIER_ID} are free (0 is "
-                "__syncthreads, 1 and 2 belong to the layer); use mbarrier channels for some"
-            )
         ch.named_ids = (list(range(base, base + ch.n)), list(range(base + ch.n, top + 1)))
         out[name] = ch.named_ids
         top = base - 1
+    for barrier_id, nb in enumerate(named_bars.values(), FIRST_FREE_BARRIER_ID):
+        nb._id = barrier_id
     return out
 
 

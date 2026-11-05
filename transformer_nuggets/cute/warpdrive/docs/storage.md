@@ -175,7 +175,8 @@ named_barrier(3, number_of_threads=128)  # cute.arch.barrier(...)
 ```
 
 These are separate examples, not a general synchronization recipe. Named barrier IDs 1 and 2
-are reserved by warpdrive; use an available ID and the right participant count. Each wrapper
+are reserved by warpdrive; prefer a declared [`NamedBarrier`](channels.md#named-barriers),
+whose `sync()` records the same event, or use an available ID and the right participant count. Each wrapper
 emits the underlying instruction plus a host-side trace event, not an extra device operation.
 Access annotations themselves emit no device code. The analysis is host-only; switching
 `alias_check` on or off does not change the generated device code.

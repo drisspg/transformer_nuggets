@@ -12,7 +12,9 @@ passed to ``run_roles`` (a frozen dataclass of prologue values in the examples) 
 parameter annotated with its type, or to the role's single unannotated parameter; any other
 annotation is a ``ProtocolError``.
 ``Ring(..., round_robin=True)`` lets the instances of one role take a side's epochs in turn;
-``sync="named"`` builds a Threads-to-Threads channel from CTA named barriers (``channels.py``).
+``sync="named"`` builds a Threads-to-Threads channel from CTA named barriers (``channels.py``);
+``NamedBarrier(threads=N)`` declares one named barrier whose ID the kernel allocates, for
+syncs inside a role or one-shot flags between roles (``named.py``).
 
 Ends are DSL values: dynamic loops carry their phases when the end is a local name that the
 loop body uses through a method call or reassignment. Helpers that take ends must return them
@@ -118,6 +120,7 @@ from transformer_nuggets.cute.warpdrive.kernel import (
     WarpSpecialized,
     role,
 )
+from transformer_nuggets.cute.warpdrive.named import NamedBarrier
 from transformer_nuggets.cute.warpdrive.pipeline_plan import plan_from_warpdrive
 from transformer_nuggets.cute.warpdrive.protocol import ProtocolError, ProtocolLog, unchecked
 from transformer_nuggets.cute.warpdrive.scheduling import (
@@ -151,6 +154,7 @@ __all__ = [
     "Handle",
     "IndexSchedule",
     "Instance",
+    "NamedBarrier",
     "OneShot",
     "PdlWait",
     "Producer",

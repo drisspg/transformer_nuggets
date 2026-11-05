@@ -3,7 +3,7 @@
 ``describe_kernel`` reads only host-side state collected by ``WarpSpecialized._collect`` (and,
 after a compile, the TMA check reports, check opt-outs, and the traced protocol), so the output
 is stable for a given declaration. Sections: header, roles, channels, turnstiles, raw barriers,
-streams, TMEM, SMEM plan, opt-outs, alias diagnostic, traced protocol.
+named barriers, streams, TMEM, SMEM plan, opt-outs, alias diagnostic, traced protocol.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ def describe_kernel(kernel) -> str:
         _channels(kernel),
         _turnstiles(kernel),
         _raw_barriers(kernel),
+        _named_barriers(kernel),
         _streams(kernel),
         _tmem(kernel),
         _smem(kernel),
@@ -297,6 +298,20 @@ def _raw_barriers(kernel) -> str:
         init = "user-initialized" if b.counts is None else f"layer-initialized {b.counts}"
         rows.append([name, f"{b.n} mbarriers", init, "user-driven (unchecked)"])
     return "\n".join(["Raw barriers", *_table(rows)])
+
+
+def _named_barriers(kernel) -> str:
+    if not kernel._ws_named_bars:
+        return ""
+    traced = getattr(kernel, "_ws_traced", False)
+    rows = []
+    for name, nb in kernel._ws_named_bars.items():
+        users = kernel._ws_named_users.get(name, {})
+        ops = [f"{op} by {', '.join(users[op])}" for op in ("arrive", "sync") if users.get(op)]
+        if not traced:
+            ops = ["users known after a compile"]
+        rows.append([name, f"id {nb.id}", f"{nb.threads} threads", "; ".join(ops) or "unused"])
+    return "\n".join(["Named barriers", *_table(rows)])
 
 
 def _streams(kernel) -> str:

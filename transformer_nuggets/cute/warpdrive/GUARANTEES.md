@@ -58,7 +58,7 @@ address and `remote_scope="cluster"`; a channel cannot infer either for you.
 
 **Launch what you declared.** Call `begin_roles` and `run_roles` in converged CTA/cluster code.
 Use `launch_config(bound)` for the declared block/cluster shape and checked work grid. Keep
-raw named barriers clear of IDs 1 and 2 and `op.named_barrier_ids`. Initialize any
+raw named barriers clear of IDs 1 and 2, `op.named_barrier_ids` and each `NamedBarrier.id`. Initialize any
 `Barriers(counts=None)` yourself before dispatch. Cluster exit synchronization and automatic
 producer tails cover the managed protocol, not arbitrary user async operations.
 

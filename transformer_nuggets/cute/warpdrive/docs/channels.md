@@ -168,9 +168,90 @@ IDs are allocated per channel in declaration order from 15 downward, in consecut
 of n full IDs followed by n empty IDs. `channel.named_ids[0][s]` and
 `channel.named_ids[1][s]` name slot s's full and empty barriers; `op.named_barrier_ids` and
 `describe()` list them. ID 0 is for CTA synchronization, and 1 and 2 belong to the layer,
-leaving 13 IDs for channels. Hand-picked IDs must avoid the allocated IDs even if they are
-small. Calls through `alias.named_barrier` are checked against them; raw `cute.arch.barrier`
-and `barrier_arrive` calls are not. Named channels have no mbarrier pointer accessors.
+leaving 13 IDs for channels and [named barriers](#named-barriers). Hand-picked IDs must avoid
+the allocated IDs even if they are small. Calls through `alias.named_barrier` are checked
+against them; raw `cute.arch.barrier` and `barrier_arrive` calls are not. Named channels have
+no mbarrier pointer accessors.
+
+## Named barriers
+
+```python
+self.compute_sync = NamedBarrier(threads=256)  # both compute warpgroups
+self.max_done = NamedBarrier(threads=160)  # the correction warpgroup and the load warp
+
+self.compute_sync.sync()  # in the compute role
+self.max_done.arrive()  # correction: publish without waiting
+self.max_done.sync()  # load: arrive and wait
+```
+
+A `NamedBarrier` is one CTA named barrier: one ID, which the kernel allocates, and one thread
+count. Declare it in `__init__` like a channel; managed and raw roles call it through `self`.
+`sync()` arrives and waits until the generation completes; `arrive()` arrives and continues.
+A generation completes when `threads` threads have arrived through either call. Both are
+unaligned (`barrier.cta.sync`/`barrier.cta.arrive`), so threads may reach them from different
+code sites. `aligned=True` emits `bar.sync`/`bar.arrive` instead, which requires every thread
+of each participating warp to execute that same instruction convergently. The GEMM epilogues
+use it: there it reproduces the hand-picked barrier it replaced, SASS included.
+
+Named barriers take IDs from 3 upward in declaration order, named channels from 15 downward,
+so declaring one moves no channel's IDs. Collection raises when they don't fit in 13 IDs.
+`describe()` lists each barrier's ID and count and, after a compile, the roles that arrived or
+synced. `.id` is the ID for exceptional native calls, such as a library function that takes
+one; the layer neither records nor checks those calls.
+
+What the layer checks: the count is a multiple of 32, at most 1024 and at most the kernel's
+threads. While tracing, an `alias.named_barrier` call raises if its ID is outside 0-15 or
+owned by the layer, a named channel or a `NamedBarrier`. A barrier also raises if the roles
+using it in some CTA have fewer threads in total than its count, since it could never
+complete there. It doesn't check which threads arrive in each generation, that participation
+is balanced, or that the protocol makes progress.
+
+`sync()` records the same diagnostic event as `alias.named_barrier`: a sync whose count is
+every thread of the calling role orders that role's warps for the alias diagnostic. An
+`arrive()` orders nothing for the arriving thread and doesn't count as one.
+
+### One-shot done flag
+
+One ID, with no empty barrier and no acknowledgement:
+
+```python
+self.done = NamedBarrier(threads=128 + 32)  # publishers + waiters
+
+# publishers (128 threads)
+...  # write the result to SMEM
+self.done.arrive()
+
+# waiters (32 threads)
+self.done.sync()
+...  # read it
+```
+
+The barrier orders the publishers' memory accesses before their arrival with the waiters'
+accesses after the sync, as for a named channel; asynchronous proxies still need their fences.
+It is sound when the flag completes at most once per launch, or once per work item with at
+most one item per CTA (the [decode example](../examples/fa4_decode_swapab.py) is `OneShot`).
+Otherwise a publisher could arrive for the next item before every waiter had synced, and its
+arrival would count toward the earlier generation. Add an edge back to the publishers, or use
+a named channel, whose empty barrier is that edge.
+
+### Reusable rendezvous
+
+```python
+self.compute_sync = NamedBarrier(threads=256)
+
+for t in cutlass.range(n_tiles, unroll=1):
+    ...  # each warpgroup writes its half
+    self.compute_sync.sync()
+    ...  # read the other half
+```
+
+If exactly `threads` threads take part in every generation and all of them sync, reuse is
+safe: nobody leaves generation g until all have arrived, so nobody arrives early for g + 1.
+A reusable barrier with participants that only arrive needs more: an argument that a fast
+participant can't arrive twice before generation g completes, since its second arrival would
+count toward g. The barrier supplies no such argument. The protocol must, for example by making
+the arriving side wait on another edge before it arrives again, as a named channel's
+producer waits on its empty barrier.
 
 ## Overlapping handles
 
