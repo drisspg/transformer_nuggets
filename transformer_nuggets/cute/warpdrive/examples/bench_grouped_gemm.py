@@ -14,7 +14,6 @@ so the executed route is known (FlexGEMM's TRITON backend without max-autotune i
 import argparse
 import json
 import sys
-import time
 from pathlib import Path
 
 import torch
@@ -29,6 +28,7 @@ from transformer_nuggets.cute.warpdrive import (
     CtaPair,
     StaticPersistent,
 )
+from transformer_nuggets.cute.warpdrive.examples.bench_support import settle
 from transformer_nuggets.cute.warpdrive.examples.grouped_gemm import (
     GroupedGemm,
     compile_grouped_gemm,
@@ -188,11 +188,7 @@ def run_shape(groups, tokens, n, k, labels, samples, rounds) -> dict:
         graphs[label] = graph
         graph.replay()
     torch.cuda.synchronize()
-    settle_end = time.monotonic() + 2.0
-    while time.monotonic() < settle_end:
-        for graph in graphs.values():
-            graph.replay()
-        torch.cuda.synchronize()
+    settle(graphs.values(), seconds=2.0)
     medians = {label: [] for label in calls}
     for round_idx in range(rounds):
         order = list(calls) if round_idx % 2 == 0 else list(reversed(calls))

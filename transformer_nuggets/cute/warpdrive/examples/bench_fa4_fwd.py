@@ -6,19 +6,15 @@ still perturb timings, so keep the per-round samples and compare the minimum rou
 """
 
 import argparse
-import hashlib
-import importlib.metadata
 import json
-import os
-import subprocess
 import sys
-import time
 from pathlib import Path
 
 import torch
 from flash_attn.cute import flash_attn_func, flash_fwd_sm100
 
 from transformer_nuggets.cute.warpdrive import ClusterLaunchControl, CtaPair, StaticPersistent
+from transformer_nuggets.cute.warpdrive.examples.bench_support import provenance, settle
 from transformer_nuggets.cute.warpdrive.examples.fa4_fwd import (
     LOG2_E,
     FlashAttentionForward,
@@ -92,12 +88,7 @@ def run_shape(b: int, h: int, s: int, variants: list[str], samples: int, profile
         graphs[label] = graph
         graph.replay()
     torch.cuda.synchronize()
-    # Settle DVFS before the first timed round, not just before graph capture.
-    warmup_end = time.monotonic() + 3.0
-    while time.monotonic() < warmup_end:
-        for graph in graphs.values():
-            graph.replay()
-        torch.cuda.synchronize()
+    settle(graphs.values(), seconds=3.0)
     medians = {label: [] for label in variants}
     raw_samples = {label: [] for label in variants}
     # Seven rounds, alternating A->B and B->A; every variant uses the same tensors/device.
@@ -121,31 +112,6 @@ def run_shape(b: int, h: int, s: int, variants: list[str], samples: int, profile
     }
 
 
-def source_metadata(source: Path) -> dict:
-    """Record the checkout revision and actual source, including uncommitted experiments."""
-    try:
-        commit = subprocess.check_output(
-            ["git", "-C", str(source.parent), "rev-parse", "HEAD"],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        ).strip()
-        dirty = bool(
-            subprocess.check_output(
-                ["git", "-C", str(source.parent), "status", "--porcelain"],
-                text=True,
-                stderr=subprocess.DEVNULL,
-            )
-        )
-    except (OSError, subprocess.CalledProcessError):
-        commit, dirty = None, None
-    return {
-        "source": str(source),
-        "commit": commit,
-        "dirty": dirty,
-        "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
-    }
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shape", type=int, choices=range(len(SHAPES)))
@@ -165,18 +131,13 @@ def main() -> None:
         parser.error("samples must be positive and variants must be unique")
     # CuTeDSL's diagnostic argparse must not reinterpret the application's arguments.
     sys.argv = sys.argv[:1]
-    versions = {
-        package: importlib.metadata.version(package)
-        for package in ["torch", "triton", "nvidia-cutlass-dsl"]
-    }
-    metadata = {
-        "versions": versions,
-        "gpu": torch.cuda.get_device_name(),
-        "reserved_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
-        "warpdrive": source_metadata(Path(__file__).with_name("fa4_fwd.py")),
-        "benchmark": source_metadata(Path(__file__)),
-        "flash_attn": source_metadata(Path(flash_fwd_sm100.__file__)),
-        "arguments": {
+    metadata = provenance(
+        {
+            "warpdrive": Path(__file__).with_name("fa4_fwd.py"),
+            "benchmark": Path(__file__),
+            "flash_attn": Path(flash_fwd_sm100.__file__),
+        },
+        {
             "shape": args.shape,
             "variants": args.variants,
             "samples": args.samples,
@@ -186,7 +147,7 @@ def main() -> None:
             "warmup_graphs_per_round": 3,
             "settle_seconds": 3,
         },
-    }
+    )
     print("metadata", metadata, flush=True)
     shapes = SHAPES if args.shape is None else [SHAPES[args.shape]]
     results = [run_shape(*shape, args.variants, args.samples, args.profile) for shape in shapes]

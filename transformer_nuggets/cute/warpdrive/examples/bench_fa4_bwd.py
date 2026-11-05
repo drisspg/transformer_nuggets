@@ -17,14 +17,9 @@ Run under ``gpu-run``:
 """
 
 import argparse
-import hashlib
-import importlib.metadata
 import json
-import os
 import statistics
-import subprocess
 import sys
-import time
 from pathlib import Path
 
 import torch
@@ -32,6 +27,11 @@ from flash_attn.cute import flash_bwd_sm100
 from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd
 
 from transformer_nuggets.cute.warpdrive.examples import fa4_bwd as port
+from transformer_nuggets.cute.warpdrive.examples.bench_support import (
+    provenance,
+    replay_timed,
+    settle,
+)
 
 # (batch, heads, seqlen_q, seqlen_k)
 SHAPES = [(2, 16, 1024, 1024), (4, 16, 4096, 4096), (1, 16, 8192, 8192), (4, 16, 3000, 2900)]
@@ -44,24 +44,6 @@ def main_kernel(names, variant):
     if len(found) != 1:
         raise RuntimeError(f"{variant}: expected one main kernel matching {needle!r}, got {names}")
     return found[0]
-
-
-def replay(graph, reps):
-    starts = [torch.cuda.Event(enable_timing=True) for _ in range(reps)]
-    ends = [torch.cuda.Event(enable_timing=True) for _ in range(reps)]
-    for _ in range(5):
-        graph.replay()
-    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
-        for s, e in zip(starts, ends):
-            s.record()
-            graph.replay()
-            e.record()
-        torch.cuda.synchronize()
-    kernels = {}
-    for ev in prof.events():
-        if ev.device_type == torch.autograd.DeviceType.CUDA and ev.device_time > 0:
-            kernels.setdefault(ev.name, []).append(ev.device_time)
-    return [s.elapsed_time(e) * 1e3 for s, e in zip(starts, ends)], kernels
 
 
 def run_shape(b, h, sq, sk, causal, variants, reps, rounds):
@@ -99,16 +81,12 @@ def run_shape(b, h, sq, sk, causal, variants, reps, rounds):
         with torch.cuda.graph(graph):
             call()
         graphs[name] = graph
-    settle = time.monotonic() + 3.0  # settle DVFS before the first timed round
-    while time.monotonic() < settle:
-        for graph in graphs.values():
-            graph.replay()
-        torch.cuda.synchronize()
+    settle(graphs.values(), seconds=3.0)
     medians = {name: {"graph": [], "main": []} for name in calls}
     samples = {name: [] for name in calls}
     for r in range(rounds):
         for name in variants if r % 2 == 0 else list(reversed(variants)):
-            graph_us, kernels = replay(graphs[name], reps)
+            graph_us, kernels = replay_timed(graphs[name], reps, warmup=5)
             main = kernels[main_kernel(list(kernels), name)]
             medians[name]["graph"].append(statistics.median(graph_us))
             medians[name]["main"].append(statistics.median(main))
@@ -125,22 +103,6 @@ def run_shape(b, h, sq, sk, causal, variants, reps, rounds):
         "medians_us": medians,
         "samples": samples,
     }
-
-
-def source_metadata(source: Path) -> dict:
-    try:
-        commit = subprocess.check_output(
-            ["git", "-C", str(source.parent), "rev-parse", "HEAD"], text=True
-        ).strip()
-        dirty = bool(
-            subprocess.check_output(
-                ["git", "-C", str(source.parent), "status", "--porcelain"], text=True
-            )
-        )
-    except (OSError, subprocess.CalledProcessError):
-        commit, dirty = None, None
-    sha = hashlib.sha256(source.read_bytes()).hexdigest()
-    return {"source": str(source), "commit": commit, "dirty": dirty, "source_sha256": sha}
 
 
 def main():
@@ -160,17 +122,14 @@ def main():
     if args.reps < 1 or args.rounds < 1 or len(set(args.variants)) != len(args.variants):
         parser.error("reps and rounds must be positive and variants unique")
     sys.argv = sys.argv[:1]  # CuTeDSL's diagnostic argparse must not see our arguments
-    metadata = {
-        "versions": {
-            p: importlib.metadata.version(p) for p in ("torch", "triton", "nvidia-cutlass-dsl")
+    metadata = provenance(
+        {
+            "warpdrive": Path(port.__file__),
+            "benchmark": Path(__file__),
+            "flash_attn": Path(flash_bwd_sm100.__file__),
         },
-        "gpu": torch.cuda.get_device_name(),
-        "reserved_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
-        "warpdrive": source_metadata(Path(port.__file__)),
-        "benchmark": source_metadata(Path(__file__)),
-        "flash_attn": source_metadata(Path(flash_bwd_sm100.__file__)),
-        "arguments": vars(args) | {"output": str(args.output)},
-    }
+        vars(args) | {"output": str(args.output)},
+    )
     print("metadata", metadata, flush=True)
     shapes = SHAPES if not args.shapes else [SHAPES[i] for i in args.shapes]
     results = [
