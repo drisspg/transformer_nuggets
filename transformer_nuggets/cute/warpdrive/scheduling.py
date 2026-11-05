@@ -1176,15 +1176,16 @@ class WorkCursor:
                 cur._state = state
         elif scheduler:
             # scheduler_role runs the hooks and start(), then publishes and receives the first item
-            # (and opens its range through _first_item()).
+            # (and opens its range through _enter_item()).
             cur._words = (Int32(0),) * stream.mapping.words
             return cur
         else:
             cur._receive()
-        cur._first_item()
+        cur._enter_item()
         return cur
 
-    def _first_item(self):
+    def _enter_item(self):
+        """Bookkeeping at the start of each item: the record log and the item's IKET range."""
         self._log()
         if self._iket is not None:
             push_if(self.index < self._problem.total, self._iket)
@@ -1283,9 +1284,7 @@ class WorkCursor:
                 )
         else:
             self._receive()
-        self._log()
-        if self._iket is not None:
-            push_if(self.index < problem.total, self._iket)
+        self._enter_item()
 
     def _receive(self):
         h = self._end.wait()
@@ -1326,7 +1325,7 @@ def _publish(h, index, words, total):
     chan = h._end._chan
     if isinstance(chan.producer, Tma):  # a cluster's ring: the bytes complete each full barrier
         targets = chan.scope.full_ctas if chan.scope.pair else (0,)  # local: leader-only users
-        _publish_pair(h.data.iterator, h.barrier, [index, *words], targets)
+        _publish_cluster(h.data.iterator, h.barrier, [index, *words], targets)
     else:
         _publish_local(h, index, words, total)
 
@@ -1341,7 +1340,7 @@ def _publish_local(h, index, words, total):
 
 
 @cute.jit
-def _publish_pair(slot_ptr, full, values, targets: cutlass.Constexpr):
+def _publish_cluster(slot_ptr, full, values, targets: cutlass.Constexpr):
     """Leader: ``st.async`` the item into the slot of every consumer CTA; the stores complete
     the bytes the producer armed on each CTA's full barrier (``Tma(16 * chunks)``)."""
     words = list(values) + [Int32(0)] * (-len(values) % 4)
@@ -1394,7 +1393,7 @@ def scheduler_role(kernel, ring, cursor: WorkCursor, fetch: _Fetch):
         with ring.produce() as h0:
             fetch, state = _publish_kept(h0, fetch, stream, problem, cursor.index, state)
         cursor._receive()
-        cursor._first_item()
+        cursor._enter_item()
     while cursor.valid:
         with ring.produce() as h:
             index = fetch.claim_next(cursor.index)
