@@ -5,6 +5,7 @@ import importlib
 import pickle
 import sys
 import textwrap
+import threading
 
 import pytest
 import torch
@@ -154,6 +155,23 @@ def test_collected_kernel_rejects_cluster_and_stream_reassignment():
     assert op.describe() == before and op.work.roles
     with pytest.raises(AttributeError):
         op.num_warps = 4  # derived from the roles, not a setting
+    assert op.__cute_cache_key__()  # a rejected assignment leaves the key intact
+
+
+def test_uncopyable_constructor_argument_keeps_the_kernel_usable_but_unkeyed():
+    """The key and the pickled form are the copied constructor call, so an argument that cannot
+    be copied makes both raise; the kernel itself still builds and describes."""
+
+    class Locked(Gemm):
+        def __init__(self, lock):
+            super().__init__()
+
+    op = Locked(threading.Lock())
+    assert op.describe().startswith("Locked: 8 warps, 256 threads")
+    with pytest.raises(TypeError, match="cannot be copied"):
+        key_of(op)
+    with pytest.raises(TypeError, match="cannot be copied"):
+        pickle.dumps(op)
 
 
 # A kernel module outside the package, as a test or user file would define one: its own source

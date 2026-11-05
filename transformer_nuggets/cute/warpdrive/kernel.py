@@ -396,22 +396,20 @@ class WarpSpecialized(metaclass=_KernelType):
 
     def __setattr__(self, name, value):
         state = vars(self)
-        if isinstance(value, WorkStream) or name in _COLLECTED_SETTINGS:
-            if state.get("_ws_roles") is not None:
-                raise ProtocolError(
-                    f"{type(self).__name__}.{name} cannot change after collection (describe, "
-                    "compile-cache lookup, or tracing derived the channels from it); construct "
-                    "a new kernel"
-                )
-            if isinstance(value, WorkStream):
-                value.owner = self  # the stream's work unit follows this kernel's cluster
-        elif not (
-            "_ws_init" not in state  # still constructing
-            or name.startswith("_")
-            or name in _HOST_SETTINGS
+        collected_setting = isinstance(value, WorkStream) or name in _COLLECTED_SETTINGS
+        if collected_setting and state.get("_ws_roles") is not None:
+            raise ProtocolError(
+                f"{type(self).__name__}.{name} cannot change after collection (describe, "
+                "compile-cache lookup, or tracing derived the channels from it); construct a "
+                "new kernel"
+            )
+        if isinstance(value, WorkStream):
+            value.owner = self  # the stream's work unit follows this kernel's cluster
+        super().__setattr__(name, value)  # a read-only property raises before anything is kept
+        if "_ws_init" in state and not (  # assigned after construction
+            collected_setting or name.startswith("_") or name in _HOST_SETTINGS
         ):
             state.setdefault("_ws_late", set()).add(name)  # not keyed: see __cute_cache_key__
-        super().__setattr__(name, value)
 
     # ---- host-side analysis ------------------------------------------------ #
 
