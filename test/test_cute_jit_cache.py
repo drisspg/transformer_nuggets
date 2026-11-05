@@ -222,6 +222,24 @@ def test_explicit_cache_key_must_be_hashable():
         compile_kernel("value")
 
 
+def test_uncached_calls_bypass_both_caches(isolated_cache):
+    compile_count = 0
+
+    @cute_cache.jit_cache(uncached=lambda key: key.startswith("trace"))
+    def compile_kernel(key: str) -> FakeCompiled:
+        nonlocal compile_count
+        compile_count += 1
+        return FakeCompiled(key)
+
+    assert compile_kernel("trace")() == "trace"
+    assert compile_kernel("trace")() == "trace"
+    assert compile_kernel("plain")() == "plain"
+    assert compile_kernel("plain")() == "plain"
+    assert compile_count == 3
+    assert compile_kernel.cache_info() == cute_cache.CacheInfo(hits=1, misses=3, currsize=1)
+    assert len(list(isolated_cache.rglob("*.o"))) == 1
+
+
 def test_runtime_cache_includes_compile_target(isolated_cache, monkeypatch):
     compile_count = 0
     target = cute_target.CompileTarget("first")
@@ -725,6 +743,23 @@ def test_callers_outside_the_package_key_on_their_package_imports(
     assert namespace_after_editing(synthetic_package / "unrelated.py") == baseline
     assert namespace_after_editing(synthetic_package / "relative.py") != baseline
     assert namespace_after_editing(caller) != baseline
+
+
+def test_module_source_digest_follows_the_module_closure(synthetic_package):
+    """A class's module digest changes with the modules it imports, as a namespace does."""
+    importlib.import_module("pkg.entry")
+    cute_key.module_source_digest.cache_clear()
+    baseline = cute_key.module_source_digest("pkg.entry")
+    assert cute_key.module_source_digest("builtins") is None
+
+    def digest_after_editing(module: str) -> str:
+        with (synthetic_package / module).open("a") as source:
+            source.write("EDITED = 1\n")
+        cute_key.module_source_digest.cache_clear()
+        return cute_key.module_source_digest("pkg.entry")
+
+    assert digest_after_editing("unrelated.py") == baseline
+    assert digest_after_editing("relative.py") != baseline
 
 
 def test_kernel_layer_modules_are_part_of_the_kernel_key():

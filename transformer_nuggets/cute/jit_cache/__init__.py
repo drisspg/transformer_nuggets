@@ -3,7 +3,11 @@
 See ``cache.jit_cache`` for the contract and ``_key`` for what the key covers.
 """
 
-from transformer_nuggets.cute.jit_cache._key import function_cache_key, module_closure
+from transformer_nuggets.cute.jit_cache._key import (
+    function_cache_key,
+    module_closure,
+    module_source_digest,
+)
 from transformer_nuggets.cute.jit_cache.cache import (
     CacheInfo,
     CacheLockError,
@@ -31,6 +35,7 @@ __all__ = [
     "get_compile_target",
     "jit_cache",
     "module_closure",
+    "module_source_digest",
     "precompile_many",
     "set_compile_target",
 ]

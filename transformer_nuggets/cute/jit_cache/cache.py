@@ -266,6 +266,7 @@ def jit_cache(
     lock_timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
     extra_sources: Iterable[str | os.PathLike[str]] = (),
     cache_key: Callable[P, Hashable] | None = None,
+    uncached: Callable[P, bool] | None = None,
 ) -> Callable[P, T]:
     """Cache a ``cute.compile`` function in memory and optionally on disk.
 
@@ -277,7 +278,10 @@ def jit_cache(
     invalidated by edits to the function's module and every ``transformer_nuggets`` module it
     transitively imports (``_key.module_closure``), not by unrelated modules.
     ``extra_sources`` adds inputs that import analysis cannot see, such as files
-    read at trace time or code outside ``transformer_nuggets``.
+    read at trace time or code outside ``transformer_nuggets``. Calls for which
+    ``uncached`` returns true compile without reading or filling either cache and
+    count as misses: use it when the caller needs the compile's trace-time side
+    effects, such as a recorded protocol trace.
     """
     if fn is None:
         return functools.partial(
@@ -286,6 +290,7 @@ def jit_cache(
             lock_timeout=lock_timeout,
             extra_sources=extra_sources,
             cache_key=cache_key,
+            uncached=uncached,
         )
     if lock_timeout <= 0:
         raise ValueError(f"lock_timeout must be positive, got {lock_timeout}")
@@ -375,8 +380,13 @@ def jit_cache(
 
     @functools.wraps(fn)
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
-        nonlocal hits
+        nonlocal hits, misses
         reset_after_fork()
+        if uncached is not None and uncached(*args, **kwargs):
+            compiled = _compile(fn, args, kwargs)
+            with state_lock:
+                misses += 1
+            return compiled
         target = get_compile_target()
         key_args, key_kwargs = key_arguments(args, kwargs)
         runtime_key = _fast_key((key_args, tuple(key_kwargs.items())))

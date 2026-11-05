@@ -98,6 +98,35 @@ def module_closure(source: Path) -> tuple[Path, ...]:
     return tuple(sorted(seen))
 
 
+def _hash_module_closure(hasher: Any, module_name: str) -> bool:
+    """Hash an imported module's ``module_closure``; False when it has no Python source."""
+    module_file = getattr(sys.modules.get(module_name), "__file__", None)
+    if module_file is None or not module_file.endswith(".py"):
+        return False
+    for path in module_closure(Path(module_file)):
+        # Package labels are package-relative so checkouts and installs share entries; only
+        # the caller itself can live outside the package.
+        if path.is_relative_to(_PACKAGE_ROOT):
+            _hash_file(hasher, path.relative_to(_PACKAGE_ROOT).as_posix(), path)
+        else:
+            _hash_file(hasher, module_name, path)
+    return True
+
+
+@functools.cache
+def module_source_digest(module_name: str) -> str | None:
+    """Hash the source of an imported module and its ``module_closure``, or return None for a
+    module without Python source (builtins, extensions).
+
+    A class passed as a compile argument is keyed by its module and name only. Its
+    ``__cute_cache_key__`` can include this digest so that editing a class defined outside the
+    compile function's imports (a test's kernel subclass, say) changes the key, where
+    ``extra_sources`` would have to name that module in advance.
+    """
+    hasher = hashlib.sha256()
+    return hasher.hexdigest() if _hash_module_closure(hasher, module_name) else None
+
+
 @functools.cache
 def source_fingerprint(
     fn: Callable[..., Any],
@@ -121,15 +150,7 @@ def source_fingerprint(
     )
     hasher.update(pickle.dumps(stamps, protocol=pickle.HIGHEST_PROTOCOL))
 
-    module_file = getattr(sys.modules.get(fn.__module__), "__file__", None)
-    if module_file is not None and module_file.endswith(".py"):
-        for path in module_closure(Path(module_file)):
-            # Package labels are package-relative so checkouts and installs share entries; only
-            # the caller itself can live outside the package.
-            if path.is_relative_to(_PACKAGE_ROOT):
-                _hash_file(hasher, path.relative_to(_PACKAGE_ROOT).as_posix(), path)
-            else:
-                _hash_file(hasher, fn.__module__, path)
+    _hash_module_closure(hasher, fn.__module__)
 
     for extra_source in extra_sources:
         path = Path(extra_source).expanduser().resolve()
