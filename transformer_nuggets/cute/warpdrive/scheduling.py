@@ -885,8 +885,8 @@ def _local_item(stream, index, problem):
 
 def _local_start(stream, first, problem):
     """``(index, words)`` a local-mode role starts with, from the unit's first index: the
-    readiness hook runs first, and a tile-grid stream takes the prologue's words. The cursor and
-    ``single_item`` share it, so a raw role sees what a managed role would (R20)."""
+    readiness hook runs before any decode, and a tile-grid stream takes the prologue's words. The
+    cursor and ``single_item`` share it, so a raw role sees what a managed role would (R20)."""
     if stream.ready is not None:
         stream.ready.wait()
     if _tile_grid(stream):
