@@ -43,18 +43,6 @@ from cutlass import Int32, Int64
 from transformer_nuggets.cute.warpdrive.scheduling import Raster, WorkMap
 
 
-def _at_least_one(value):
-    return max(value, 1) if isinstance(value, int) else cutlass.max(value, 1)
-
-
-def _bind_extents(space):
-    """``(extents, external)`` for a ``(m, n, l)`` space: the ``Raster``-normalized extents (an
-    empty space is ``(1, 1, 0)``), and the same with ``l`` at least 1 (an empty space becomes one
-    tile, so no external arithmetic divides by zero)."""
-    em, en, el = Raster().bind(space)
-    return (em, en, el), (em, en, _at_least_one(el))
-
-
 def _round_up(extent, multiple: int):
     """``extent`` rounded up to ``multiple``, in Int64 for DSL values (never wraps Int32)."""
     if isinstance(extent, int):
@@ -188,13 +176,14 @@ class Fa4Mapping(WorkMap):
         if len(space) != rank:
             what = "(num_block, num_head, num_batch" + ("" if rank == 3 else ", seqlen_k") + ")"
             raise ValueError(f"{self.describe()} space is {what}, got {space!r}")
-        extents, (num_block, num_head, num_batch) = _bind_extents(space[:3])
-        # FA4 divides by the K/V bytes per head: an empty KV sizes its sections as one key.
-        seqlen_k = Int32(0) if self._persistent else _at_least_one(Int32(space[3]))
+        extents = Raster().bind(space[:3])  # an empty space is (1, 1, 0)
+        num_block, num_head, num_batch = extents
+        # An empty space becomes one tile and an empty KV one key (``decodes_any_index``).
+        seqlen_k = Int32(0) if self._persistent else cutlass.max(Int32(space[3]), 1)
         args = _fa4_tile_scheduler().TileSchedulerArguments(
             num_block,
             num_head,
-            num_batch,
+            cutlass.max(num_batch, 1),
             Int32(1),  # num_splits
             seqlen_k,
             self.head_dim,
