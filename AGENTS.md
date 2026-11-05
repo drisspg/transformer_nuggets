@@ -70,8 +70,9 @@ The disk cache is `$TRANSFORMER_NUGGETS_CUTE_CACHE_DIR`, default
 Pick the smallest tier that covers the change; run bigger tiers only when asked or before
 landing core synchronization/scheduling changes.
 
-- Every change (~30 s on a GB300): `pytest -n 12 test/test_cute_warpdrive*.py`. Fuzz tests are
-  skipped by default (`addopts` excludes the `fuzz` marker).
+- Every change (~45 s cold, ~22 s with a warm jit_cache on a GB300):
+  `pytest -n 12 test/test_cute_warpdrive*.py`. Fuzz tests are skipped by default (`addopts`
+  excludes the `fuzz` marker).
 - Quick fuzz (~2-3 min, on request or before landing layer changes):
   `pytest -n 12 -m fuzz test/test_cute_warpdrive*.py`.
 - Long campaigns, sanitizer and CUTracer runs, SASS/perf A/Bs: only when the user asks.

@@ -141,7 +141,9 @@ pytest -n 12 -m fuzz test/test_cute_warpdrive*.py
 ```
 
 The first pytest command runs the normal suite; fuzz tests are skipped by default. The second
-opts into quick fuzzing. FA4 tests skip without `flash_attn.cute`. Long campaigns, sanitizer and
+opts into quick fuzzing. Compiled kernels stay in the [compile cache](../jit_cache/README.md#the-disk-cache),
+so a second run mostly loads them: on a GB300 the normal suite took 43 s cold and 22 s warm
+(48 s before the cache). FA4 tests skip without `flash_attn.cute`. Long campaigns, sanitizer and
 CUTracer runs are described in [GUARANTEES.md](GUARANTEES.md#fuzzing-and-evidence).
 
 The suite covers numerical correctness and determinism, shape reuse, schedules, CTA pairs and
