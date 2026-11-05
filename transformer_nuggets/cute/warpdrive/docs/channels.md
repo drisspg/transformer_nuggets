@@ -32,10 +32,12 @@ with ab.consume() as h:
 
 `Tma(tx_bytes)` completes the full barrier through TMA. Supply the bytes per stage per
 producing CTA. `Tma(tx_bytes, multicast="n")` declares copies multicast along a cluster mode;
-see [clusters](clusters.md#multicast). `Umma` signals with an elected `tcgen05.commit`; `Threads` has every thread
-of every bound role arrive. A TMA or UMMA side must bind to exactly one single-warp role
-(or the one instance whose turn it is on a round-robin side). TMA acquire arms the expected
-bytes; commit emits no arrival because the copies complete the full barrier.
+see [clusters](clusters.md#multicast). `Tma(tx_bytes, fills="pair")` has one CTA issue the
+copies of others; see [one CTA loads for others](clusters.md#one-cta-loads-for-others). `Umma`
+signals with an elected `tcgen05.commit`; `Threads` has every thread of every bound role
+arrive. A TMA or UMMA side must bind to exactly one single-warp role (or the one instance whose
+turn it is on a round-robin side). TMA acquire arms the expected bytes; commit emits no arrival
+because the copies complete the full barrier.
 TMA is a producer mechanism, not a consumer mechanism.
 
 ## Counts come from the roles

@@ -11,21 +11,23 @@ and writes each CTA's half of the accumulator into that CTA's tensor memory. ``C
 CTAs share loads through TMA multicast. A ``Tma(bytes, multicast="n")`` producer's copies may
 land in every CTA with this CTA's coordinates except along N (the CTAs that need the same rows
 of A), ``"m"`` likewise along M (the same rows of B). ``Cluster.multicast(mode)`` gives the
-partition coordinate and the copy mask of one mode.
+partition coordinate and the copy mask of one mode. A ``Tma(bytes, fills="pair")`` producer on
+each pair leader (``fills="cluster"``: on rank 0) issues the copies of every CTA it fills, with
+masks from ``Cluster.fill``.
 
 Roles run in every CTA of the cluster unless pinned: ``cta="leader"`` runs in the leader of each
 MMA pair (every CTA when the cluster has no pairs), ``cta="rank0"`` in cluster rank 0 only. From
 that placement the layer derives each channel's *scope*:
 
-* **local**: every participant runs in the same CTAs and no copy is multicast. Each CTA has its
-  own independent copy of the channel.
+* **local**: every participant runs in the same CTAs and no copy is multicast or issued for
+  another CTA. Each CTA has its own independent copy of the channel.
 * **cross-CTA** (*pair-scoped* in a CTA pair): participants run in different CTAs, or copies are
-  multicast. A barrier lives in every CTA that has a role waiting on it, each signal reaches the
-  barrier of every target CTA (remote ``mbarrier.arrive``, ``tcgen05.commit`` multicast, or a TMA
-  transaction completing on the pair leader's barrier), and arrival counts and transaction bytes
-  sum the contributions of every signalling CTA. A channel spans each MMA pair (each CTA without
-  pairs), extended to the CTAs its multicast copies reach; with a ``rank0`` participant it spans
-  the whole cluster.
+  multicast or issued for other CTAs. A barrier lives in every CTA that has a role waiting on
+  it, each signal reaches the barrier of every target CTA (remote ``mbarrier.arrive``,
+  ``tcgen05.commit`` multicast, a TMA transaction completing on the pair leader's barrier, or a
+  filling CTA's remote arm), and arrival counts and transaction bytes sum the contributions of
+  every signalling CTA. A channel spans each MMA pair (each CTA without pairs), extended to the
+  CTAs its copies reach; with a ``rank0`` participant it spans the whole cluster.
 """
 
 from __future__ import annotations

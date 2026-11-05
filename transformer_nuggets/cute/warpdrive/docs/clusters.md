@@ -30,13 +30,14 @@ runs on [larger clusters](#larger-clusters).
 
 If all participants have the same placement and nothing is multicast, the channel is
 CTA-local: all/all means an independent channel in each CTA; leader/leader means one in each
-pair leader (rank 0 of a `CtaPair`). Mixed placements or [multicast](#multicast) copies make it
-cross-CTA (pair-scoped in a `CtaPair`).
+pair leader (rank 0 of a `CtaPair`). Mixed placements, [multicast](#multicast) copies or a
+producer that [fills other CTAs](#one-cta-loads-for-others) make it cross-CTA (pair-scoped in
+a `CtaPair`).
 
 For the GEMM's A/B channel, the load role runs in both CTAs and the MMA role only on the
 leader. Each CTA issues its TMA copies; the leader arms twice the declared per-CTA byte count.
-Use group-TWO copies for this handoff. Ordinary leader-only TMA producing to both CTAs would
-need multicast and is rejected.
+Use group-TWO copies for this handoff. A leader-only TMA producer can also issue both CTAs'
+copies when it declares `fills="pair"`; see [One CTA loads for others](#one-cta-loads-for-others).
 
 For the accumulator channel, the leader's UMMA completion signals both CTAs. Their epilogue
 threads release back to the leader. Counts and masks follow the declared placement; you don't
@@ -52,20 +53,24 @@ Let `C(role)` be the ranks where a role runs: every rank for `all`, the even ran
 `leader` with MMA pairs (every rank without pairs), and `{0}` for `rank0`.
 `reach(p)` is the SMEM written by producer rank p: p itself plus the ranks on
 `Cluster.line(p, mode)` for each declared multicast mode. This is a union of lines, not a
-Cartesian product when both modes are declared.
+Cartesian product when both modes are declared. A `Tma(fills=...)` producer in rank p issues
+the copies of `filled(p)` (p's pair for `"pair"`, every rank for `"cluster"`) and writes
+`W(p)`, the union of `reach(d)` over `d` in `filled(p)`; without fills `W(p) = reach(p)`.
 
-When every participant has the same `C` and there is no multicast, the channel is CTA-local.
+When every participant has the same `C` and there is no multicast or fills, the channel is
+CTA-local.
 It uses ordinary per-slot counts, unscaled transaction bytes and self-targets, with no tail.
 Masks are 1 except that a UMMA commit to its own CTA uses `1 << rank`.
 
 Otherwise, define a synchronization unit for each rank r:
 
-- r alone when every participant has the same `C` (only multicast crosses CTAs);
+- r alone when every participant has the same `C` (only multicast or fills copies cross CTAs);
 - r's MMA pair when each participant runs somewhere in every pair;
 - the whole cluster otherwise, when placement restricts a participant to rank 0.
 
 The full targets of producer rank p are the consumer CTAs in p's unit. The empty targets of
-consumer rank c are the producer CTAs p for which `reach(p)` intersects c's unit. In a
+consumer rank c are the producer CTAs in c's unit. User TMA channels follow the TMA rule below
+instead. In a
 `CtaPair`, mixed placement therefore targets the union of consumer or producer CTAs.
 For each target and slot, `Threads` counts `32 * role.num_warps` for each signaling
 (instance, CTA); TMA/UMMA count one arrival per signaling CTA. Nontarget ranks have placeholder
@@ -77,18 +82,45 @@ The UMMA side must include the leader of every pair the other side uses: each CT
 and accumulator belong to its own leader's MMAs. Without pairs, a UMMA producer must include
 every consumer CTA; a UMMA consumer may release other CTAs' storage.
 
-Ordinary mixed-placement TMA has one supported shape: producers in every CTA feed exactly
-the pair leaders. Only leaders arm full barriers, each for `2 * Tma.tx_bytes`; each CTA's
-copies deliver its declared per-CTA bytes with group TWO, multicast or not. These leader-only
-arming targets replace the general full targets above. All other mixed-placement TMA shapes
-are rejected. Same-placement TMA, multicast or not, arms each participating CTA's own barrier
-with unscaled bytes. All/all requires group ONE; with pairs, leader/leader accepts either
-group in the channel's group check (descriptor legality remains yours).
+Cross-CTA TMA: let `W` be every CTA some `W(p)` contains and `F` the consumer CTAs. If
+`W ⊆ F`, the bytes landing in CTA d complete on d's own barrier (group ONE). Otherwise, with
+pairs and `F` within the pair leaders, they complete on d's pair leader (group TWO), and every
+such leader must be in `F`. Every other shape is rejected, as is a consumer CTA no copy
+completes on. Exactly one CTA arms each barrier, for every CTA whose bytes complete there
+(`k * Tma.tx_bytes`, `k = 2` with group TWO, else 1): the barrier's own CTA, which must run the
+producer, or with fills the CTA that fills it. So each full barrier expects one arrival.
+Consumer CTA c releases every producer p whose `W(p)` meets the CTAs completing on c's
+barrier or c's unit (the unit keeps the releases of placements accepted before fills).
+Producers in every CTA feeding the pair leaders are the GEMM's case: each leader arms
+`2 * Tma.tx_bytes`. Same-placement TMA arms each CTA's own barrier with unscaled bytes.
+All/all requires group ONE; with pairs, leader/leader without fills accepts either group in
+the channel's group check (descriptor legality remains yours).
 
-Multicast cannot have a `rank0` participant. Its byte count is still what lands in each CTA's
-SMEM per stage; a copy delivers its box to every CTA in its mask. The declaration derives the
-release targets, not the copy itself. The internal scheduler is separate: rank 0 explicitly
-fills each target's payload and uses unscaled payload bytes, not ordinary multicast TMA.
+`Tma.tx_bytes` is still what lands in each CTA's SMEM per stage; a copy delivers its box to
+every CTA in its mask. The declaration derives the release targets, not the copy itself. A
+`rank0` consumer may join a multicast channel as long as every written CTA keeps a waiting
+consumer. The internal scheduler is separate: rank 0 explicitly fills each target's payload
+and uses unscaled payload bytes, not ordinary multicast TMA.
+
+These rules rest on PTX ISA 9.5. `cp.async.bulk.tensor` (9.7.10.28.5.3) with a
+`.shared::cluster` destination may write any CTA of the cluster. A `.multicast::cluster`
+`ctaMask` names the destination CTAs (nothing requires the issuing CTA among them), and the
+data lands at the same offset in each. With `.cta_group::1` each destination's mbarrier at
+`mbar`'s offset is signalled; with `.cta_group::2` the signal goes to the destination or its
+peer by the parity of the CTA holding `mbar`, so a leader's barrier collects its pair's bytes
+(CUTLASS `SM100_TMA_2SM_LOAD*` clears the peer bit of the barrier address for the same
+effect). `mbarrier.arrive.expect_tx.shared::cluster` (9.7.15.16.16) arms a remote barrier. The
+tx-count ranges over `±(2^20 - 1)` (9.7.15.16.3), so a copy may complete before its arm; a
+phase completes when both the pending arrivals and the tx-count reach zero (9.7.15.16.8). Each
+phase must be observed complete by a wait before an arrive of the next phase (9.7.15.16.5.1).
+A filler arms CTA d's next phase only after its empty barrier saw d's consumers release, which
+follows their full wait. A stage that fills in a CTA with no waiter would break that rule,
+which is why every written CTA needs a consumer.
+
+Teardown: a filled CTA's consumers wait on every stage filled for them, so every copy and
+remote arm into that CTA has landed before they reach the exit cluster barrier. Thread
+releases back to the filler precede the releasing threads' arrival at that barrier, as for
+every cross-CTA thread release; UMMA releases into another CTA tail as described below.
 
 ## Work and exit
 
@@ -234,12 +266,75 @@ inside a pair: rank 0 commits to ranks 0-1, rank 2 to ranks 2-3. The work ring e
 4 x (128 + 32) threads from the epilogue and load warps, 2 x 32 from the leaders' MMA warps and
 32 from the scheduler.
 
-### Limits
+## One CTA loads for others
 
-- Multicast channels cannot have a `rank0` participant. Mixed-placement TMA still needs
-  producers in every CTA feeding the pair leaders. Same-placement multicast (all/all or
-  leader/leader) arms each CTA's own barrier and releases every CTA its copies reach.
-- A leader-only TMA producer can't fill other CTAs' stages for consumers there (that would
-  need the leader to arm their barriers).
+```python
+self.ld = Ring(2, Tma(stage_bytes, fills="pair"), Threads)  # load on cta="leader"
+
+
+@role(warps=0, cta="leader")
+@cute.jit
+def load(self, ld: Producer, ctx):
+    rank = self.cluster.rank()
+    own, peer = self.cluster.fill(rank), self.cluster.fill(rank + 1)
+    for i in cutlass.range(ctx.n, unroll=1):
+        with ld.produce() as s:
+            cute.copy(ctx.tma, ctx.g_own[None, i], ctx.s[None, s.index], tma_bar_ptr=s.barrier,
+                      mcast_mask=own.mask)
+            cute.copy(ctx.tma, ctx.g_peer[None, i], ctx.s[None, s.index], tma_bar_ptr=s.barrier,
+                      mcast_mask=peer.mask)
+    return ld
+```
+
+`Tma(bytes, fills="pair")` puts the producer on each pair leader, which issues the copies of
+both CTAs in its pair. `fills="cluster"` puts it on `rank0`, which issues every CTA's copies.
+`bytes` is still what lands in each CTA per stage. `Cluster.fill(rank)` gives the mask of a copy
+that lands only in CTA `rank`, at the same SMEM offset as the issuing CTA's stage. Build the atom
+with a multicast op, since even the copy into the issuing CTA needs a mask.
+`Cluster.fill(rank, "n")` multicasts that copy along N as `rank`'s own `multicast("n")` copy
+would; fills and multicast compose.
+
+Where the bytes complete depends on the consumers. If every CTA a copy lands in has a
+consumer, each CTA's bytes complete on its own barrier (use `CtaGroup.ONE`). If the consumers
+are the pair leaders, as for a 2-CTA MMA, both CTAs' bytes complete on the leader's barrier
+(use `CtaGroup.TWO`). The filling CTA arms each of those barriers, the remote ones with
+`mbarrier.arrive.expect_tx` on the target CTA, so each full barrier expects one arrival. The
+consumers where the copies land release the filling CTA.
+
+```
+  ld  Ring(2)  load -> use
+      signal    Tma(4096 B) -> Threads
+      full      rank 0 1 x2, rank 1 1 x2, rank 2 1 x2, rank 3 1 x2, tx 4096 B, rank 0 arms 0+1, rank 2 arms 2+3
+      empty     rank 0 128 x2, rank 2 128 x2
+      scope     cross-CTA, fills pair, multicast n, remote_scope cta
+```
+
+This is a 2x2 cluster of pairs whose leaders fill their pair and multicast along N. Rank 1's
+stage holds half a tile from each leader, so it releases both leaders (each leader's empty
+barrier waits for 4 x 32 consumer threads), but only rank 0 arms it. The TMA check counts a
+filling CTA's copies for every CTA it fills: 8192 bytes per stage here, reported as 4096 per
+CTA.
+
+Fills are for CTAs that can't issue their own loads, not a speedup. A persistent GEMM whose
+pair leaders load the A/B ring for both CTAs (`LeaderLoadGemm` in
+[`test_cute_warpdrive_fills.py`](../../../../test/test_cute_warpdrive_fills.py)) was 6-13%
+slower than loading from both CTAs for a pair on a GB300, and within noise for the 2x2 cluster
+(CUDA-graph replay, warm L2, 2048 x 2048 x 8192 to 8192^3).
+
+### A rank0 consumer on a multicast channel
+
+A multicast channel may have a `rank0` consumer next to the consumers in the other CTAs, for
+example an observer that also reads rank 0's stages. Every CTA a copy lands in still needs a
+consumer that waits on its barrier: a stage that fills with no waiter would take completions on
+a barrier nobody arms. With a rank0 participant the channel spans the whole cluster, so each
+consumer releases every producer.
+
+## Limits
+
+- A copy can land only in CTAs that have a consumer (or, with pairs, whose leader has one).
+  Multicast copies need a producer in each CTA they land in, unless `fills` names the CTA that
+  arms there.
+- `fills="pair"` needs MMA pairs and a `leader` producer; `fills="cluster"` needs a `rank0`
+  producer.
 - Clusters have at most 8 CTAs (the portable limit).
 - The alias diagnostic doesn't model clusters.
