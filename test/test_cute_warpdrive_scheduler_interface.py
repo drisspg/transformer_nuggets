@@ -281,8 +281,12 @@ class Chained(Raster):
 
     def decode(self, index, space, state):
         _, (m, n, li), _ = super().decode(index, space, None)
-        keep = (m + n) % 2 == 0 if self.drop_odd else True
+        keep = self.kept((m, n, li)) if self.drop_odd else True
         return keep, (m, n, li, state.prev, state.decodes), Chain(index, state.decodes + 1)
+
+    def kept(self, item):
+        m, n, _ = item
+        return not self.drop_odd or (m + n) % 2 == 0
 
     def get_key(self) -> str:
         return f"chained{int(self.drop_odd)}_" + super().get_key()
@@ -293,6 +297,14 @@ class ChainedAnyIndex(Chained):
     """Decodable at any index: broadcast roles decode the first item locally."""
 
     decodes_any_index = True
+
+
+@dataclass(frozen=True)
+class ChainedTiles(Chained):
+    """``Chained`` whose item is the tile, for toys that read ``(m, n, l)``."""
+
+    def unpack(self, words):
+        return tuple(words[:3])
 
 
 class ChainToy(WarpSpecialized):
@@ -394,7 +406,7 @@ def test_decode_state_follows_each_site(requires_blackwell, schedule, mapping, c
     sched = CHAIN_SCHEDULES[schedule]
     op = ChainToy(sched, mapping, cluster)
     fn = compile_chain_toy(op)
-    em, en, el = 9, 7, 2
+    em, en, el = ext = 9, 7, 2
     total, max_ctas, cs = em * en * el, 16 * cluster.size, cluster.size
     units = min(total, max_ctas // cs) if sched.uses_max_ctas else total
     log = torch.full((2, units * cs, ChainToy.MAX_ITEMS, 3), -2, dtype=torch.int32, device="cuda")
@@ -403,7 +415,7 @@ def test_decode_state_follows_each_site(requires_blackwell, schedule, mapping, c
     torch.cuda.synchronize()
     log = log.cpu()
     assert torch.equal(log[0], log[1])
-    kept = [i for i in range(total) if not mapping.drop_odd or _even_tile(i, (em, en, el))]
+    kept = [i for i in range(total) if mapping.kept(Raster(swizzle=2).decode(i, ext, None)[1])]
     seen = sorted(int(i) for i in log[0, :, :, 0].flatten() if i >= 0)
     assert seen == sorted(kept * cs)
     stride = {"static": units, "reverse_static": -units, "reverse_broadcast": -units}.get(schedule)
@@ -423,9 +435,16 @@ def test_decode_state_follows_each_site(requires_blackwell, schedule, mapping, c
             assert all((prev == -1) == (decodes == 0) for _, prev, decodes in items)
 
 
-def _even_tile(index, ext):
-    m, n, _ = Raster(swizzle=2).decode(index, ext, None)[1]
-    return (m + n) % 2 == 0
+@pytest.mark.parametrize("schedule", list(CHAIN_SCHEDULES))
+def test_stateful_mapping_on_an_empty_space(requires_blackwell, schedule):
+    """Every site starts its state on an empty stream too, and no role sees an item."""
+    op = ChainToy(CHAIN_SCHEDULES[schedule], Chained(swizzle=2))
+    fn = compile_chain_toy(op)
+    log = torch.full((2, 1, ChainToy.MAX_ITEMS, 3), -2, dtype=torch.int32, device="cuda")
+    ws, _ = op.work.launch_args("cuda")
+    fn(log, ws, 0, 7, 2, 16)
+    torch.cuda.synchronize()
+    assert (log == -2).all() and ws[:2].tolist() == [0, 0]
 
 
 # --------------------------------------------------------------------------- #
@@ -772,9 +791,12 @@ def compile_raw_item_toy(op: RawItemToy):
         # A default WorkMap traps if decoded past the end: one CTA per item, plus drops.
         (CheckedRaster(drop_odd=True), "grid", (9, 7, 2), CtaPair()),
         (CheckedRaster(), "grid", (0, 3, 1), SingleCta()),
+        # A stateful mapping: single_item starts the state like a managed role.
+        (ChainedTiles(swizzle=2, drop_odd=True), "grid", (9, 7, 2), CtaPair()),
+        (ChainedTiles(swizzle=2), "grid", (0, 3, 1), SingleCta()),
     ],
     ids=["tile_grid", "fallback", "hand_1d", "pair_fallback", "pair_swizzle", "skip", "cutlass",
-         "empty", "checked_skip", "checked_empty"],
+         "empty", "checked_skip", "checked_empty", "stateful_skip", "stateful_empty"],
 )  # fmt: skip
 def test_raw_role_single_item(requires_blackwell, mapping, mode, ext, cluster):
     op = RawItemToy(mapping, mode, cluster)

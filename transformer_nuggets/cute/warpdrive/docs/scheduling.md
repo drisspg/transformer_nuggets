@@ -167,8 +167,9 @@ the layer does not check either property.
 
 Some decodes are cheap only incrementally. The grouped GEMM numbers its groups' m-tiles back to
 back, so finding a tile's group takes a prefix sum of the groups' tile counts over device
-offsets. A unit's indices increase under the built-in persistent schedules, so the prefix
-reached for one item is where the walk for the next one starts. `start(space)` returns that
+offsets. A unit's indices increase under static and atomic persistence (and in practice under
+cluster launch control), so the prefix reached for one item is where the walk for the next one
+starts. `start(space)` returns that
 carried state, and `decode` receives and returns it:
 
 ```python
@@ -196,7 +197,9 @@ class GroupedTiles(WorkMap):
 Each decoding site owns one state: every role of a local schedule, the scheduler warp of a
 broadcast one, and `single_item`. The site calls `start` once, after the readiness hook, even
 when the stream is empty, and then passes each decode the state the previous one returned,
-dropped items included. Ring receivers decode nothing, so they hold no state.
+dropped items included. Ring receivers hold no state. The one exception is a
+`decodes_any_index` mapping without hooks: every role decodes its first item from a fresh
+`start` state.
 
 The state is a cache, never an input to the answer. From any state reachable from `start`,
 `decode` must return the `keep`, and for a kept index the words, that `start`'s own state would.

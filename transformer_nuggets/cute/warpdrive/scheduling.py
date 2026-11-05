@@ -872,6 +872,11 @@ def _state_schema(mapping, state):
             f"{name} decode state has a Python value {state!r}; state leaves are DSL values "
             "(Int32(0), not 0), so the cursor can carry them"
         )
+    if isinstance(state, (list, dict)):
+        raise ProtocolError(
+            f"{name} decode state holds a {type(state).__name__}, whose Python entries are not "
+            "carried across work items; use a tuple or NamedTuple"
+        )
     if is_dataclass(state):
         raise ProtocolError(
             f"{name} decode state holds a dataclass {type(state).__name__}, whose fields are not "

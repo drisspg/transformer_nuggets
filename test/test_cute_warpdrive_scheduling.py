@@ -626,6 +626,8 @@ class BadState(CheckedRaster):
                 return Counter(Int32(0))
             case "python_int":
                 return (0,)
+            case "list":
+                return ([Int32(0), 0],)
         return (Int32(0),)
 
     def decode(self, index, space, state):
@@ -645,6 +647,7 @@ class BadState(CheckedRaster):
     [
         ("dataclass", "use a NamedTuple"),
         ("python_int", r"Int32\(0\), not 0"),
+        ("list", "use a tuple or NamedTuple"),
         ("grows", "another structure or type"),
         ("retyped", "another structure or type"),
         ("two_values", r"must return \(keep, words, state\)"),

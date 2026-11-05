@@ -313,6 +313,35 @@ def test_grouped_tiles_state_never_changes_the_item(
                 assert stateful == fresh == want[index], (name, index, row)
 
 
+@pytest.mark.parametrize("tile_m", [128, 256])
+def test_grouped_tiles_extreme_offsets_stay_in_int32(requires_blackwell, tile_m):
+    """Offsets at the Int32 extremes with ``total_M`` at the host's bound: every decoded row
+    stays inside ``A`` and the stateful decode still matches the reference."""
+    G, n_tiles = 6, 3
+    total_m = 2**31 - 1 - (G + 1) * gg.MAX_TILE_M
+    offsets = [2**31 - 1, -(2**31), 5, 2**30, 2**30 + 7, 2**31 - 1]
+    count = (math.ceil(total_m / tile_m) + G) * n_tiles
+    rng = random.Random(tile_m)
+    order = [0, 1, 2, 3, count - 1, count - 2, 3 * (2**30 // tile_m), count // 2, 0]
+    order += [rng.randrange(count) for _ in range(40)]
+    fn = compile_decode_probe(DecodeProbe(tile_m))
+    out = torch.zeros(len(order), 10, dtype=torch.int32, device="cuda")
+    fn(
+        torch.tensor(offsets, dtype=torch.int32, device="cuda"),
+        total_m,
+        n_tiles,
+        torch.tensor(order, dtype=torch.int32, device="cuda"),
+        out,
+    )
+    torch.cuda.synchronize()
+    for index, row in zip(order, out.cpu().tolist(), strict=True):
+        found, g, row0, rows = _python_locate_tile(index // n_tiles, offsets, tile_m, total_m)
+        assert row[0] == row[5] == int(found), (index, row)
+        if found:
+            assert tuple(row[1:5]) == tuple(row[6:]) == (g, row0, rows, index % n_tiles)
+            assert 0 <= row0 and row0 + rows <= total_m
+
+
 def test_grouped_gemm_zero_work(requires_blackwell):
     """Empty K writes zeros over the covered rows only; an empty output or G=0 launches
     nothing and leaves ``out`` alone."""
