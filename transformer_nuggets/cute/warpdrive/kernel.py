@@ -167,12 +167,16 @@ def _resolve_param(role_name: str, pname: str, ann, fn) -> tuple[object, type | 
     if ann is inspect.Parameter.empty:
         return _Context, None
     if isinstance(ann, str):
+        # Under ``from __future__ import annotations`` every annotation is a string; resolve it
+        # in the defining module, not in the module of the ``@cute.jit`` wrapper around ``fn``.
+        namespace = {**inspect.unwrap(fn).__globals__, **_ANNOTATIONS}
         try:
-            ann = eval(ann, {**fn.__globals__, **_ANNOTATIONS})
+            ann = eval(ann, namespace)
         except Exception as exc:
             raise ProtocolError(
                 f"role {role_name}: parameter {pname} is annotated {ann!r}, which does not "
-                f"resolve ({type(exc).__name__}: {exc})"
+                f"resolve ({type(exc).__name__}: {exc}); string annotations resolve in the "
+                "role's module globals, so a context type must be module-level"
             ) from exc
     if isinstance(ann, _Bound) or ann in _ANNOTATIONS.values():
         return ann, None

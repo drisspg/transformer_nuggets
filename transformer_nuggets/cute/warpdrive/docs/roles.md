@@ -81,7 +81,9 @@ does not make the namespace immutable.
 
 An annotation matching the params type, or a base class of it, receives that object. An
 unresolvable annotation, a missing dependency, two context parameters or incompatible context
-types raises `ProtocolError`. `run_roles(params)` checks the object against the annotated
+types raises `ProtocolError`. String annotations (every annotation under
+`from __future__ import annotations`) resolve in the role's module globals, so define the
+params type at module level. `run_roles(params)` checks the object against the annotated
 type. Mutable dataclasses are rejected, even without a type annotation.
 
 ## Return the updated state
