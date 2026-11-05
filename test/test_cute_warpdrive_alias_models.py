@@ -137,7 +137,7 @@ def test_diagnostic_emits_no_device_code():
     for mode in ("warn", "off"):
         op = CrossWarpPOverS(barrier=True)
         op.alias_check = mode
-        fn, _ = compile_quietly(op, "cross_warp_1")
+        fn = compile_toy.__wrapped__(op, "cross_warp_1")  # the compiled IR, not a cached artifact
         ir.append(str(fn.ir_module))
     assert ir[0] == ir[1]
 

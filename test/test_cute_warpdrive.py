@@ -461,9 +461,10 @@ class NamespaceCtxToy(TypedCtxToy):
     [(TypedCtxToy, ToyCtx), (NamespaceCtxToy, SimpleNamespace)],
     ids=["typed", "namespace"],
 )
-def test_context_reaches_roles(requires_blackwell, toy, seen):
+def test_context_reaches_roles(requires_blackwell, traced_compiles, toy, seen):
     """A frozen dataclass reaches the roles as itself; a namespace still works, as a namespace."""
     op = toy("typed" if toy is TypedCtxToy else "namespace")
+    compile_toy.cache_clear()  # the roles record their context types while tracing
     out = torch.full((32,), -1, device="cuda", dtype=torch.int32)
     compile_toy(op)(out, 5)
     lane = torch.arange(32, device="cuda", dtype=torch.int32)

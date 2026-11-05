@@ -694,7 +694,8 @@ def test_space_overflowing_int32_is_rejected(requires_blackwell, case, cluster):
         # cluster shape launches more than 10 units here).
         spaces.append((2**31 - 10, 1, 1))
     for space in spaces:
-        with pytest.raises(Exception, match="CUDA launch failed"):
+        # The message differs for a freshly compiled and a cached (loaded) kernel.
+        with pytest.raises(Exception, match="CUDA launch failed|CUDA Error Code"):
             _count_items(fn, ws, space, 148)
     _check_valid_launch(op, fn, ws)
 

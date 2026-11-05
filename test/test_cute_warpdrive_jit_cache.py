@@ -165,8 +165,8 @@ def test_editing_the_kernel_module_recompiles(
         assert run(module) == [7] * 32
         assert module.compile_fill.cache_info() == CacheInfo(hits=1, misses=0, currsize=1)
 
-        module = load(8)
-        assert run(module) == [8] * 32
+        module = load(1234)  # another size: a same-size edit within a second reuses the .pyc
+        assert run(module) == [1234] * 32
         assert module.compile_fill.cache_info() == CacheInfo(hits=0, misses=1, currsize=1)
         assert len(list(isolated_cache.rglob("*.o"))) == 2
 

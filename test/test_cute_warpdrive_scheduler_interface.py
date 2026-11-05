@@ -506,7 +506,8 @@ def test_swapped_schedules_cover_empty_and_overflowing_spaces(requires_blackwell
     for space in EMPTY_SPACES:
         assert _count_items(fn, ws, space, 148) == [0, 0], space
     for space in OVERFLOWING_SPACES:
-        with pytest.raises(Exception, match="CUDA launch failed"):
+        # The message differs for a freshly compiled and a cached (loaded) kernel.
+        with pytest.raises(Exception, match="CUDA launch failed|CUDA Error Code"):
             _count_items(fn, ws, space, 148)
     want = 5 * 3 * 2 * cluster.size
     assert _count_items(fn, ws, (5, 3, 2), 4) == [want, want]
