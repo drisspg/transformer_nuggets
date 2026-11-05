@@ -17,10 +17,12 @@ from transformer_nuggets.cute.jit_cache import jit_cache
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
     Consumer,
+    CtaPair,
     Instance,
     Producer,
     ProtocolError,
     Ring,
+    RoleConfig,
     Slots,
     Threads,
     Tma,
@@ -670,6 +672,78 @@ def test_gemm(requires_blackwell, m, n, k):
     assert err <= 2 * torch_err + 1e-3
 
 
+def _check_gemm_config(fn, m, n, k, **config):
+    torch.manual_seed(0)
+    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    ref = torch.nn.functional.linear(a.float(), b.float())
+    torch_err = (torch.nn.functional.linear(a, b).float() - ref).abs().max().item()
+    err = (fn(a, b, **config).float() - ref).abs().max().item()
+    assert err <= 2 * torch_err + 1e-3, (config, err, torch_err)
+
+
+@pytest.mark.parametrize("tile_n", [64, 128, 192])
+def test_gemm_tile_n(requires_blackwell, tile_n):
+    """Narrower tiles: the TMEM region, A/B stage bytes and epilogue subtile count follow."""
+    from transformer_nuggets.cute.warpdrive.examples.gemm import Gemm, compile_gemm
+
+    op = Gemm(tile_n=tile_n)
+    assert op.tmem_plan.alloc_cols == 1 << (tile_n - 1).bit_length()  # a power of two
+    assert op.epi_subtiles == tile_n // 32
+    fn = compile_gemm(op)
+    torch.manual_seed(0)
+    a = torch.randn(300, 136, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(520, 136, device="cuda", dtype=torch.bfloat16)
+    out = torch.empty(300, 520, device="cuda", dtype=torch.bfloat16)
+    fn(a, b, out)
+    ref = torch.nn.functional.linear(a.float(), b.float())
+    torch_err = (torch.nn.functional.linear(a, b).float() - ref).abs().max().item()
+    assert (out.float() - ref).abs().max().item() <= 2 * torch_err + 1e-3
+    with pytest.raises(ValueError, match="multiple of 32"):
+        Gemm(tile_n=48)
+
+
+PGEMM_CONFIGS = [
+    {"c_stages": 1},
+    {"c_stages": 3},
+    {"epi_tile_n": 64},
+    {"epi_tile_n": 16, "c_stages": 4},
+    {"tile_n": 224, "epi_tile_n": 16},
+    {"acc_stages": 1},
+    {"ab_stages": 2},
+    {"roles": {"epilogue": RoleConfig(range(4), regs=152)}},
+]
+
+
+@pytest.mark.parametrize(
+    "config",
+    PGEMM_CONFIGS,
+    ids=[
+        "_".join(f"{k}{v}" for k, v in c.items() if k != "roles") or "roles" for c in PGEMM_CONFIGS
+    ],
+)
+def test_persistent_gemm_configs(requires_blackwell, config):
+    """Each epilogue/stage/role knob on its own, on a ragged multi-wave shape."""
+    _check_gemm_config(persistent_gemm, 1000, 1000, 264, **config)
+
+
+def test_persistent_gemm_rejects_unfit_configurations():
+    from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import PersistentGemm
+
+    with pytest.raises(ValueError, match="epi_tile_n must be one of"):
+        PersistentGemm(epi_tile_n=128)
+    with pytest.raises(ValueError, match="multiple of epi_tile_n=64"):
+        PersistentGemm(tile_n=224, epi_tile_n=64)
+    with pytest.raises(ValueError, match="c_stages must be positive"):
+        PersistentGemm(c_stages=0)
+    with pytest.raises(ValueError, match="mixed register budgets"):
+        PersistentGemm(roles={"load": RoleConfig(4, regs=48)}).describe()  # warpgroup of mma
+    tuned = PersistentGemm(roles={"epilogue": RoleConfig(range(4), regs=152)})
+    assert "0-3    epilogue    152" in tuned.describe()
+    assert tuned.__cute_cache_key__() != PersistentGemm().__cute_cache_key__()
+    assert PersistentGemm(c_stages=3).get_name() != PersistentGemm().get_name()
+
+
 GEMMS = pytest.mark.parametrize("fn", [gemm, persistent_gemm], ids=lambda f: f.__name__)
 
 
@@ -738,9 +812,9 @@ def test_gemm_checks_out_before_zero_work_returns(fn, m, n, k, out, error):
 # --------------------------------------------------------------------------- #
 
 
-def fa4_inputs(b, h, sq, sk, nonuniform):
+def fa4_inputs(b, h, sq, sk, nonuniform, head_dim=128):
     torch.manual_seed(0)
-    q, k, v = (torch.randn(b, s, h, 128, device="cuda") for s in (sq, sk, sk))
+    q, k, v = (torch.randn(b, s, h, head_dim, device="cuda") for s in (sq, sk, sk))
     if nonuniform:
         # Distinct magnitude per 128-row Q tile (slot/stage mixups), growing K blocks (forces
         # O rescales), per-key-block V offsets, per-head scale.
@@ -771,6 +845,67 @@ def test_fa4_fwd(requires_blackwell, b, h, sq, sk, nonuniform, turnstile):
     tol = 2**-7 * ref.abs().max().item() + 4e-3
     assert (o.float() - ref).abs().max().item() <= tol
     torch.testing.assert_close(lse, ref_lse, atol=1e-3, rtol=1e-4)
+
+
+def check_fa4(q, k, v, **options):
+    from transformer_nuggets.cute.warpdrive.examples.fa4_fwd import fa4_fwd
+
+    o, lse = fa4_fwd(q, k, v, **options)
+    qf, kf, vf = (x.float().transpose(1, 2) for x in (q, k, v))
+    ref = torch.nn.functional.scaled_dot_product_attention(qf, kf, vf).transpose(1, 2)
+    ref_lse = torch.logsumexp((qf @ kf.transpose(-1, -2)) / math.sqrt(q.shape[-1]), dim=-1)
+    tol = 2**-7 * ref.abs().max().item() + 4e-3
+    assert (o.float() - ref).abs().max().item() <= tol
+    torch.testing.assert_close(lse, ref_lse, atol=1e-3, rtol=1e-4)
+
+
+FA4_CONFIGS = [
+    {"tile_n": 64},
+    {"tile_n": 64, "split_p": True},
+    {"head_dim": 64},
+    {"head_dim": 64, "tile_n": 64, "cluster": CtaPair()},
+    {"rescale_threshold": 0.0},
+    {"kv_stages": 2},
+    {
+        "roles": {
+            "softmax": RoleConfig((range(4), range(4, 8)), regs=176),
+            "correction": RoleConfig(range(8, 12), regs=96),
+        }
+    },
+]
+
+
+@pytest.mark.parametrize(
+    "options",
+    FA4_CONFIGS,
+    ids=[
+        "_".join(f"{k}{v}" for k, v in c.items() if k != "roles") or "roles" for c in FA4_CONFIGS
+    ],
+)
+def test_fa4_fwd_configs(requires_blackwell, options):
+    """Each tile/head-dim/stage/threshold/role knob on its own, with nonuniform inputs that
+    force rescales, on a ragged Q length."""
+    pytest.importorskip("flash_attn.cute")
+    options = dict(options)
+    head_dim = options.pop("head_dim", 128)
+    sk = 4 * options.get("tile_n", 128)
+    q, k, v = fa4_inputs(2, 3, 640, sk, True, head_dim=head_dim)
+    check_fa4(q, k, v, **options)
+
+
+def test_fa4_rejects_unfit_configurations():
+    pytest.importorskip("flash_attn.cute")
+    from transformer_nuggets.cute.warpdrive.examples.fa4_fwd import FlashAttentionForward
+
+    with pytest.raises(ValueError, match="tile_n must be one of"):
+        FlashAttentionForward(tile_n=256)  # 2 x (256 + 128) TMEM columns would not fit anyway
+    with pytest.raises(ValueError, match="head_dim must be one of"):
+        FlashAttentionForward(head_dim=96)
+    with pytest.raises(ValueError, match="rescale_threshold"):
+        FlashAttentionForward(rescale_threshold=-1.0)
+    small = FlashAttentionForward(tile_n=64, head_dim=64)
+    assert small.tmem_plan.alloc_cols == 256 and small.kv.producer.tx_bytes == 64 * 64 * 2
+    assert small.get_name() != FlashAttentionForward().get_name()
 
 
 def test_fa4_declared_graph():

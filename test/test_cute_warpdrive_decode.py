@@ -343,22 +343,19 @@ def decode():
     return pytest.importorskip("transformer_nuggets.cute.warpdrive.examples.fa4_decode_swapab")
 
 
-def reference_partials(decode, q, k, v, splits, used, counts):
-    """fp32 split partials of FA4's split rule; (O, LSE, owned mask)."""
+def reference_partials(q, k, v, splits, used, counts, tile_n=256):
+    """fp32 split partials of FA4's split rule over ``tile_n``-token blocks; (O, LSE, owned)."""
     b, _, h, d = q.shape
     qpk = h // k.shape[2]
-    o = torch.zeros(splits, b, h, d, device=q.device)
+    o = torch.zeros(splits, b, h, v.shape[-1], device=q.device)
     lse = torch.full((splits, b, h), -math.inf, device=q.device)
     owned = torch.zeros(splits, b, dtype=torch.bool, device=q.device)
     for i in range(b):
-        n_blocks = -(-used[i] // decode.TILE_N)
+        n_blocks = -(-used[i] // tile_n)
         per_split = -(-n_blocks // counts[i])
         for s in range(counts[i]):
             owned[s, i] = True
-            lo, hi = (
-                s * per_split * decode.TILE_N,
-                min((s + 1) * per_split * decode.TILE_N, used[i]),
-            )
+            lo, hi = s * per_split * tile_n, min((s + 1) * per_split * tile_n, used[i])
             if hi <= lo:
                 continue
             kk = k[i, lo:hi].float().repeat_interleave(qpk, 1)
@@ -377,20 +374,42 @@ DECODE_CASES = [
     (2, 1500, 32, 1, 8, [300, 1500], [8, 3]),  # 32-head tile with register budgets
     (1, 768, 1, 1, 2, None, None),  # MQA-free single head: tile 1, MMA N 8
 ]
+# Constructor choices other than FA4's: (case, SwapABDecode keyword options). Each exercises one
+# knob against the fp32 reference; the FA4-bitwise test below stays at the defaults.
+DECODE_CONFIGS = [
+    ((2, 1000, 10, 2, 3, None, None), {"tile_n": 128}),
+    ((3, 2048, 8, 1, 4, [1, 700, 2048], [1, 2, 4]), {"tile_n": 512}),
+    ((2, 1000, 10, 2, 3, None, None), {"tile_k": 32}),
+    ((2, 1024, 8, 1, 2, None, None), {"tile_k": 16}),
+    ((2, 1000, 10, 2, 3, None, None), {"head_dim": 256}),
+    ((2, 1500, 32, 1, 8, [300, 1500], [8, 3]), {"head_dim_v": 256}),
+    ((3, 2048, 8, 1, 4, [1, 700, 2048], [1, 2, 4]), {"s_stages": 2, "p_stages": 6}),
+    ((2, 1000, 10, 2, 3, None, None), {"s_stages": 6, "p_stages": 2, "kv_stages": (4, 4)}),
+]
 
 
-@pytest.mark.parametrize("case", DECODE_CASES)
-def test_decode_matches_fp32_reference(requires_blackwell, decode, case):
+def decode_inputs(case, head_dim=128, head_dim_v=128):
     b, s, h, hkv, splits, used, counts = case
     torch.manual_seed(0)
-    q = torch.randn(b, 1, h, 128, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(b, s, hkv, 128, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(b, s, hkv, 128, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(b, 1, h, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(b, s, hkv, head_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(b, s, hkv, head_dim_v, device="cuda", dtype=torch.bfloat16)
     used_t = None if used is None else torch.tensor(used, device="cuda", dtype=torch.int32)
     counts_t = None if counts is None else torch.tensor(counts, device="cuda", dtype=torch.int32)
-    o, lse = decode.decode_partials(q, k, v, splits, seqused_k=used_t, splits_per_seq=counts_t)
+    return q, k, v, splits, used_t, counts_t
+
+
+def check_against_reference(decode, case, **config):
+    b, s, *_ = case
+    dims = {k: config.pop(k) for k in ("head_dim", "head_dim_v") if k in config}
+    q, k, v, splits, used_t, counts_t = decode_inputs(case, **dims)
+    o, lse = decode.decode_partials(
+        q, k, v, splits, seqused_k=used_t, splits_per_seq=counts_t, **config
+    )
+    used = case[5] or [s] * b
+    counts = case[6] or [splits] * b
     ro, rl, owned = reference_partials(
-        decode, q, k, v, splits, used or [s] * b, counts or [splits] * b
+        q, k, v, splits, used, counts, tile_n=config.get("tile_n", 256)
     )
     o, lse = o[:, :, 0], lse[..., 0]
     torch.testing.assert_close(o[owned], ro[owned], atol=3e-3, rtol=0)
@@ -399,6 +418,59 @@ def test_decode_matches_fp32_reference(requires_blackwell, decode, case):
     torch.testing.assert_close(lse[finite], rl[finite], atol=1e-4, rtol=0)
     empty = owned[..., None] & torch.isneginf(rl)
     assert torch.count_nonzero(o[empty]) == 0, "an empty split must write O = 0"
+
+
+@pytest.mark.parametrize("case", DECODE_CASES)
+def test_decode_matches_fp32_reference(requires_blackwell, decode, case):
+    check_against_reference(decode, case)
+
+
+@pytest.mark.parametrize(
+    "case, config",
+    DECODE_CONFIGS,
+    ids=["_".join(f"{k}{v}" for k, v in c.items()) for _, c in DECODE_CONFIGS],
+)
+def test_decode_configs_match_fp32_reference(requires_blackwell, decode, case, config):
+    check_against_reference(decode, case, **dict(config))
+
+
+def test_decode_role_overrides(requires_blackwell, decode):
+    """A 32-head tile with another register split: describe() shows it, the key changes, and
+    the partials still match the reference."""
+    from transformer_nuggets.cute.warpdrive import RoleConfig
+
+    roles = {
+        "softmax": RoleConfig((range(4, 8), range(8, 12)), regs=112),
+        "correction": RoleConfig(range(12, 16), regs=224),
+    }
+    op = decode.SwapABDecode(32, roles=roles)
+    text = op.describe()
+    assert "softmax[0]   112" in text and "correction   224" in text and "mma_qk        64" in text
+    assert op.__cute_cache_key__() != decode.SwapABDecode(32).__cute_cache_key__()
+    with pytest.raises(ProtocolError, match="not roles"):
+        decode.SwapABDecode(32, roles={"softmx": RoleConfig(0)}).describe()
+    with pytest.raises(ValueError, match="register budgets need"):
+        decode.SwapABDecode(
+            32, roles={"correction": RoleConfig(range(12, 16), regs=232)}
+        ).describe()
+    check_against_reference(decode, (2, 1500, 32, 1, 8, [300, 1500], [8, 3]), roles=roles)
+
+
+def test_decode_rejects_unfit_configurations(decode):
+    with pytest.raises(ValueError, match="TMEM plan needs"):
+        decode.SwapABDecode(32, tile_n=512)
+    with pytest.raises(ValueError, match="power-of-two multiple"):
+        decode.SwapABDecode(8, tile_n=384)
+    with pytest.raises(ValueError, match="tile_k must be one of"):
+        decode.SwapABDecode(8, tile_k=128)
+    with pytest.raises(ValueError, match="head_dim must be"):
+        decode.SwapABDecode(8, head_dim=96)
+    with pytest.raises(ValueError, match="head_dim_v must be"):
+        decode.SwapABDecode(8, head_dim_v=64)
+    with pytest.raises(ValueError, match="even number"):
+        decode.SwapABDecode(8, s_stages=3)
+    with pytest.raises(ValueError, match="room for"):
+        decode.SwapABDecode(32, tile_n=256, p_stages=12)
 
 
 def test_decode_matches_fa4_partials_bitwise(requires_blackwell, decode, monkeypatch):
