@@ -512,6 +512,35 @@ FA4 does (later measured at -0.4 to -0.7% and made the default; see
 the prologue, skipping all setup for dropped splits (slower: it serializes on the PDL wait), and
 prefetching the TMA descriptors (kept, as FA4 does).
 
+[Try tokens](channels.md#try-tokens) were measured on the split rings as FA4 uses them: the PV
+warp probes V before its P wait and O acquire, consumes the token at the first V wait and
+re-probes after each V release; the QK warp probes K before its S acquire and likewise. An
+"all" variant also probed P, O and S as FA4 does. Partials stayed bitwise equal to FA4's in
+every variant. Decode-kernel CUPTI medians of graph-replayed `decode_partials` (nine or eleven
+rotating rounds of 200 replays after three seconds of warmup, three processes on one GB300,
+CuTeDSL 4.8.0, PyTorch `2.15.0.dev20260922+cu132`, FA4 `00807a02`, November 5, 2026), in
+microseconds, median over the processes; lower is better:
+
+| batch x kv_len, heads/kv_heads | no tokens | K/V tokens | delta |
+|---|---:|---:|---:|
+| 1x8192, 8/1 | 4.289 | 4.352 | +1.5% |
+| 4x16384, 32/8 | 40.256 | 40.352 | +0.2% |
+| 8x32768, 32/8 | 148.368 | 148.448 | +0.1% |
+| 8x65536 ragged, 8/1 | 28.065 | 28.064 | 0.0% |
+| 16x32768 ragged, 64/8 | 179.810 | 179.794 | 0.0% |
+| 1x32768, 32/1 | 7.360 | 7.328 | -0.4% |
+| 2x131072 ragged, 16/1 | 8.928 | 8.928 | 0.0% |
+
+The K/V tokens measured 4.352 us at 1x8192 in all three processes, while the baseline's
+process medians ranged over 4.288-4.416 us. 4x16384 and 8x32768 were 0.01-0.3% slower in
+every process; the remaining shapes moved by at most one 32 ns CUPTI tick, in both
+directions. The "all" variant, measured in two of the processes, moved within 0.4% of the baseline
+except at 1x8192 (+1.5% in one process, -3.6% in the other). The ragged case, where the shared-ring
+prototype below gained 0.06 us from its K/V prechecks, gained nothing on split rings. Not
+neutral-or-better on the smallest shape, so the example keeps blocking waits. The consumer
+tokens never cross a loop iteration (FA4's loader carries its producer token across blocks;
+that was not tried).
+
 ### Decode setup costs
 
 `SplitKV.bind()` now builds `FastDivmodDivisorV2` values for the launch's split/head mapping,
