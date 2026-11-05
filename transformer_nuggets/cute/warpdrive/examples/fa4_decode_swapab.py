@@ -56,6 +56,7 @@ Differences from FA4 (see docs/examples.md for the measured effect):
 """
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import partial
 
@@ -97,19 +98,10 @@ from transformer_nuggets.cute.warpdrive import (
     role,
 )
 
-HEAD_DIM = 128
-TILE_N = 256  # KV tokens per block (FA4's SwapABPolicy.tile_n)
-TILE_M = 128  # MMA M: KV tokens of one S subtile, head dims of one O tile
-TILE_K = 64  # MMA K step; a K tile (128 x 64) and a V^T tile (128 x 64) have the same bytes
+TILE_M = 128  # MMA M: KV tokens of one S subtile, head dims of one O tile (one lane per row)
 MMA_N_MIN = 8
-S_SUBTILES = TILE_N // TILE_M
-K_TILES = HEAD_DIM // TILE_K  # QK K steps
-PV_K_TILES = TILE_N // TILE_K  # PV K steps
-D_TILES = HEAD_DIM // TILE_M
-S_STAGES = 4
-P_STAGES = 4
-O_STAGES = 2  # even / odd blocks
-KV_STAGE_BYTES = TILE_M * TILE_K * 2
+TILE_KS = (16, 32, 64)  # MMA K step: 32 B to 128 B K-major rows, up to the SW128 atom
+O_STAGES = 2  # even / odd blocks: one O slot per softmax warpgroup, merged by the correction
 WARPS_PER_WG = 4
 WG_SIZE = 128
 LN2 = math.log(2.0)
@@ -160,31 +152,6 @@ class SplitKV(WorkMap):
 
 
 @dataclass(frozen=True)
-class DecodeRoles:
-    """Placement and register budgets. FA4 adjusts registers only for 32-head tiles."""
-
-    mma_qk: RoleConfig
-    mma_pv: RoleConfig
-    load: RoleConfig
-    q_store: RoleConfig
-    softmax: RoleConfig
-    correction: RoleConfig
-
-    @staticmethod
-    def for_tile(tile_hq: int) -> "DecodeRoles":
-        # 64 + 2 * 120 + 208 = 512 registers per thread position = 64K / 128 threads.
-        small, softmax, correction = (64, 120, 208) if tile_hq > 16 else (None, None, None)
-        return DecodeRoles(
-            mma_qk=RoleConfig(0, regs=small),
-            mma_pv=RoleConfig(1, regs=small),
-            load=RoleConfig(2, regs=small),
-            q_store=RoleConfig(3, regs=small),
-            softmax=RoleConfig((range(4, 8), range(8, 12)), regs=softmax),
-            correction=RoleConfig(range(12, 16), regs=correction),
-        )
-
-
-@dataclass(frozen=True)
 class DecodeParams:
     """Kernel-prologue values the roles read; built once in ``SwapABDecode.kernel``."""
 
@@ -223,26 +190,6 @@ class SplitRange:
     bh: Int32  # batch * kv_heads + kv_head: the (h_kv, b) coordinate
 
 
-def split_range(params: DecodeParams, item) -> SplitRange:
-    """FA4's ``BlockInfo.get_n_block_min_max`` for one split of a sequence (0 blocks per split
-    when the sequence is empty)."""
-    split, kv_head, batch, splits = item
-    seqlen_k = params.mSeqUsedK[batch]
-    n_total = (seqlen_k + TILE_N - 1) // TILE_N
-    per_split = (n_total + splits - 1) // splits
-    n_min = split * per_split
-    n_max = cutlass.min(n_min + per_split, n_total)
-    return SplitRange(
-        n_min,
-        cutlass.max(n_max - n_min, 0),
-        seqlen_k,
-        split,
-        kv_head,
-        batch,
-        batch * params.num_heads_kv + kv_head,
-    )
-
-
 def gemm_view(mX, order, head_idx=None, qhead_per_kvhead=None, num_heads_kv=None):
     """``mX`` with its modes permuted to ``order`` and the (kv head, batch) modes 2 and 3 grouped;
     with ``head_idx``, the head mode is first split into (qhead_per_kvhead, num_heads_kv)."""
@@ -252,14 +199,79 @@ def gemm_view(mX, order, head_idx=None, qhead_per_kvhead=None, num_heads_kv=None
 
 
 class SwapABDecode(WarpSpecialized):
-    def __init__(self, tile_hq: int, kv_stages: tuple[int, int] | None = None, per_sequence=False):
+    def __init__(
+        self,
+        tile_hq: int,
+        kv_stages: tuple[int, int] | None = None,
+        per_sequence=False,
+        *,
+        tile_n: int = 256,
+        tile_k: int = 64,
+        s_stages: int = 4,
+        p_stages: int = 4,
+        head_dim: int = 128,
+        head_dim_v: int = 128,
+        roles: Mapping[str, RoleConfig] | None = None,
+    ):
+        """``tile_hq``: query heads per KV head, a power of two up to 32. ``tile_n``: KV tokens
+        per block, a power-of-two multiple of 128 (FA4: 256). ``tile_k``: MMA K step, one of
+        ``TILE_KS``. ``s_stages``/``p_stages``: S (TMEM) and P (SMEM) ring depths, even (two
+        softmax warpgroups). ``head_dim``/``head_dim_v``: Q/K and V/O head dimensions, multiples
+        of ``tile_k`` and 128. ``roles``: placement and register budgets by role name over the
+        defaults (FA4's 64/120/208 split for 32-head tiles, none otherwise). Combinations that do
+        not fit TMEM or SMEM raise at construction or first collection."""
         if tile_hq not in (1, 2, 4, 8, 16, 32):
             raise ValueError(f"tile_hq must be a power of two up to 32, got {tile_hq}")
+        s_subtiles = tile_n // TILE_M
+        if tile_n % TILE_M or s_subtiles & (s_subtiles - 1):
+            raise ValueError(f"tile_n must be a power-of-two multiple of {TILE_M}, got {tile_n}")
+        if tile_hq * s_subtiles > 128:
+            raise ValueError(
+                f"tile_hq x tile_n / {TILE_M} = {tile_hq * s_subtiles} exceeds the 128-column "
+                "tcgen05.ld repetition that reads one S block"
+            )
+        if tile_k not in TILE_KS:
+            raise ValueError(f"tile_k must be one of {TILE_KS}, got {tile_k}")
+        if head_dim <= 0 or head_dim % tile_k:
+            raise ValueError(
+                f"head_dim must be a positive multiple of tile_k={tile_k}, got {head_dim}"
+            )
+        if head_dim_v <= 0 or head_dim_v % TILE_M:
+            raise ValueError(
+                f"head_dim_v must be a positive multiple of {TILE_M}, got {head_dim_v}"
+            )
+        for name, stages in (("s_stages", s_stages), ("p_stages", p_stages)):
+            if stages < 2 or stages % 2:
+                raise ValueError(
+                    f"{name} must be an even number >= 2 (two softmax warpgroups), got {stages}"
+                )
         self.tile_hq = tile_hq
         self.tile_hq_mma = max(MMA_N_MIN, tile_hq)
         self.per_sequence = per_sequence
+        self.tile_n, self.tile_k = tile_n, tile_k
+        self.s_stages, self.p_stages = s_stages, p_stages
+        self.head_dim, self.head_dim_v = head_dim, head_dim_v
+        self.s_subtiles = s_subtiles
+        self.k_tiles = head_dim // tile_k  # QK K steps
+        self.pv_k_tiles = tile_n // tile_k  # PV K steps
+        self.d_tiles = head_dim_v // TILE_M  # O tiles
+        self.kv_stage_bytes = TILE_M * tile_k * 2  # a K tile and a V^T tile have the same bytes
         self.kv_stages = kv_stages or self.default_kv_stages()
-        self.roles = DecodeRoles.for_tile(tile_hq)
+        if min(self.kv_stages) < 1:
+            raise ValueError(f"kv_stages must be positive, got {self.kv_stages}")
+        # FA4 adjusts registers only for 32-head tiles: 64 + 2 x 120 + 208 = 512 per thread
+        # position, 64K / 128 threads.
+        defaults = {}
+        if tile_hq > 16:
+            defaults = {
+                "mma_qk": RoleConfig(0, regs=64),
+                "mma_pv": RoleConfig(1, regs=64),
+                "load": RoleConfig(2, regs=64),
+                "q_store": RoleConfig(3, regs=64),
+                "softmax": RoleConfig((range(4, 8), range(8, 12)), regs=120),
+                "correction": RoleConfig(range(12, 16), regs=208),
+            }
+        self.roles = {**defaults, **(roles or {})}
         n, bf16 = self.tile_hq_mma, cutlass.BFloat16
         n_k, n_v = self.kv_stages
 
@@ -272,12 +284,12 @@ class SwapABDecode(WarpSpecialized):
         # follows every QK MMA (S full -> P -> PV -> O full).
         o_buf = self.smem_plan.buffer("O", Float32, align=1024, overlaps=k_buf)
 
-        self.q = Ring(1, Tma(n * HEAD_DIM * 2), Umma)
-        self.k = Ring(n_k, Tma(KV_STAGE_BYTES), Umma, buffer=k_buf)
-        self.v = Ring(n_v, Tma(KV_STAGE_BYTES), Umma, buffer=v_buf)
-        self.s = Ring(S_STAGES, Umma, Threads, round_robin=True)
+        self.q = Ring(1, Tma(n * head_dim * 2), Umma)
+        self.k = Ring(n_k, Tma(self.kv_stage_bytes), Umma, buffer=k_buf)
+        self.v = Ring(n_v, Tma(self.kv_stage_bytes), Umma, buffer=v_buf)
+        self.s = Ring(s_stages, Umma, Threads, round_robin=True)
         self.p = Ring(
-            P_STAGES, Threads, Umma, round_robin=True, commit_fence="smem_async", buffer=p_buf
+            p_stages, Threads, Umma, round_robin=True, commit_fence="smem_async", buffer=p_buf
         )
         self.o = Ring(O_STAGES, Umma, Threads, release_fence="tmem_store")
         self.row_max = Ring(1, Threads, Threads, sync="named", round_robin=True, turnstile="mufu")
@@ -292,8 +304,12 @@ class SwapABDecode(WarpSpecialized):
         self.epi = Ring(1, Threads, Threads, commit_fence="smem_async", buffer=o_buf)
         self.mufu = Turnstile()
         self.tmem_plan = (
-            TmemPlan().region("S", S_SUBTILES * n, S_STAGES).region("L", n, 2).region("O", n, 2)
+            TmemPlan()
+            .region("S", s_subtiles * n, s_stages)
+            .region("L", n, O_STAGES)
+            .region("O", self.d_tiles * n, O_STAGES)
         )
+        _ = self.tmem_plan.alloc_cols  # raises when the plan exceeds 512 columns
         mapping = SplitKV(per_sequence)
         self.work = WorkStream(
             mapping=mapping, schedule=OneShot(), ready=PdlWait() if per_sequence else None
@@ -304,16 +320,46 @@ class SwapABDecode(WarpSpecialized):
         about 7:5 between K (two blocks ahead) and V. On GB300, 7:5 of 12 was within 2% of the
         best split on three decode shapes; a V ring below 4 stages starves the PV MMA."""
         n = self.tile_hq_mma
-        fixed = P_STAGES * n * TILE_N * 2 + n * HEAD_DIM * 2 + 1024  # P, Q, barriers and stats
-        total = (get_smem_capacity_in_bytes("sm_100") - fixed) // KV_STAGE_BYTES - 1
-        n_v = max(total * 5 // 12, 3)
+        # P, Q, barriers and stats; the O staging tile shares the K ring's bytes.
+        fixed = self.p_stages * n * self.tile_n * 2 + n * self.head_dim * 2 + 1024
+        total = (get_smem_capacity_in_bytes("sm_100") - fixed) // self.kv_stage_bytes - 1
+        if total < 2:
+            raise ValueError(
+                f"tile_hq={self.tile_hq}, tile_n={self.tile_n}, p_stages={self.p_stages} leave "
+                f"room for {total} K/V stages; shrink the P ring or the KV block"
+            )
+        n_v = max(total * 5 // 12, min(3, total - 1))
         return total - n_v, n_v
 
     def get_name(self) -> str:
         n_k, n_v = self.kv_stages
+        shape = ""
+        if (self.tile_n, self.tile_k, self.head_dim, self.head_dim_v) != (256, 64, 128, 128):
+            shape = f"_n{self.tile_n}k{self.tile_k}d{self.head_dim}dv{self.head_dim_v}"
+        if (self.s_stages, self.p_stages) != (4, 4):
+            shape += f"_s{self.s_stages}p{self.p_stages}"
         return (
-            f"warpdrive_fa4_decode_swapab_hq{self.tile_hq}_k{n_k}v{n_v}_{self.work.get_key()}"
-            f"{self.iket_key()}{self.trace_key()}"
+            f"warpdrive_fa4_decode_swapab_hq{self.tile_hq}_k{n_k}v{n_v}{shape}_"
+            f"{self.work.get_key()}{self.iket_key()}{self.trace_key()}"
+        )
+
+    def split_range(self, params: DecodeParams, item) -> SplitRange:
+        """FA4's ``BlockInfo.get_n_block_min_max`` for one split of a sequence (0 blocks per
+        split when the sequence is empty)."""
+        split, kv_head, batch, splits = item
+        seqlen_k = params.mSeqUsedK[batch]
+        n_total = (seqlen_k + self.tile_n - 1) // self.tile_n
+        per_split = (n_total + splits - 1) // splits
+        n_min = split * per_split
+        n_max = cutlass.min(n_min + per_split, n_total)
+        return SplitRange(
+            n_min,
+            cutlass.max(n_max - n_min, 0),
+            seqlen_k,
+            split,
+            kv_head,
+            batch,
+            batch * params.num_heads_kv + kv_head,
         )
 
     # ------------------------------------------------------------------ helpers
@@ -323,10 +369,12 @@ class SwapABDecode(WarpSpecialized):
         ((128, N), 1, 1, d tile, slot)."""
         thr_qk = params.mma_qk.get_slice(0)
         acc_shape = thr_qk.partition_shape_C((TILE_M, self.tile_hq_mma))
-        s_frag = thr_qk.make_fragment_C(cute.append(cute.append(acc_shape, S_SUBTILES), S_STAGES))
+        s_frag = thr_qk.make_fragment_C(
+            cute.append(cute.append(acc_shape, self.s_subtiles), self.s_stages)
+        )
         l_frag = thr_qk.make_fragment_C(cute.append(acc_shape, 2))
         o_frag = params.mma_pv.get_slice(0).make_fragment_C(
-            cute.append(cute.append(acc_shape, D_TILES), O_STAGES)
+            cute.append(cute.append(acc_shape, self.d_tiles), O_STAGES)
         )
         return (
             cute.make_tensor(tmem.ptr("S", 0), s_frag.layout),
@@ -351,25 +399,25 @@ class SwapABDecode(WarpSpecialized):
 
     # ------------------------------------------------------------------ roles
 
-    @role(config=lambda kernel: kernel.roles.q_store)
+    @role(warps=3)
     @cute.jit
     def q_store(self, params: DecodeParams, *, q: Producer, epi: Consumer, work: WorkCursor):
         thr_qk = params.mma_qk.get_slice(0)
         n = self.tile_hq_mma
         while work.valid:
-            r = split_range(params, work.item)
+            r = self.split_range(params, work.item)
             # Q: every query head of this KV head, one 64-dim chunk per sQ stage.
             if r.n_blocks > 0:
-                gQ = cute.local_tile(params.mQ, (n, TILE_K), (0, None, r.bh))
+                gQ = cute.local_tile(params.mQ, (n, self.tile_k), (0, None, r.bh))
                 load_q, _, _ = copy_utils.tma_get_copy_fn(
                     params.tma_q, 0, cute.make_layout(1), thr_qk.partition_B(gQ), params.sQ
                 )
                 with q.produce() as h:
-                    for dk in cutlass.range_constexpr(K_TILES):
+                    for dk in cutlass.range_constexpr(self.k_tiles):
                         load_q(src_idx=dk, dst_idx=dk, tma_bar_ptr=h.barrier)
             with epi.consume() as h:
                 sO = h.data
-                for dm in cutlass.range_constexpr(D_TILES):
+                for dm in cutlass.range_constexpr(self.d_tiles):
                     gO = cute.local_tile(params.mO, (TILE_M, n), (dm, 0, r.bh, r.split))
                     store_o, _, _ = copy_utils.tma_get_copy_fn(
                         params.tma_o,
@@ -385,7 +433,7 @@ class SwapABDecode(WarpSpecialized):
             work.advance()
         return q, epi, work
 
-    @role(config=lambda kernel: kernel.roles.load)
+    @role(warps=2)
     @cute.jit
     def load(
         self,
@@ -401,11 +449,11 @@ class SwapABDecode(WarpSpecialized):
         for atom in (params.tma_q, params.tma_k, params.tma_v, params.tma_o):
             cpasync.prefetch_descriptor(atom)
         thr_qk, thr_pv = params.mma_qk.get_slice(0), params.mma_pv.get_slice(0)
-        tiler = (TILE_M, TILE_K)
+        tiler = (TILE_M, self.tile_k)
         # The SMEM side of a TMA partition does not depend on the global tile.
-        gK0 = cute.zipped_divide(cute.local_tile(params.mK, (TILE_M, HEAD_DIM), (0, 0, 0)), tiler)[
-            (None, None), (0, None)
-        ]
+        gK0 = cute.zipped_divide(
+            cute.local_tile(params.mK, (TILE_M, self.head_dim), (0, 0, 0)), tiler
+        )[(None, None), (0, None)]
         tKsK, _ = cpasync.tma_partition(
             params.tma_k,
             0,
@@ -413,9 +461,9 @@ class SwapABDecode(WarpSpecialized):
             cute.group_modes(params.sK, 0, 3),
             cute.group_modes(thr_qk.partition_A(gK0), 0, 3),
         )
-        gV0 = cute.zipped_divide(cute.local_tile(params.mV, (HEAD_DIM, TILE_M), (0, 0, 0)), tiler)[
-            (None, None), (None, 0)
-        ]
+        gV0 = cute.zipped_divide(
+            cute.local_tile(params.mV, (self.head_dim_v, TILE_M), (0, 0, 0)), tiler
+        )[(None, None), (None, 0)]
         tVsV, _ = cpasync.tma_partition(
             params.tma_v,
             0,
@@ -427,12 +475,12 @@ class SwapABDecode(WarpSpecialized):
         v = v.views(V=StageView(tVsV, axis=1))
         lookahead = 2  # FA4's issue order: K(s) with V(s - 2)
         while work.valid:
-            r = split_range(params, work.item)
+            r = self.split_range(params, work.item)
             for s in cutlass.range(lookahead + r.n_blocks, unroll=1):
                 if s < r.n_blocks:
-                    for sm in cutlass.range_constexpr(S_SUBTILES):
-                        unit = (s + r.n_block_min) * S_SUBTILES + sm
-                        gK = cute.local_tile(params.mK, (TILE_M, HEAD_DIM), (unit, 0, r.bh))
+                    for sm in cutlass.range_constexpr(self.s_subtiles):
+                        unit = (s + r.n_block_min) * self.s_subtiles + sm
+                        gK = cute.local_tile(params.mK, (TILE_M, self.head_dim), (unit, 0, r.bh))
                         gK_sub = cute.zipped_divide(gK, tiler)[(None, None), (0, None)]
                         _, tKgK = cpasync.tma_partition(
                             params.tma_k,
@@ -441,7 +489,7 @@ class SwapABDecode(WarpSpecialized):
                             cute.group_modes(params.sK, 0, 3),
                             cute.group_modes(thr_qk.partition_A(gK_sub), 0, 3),
                         )
-                        for dk in cutlass.range_constexpr(K_TILES):
+                        for dk in cutlass.range_constexpr(self.k_tiles):
                             with k.produce() as h:
                                 cute.copy(
                                     params.tma_k,
@@ -451,13 +499,13 @@ class SwapABDecode(WarpSpecialized):
                                 )
                 if s >= lookahead:
                     block = s - lookahead + r.n_block_min
-                    for sk in cutlass.range_constexpr(PV_K_TILES):
-                        unit = block * S_SUBTILES + sk // (TILE_M // TILE_K)
+                    for sk in cutlass.range_constexpr(self.pv_k_tiles):
+                        unit = block * self.s_subtiles + sk // (TILE_M // self.tile_k)
                         gVt = cute.zipped_divide(
-                            cute.local_tile(params.mV, (HEAD_DIM, TILE_M), (0, unit, r.bh)),
+                            cute.local_tile(params.mV, (self.head_dim_v, TILE_M), (0, unit, r.bh)),
                             tiler,
                         )
-                        gVt_sub = gVt[(None, None), (None, sk % (TILE_M // TILE_K))]
+                        gVt_sub = gVt[(None, None), (None, sk % (TILE_M // self.tile_k))]
                         _, tVgV = cpasync.tma_partition(
                             params.tma_v,
                             0,
@@ -465,7 +513,7 @@ class SwapABDecode(WarpSpecialized):
                             cute.group_modes(params.sV, 0, 3),
                             cute.group_modes(thr_pv.partition_A(gVt_sub), 0, 3),
                         )
-                        for dm in cutlass.range_constexpr(D_TILES):
+                        for dm in cutlass.range_constexpr(self.d_tiles):
                             with v.produce() as h:
                                 cute.copy(
                                     params.tma_v,
@@ -508,7 +556,7 @@ class SwapABDecode(WarpSpecialized):
         sh.release()
         return max_done, sum_done, stats_ready
 
-    @role(config=lambda kernel: kernel.roles.mma_qk)
+    @role(warps=0)
     @cute.jit
     def mma_qk(
         self,
@@ -525,17 +573,17 @@ class SwapABDecode(WarpSpecialized):
         tCrQ = mma.make_fragment_B(params.sQ)
         k = k.views(K=StageView(mma.make_fragment_A(params.sK), axis=3))
         tStS, _, _ = self.tmem_tensors(params, tmem)
-        qk_k_blocks = TILE_K // cute.size(mma.shape_mnk, mode=[2])
+        qk_k_blocks = self.tile_k // cute.size(mma.shape_mnk, mode=[2])
         while work.valid:
-            r = split_range(params, work.item)
+            r = self.split_range(params, work.item)
             if r.n_blocks > 0:
                 qh = q.wait()
                 for _ in cutlass.range(r.n_blocks, unroll=1):
                     sh = s.acquire()
-                    for sm in cutlass.range_constexpr(S_SUBTILES):
+                    for sm in cutlass.range_constexpr(self.s_subtiles):
                         atom.set(tcgen05.Field.ACCUMULATE, False)
                         acc = tStS[None, None, None, sm, sh.index]
-                        for dk in cutlass.range_constexpr(K_TILES):
+                        for dk in cutlass.range_constexpr(self.k_tiles):
                             with k.consume() as kh:
                                 for i in cutlass.range_constexpr(qk_k_blocks):
                                     cute.gemm(
@@ -551,7 +599,7 @@ class SwapABDecode(WarpSpecialized):
             work.advance()
         return q, k, s, work
 
-    @role(config=lambda kernel: kernel.roles.mma_pv)
+    @role(warps=1)
     @cute.jit
     def mma_pv(
         self,
@@ -568,15 +616,15 @@ class SwapABDecode(WarpSpecialized):
         v = v.views(V=StageView(mma.make_fragment_A(params.sV), axis=3))
         p = p.views(P=StageView(mma.make_fragment_B(params.sP), axis=3))
         _, _, tOtO = self.tmem_tensors(params, tmem)
-        pv_k_blocks = TILE_K // cute.size(mma.shape_mnk, mode=[2])
+        pv_k_blocks = self.tile_k // cute.size(mma.shape_mnk, mode=[2])
         while work.valid:
-            r = split_range(params, work.item)
+            r = self.split_range(params, work.item)
             for j in cutlass.range(r.n_blocks, unroll=1):
                 ph = p.wait()
                 # Free once the correction has rescaled what PV(j - 2) left there.
                 oh = o.acquire()
-                for dk in cutlass.range_constexpr(PV_K_TILES):
-                    for dm in cutlass.range_constexpr(D_TILES):
+                for dk in cutlass.range_constexpr(self.pv_k_tiles):
+                    for dm in cutlass.range_constexpr(self.d_tiles):
                         acc = tOtO[None, None, None, dm, oh.index]
                         with v.consume() as vh:
                             for i in cutlass.range_constexpr(pv_k_blocks):
@@ -601,7 +649,7 @@ class SwapABDecode(WarpSpecialized):
             work.advance()
         return v, p, o, work
 
-    @role(config=lambda kernel: kernel.roles.softmax)
+    @role(warps=(range(4, 8), range(8, 12)))
     @cute.jit
     def softmax(
         self,
@@ -625,7 +673,7 @@ class SwapABDecode(WarpSpecialized):
         vec_size = cute.cosize(vec_layout)
         # Each thread owns one token row of each 128-token subtile and tile_hq head columns.
         tStS_0 = tStS[(None, None), 0, 0, None, 0]
-        rep_s = tcgen05.Repetition(tile_hq * S_SUBTILES if n == tile_hq else tile_hq)
+        rep_s = tcgen05.Repetition(tile_hq * self.s_subtiles if n == tile_hq else tile_hq)
         t2r_s = tcgen05.make_tmem_copy(
             cute.make_copy_atom(tcgen05.Ld32x32bOp(rep_s, tcgen05.Pack.NONE), Float32), tStS_0
         )
@@ -635,14 +683,14 @@ class SwapABDecode(WarpSpecialized):
         thr_t2r_s, thr_r2s_p = t2r_s.get_slice(tidx), r2s_p.get_slice(tidx)
         tSrS_layout = thr_t2r_s.partition_D(tStS_0).layout
         tSrP_layout = cute.make_layout(
-            (*vec_layout.shape, S_SUBTILES), stride=(*vec_layout.stride, vec_size)
+            (*vec_layout.shape, self.s_subtiles), stride=(*vec_layout.stride, vec_size)
         )
-        scores_layout = cute.make_layout((tile_hq, S_SUBTILES), stride=(1, vec_size))
+        scores_layout = cute.make_layout((tile_hq, self.s_subtiles), stride=(1, vec_size))
         # (token row, head, subtile) -> one P stage's (head, token) index, head + N * token.
-        sP_view_layout = cute.make_layout((TILE_M, n, S_SUBTILES), stride=(n, 1, TILE_M * n))
+        sP_view_layout = cute.make_layout((TILE_M, n, self.s_subtiles), stride=(n, 1, TILE_M * n))
         tLtL_mine = tLtL[(None, None), 0, 0, stage]
         while work.valid:
-            r = split_range(params, work.item)
+            r = self.split_range(params, work.item)
             for j in cutlass.range(stage, r.n_blocks, 2, unroll=1):
                 tSrS = cute.make_rmem_tensor(tSrS_layout, Float32)
                 tSrP = cute.make_rmem_tensor(tSrP_layout, cutlass.BFloat16)
@@ -662,8 +710,8 @@ class SwapABDecode(WarpSpecialized):
                 sh.release()
 
                 # Token rows past seqlen_k in the last block.
-                valid_rows = r.seqlen_k - (j + r.n_block_min) * TILE_N
-                for sm in cutlass.range_constexpr(S_SUBTILES):
+                valid_rows = r.seqlen_k - (j + r.n_block_min) * self.tile_n
+                for sm in cutlass.range_constexpr(self.s_subtiles):
                     if tidx + sm * TILE_M >= valid_rows:
                         scores_r[None, sm].fill(-Float32.inf)
                 scores = scores_r.load()
@@ -718,7 +766,7 @@ class SwapABDecode(WarpSpecialized):
             work.advance()
         return s, p, row_max, row_sum, mufu, work
 
-    @role(config=lambda kernel: kernel.roles.correction)
+    @role(warps=range(12, 16))
     @cute.jit
     def correction(
         self,
@@ -750,11 +798,11 @@ class SwapABDecode(WarpSpecialized):
             (*vec_layout.shape, O_STAGES), stride=(*vec_layout.stride, vec_size)
         )
         o_tail_layout = cute.make_layout(
-            (*vec_layout.shape, D_TILES, O_STAGES),
-            stride=(*vec_layout.stride, vec_size, D_TILES * vec_size),
+            (*vec_layout.shape, self.d_tiles, O_STAGES),
+            stride=(*vec_layout.stride, vec_size, self.d_tiles * vec_size),
         )
         while work.valid:
-            r = split_range(params, work.item)
+            r = self.split_range(params, work.item)
             n_blocks = r.n_blocks
             tLrL = cute.make_rmem_tensor(vec_layout, Float32)
             row_sum_final = cute.make_rmem_tensor(vec_layout, Float32)
@@ -797,7 +845,7 @@ class SwapABDecode(WarpSpecialized):
                     acc_scale_lane = exp2_fast(row_max_prev2 - row_max_cur)
                     for h in cutlass.range_constexpr(tile_hq):
                         acc_scale[h] = cute.arch.shuffle_sync(acc_scale_lane, h)
-                    for dm in cutlass.range_constexpr(D_TILES):
+                    for dm in cutlass.range_constexpr(self.d_tiles):
                         tOtO_slot = tOtO[(None, None), 0, 0, dm, phase]
                         tOrO = cute.make_rmem_tensor(vec_layout, Float32)
                         cute.copy(t2r, thr_t2r.partition_S(tOtO_slot), tOrO)
@@ -873,8 +921,8 @@ class SwapABDecode(WarpSpecialized):
                 cute.autovec_copy(params.sRowMax, tLrL)
 
             # Normalize the merged O in fp32 and stage it for the TMA store.
-            tail0 = tOrO_tail[None, None, None, None, 0].load().reshape((vec_size, D_TILES))
-            tail1 = tOrO_tail[None, None, None, None, 1].load().reshape((vec_size, D_TILES))
+            tail0 = tOrO_tail[None, None, None, None, 0].load().reshape((vec_size, self.d_tiles))
+            tail1 = tOrO_tail[None, None, None, None, 1].load().reshape((vec_size, self.d_tiles))
             o_final = tail1 + acc_scale.load().reshape((vec_size, 1)) * tail0
             o_final *= tLrL.load().reshape((vec_size, 1))
             with epi.produce() as eh:
@@ -972,7 +1020,7 @@ class SwapABDecode(WarpSpecialized):
         mVt = gemm_view(v, [3, 1, 2, 0])  # (d, s, (h_kv, b))
         mQ = gemm_view(q, [0, 3, 2, 1], 1, *gqa)  # (qpk, d, (h_kv, b))
         mO = gemm_view(o_partial, [4, 0, 3, 2, 1], 2, *gqa)  # (d, qpk, (h_kv, b), split)
-        tiler = (TILE_M, n, TILE_K)
+        tiler = (TILE_M, n, self.tile_k)
         major = OperandMajorMode
         one = tcgen05.CtaGroup.ONE
         # QK: K and Q are both K-major (head_dim contiguous). PV reduces over tokens, contiguous
@@ -984,12 +1032,14 @@ class SwapABDecode(WarpSpecialized):
             bf16, major.MN, major.MN, Float32, one, (TILE_M, n)
         )
         n_k, n_v = self.kv_stages
-        sQ_layout = sm100_utils.make_smem_layout_b(mma_qk, tiler, bf16, K_TILES)
-        sP_layout = sm100_utils.make_smem_layout_b(mma_pv, (None, n, TILE_N), bf16, P_STAGES)
+        sQ_layout = sm100_utils.make_smem_layout_b(mma_qk, tiler, bf16, self.k_tiles)
+        sP_layout = sm100_utils.make_smem_layout_b(
+            mma_pv, (None, n, self.tile_n), bf16, self.p_stages
+        )
         sK_layout = sm100_utils.make_smem_layout_a(mma_qk, tiler, bf16, n_k)
         sV_layout = sm100_utils.make_smem_layout_a(mma_pv, tiler, bf16, n_v)
         o_atom = tcgen05.make_smem_layout_atom(tcgen05.mma.SmemLayoutAtomKind.MN_SW128, Float32)
-        sO_layout = cute.tile_to_shape(o_atom, (D_TILES * TILE_M, n), order=(1, 0))
+        sO_layout = cute.tile_to_shape(o_atom, (self.d_tiles * TILE_M, n), order=(1, 0))
         sO_layout = cute.flat_divide(sO_layout, (TILE_M, n))
         load = cpasync.CopyBulkTensorTileG2SOp(one)
         vmnk = (1, 1, 1, 1)
@@ -1045,16 +1095,20 @@ def compile_decode(op: SwapABDecode):
     bf16, i32 = cutlass.BFloat16, cutlass.Int32
     return compile_tvm_ffi(
         op,
-        make_fake_compact_tensor(bf16, (b, h, HEAD_DIM)),
-        make_fake_compact_tensor(bf16, (b, s, hkv, HEAD_DIM)),
-        make_fake_compact_tensor(bf16, (b, s, hkv, HEAD_DIM)),
-        make_fake_compact_tensor(Float32, (ns, b, h, HEAD_DIM)),
+        make_fake_compact_tensor(bf16, (b, h, op.head_dim)),
+        make_fake_compact_tensor(bf16, (b, s, hkv, op.head_dim)),
+        make_fake_compact_tensor(bf16, (b, s, hkv, op.head_dim_v)),
+        make_fake_compact_tensor(Float32, (ns, b, h, op.head_dim_v)),
         make_fake_compact_tensor(Float32, (ns, b, h), assumed_align=4),
         make_fake_compact_tensor(i32, (b,), assumed_align=4),
         make_fake_compact_tensor(i32, (b,), assumed_align=4),
         Float32(1.0),
         name=op.get_name(),
     )
+
+
+def _frozen_roles(roles):
+    return None if roles is None else tuple(sorted(roles.items()))
 
 
 def tile_hq_for(num_heads: int, num_heads_kv: int) -> int:
@@ -1072,18 +1126,27 @@ def decode_partials(
     splits_per_seq: torch.Tensor | None = None,
     softmax_scale: float | None = None,
     kv_stages: tuple[int, int] | None = None,
+    **config,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Split partials ``(O (splits, b, 1, h, d) fp32, LSE (splits, b, h, 1) fp32)`` in FA4's
-    combine layout. ``q`` is ``(b, 1, h, 128)``; ``k``, ``v`` are ``(b, s, h_kv, 128)``, all bf16,
-    contiguous. ``splits_per_seq`` (int32 ``(b,)``, each <= ``num_splits``) gives per-sequence
-    split counts; partials of splits past a sequence's count are left unwritten. Splits without
-    KV blocks write O = 0 and LSE = -inf."""
+    """Split partials ``(O (splits, b, 1, h, d_v) fp32, LSE (splits, b, h, 1) fp32)`` in FA4's
+    combine layout. ``q`` is ``(b, 1, h, d)``; ``k`` is ``(b, s, h_kv, d)`` and ``v``
+    ``(b, s, h_kv, d_v)``, all bf16, contiguous. ``splits_per_seq`` (int32 ``(b,)``, each
+    <= ``num_splits``) gives per-sequence split counts; partials of splits past a sequence's
+    count are left unwritten. Splits without KV blocks write O = 0 and LSE = -inf. ``config``:
+    ``SwapABDecode``'s keyword options (``tile_n``, ``tile_k``, ``s_stages``, ``p_stages``,
+    ``roles``); ``head_dim``/``head_dim_v`` follow the tensors."""
     if any(t.dtype != torch.bfloat16 for t in (q, k, v)):
         raise TypeError("decode_partials expects bfloat16 q, k, v")
-    if q.ndim != 4 or q.shape[1] != 1 or q.shape[-1] != HEAD_DIM or k.shape != v.shape:
-        raise ValueError(f"expected q (b, 1, h, {HEAD_DIM}) and k, v (b, s, h_kv, {HEAD_DIM})")
-    batch, _, heads, _ = q.shape
-    heads_kv = k.shape[2]
+    if (
+        q.ndim != 4
+        or q.shape[1] != 1
+        or k.ndim != 4
+        or k.shape[:3] != v.shape[:3]
+        or k.shape[-1] != q.shape[-1]
+    ):
+        raise ValueError("expected q (b, 1, h, d), k (b, s, h_kv, d) and v (b, s, h_kv, d_v)")
+    batch, _, heads, head_dim = q.shape
+    heads_kv, head_dim_v = k.shape[2], v.shape[-1]
     if k.shape[0] != batch or heads % heads_kv or heads // heads_kv > 32:
         raise ValueError("heads must be a multiple of kv heads, at most 32 per kv head")
     if any(not t.is_contiguous() for t in (q, k, v)):
@@ -1095,13 +1158,17 @@ def decode_partials(
         seqused_k = torch.full((batch,), k.shape[1], dtype=torch.int32, device=dev)
     per_sequence = splits_per_seq is not None
     table = splits_per_seq if per_sequence else seqused_k  # unread without per_sequence
-    o_partial = torch.empty(num_splits, batch, 1, heads, HEAD_DIM, device=dev, dtype=torch.float32)
+    o_partial = torch.empty(
+        num_splits, batch, 1, heads, head_dim_v, device=dev, dtype=torch.float32
+    )
     lse_partial = torch.empty(num_splits, batch, heads, 1, device=dev, dtype=torch.float32)
-    key = (tile_hq_for(heads, heads_kv), kv_stages, per_sequence)
+    options = dict(config, head_dim=head_dim, head_dim_v=head_dim_v)
+    frozen = {k: _frozen_roles(v) if k == "roles" else v for k, v in options.items()}
+    key = (tile_hq_for(heads, heads_kv), kv_stages, per_sequence, *sorted(frozen.items()))
     op = _OPS.get(key)
     if op is None:
-        op = _OPS[key] = SwapABDecode(key[0], kv_stages, per_sequence)
-    scale = softmax_scale if softmax_scale is not None else HEAD_DIM**-0.5
+        op = _OPS[key] = SwapABDecode(key[0], kv_stages, per_sequence, **options)
+    scale = softmax_scale if softmax_scale is not None else head_dim**-0.5
     compile_decode.by_static_key(key, lambda: compile_decode(op))(
         q[:, 0],
         k,
@@ -1125,9 +1192,11 @@ def fa4_decode(
     splits_per_seq: torch.Tensor | None = None,
     softmax_scale: float | None = None,
     kv_stages: tuple[int, int] | None = None,
+    **config,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Single-token attention: ``(out (b, 1, h, 128) bf16, lse (b, h, 1) fp32)``. The split
-    partials (``decode_partials``) are combined by FA4's combine kernel."""
+    """Single-token attention: ``(out (b, 1, h, d_v) bf16, lse (b, h, 1) fp32)``. The split
+    partials (``decode_partials``, which documents ``config``) are combined by FA4's combine
+    kernel."""
     from flash_attn.cute.interface import _flash_attn_fwd_combine
 
     o_partial, lse_partial = decode_partials(
@@ -1139,8 +1208,9 @@ def fa4_decode(
         splits_per_seq=splits_per_seq,
         softmax_scale=softmax_scale,
         kv_stages=kv_stages,
+        **config,
     )
-    out = torch.empty_like(q)
+    out = torch.empty(*q.shape[:3], v.shape[-1], device=q.device, dtype=q.dtype)
     lse = torch.empty(q.shape[0], q.shape[2], 1, device=q.device, dtype=torch.float32)
     _flash_attn_fwd_combine(
         o_partial,
