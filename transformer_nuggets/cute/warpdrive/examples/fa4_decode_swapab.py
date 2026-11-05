@@ -908,8 +908,8 @@ class SwapABDecode(WarpSpecialized):
             with stats_ready.consume():
                 cute.autovec_copy(params.sRowMax, tLrL)
 
-            # Then the last two O slots (slot (n-2) % 2 is unwritten, and reads as zero, in a
-            # one-block split).
+            # Then the last two O slots. A one-block split skips slot (n-2) % 2, whose register
+            # tile stays zero.
             if n_blocks > 0:
                 for ph in cutlass.range_constexpr(O_STAGES):
                     if n_blocks % O_STAGES == ph:

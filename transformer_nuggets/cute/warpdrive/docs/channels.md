@@ -236,8 +236,9 @@ Nonalias regions occupy declaration-order intervals of `cols * slots` columns; a
 inside their parent in each slot. Allocations round up to a power of two from 32 to 512
 columns. Capacity, duplicate names and alias bounds are checked. Every role using TMEM must
 take `tmem: Tmem`, including raw roles, so it participates in teardown. Without any annotated users, no TMEM allocation is made.
-Single-CTA allocation happens in `begin_roles()` from the first declared TMEM-using role;
-clusters allocate after the cluster sync in `run_roles()` as described in
+Single-CTA allocation happens in `begin_roles()` from the lowest warp other than warp 0
+among the TMEM roles (warp 0 when it is the only one), so it overlaps warp 0's barrier
+initialization; that warp also frees. Clusters allocate after the cluster sync in `run_roles()` as described in
 [work and exit](clusters.md#work-and-exit). All declared users join an unaligned teardown
 barrier before the allocator frees TMEM.
 
