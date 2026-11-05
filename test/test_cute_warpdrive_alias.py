@@ -114,7 +114,7 @@ class QkBeforePv(FlashAttentionForward):
     def get_name(self) -> str:
         return f"{super().get_name()}_qk_before_pv{int(self.opt_out)}"
 
-    @role(config=lambda kernel: kernel.roles.mma)
+    @role(warps=12, regs=48, cta="leader")
     @cute.jit
     def mma(
         self,
@@ -259,7 +259,7 @@ class PersistentOverlapOQ(FlashAttentionForward):
     def get_key(self) -> str:
         return self.get_name()
 
-    @role(config=lambda kernel: kernel.roles.load)
+    @role(warps=14, regs=48)
     @cute.jit
     def load(
         self, params: Fa4Params, *, q: Producer, kv: Producer, q_free: Consumer, work: WorkCursor
@@ -274,7 +274,7 @@ class PersistentOverlapOQ(FlashAttentionForward):
             work.advance()
         return q, kv, q_free, work
 
-    @role(config=lambda kernel: kernel.roles.epilogue)
+    @role(warps=13, regs=48)
     @cute.jit
     def epilogue(self, params: Fa4Params, *, epi: Consumer, q_free: Producer, work: WorkCursor):
         rank = self.cluster.rank()

@@ -43,7 +43,8 @@ the leader's barrier) and keeps stats/epi/turnstile CTA-local.
 """
 
 import math
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import cutlass
@@ -88,12 +89,10 @@ from transformer_nuggets.cute.warpdrive import (
     role,
 )
 
-M_BLOCK = 128
-N_BLOCK = 128
-HEAD_DIM = 128
-Q_STAGE = 2
-TILE_BYTES = M_BLOCK * HEAD_DIM * 2  # one bf16 128x128 Q, K, or V tile
-RESCALE_THRESHOLD = 8.0  # FA4 bf16: skip rescaling O unless the row max grew by > 2^8
+M_BLOCK = 128  # Q rows per CTA MMA tile: one softmax thread per row
+Q_STAGE = 2  # Q tiles per work item, one softmax warpgroup each
+TILE_NS = (64, 128)  # keys per K/V tile; TMEM holds Q_STAGE x (tile_n + head_dim) columns
+HEAD_DIMS = (64, 128)
 LOG2_E = math.log2(math.e)
 LN2 = math.log(2.0)
 
@@ -135,25 +134,10 @@ def umma(tiled_mma, acc, a, b, accumulate, ks=None):
         cute.gemm(atom, acc, a[None, None, k], b[None, None, k], acc)
 
 
-SPLIT_P = 3  # FA4 split_P_arrive: S/P/O is released after 3 of the 4 P stores (96 of 128 keys)
-
-
-@dataclass(frozen=True)
-class Fa4Roles:
-    """Role placement and register budgets for this example's two-Q-stage schedule.
-
-    Use dataclasses.replace to choose another register tuning bucket. Changing warp placement
-    also requires compatible tensor partitions; the kernel's math still assumes four-warps
-    for softmax/correction and one warp for load/MMA/epilogue.
-    """
-
-    softmax: RoleConfig = field(
-        default_factory=lambda: RoleConfig((range(4), range(4, 8)), regs=192)
-    )
-    correction: RoleConfig = field(default_factory=lambda: RoleConfig(range(8, 12), regs=80))
-    mma: RoleConfig = field(default_factory=lambda: RoleConfig(12, regs=48, cta="leader"))
-    epilogue: RoleConfig = field(default_factory=lambda: RoleConfig(13, regs=48))
-    load: RoleConfig = field(default_factory=lambda: RoleConfig(14, regs=48))
+# FA4 split_P_arrive: S/P/O is released after 3/4 of the P stores (3 of 4 at tile_n 128: 96 of 128
+# keys; 1 of 2 at tile_n 64). The MMA issues the K blocks those stores cover before waiting for
+# the rest, so both sides derive their split from the same store count (``split_p_stores``).
+SPLIT_P = 3
 
 
 class FlashAttentionForward(WarpSpecialized):
@@ -165,14 +149,32 @@ class FlashAttentionForward(WarpSpecialized):
         schedule=None,
         cluster=None,
         split_p: bool = False,
-        roles: Fa4Roles | None = None,
+        roles: Mapping[str, RoleConfig] | None = None,
         mapping: WorkMap | None = None,
         overlap_o_q: bool = False,
         use_ldred_rowmax: bool = False,
+        tile_n: int = 128,
+        head_dim: int = 128,
+        rescale_threshold: float = 8.0,
     ):
         if use_ldred_rowmax and not BaseDSL._get_dsl().get_arch_enum().is_family_of(Arch.sm_103f):
             raise ValueError("use_ldred_rowmax requires an SM103-family target")
-        self.roles = roles if roles is not None else Fa4Roles()
+        if tile_n not in TILE_NS:
+            raise ValueError(f"tile_n must be one of {TILE_NS}, got {tile_n}")
+        if head_dim not in HEAD_DIMS:
+            raise ValueError(f"head_dim must be one of {HEAD_DIMS}, got {head_dim}")
+        if not rescale_threshold >= 0.0:
+            raise ValueError(
+                f"rescale_threshold must be >= 0 (log2 units), got {rescale_threshold}"
+            )
+        self.tile_n, self.head_dim = tile_n, head_dim
+        self.p_stores = tile_n // 32  # 16-column tcgen05.st of bf16 pairs per P tile
+        self.split_p_stores = self.p_stores * SPLIT_P // 4
+        # FA4 bf16: skip rescaling O unless the row max grew by more than 2**rescale_threshold.
+        self.rescale_threshold = float(rescale_threshold)
+        # Placement and register budgets by role name, over the @role defaults (FA4's 192/80/48
+        # split). The math still assumes four warps for softmax and correction, one for the rest.
+        self.roles = roles
         self.cluster = cluster or SingleCta()
         if self.cluster.size != self.cluster.pair_size:
             raise ValueError(f"the FA4 example runs on one CTA or a CTA pair, got {self.cluster}")
@@ -197,10 +199,9 @@ class FlashAttentionForward(WarpSpecialized):
         v_buf = self.smem_plan.buffer("V", bf16, align=1024, overlaps=k_buf)  # K/V share stages
         if overlap_o_q:  # FA4's overlap_sO_sQ: O reuses Q's bytes once the item's QKs are done
             self.smem_plan.buffer("O", bf16, align=1024, overlaps=q_buf)
-        self.q = Slots(Q_STAGE, Tma(TILE_BYTES), Umma, producer_role="load", buffer=q_buf)
-        self.kv = Ring(
-            self.kv_stages, Tma(TILE_BYTES // cs), Umma, buffer={"K": k_buf, "V": v_buf}
-        )
+        q_bytes, kv_bytes = M_BLOCK * head_dim * 2, tile_n * head_dim * 2  # bf16 tiles
+        self.q = Slots(Q_STAGE, Tma(q_bytes), Umma, producer_role="load", buffer=q_buf)
+        self.kv = Ring(self.kv_stages, Tma(kv_bytes // cs), Umma, buffer={"K": k_buf, "V": v_buf})
         self.s = Slots(
             Q_STAGE,
             Umma,
@@ -220,9 +221,9 @@ class FlashAttentionForward(WarpSpecialized):
         self.mufu = Turnstile(enabled=turnstile)
         self.tmem_plan = (
             TmemPlan()
-            .region("S", N_BLOCK, Q_STAGE)
-            .region("O", HEAD_DIM, Q_STAGE)
-            .alias("P", of="S", offset=N_BLOCK // 2, cols=N_BLOCK // 2)
+            .region("S", tile_n, Q_STAGE)
+            .region("O", head_dim, Q_STAGE)
+            .alias("P", of="S", offset=tile_n // 2, cols=tile_n // 2)
         )
         # Work items: (256-row Q block, head, batch); all Q blocks of a head run back to back so
         # its K/V stays in L2.
@@ -234,6 +235,8 @@ class FlashAttentionForward(WarpSpecialized):
         ts = ("_ts" if self.mufu.enabled else "") + ("_splitp" if self.split_p else "")
         ts += "_oq" if self.overlap_o_q else ""
         ts += "_ldred" if self.use_ldred_rowmax else ""
+        if (self.tile_n, self.head_dim) != (128, 128):
+            ts += f"_n{self.tile_n}_d{self.head_dim}"
         return (
             f"warpdrive_fa4_fwd_{self.cluster.get_key()}_kv{self.kv_stages}{ts}_"
             f"{self.work.get_key()}{self.iket_key()}{self.trace_key()}"
@@ -241,7 +244,7 @@ class FlashAttentionForward(WarpSpecialized):
 
     # ------------------------------------------------------------------ roles
 
-    @role(config=lambda kernel: kernel.roles.load)
+    @role(warps=14, regs=48)
     @cute.jit
     def load(self, params: Fa4Params, *, q: Producer, kv: Producer, work: WorkCursor):
         rank = self.cluster.rank()  # this CTA's rows of Q, keys of K, head dims of V
@@ -259,14 +262,18 @@ class FlashAttentionForward(WarpSpecialized):
         mma_m = M_BLOCK * self.cluster.size
         m_blk, head, batch = item
         gQ = cute.local_tile(
-            params.mQ[None, None, head, batch], (Q_STAGE * mma_m, HEAD_DIM), (m_blk, 0)
+            params.mQ[None, None, head, batch], (Q_STAGE * mma_m, self.head_dim), (m_blk, 0)
         )
         gQ = layout_utils.select(cute.flat_divide(gQ, (mma_m,)), mode=[0, 2, 1])
         load_q, _, _ = copy_utils.tma_get_copy_fn(
             params.tma_q, 0, cute.make_layout(1), thr_qk.partition_A(gQ), params.sQ
         )
-        gK = cute.local_tile(params.mK[None, None, head, batch], (N_BLOCK, HEAD_DIM), (None, 0))
-        gV = cute.local_tile(params.mV[None, None, head, batch], (HEAD_DIM, N_BLOCK), (0, None))
+        gK = cute.local_tile(
+            params.mK[None, None, head, batch], (self.tile_n, self.head_dim), (None, 0)
+        )
+        gV = cute.local_tile(
+            params.mV[None, None, head, batch], (self.head_dim, self.tile_n), (0, None)
+        )
         tKsK, tKgK = cpasync.tma_partition(
             params.tma_k,
             0,
@@ -318,7 +325,7 @@ class FlashAttentionForward(WarpSpecialized):
                 )
         return q, kv
 
-    @role(config=lambda kernel: kernel.roles.mma)
+    @role(warps=12, regs=48, cta="leader")
     @cute.jit
     def mma(
         self,
@@ -432,8 +439,8 @@ class FlashAttentionForward(WarpSpecialized):
             umma(params.mma_pv, tO, tOrP, tOrV, accumulate)
             return p_last
         n = cute.size(tOrP.shape[2])
-        first = n * SPLIT_P // 4
-        p_cols = N_BLOCK // 2  # P packs two bf16 per 32-bit column; K block k reads n-th of them
+        first = n * self.split_p_stores // self.p_stores  # K blocks the early P stores cover
+        p_cols = self.tile_n // 2  # P packs two bf16 per 32-bit column; K block k reads n-th
         tmem.access("P", j, read=True, by="umma", cols=range(p_cols * first // n))
         umma(params.mma_pv, tO, tOrP, tOrV, accumulate, range(first))
         with p_last.consume(j):  # release = commit: this PV has read the last quarter
@@ -441,7 +448,7 @@ class FlashAttentionForward(WarpSpecialized):
             umma(params.mma_pv, tO, tOrP, tOrV, True, range(first, n))
         return p_last
 
-    @role(config=lambda kernel: kernel.roles.softmax)
+    @role(warps=(range(4), range(4, 8)), regs=192)
     @cute.jit
     def softmax(
         self,
@@ -460,10 +467,12 @@ class FlashAttentionForward(WarpSpecialized):
         tSAcc = cute.make_tensor(tmem.ptr("S", stage), params.s_layout)[(None, None), 0, 0]
         tStP = cute.make_tensor(
             tmem.ptr("P", stage),
-            cute.composition(tSAcc.layout, cute.make_layout((M_BLOCK, N_BLOCK // 2))),
+            cute.composition(tSAcc.layout, cute.make_layout((M_BLOCK, self.tile_n // 2))),
         )
         mma_m = M_BLOCK * self.cluster.size
-        tScS = thr_qk.partition_C(cute.make_identity_tensor((mma_m, N_BLOCK)))[(None, None), 0, 0]
+        tScS = thr_qk.partition_C(cute.make_identity_tensor((mma_m, self.tile_n)))[
+            (None, None), 0, 0
+        ]
         ld_op = (
             tcgen05.copy.LdRed32x32bOp(tcgen05.copy.Repetition(32))
             if self.use_ldred_rowmax
@@ -483,10 +492,12 @@ class FlashAttentionForward(WarpSpecialized):
             tStS=thr_ld.partition_S(tSAcc),
             tStP=thr_st.partition_D(tStP),
             rS_shape=thr_ld.partition_D(tScS).shape,
-            rP_shape=thr_st.partition_S(cute.make_identity_tensor((M_BLOCK, N_BLOCK // 2))).shape,
+            rP_shape=thr_st.partition_S(
+                cute.make_identity_tensor((M_BLOCK, self.tile_n // 2))
+            ).shape,
         )
         while work.valid:
-            sm = SoftmaxSm100.create(params.scale_log2, rescale_threshold=RESCALE_THRESHOLD)
+            sm = SoftmaxSm100.create(params.scale_log2, rescale_threshold=self.rescale_threshold)
             sm.reset()
             s, p_last, stats, mufu = self.softmax_step(stage, s, p_last, stats, mufu, sm, t, True)
             for _ in cutlass.range(params.n_blocks - 1, unroll=1):
@@ -527,8 +538,8 @@ class FlashAttentionForward(WarpSpecialized):
         with mufu.turn():
             sm.apply_exp2_convert(rS, rP)
         n_st = cute.size(t.tStP.shape[2])
-        split = n_st * SPLIT_P // 4 if self.split_p else n_st
-        p_cols = N_BLOCK // 2  # P's 32-bit columns (two bf16 each); store i writes n_st-th of them
+        split = self.split_p_stores if self.split_p else n_st
+        p_cols = self.tile_n // 2  # P's 32-bit columns (two bf16 each); store i writes n_st-th
         t.tmem.access("P", stage, write=True, cols=range(p_cols * split // n_st))
         for i in range(split):  # plain Python: no preprocessor here
             cute.copy(t.thr_st, rP32[None, None, i], t.tStP[None, None, i])
@@ -541,7 +552,7 @@ class FlashAttentionForward(WarpSpecialized):
         sm.update_row_sum(rS.load(), acc_scale, is_first)
         return s, p_last, stats, mufu
 
-    @role(config=lambda kernel: kernel.roles.correction)
+    @role(warps=range(8, 12), regs=80)
     @cute.jit
     def correction(
         self,
@@ -594,7 +605,7 @@ class FlashAttentionForward(WarpSpecialized):
         """O_j *= scale for this thread's row, 16 columns at a time (FA4 correction_rescale)."""
         cols = 16
         mma_m = M_BLOCK * self.cluster.size
-        tOcO = thr_pv.partition_C(cute.make_identity_tensor((mma_m, HEAD_DIM)))
+        tOcO = thr_pv.partition_C(cute.make_identity_tensor((mma_m, self.head_dim)))
         ld = cute.make_copy_atom(tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(cols)), Float32)
         st = cute.make_copy_atom(tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(cols)), Float32)
         tO_i = cute.composition(tO, cute.make_layout((M_BLOCK, cols)))
@@ -604,7 +615,7 @@ class FlashAttentionForward(WarpSpecialized):
         tOtO_t2r = thr_ld.partition_S(tO_i)
         tOtO_r2t = thr_st.partition_D(tO_i)
         r_shape = thr_ld.partition_D(tOcO_i).shape
-        for i in cutlass.range_constexpr(HEAD_DIM // cols):
+        for i in cutlass.range_constexpr(self.head_dim // cols):
             r = cute.make_rmem_tensor(r_shape, Float32)
             cute.copy(thr_ld, cute.make_tensor(tOtO_t2r.iterator + i * cols, tOtO_t2r.layout), r)
             for e in cutlass.range(0, cute.size(r), 2, unroll_full=True):
@@ -618,12 +629,12 @@ class FlashAttentionForward(WarpSpecialized):
         cs = self.cluster.size
         # sO is per-CTA sized: partition it with slice 0 of the MMA (FA4 does the same).
         tOsO = mma_pv.get_slice(0).partition_C(sO)
-        tOcO = thr_pv.partition_C(cute.make_identity_tensor((M_BLOCK * cs, HEAD_DIM)))
+        tOcO = thr_pv.partition_C(cute.make_identity_tensor((M_BLOCK * cs, self.head_dim)))
         tO_i = cute.logical_divide(tO, cute.make_layout((M_BLOCK, cols)))
         tOcO_i = cute.logical_divide(tOcO, cute.make_layout((M_BLOCK, cols)))
         tOsO_i = cute.logical_divide(tOsO, cute.make_layout((M_BLOCK, cols)))
         ld_atom = sm100_utils.get_tmem_load_op(
-            (M_BLOCK * cs, HEAD_DIM, N_BLOCK),
+            (M_BLOCK * cs, self.head_dim, self.tile_n),
             LayoutEnum.ROW_MAJOR,
             cutlass.BFloat16,
             Float32,
@@ -639,14 +650,14 @@ class FlashAttentionForward(WarpSpecialized):
         tOtO_t2r = thr_ld.partition_S(tO_i[(None, None), None])
         tOsO_r2s = copy_utils.partition_D_position_independent(thr_ld, tOsO_i[(None, None), None])
         tOcO_t2r = thr_ld.partition_D(tOcO_i[(None, None), None])
-        for i in cutlass.range_constexpr(HEAD_DIM // cols):
+        for i in cutlass.range_constexpr(self.head_dim // cols):
             r = cute.make_rmem_tensor(tOcO_t2r[None, 0, 0, i].shape, Float32)
             cute.copy(tiled_ld, tOtO_t2r[None, 0, 0, i], r)
             for e in cutlass.range(0, cute.size(r), 2, unroll_full=True):
                 r[e], r[e + 1] = cute.arch.mul_packed_f32x2((r[e], r[e + 1]), (scale, scale))
             copy_utils.cvt_copy(tiled_st, r, tOsO_r2s[None, 0, 0, i])
 
-    @role(config=lambda kernel: kernel.roles.epilogue)
+    @role(warps=13, regs=48)
     @cute.jit
     def epilogue(self, params: Fa4Params, *, epi: Consumer, work: WorkCursor):
         rank = self.cluster.rank()
@@ -661,7 +672,7 @@ class FlashAttentionForward(WarpSpecialized):
         mma_m = M_BLOCK * self.cluster.size
         m_blk, head, batch = item
         gO = cute.local_tile(
-            params.mO[None, None, head, batch], (Q_STAGE * mma_m, HEAD_DIM), (m_blk, 0)
+            params.mO[None, None, head, batch], (Q_STAGE * mma_m, self.head_dim), (m_blk, 0)
         )
         gO = layout_utils.select(cute.flat_divide(gO, (mma_m,)), mode=[0, 2, 1])
         if cutlass.const_expr(self.cluster.size > 1):  # this CTA's 128 rows of each tile
@@ -729,9 +740,11 @@ class FlashAttentionForward(WarpSpecialized):
             sO=sO,
             p_layout=p_layout,
             scale_log2=scale_log2,
-            s_layout=thr_qk.make_fragment_C(thr_qk.partition_shape_C((mma_m, N_BLOCK))).layout,
-            o_layout=thr_pv.make_fragment_C(thr_pv.partition_shape_C((mma_m, HEAD_DIM))).layout,
-            n_blocks=mK.shape[0] // N_BLOCK,
+            s_layout=thr_qk.make_fragment_C(thr_qk.partition_shape_C((mma_m, self.tile_n))).layout,
+            o_layout=thr_pv.make_fragment_C(
+                thr_pv.partition_shape_C((mma_m, self.head_dim))
+            ).layout,
+            n_blocks=mK.shape[0] // self.tile_n,
             seqlen_q=mQ.shape[0],
         )
         self.run_roles(params)
@@ -761,7 +774,7 @@ class FlashAttentionForward(WarpSpecialized):
         major = cute.nvgpu.OperandMajorMode
         group, mma_m = self.cluster.cta_group, M_BLOCK * self.cluster.size
         mma_qk = sm100_utils.make_trivial_tiled_mma(
-            bf16, bf16, major.K, major.K, Float32, group, (mma_m, N_BLOCK)
+            bf16, bf16, major.K, major.K, Float32, group, (mma_m, self.tile_n)
         )
         mma_pv = sm100_utils.make_trivial_tiled_mma(
             bf16,
@@ -770,16 +783,19 @@ class FlashAttentionForward(WarpSpecialized):
             major.MN,
             Float32,
             group,
-            (mma_m, HEAD_DIM),
+            (mma_m, self.head_dim),
             tcgen05.OperandSource.TMEM,
         )
-        tiler_qk, tiler_pv = (mma_m, N_BLOCK, HEAD_DIM), (mma_m, HEAD_DIM, N_BLOCK)
+        tiler_qk, tiler_pv = (
+            (mma_m, self.tile_n, self.head_dim),
+            (mma_m, self.head_dim, self.tile_n),
+        )
         sQ_layout = sm100_utils.make_smem_layout_a(mma_qk, tiler_qk, bf16, Q_STAGE)
         sK_layout = sm100_utils.make_smem_layout_b(mma_qk, tiler_qk, bf16, self.kv_stages)
         p_layout = sm100_utils.make_smem_layout_a(mma_pv, tiler_pv, bf16, Q_STAGE)
         sV_layout = sm100_utils.make_smem_layout_b(mma_pv, tiler_pv, bf16, self.kv_stages)
         sO_layout = sm100_utils.make_smem_layout_epi(
-            bf16, LayoutEnum.ROW_MAJOR, (M_BLOCK, HEAD_DIM), Q_STAGE
+            bf16, LayoutEnum.ROW_MAJOR, (M_BLOCK, self.head_dim), Q_STAGE
         )
         load_op = cpasync.CopyBulkTensorTileG2SOp(group)
         vmnk = self.cluster.layout_vmnk().shape
@@ -796,7 +812,7 @@ class FlashAttentionForward(WarpSpecialized):
             cpasync.CopyBulkTensorTileS2GOp(),
             mO,
             cute.select(sO_layout, mode=[0, 1]),
-            (M_BLOCK, HEAD_DIM),
+            (M_BLOCK, self.head_dim),
         )
         m_blocks = cute.ceil_div(mQ.shape[0], Q_STAGE * mma_m)
         bound = self.work.bind((m_blocks, mQ.shape[2], mQ.shape[3]), workspace, max_ctas)
@@ -828,10 +844,10 @@ def compile_fa4_fwd(op: FlashAttentionForward):
     """Compile once with dynamic batch, heads, and sequence lengths. Cached in memory and on
     disk under ``op.__cute_cache_key__()``."""
     b, h = cute.sym_int(), cute.sym_int()
-    sq, sk = cute.sym_int(), cute.sym_int(divisibility=N_BLOCK)
+    sq, sk = cute.sym_int(), cute.sym_int(divisibility=op.tile_n)
     bf16 = cutlass.BFloat16
-    qo = (b, sq, h, HEAD_DIM)
-    kv = (b, sk, h, HEAD_DIM)
+    qo = (b, sq, h, op.head_dim)
+    kv = (b, sk, h, op.head_dim)
     return compile_tvm_ffi(
         op,
         make_fake_compact_tensor(bf16, qo),
@@ -858,11 +874,14 @@ def fa4_fwd(
     max_ctas: int | None = None,
     cluster=None,
     split_p: bool = False,
-    roles: Fa4Roles | None = None,
+    roles: Mapping[str, RoleConfig] | None = None,
     mapping: WorkMap | None = None,
     use_ldred_rowmax: bool = False,
+    tile_n: int = 128,
+    rescale_threshold: float = 8.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Attention forward for ``(batch, seqlen, heads, 128)`` bf16 tensors; returns (O, LSE).
+    """Attention forward for ``(batch, seqlen, heads, head_dim)`` bf16 tensors, head_dim 64 or
+    128; returns (O, LSE).
 
     ``LSE`` is ``(batch, heads, seqlen_q)`` fp32 (natural log), as in FA4. ``schedule``: work
     scheduling (default ``OneShot()``; ``StaticPersistent()``, ``AtomicPersistent()``,
@@ -871,24 +890,43 @@ def fa4_fwd(
     runs FA4's default 2-CTA schedule (512-row work items, 6 KV stages by default).
     ``mapping``: the order of the ``(query block, head, batch)`` items (default
     ``Raster(along="m")``; e.g. ``Raster(reverse="m")`` or ``Fa4Mapping(...)``).
+    ``roles``: placement and register budgets by role name (``{"softmax": RoleConfig(...)}``)
+    over the kernel's defaults. ``tile_n``: keys per K/V tile (64 or 128; ``seqlen_k`` must be
+    a multiple). ``rescale_threshold``: FA4's lazy-rescale threshold in log2 units.
     ``use_ldred_rowmax`` (SM103-family targets) reduces unmasked score tiles' maxima during the
     TMEM load instead of in registers. Both paths keep the same rescale threshold and softmax
     arithmetic.
     """
     if any(t.dtype != torch.bfloat16 for t in (q, k, v)):
         raise TypeError("fa4_fwd expects bfloat16 q, k, v")
-    if q.ndim != 4 or q.shape[-1] != HEAD_DIM or k.shape != v.shape:
-        raise ValueError(f"expected (b, s, h, {HEAD_DIM}) tensors with k.shape == v.shape")
-    if k.shape[0] != q.shape[0] or k.shape[2] != q.shape[2]:
-        raise ValueError("q and k/v must share batch and head counts (no GQA)")
-    if k.shape[1] == 0 or k.shape[1] % N_BLOCK:
-        raise ValueError(f"seqlen_k must be a positive multiple of {N_BLOCK} (no key masking)")
+    if q.ndim != 4 or q.shape[-1] not in HEAD_DIMS or k.shape != v.shape:
+        raise ValueError(
+            f"expected (b, s, h, d) tensors with d in {HEAD_DIMS} and k.shape == v.shape"
+        )
+    if k.shape[0] != q.shape[0] or k.shape[2] != q.shape[2] or k.shape[3] != q.shape[3]:
+        raise ValueError("q and k/v must share batch, head counts and head_dim (no GQA)")
+    if k.shape[1] == 0 or k.shape[1] % tile_n:
+        raise ValueError(f"seqlen_k must be a positive multiple of {tile_n} (no key masking)")
     if any(not t.is_contiguous() or t.data_ptr() % 16 for t in (q, k, v)):
         raise ValueError("q, k, v must be contiguous and 16-byte aligned")
-    scale = softmax_scale if softmax_scale is not None else HEAD_DIM**-0.5
+    head_dim = q.shape[-1]
+    scale = softmax_scale if softmax_scale is not None else head_dim**-0.5
     out = torch.empty_like(q)
     lse = torch.empty(q.shape[0], q.shape[2], q.shape[1], device=q.device, dtype=torch.float32)
-    key = (kv_stages, turnstile, schedule, cluster, split_p, roles, mapping, use_ldred_rowmax)
+    roles_key = None if roles is None else tuple(sorted(roles.items()))
+    key = (
+        kv_stages,
+        turnstile,
+        schedule,
+        cluster,
+        split_p,
+        roles_key,
+        mapping,
+        use_ldred_rowmax,
+        tile_n,
+        head_dim,
+        rescale_threshold,
+    )
     op = _OPS.get(key)
     if op is None:
         op = _OPS[key] = FlashAttentionForward(
@@ -900,6 +938,9 @@ def fa4_fwd(
             roles=roles,
             mapping=mapping,
             use_ldred_rowmax=use_ldred_rowmax,
+            tile_n=tile_n,
+            head_dim=head_dim,
+            rescale_threshold=rescale_threshold,
         )
     fn = compile_fa4_fwd.by_static_key(key, lambda: compile_fa4_fwd(op))
     workspace, sms = op.work.launch_args(q.device)
