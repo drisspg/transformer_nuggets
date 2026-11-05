@@ -323,7 +323,9 @@ This is a 2x2 cluster of pairs whose leaders fill their pair and multicast along
 stage holds half a tile from each leader, so it releases both leaders (each leader's empty
 barrier waits for 4 x 32 consumer threads), but only rank 0 arms it. The TMA check counts a
 filling CTA's copies for every CTA it fills: 8192 bytes per stage here, reported as 4096 per
-CTA.
+CTA. It can't see which CTA each byte lands in, so a stage whose copies take fewer distinct
+`Cluster.fill` masks than the CTAs it fills (two copies into the same CTA, say) is reported
+`unverified` rather than `verified`.
 
 Fills are for CTAs that can't issue their own loads, not a speedup. A persistent GEMM whose
 pair leaders load the A/B ring for both CTAs (`LeaderLoadGemm` in

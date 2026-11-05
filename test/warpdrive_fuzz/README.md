@@ -62,7 +62,10 @@ Current gaps to consider when extending a kernel or the generator:
 - The generated MMA data path is single-CTA; example tests cover two-CTA MMA data.
 - Round-robin/named channels and IKET captures are not generated. IKET compile/run is covered.
 - Multicast generation does not combine both modes in one channel. Manual signals, overrides
-  and unclosed handles skip multicast because the local-only manual protocol is invalid there.
+  and unclosed handles skip multicast and `fills` because the local-only manual protocol is
+  invalid there. `Tma(fills=...)` channels copy the same tile into every CTA they fill (a
+  misdirected copy changes no value), and only pair fills are multicast. The scope model
+  restates the documented TMA rule, including the signal-unit superset of releases.
 - Concurrent launches deliberately sharing a workspace are outside the supported contract.
 - A missing async wait can escape a value oracle when the operation happens to complete first.
   In particular, replacing only the UMMA consumer's release with a plain arrival was not

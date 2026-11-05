@@ -56,8 +56,8 @@ inside a compiled entry point.
 | E38 | Pair turnstile seats have different placements | ProtocolError |
 | E39 | Cluster has TMEM users but none runs in every CTA | ProtocolError |
 | E40 | User pair-scoped channel has a layer-owned payload | ProtocolError |
-| E41 | Ordinary leader-only TMA producer feeds other CTAs | ProtocolError |
-| E42 | Other cross-CTA TMA shapes: producers not in every CTA, or consumers not exactly the pair leaders | ProtocolError |
+| E41 | TMA consumer CTA whose stage no copy fills (a leader or rank0 producer feeding other CTAs without `fills`) | ProtocolError |
+| E42 | Other cross-CTA TMA shapes: a copy lands in a CTA with no waiting consumer (with pairs: whose leader has none), a multicast copy lands in a CTA without a producer and without `fills`, or barriers would complete uneven byte counts | ProtocolError |
 | E43 | Tma used as a consumer, including on a local channel | ValueError (constructor) |
 | E44 | tx/mask override not a nonnegative Python int | ProtocolError |
 | E45 | tx override on a channel without derived TMA bytes | ProtocolError |
@@ -139,9 +139,9 @@ inside a compiled entry point.
 | E121 | Named round-robin instances sharing stage barriers without an enabled `turnstile` over exactly them; an acquire/wait on that side outside its turn | ProtocolError / kernel.py, channels.py (trace) |
 | E122 | `alias.named_barrier(id, ...)` using a layer or named-channel ID | ProtocolError / kernel.py (trace) |
 | E123 | `commit(wait=True)` on an mbarrier channel or with `signal=False`; mbarrier pointer accessors on a named channel | ProtocolError / channels.py |
-| E124 | `Cluster` with a non-positive-int extent, non-bool `pair`, odd `m` with pairs, or more than 8 CTAs; `Tma.multicast` naming anything but "m"/"n" | ValueError / cluster.py, channels.py |
-| E125 | Multicast TMA channel with a `rank0` participant | ProtocolError / cluster.py |
-| E126 | Recognized multicast TMA copy into a channel whose `Tma` declares no multicast, or whose mask (from `Cluster.multicast`) has an undeclared mode | ProtocolError (trace time) / tma.py |
+| E124 | `Cluster` with a non-positive-int extent, non-bool `pair`, odd `m` with pairs, or more than 8 CTAs; `Tma.multicast` naming anything but "m"/"n"; `Tma.fills` other than None/"pair"/"cluster" | ValueError / cluster.py, channels.py |
+| E125 | `Tma(fills="pair")` without MMA pairs or with a producer not exactly on the pair leaders; `fills="cluster"` with a producer not exactly on rank 0 | ProtocolError / cluster.py |
+| E126 | Recognized multicast TMA copy into a channel whose `Tma` declares no multicast, or whose mask (from `Cluster.multicast`/`Cluster.fill`) has an undeclared mode; a `Cluster.fill` mask into a channel without `fills` | ProtocolError (trace time) / tma.py |
 
 ## Runtime labels
 
