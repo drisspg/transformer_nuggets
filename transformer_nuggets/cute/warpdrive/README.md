@@ -123,7 +123,7 @@ budgets, every channel's per-CTA arrival counts, masks and TMA bytes, the schedu
 - [Roles](docs/roles.md): placement, params, returned state and register budgets.
 - [Scheduling](docs/scheduling.md): launch setup, custom work lists and CUTLASS/FA4 mappings.
 - [Channels](docs/channels.md): rings, slots, round-robin instances, named barriers,
-  overlapping handles, TMEM and turnstiles.
+  overlapping handles, try tokens, previews, TMEM and turnstiles.
 - [Storage](docs/storage.md): stage views and checking declared aliases.
 - [Clusters](docs/clusters.md): two-CTA MMA, larger clusters, TMA multicast and cross-CTA
   handoffs.

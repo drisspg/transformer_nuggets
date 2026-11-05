@@ -283,6 +283,80 @@ Return the updated endpoint at role exit, not the handles.
 acquire whose stage will never be consumed. It is rejected on automatically tailed pair channels.
 Post-close payload or pointer use is still your responsibility; the checker is not an ownership system.
 
+## Try tokens
+
+```python
+token = kv.try_wait()  # probe; no handle, no advance
+...  # independent work
+h = kv.wait(token=token)  # waits only if the probe failed; advances once
+
+token = out.try_acquire()
+h = out.acquire(token=token)  # a Tma producer arms the stage here, once, either way
+```
+
+`try_wait()` and `try_acquire()` probe the barrier the end's next `wait()`/`acquire()` takes
+(the full or the empty barrier) with one `mbarrier.try_wait.parity`. They return a `Token`
+whose `ready` is the probe's dynamic result. Passing it back as `token=` makes the wait
+conditional on that result; everything else, including the handle, is unchanged. Slots take
+the slot on both calls. Without `token=` the generated code is exactly the blocking wait.
+
+The probe is a single `try_wait`, which the hardware may suspend for a system-dependent
+time: it is not a latency bound and not a nonblocking poll. A token records readiness only.
+It carries no stage index and can't release, commit or arm anything, and an unused token is
+harmless.
+
+A token names one end, side and epoch, not just a parity. While tracing, `wait`/`acquire`
+raise `ProtocolError` when the token:
+
+- is not a `Token` from this end's own probe (a value built by hand, another channel's end,
+  or the other side of the channel);
+- names another slot;
+- is stale: an acquire/wait on the end (on that slot, for `Slots`) or an `end.state`
+  assignment happened since the probe, which covers reuse of the token and an epoch n stages
+  later with the same stage and parity;
+- was probed in another dynamic region (loop or branch). The trace sees a loop body once,
+  so a token taken before a loop could be consumed by the first iteration and then reused as
+  stale. Probe in the region that consumes the token, as FA4 does inside an unrolled K-step
+  loop. Tokens can't be carried across loop iterations.
+
+Named-barrier channels have no probe: waiting on a named barrier (`bar.sync`) is itself an
+arrival, so `try_wait`, `try_acquire` and `token=` raise there. The checks don't establish
+that probing pays off. On the decode example it measured neutral to slower
+([examples](examples.md#single-token-decode)).
+
+## Previews
+
+```python
+preview = q.peek()  # wait for the epoch the next q.wait() takes; do not advance
+issue_s(preview.view("Q", read=True, by="umma"))
+...
+h = q.wait()  # the same epoch: this handle owns it, and its release covers the preview
+...
+h.release()
+```
+
+`peek()` (consumer ends) blocks until the stage that the next `wait()` takes is full and
+returns a read-only `Preview`. It adds no arrival, opens no handle and doesn't advance the
+end. `preview.view(name, *coords, by=...)` and `preview.access(name, by=...)` work like a
+handle's, as reads: `write=True` and `commit`/`release`/`retire` raise `ProtocolError`.
+`preview.index`/`phase` are the stage and parity it waited on. The FA4 backward uses one for
+S_{t+1}'s read of Q_{t+1}, while Q_t's handle stays open for dK_t.
+
+The next `wait()` on the end (same slot for `Slots`) after the peek, in trace order, owns the
+previewed epoch. The alias diagnostic records the preview's accesses under that handle, so
+they are checked against its release (its mechanism and fences, as for the handle's own
+accesses). While tracing, it is an error to use a preview after that handle closed, in
+another dynamic region than the peek, or to leave a preview with no later wait in its role.
+A loop that previews the next iteration's epoch therefore peels its last iteration, as the
+backward does; the peeled wait owns the loop's final preview. CuTeDSL also refuses to carry
+a preview through a dynamic loop or branch that calls one of its methods.
+
+These checks are trace-local. They don't prove that the owning wait takes the previewed
+epoch at runtime (for example if raw code reassigns the end's state between them), that the
+preview's asynchronous reads complete before the owner's release, or that the producer ever
+fills the epoch. Previews are not general carried handles: a handle still closes in the
+region that opened it.
+
 ## Storage and fences
 
 The channel can just carry synchronization while you allocate and index the buffers yourself.

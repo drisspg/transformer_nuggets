@@ -7,9 +7,9 @@ layer emits nothing, so the generated code is unchanged. Range names are stable:
   cursor's start to its ``advance()``), else one range over the whole role. Role instances keep
   their suffix (``softmax[0]``). The CTA of a pair kernel is not in the name: IKET records the
   CTA of every range, and ``plan_from_warpdrive(kernel, cta=...)`` builds the plan of one CTA.
-* ``<channel>.acquire`` / ``<channel>.wait`` / ``<channel>.tail``: the blocking mbarrier wait of
-  a producer acquire, a consumer wait, and a producer tail, nested inside the role range, so
-  waiting is separated from working. ``<turnstile>.turn`` and ``<named barrier>.sync`` likewise.
+* ``<channel>.acquire`` / ``<channel>.wait`` / ``<channel>.peek`` / ``<channel>.tail``: the
+  blocking mbarrier wait of a producer acquire, a consumer wait or preview, and a producer
+  tail, nested inside the role range, so waiting is separated from working. ``<turnstile>.turn`` and ``<named barrier>.sync`` likewise.
 * user regions: ``with self.trace_region("name"):`` inside a role.
 
 ``pipeline_plan.plan_from_warpdrive`` exports the layer's structure in the profiler's neutral model

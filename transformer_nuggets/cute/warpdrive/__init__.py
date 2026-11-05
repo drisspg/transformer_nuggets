@@ -13,6 +13,9 @@ parameter annotated with its type, or to the role's single unannotated parameter
 annotation is a ``ProtocolError``.
 ``Ring(..., round_robin=True)`` lets the instances of one role take a side's epochs in turn;
 ``sync="named"`` builds a Threads-to-Threads channel from CTA named barriers (``channels.py``);
+``end.try_wait()``/``try_acquire()`` probe a stage once and ``wait``/``acquire(token=...)`` skip
+the blocking wait when it was ready; ``end.peek()`` returns a read-only ``Preview`` of the epoch
+the next ``wait()`` takes;
 ``NamedBarrier(threads=N)`` declares one named barrier whose ID the kernel allocates, for
 syncs inside a role or one-shot flags between roles (``named.py``).
 
@@ -77,7 +80,7 @@ Dropping down, per edge:
 
 Tracing: ``kernel.enable_iket()`` before compiling makes the layer emit IKET ranges named after
 the declarations: ``<role>`` per work item (or per role body), ``<channel>.acquire``/``.wait``/
-``.tail`` around blocking waits, ``<turnstile>.turn``, and ``with self.trace_region(name)`` user
+``.peek``/``.tail`` around blocking waits, ``<turnstile>.turn``, and ``with self.trace_region(name)`` user
 regions (``enable_iket(waits=False)``: role ranges only). Disabled, it emits nothing.
 ``plan_from_warpdrive(kernel, cta=0)`` exports the matching ``PipelinePlan``, so a ``run-iket``
 capture feeds ``load_iket_capture``, ``analyze_pipeline``, and ``write_pipeline_perfetto`` from
@@ -101,10 +104,12 @@ from transformer_nuggets.cute.warpdrive.channels import (
     Barriers,
     Channel,
     Handle,
+    Preview,
     Ring,
     Slots,
     Threads,
     Tma,
+    Token,
     Turnstile,
     Umma,
     Warps,
@@ -157,6 +162,7 @@ __all__ = [
     "NamedBarrier",
     "OneShot",
     "PdlWait",
+    "Preview",
     "Producer",
     "ProtocolError",
     "ProtocolLog",
@@ -173,6 +179,7 @@ __all__ = [
     "Threads",
     "Tma",
     "TmaMulticast",
+    "Token",
     "Tmem",
     "TmemPlan",
     "TmemView",

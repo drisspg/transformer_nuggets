@@ -230,7 +230,9 @@ class RoleTrace:
         opted_out = False
         if kind == "access":
             opted_out = self.opt_out("alias", f"{data['storage'][1]} access at {site}")
-        self.events.append(Event(kind, data, site, self.where(), tuple(self.open), opted_out))
+        ev = Event(kind, data, site, self.where(), tuple(self.open), opted_out)
+        self.events.append(ev)
+        return ev
 
     def opt_out(self, check: str, what: str) -> bool:
         """True (and recorded) when an ``unchecked(check)`` block is active here."""

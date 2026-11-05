@@ -46,6 +46,7 @@ from dataclasses import dataclass, field
 import cutlass
 from cutlass import Int32, cute
 from cutlass._mlir.dialects import nvvm as _nvvm
+from cutlass.cutlass_dsl import if_generate
 
 from transformer_nuggets.cute.warpdrive.cluster import (
     ALL,
@@ -404,7 +405,79 @@ class StageBuffer:
 AGENTS = ("threads", "tma", "umma")
 
 
-class Handle:
+class _Stage:
+    """One stage or slot of a channel as an end sees it: views of its buffers and the access
+    annotations recorded for the alias diagnostic. ``_slot`` and ``_owner()`` say which stage
+    and which handle record the annotations belong to."""
+
+    def view(
+        self,
+        name: str | None = None,
+        *coord,
+        read: bool = False,
+        write: bool = False,
+        by="threads",
+    ):
+        """Buffer ``name`` at this stage: the partition registered with ``end.views(name=...)``,
+        else the canonical view. ``name`` may be omitted (``None``) for a single buffer.
+        ``coord``: indices of the other modes, taken in the same slice as the stage
+        (``h.view("A", None, None, kb)`` is ``tCrA[None, None, kb, h.index]``). ``read``/
+        ``write`` with ``by`` ("threads", "tma", "umma") annotate the access for the alias
+        diagnostic."""
+        key, b = self._buffer(name)
+        part = self._end._views.get(key)
+        tensor, axis = (part.tensor, part.axis) if part is not None else (b.tensor, b.axis)
+        if read or write:
+            self._record_access(b, read, write, by)
+        else:
+            self._record_raw(b)
+        return project(tensor, axis, self.index, coord)
+
+    def access(
+        self, name: str | None = None, *, read: bool = False, write: bool = False, by="threads"
+    ):
+        """Annotate an access to buffer ``name`` at this stage made through a tensor obtained
+        elsewhere (for example a TMA copy function that selects the stage itself). No IR."""
+        if not (read or write):
+            raise ValueError("access() needs read=True and/or write=True")
+        _, b = self._buffer(name)
+        self._record_access(b, read, write, by)
+
+    def _buffer(self, name):
+        buffers, chan = self._end._buffers, self._end._chan
+        if name is None:
+            if len(buffers) != 1:
+                raise ProtocolError(
+                    f"channel {chan.name} has buffers {sorted(buffers)}; name the one to view"
+                )
+            name = next(iter(buffers))
+        if name not in buffers:
+            raise ProtocolError(
+                f"channel {chan.name} has no buffer {name!r} (have {sorted(buffers)})"
+            )
+        return name, buffers[name]
+
+    def _record_access(self, b: StageBuffer, read: bool, write: bool, by):
+        if by not in AGENTS:
+            raise ValueError(f"access agent must be one of {AGENTS}, got {by!r}")
+        if b.storage is None:
+            return None  # a layer payload is never aliased
+        return self._end._trace.event(
+            "access",
+            storage=("smem", b.storage),
+            slot=self._slot,
+            read=read,
+            write=write,
+            agent=by,
+            handle=self._owner(),
+        )
+
+    def _record_raw(self, b: StageBuffer):
+        if b.storage is not None:
+            self._end._trace.event("raw", storage=("smem", b.storage))
+
+
+class Handle(_Stage):
     """One acquired stage or slot. Close it exactly once, in the region that opened it.
 
     Raw state: ``index`` (stage or slot), ``phase`` (the parity this handle waited on),
@@ -481,71 +554,12 @@ class Handle:
         views = {k: project(b.tensor, b.axis, self.index) for k, b in buffers.items()}
         return next(iter(views.values())) if len(views) == 1 else views
 
-    def view(
-        self,
-        name: str | None = None,
-        *coord,
-        read: bool = False,
-        write: bool = False,
-        by="threads",
-    ):
-        """Buffer ``name`` at this stage: the partition registered with ``end.views(name=...)``,
-        else the canonical view. ``name`` may be omitted (``None``) for a single buffer.
-        ``coord``: indices of the other modes, taken in the same slice as the stage
-        (``h.view("A", None, None, kb)`` is ``tCrA[None, None, kb, h.index]``). ``read``/
-        ``write`` with ``by`` ("threads", "tma", "umma") annotate the access for the alias
-        diagnostic."""
-        key, b = self._buffer(name)
-        part = self._end._views.get(key)
-        tensor, axis = (part.tensor, part.axis) if part is not None else (b.tensor, b.axis)
-        if read or write:
-            self._record_access(b, read, write, by)
-        else:
-            self._record_raw(b)
-        return project(tensor, axis, self.index, coord)
+    @property
+    def _slot(self):
+        return self.rec.slot
 
-    def access(
-        self, name: str | None = None, *, read: bool = False, write: bool = False, by="threads"
-    ):
-        """Annotate an access to buffer ``name`` at this stage made through a tensor obtained
-        elsewhere (for example a TMA copy function that selects the stage itself). No IR."""
-        if not (read or write):
-            raise ValueError("access() needs read=True and/or write=True")
-        _, b = self._buffer(name)
-        self._record_access(b, read, write, by)
-
-    def _buffer(self, name):
-        buffers, chan = self._end._buffers, self._end._chan
-        if name is None:
-            if len(buffers) != 1:
-                raise ProtocolError(
-                    f"channel {chan.name} has buffers {sorted(buffers)}; name the one to view"
-                )
-            name = next(iter(buffers))
-        if name not in buffers:
-            raise ProtocolError(
-                f"channel {chan.name} has no buffer {name!r} (have {sorted(buffers)})"
-            )
-        return name, buffers[name]
-
-    def _record_access(self, b: StageBuffer, read: bool, write: bool, by):
-        if by not in AGENTS:
-            raise ValueError(f"access agent must be one of {AGENTS}, got {by!r}")
-        if b.storage is None:
-            return  # a layer payload is never aliased
-        self._end._trace.event(
-            "access",
-            storage=("smem", b.storage),
-            slot=self.rec.slot,
-            read=read,
-            write=write,
-            agent=by,
-            handle=self.rec,
-        )
-
-    def _record_raw(self, b: StageBuffer):
-        if b.storage is not None:
-            self._end._trace.event("raw", storage=("smem", b.storage))
+    def _owner(self):
+        return self.rec
 
     def commit(self, signal: bool = True, wait: bool = False):
         """Producer: publish the stage (signal full). ``signal=False``: the caller signals the
@@ -610,12 +624,131 @@ class Handle:
         return False
 
 
+class Preview(_Stage):
+    """A read-only, borrowed view of the epoch a consumer end's next ``wait()`` takes, returned
+    by ``end.peek()`` once that epoch is full. It owns nothing: it has no release, adds no
+    arrival and does not advance the end. The end's next ``wait()`` on the same stage or slot
+    (next in trace order) owns the epoch, and its release must cover the preview's accesses;
+    the alias diagnostic records them under that handle. Use it in the dynamic region of its
+    ``peek()`` and before that handle closes.
+
+    Raw state: ``index`` (stage or slot) and ``phase`` (the parity it waited on)."""
+
+    def __init__(self, end, index, phase, slot):
+        self._end = end
+        self.index = index
+        self.phase = phase
+        self._slot = slot if end._chan.fixed else None
+        self._key = slot  # the end's advance key: the slot, None for a ring
+        self._site = user_site()
+        self._block = current_block()
+        self._owner_rec = None  # the adopting wait's HandleRecord
+        self._events = []  # access events recorded before adoption
+
+    def describe(self) -> str:
+        label = "i" if self._key is None else self._key
+        return f"{self._end._chan.name}[{label}] peek"
+
+    def view(
+        self,
+        name: str | None = None,
+        *coord,
+        read: bool = True,
+        write: bool = False,
+        by="threads",
+    ):
+        """Buffer ``name`` at the previewed stage (as ``Handle.view``), always a read."""
+        if write or not read:
+            self._read_only("view(..., write=True)" if write else "view(..., read=False)")
+        return super().view(name, *coord, read=True, by=by)
+
+    def access(
+        self, name: str | None = None, *, read: bool = True, write: bool = False, by="threads"
+    ):
+        """Annotate a read of buffer ``name`` at the previewed stage (as ``Handle.access``)."""
+        if write or not read:
+            self._read_only("access(..., write=True)" if write else "access(..., read=False)")
+        super().access(name, read=True, by=by)
+
+    def commit(self, *args, **kwargs):
+        self._read_only("commit()")
+
+    def release(self, *args, **kwargs):
+        self._read_only("release()")
+
+    def retire(self, *args, **kwargs):
+        self._read_only("retire()")
+
+    def _read_only(self, op: str):
+        raise ProtocolError(
+            f"{self._end._trace.role_name}: {op} on {self.describe()} (taken at {self._site}) "
+            f"at {user_site()}: a preview is a read-only borrow; the end's next wait() owns, "
+            "and releases, this epoch"
+        )
+
+    def _owner(self):
+        return self._owner_rec
+
+    def _record_access(self, b: StageBuffer, read: bool, write: bool, by):
+        who, site = self._end._trace.role_name, user_site()
+        if current_block() != self._block:
+            raise ProtocolError(
+                f"{who}: {self.describe()} taken at {self._site} is used at {site} in a different "
+                "dynamic region (loop or branch); a region running more often would read an "
+                "epoch the preview never waited for. Use a preview where it was taken"
+            )
+        owner = self._owner_rec
+        if owner is not None and owner.closed_at is not None:
+            raise ProtocolError(
+                f"{who}: {self.describe()} taken at {self._site} is used at {site}, after its "
+                f"epoch was handed back ({owner.closed_op} at {owner.closed_at}): a stale preview"
+            )
+        ev = super()._record_access(b, read, write, by)
+        if ev is not None and owner is None:
+            self._events.append(ev)
+
+    def _adopt(self, rec: HandleRecord):
+        """The wait that owns this epoch: earlier access annotations move to its record."""
+        self._owner_rec = rec
+        for ev in self._events:
+            ev.data["handle"] = rec
+        self._events.clear()
+
+
+class Token:
+    """The result of one readiness probe (``end.try_wait()``/``try_acquire()``) of one epoch of
+    one end: ``ready`` is the probe's dynamic Boolean. Pass it back as ``token=`` to that end's
+    next ``wait()``/``acquire()``, which then skips its blocking wait when ``ready`` holds. A
+    token is readiness, not ownership: it cannot release, commit or index a stage. Only the end
+    that probed it can use it, for that epoch, in the same dynamic region, before any other
+    acquire/wait on the end (or slot) and before ``end.state`` is reassigned."""
+
+    def __init__(self, end, key, ready):
+        self.ready = ready
+        self._rec = end._rec
+        self._what = (
+            f"{end._chan.name} {'producer' if isinstance(end, ProducerEnd) else 'consumer'} "
+            f"end of {end._trace.role_name}"
+        )
+        self._key = key  # the slot, None for a ring
+        self._epoch = end._epoch(key)
+        self._block = current_block()
+        self._site = user_site()
+
+
 @dataclass
 class _EndRecord:
     """Trace-time record shared by loop-carried copies of one end: the fixed ``slots`` it used
-    (a tail drains only those)."""
+    (a tail drains only those), the acquires/waits traced per slot (``None`` for a ring) and
+    reassignments of ``end.state`` (together a token's epoch), the tokens it minted and the
+    previews no wait has adopted yet."""
 
     slots: set = field(default_factory=set)
+    advances: dict = field(default_factory=dict)
+    resets: int = 0
+    tokens: list = field(default_factory=list)
+    previews: list = field(default_factory=list)
+    checked: bool = False  # the role-exit check of unadopted previews is registered
 
 
 class _End:
@@ -799,6 +932,7 @@ class _End:
     @state.setter
     def state(self, value):
         self._state = value
+        self._rec.resets += 1  # outstanding tokens no longer name the end's epoch
 
     @property
     def index(self):
@@ -886,13 +1020,28 @@ class _End:
 
     def _next(self, slot, op):
         """(index, phase, label) of the next use, advancing this end's state."""
+        index, phase, label = self._current(slot, op)
+        if self._chan.fixed:
+            self._state = self._state ^ (1 << slot)
+            self._rec.slots.add(slot)
+        else:
+            self._state.advance(self._stride)
+        self._rec.advances[slot] = self._rec.advances.get(slot, 0) + 1
+        return index, phase, label
+
+    def _current(self, slot, op):
+        """(index, phase, label) of the next use, without advancing."""
+        self._check_slot(slot, op)
+        if not self._chan.fixed:
+            return self._state.index, self._state.phase, "i"
+        return slot, (self._state >> slot) & 1, slot
+
+    def _check_slot(self, slot, op):
         chan, who = self._chan, self._trace.role_name
         if not chan.fixed:
             if slot is not None:
                 raise ProtocolError(f"{who}: ring {chan.name}.{op}() takes no slot")
-            index, phase = self._state.index, self._state.phase
-            self._state.advance(self._stride)
-            return index, phase, "i"
+            return
         if not isinstance(slot, int):
             raise ProtocolError(
                 f"{who}: {chan.name}.{op}(slot) needs a Python int slot (use "
@@ -905,15 +1054,79 @@ class _End:
                 f"{who}: this {chan.name} end is bound to slot {self._bound}, but {op}({slot}) "
                 f"was called at {user_site()}"
             )
-        phase = (self._state >> slot) & 1
-        self._state = self._state ^ (1 << slot)
-        self._rec.slots.add(slot)
-        return slot, phase, slot
+
+    def _epoch(self, key):
+        """Trace-time identity of the epoch the end's next use of ``key`` (a slot, None for a
+        ring) takes, within one dynamic region."""
+        return self._rec.resets, self._rec.advances.get(key, 0)
+
+    def _probeable(self, op: str):
+        if self._chan.named:
+            raise ProtocolError(
+                f"{self._trace.role_name}: {self._chan.name}.{op}() at {user_site()}: a "
+                "named-barrier channel cannot be probed or previewed; waiting on a named "
+                "barrier (bar.sync) is an arrival that joins the handoff"
+            )
+
+    def _probe(self, slot, op: str, bar) -> Token:
+        """One ``mbarrier.try_wait.parity`` on ``bar(index)`` for the end's next use."""
+        self._probeable(op)
+        index, phase, label = self._current(slot, op)
+        self._trace.record(self._chan.name, op, label)
+        token = Token(self, slot, cute.arch.mbarrier_try_wait(bar(index), phase))
+        self._rec.tokens.append(token)
+        return token
+
+    def _take_token(self, token, slot, op: str):
+        """Check that ``token`` is this end's probe of the epoch ``op`` is about to take."""
+        chan, who, site = self._chan, self._trace.role_name, user_site()
+        probe = "try_acquire" if isinstance(self, ProducerEnd) else "try_wait"
+        where = f"{who}: {chan.name}.{op}(token=...) at {site}"
+        if chan.named:
+            raise ProtocolError(f"{where}: a named-barrier channel has no tokens")
+        if not isinstance(token, Token):
+            raise ProtocolError(
+                f"{where} takes the Token returned by {chan.name}.{probe}(), got "
+                f"{type(token).__name__}"
+            )
+        if token._rec is not self._rec:
+            raise ProtocolError(
+                f"{where} got a token of the {token._what} (probed at {token._site}); a token "
+                "serves only the end that probed it"
+            )
+        if not any(t is token for t in self._rec.tokens):
+            raise ProtocolError(f"{where}: this token was not returned by {chan.name}.{probe}()")
+        self._check_slot(slot, op)
+        if token._key != slot:
+            raise ProtocolError(
+                f"{where}: the token probed slot {token._key} (at {token._site}), not {slot}"
+            )
+        if token._epoch != self._epoch(slot):
+            raise ProtocolError(
+                f"{where}: stale token probed at {token._site}; an acquire/wait on this end (or "
+                "a reassigned end.state) since the probe moved it to another epoch"
+            )
+        if token._block != current_block():
+            raise ProtocolError(
+                f"{where}: the token probed at {token._site} is used in a different dynamic "
+                "region (loop or branch), where it may not name the epoch this wait takes; "
+                "probe in the region that consumes it"
+            )
 
 
 class ProducerEnd(_End):
-    def acquire(self, slot=None) -> Handle:
-        """Wait until the stage is empty; returns a handle to commit or retire."""
+    def try_acquire(self, slot=None) -> Token:
+        """Probe once whether the stage the next ``acquire`` takes is empty, without advancing
+        or arming. The probe (``mbarrier.try_wait``) may suspend the thread for a
+        hardware-dependent time: it is one probe, not a latency bound."""
+        return self._probe(slot, "try_acquire", self._empty)
+
+    def acquire(self, slot=None, *, token=None) -> Handle:
+        """Wait until the stage is empty; returns a handle to commit or retire. ``token``: this
+        end's ``try_acquire()`` of the same stage; the wait runs only if that probe failed. A
+        ``Tma`` producer arms the stage's bytes here either way, once."""
+        if token is not None:
+            self._take_token(token, slot, "acquire")
         index, phase, label = self._next(slot, "acquire")
         self._trace.record(self._chan.name, "acquire", label)
         if self._chan.named:
@@ -921,7 +1134,7 @@ class ProducerEnd(_End):
             self._named_wait(self._chan.named_ids[1], index, "acquire")
             return Handle(self, index, phase, label, True)
         with wait_range(self._trace, f"{self._chan.name}.acquire"):
-            cute.arch.mbarrier_wait(self._empty(index), phase)
+            _wait(self._empty(index), phase, token)
         if isinstance(self._chan.producer, Tma):
             self._arm(self._full(index))
         return Handle(self, index, phase, label, True)
@@ -986,8 +1199,17 @@ class ProducerEnd(_End):
 
 
 class ConsumerEnd(_End):
-    def wait(self, slot=None) -> Handle:
-        """Wait until the stage is full; returns a handle to release."""
+    def try_wait(self, slot=None) -> Token:
+        """Probe once whether the stage the next ``wait`` takes is full, without advancing. The
+        probe (``mbarrier.try_wait``) may suspend the thread for a hardware-dependent time: it
+        is one probe, not a latency bound."""
+        return self._probe(slot, "try_wait", self._full)
+
+    def wait(self, slot=None, *, token=None) -> Handle:
+        """Wait until the stage is full; returns a handle to release. ``token``: this end's
+        ``try_wait()`` of the same stage; the wait runs only if that probe failed."""
+        if token is not None:
+            self._take_token(token, slot, "wait")
         index, phase, label = self._next(slot, "wait")
         self._trace.record(self._chan.name, "wait", label)
         if self._chan.named:
@@ -995,10 +1217,44 @@ class ConsumerEnd(_End):
             self._named_wait(self._chan.named_ids[0], index, "wait")
             return Handle(self, index, phase, label, False)
         with wait_range(self._trace, f"{self._chan.name}.wait"):
-            cute.arch.mbarrier_wait(self._full(index), phase)
-        return Handle(self, index, phase, label, False)
+            _wait(self._full(index), phase, token)
+        handle = Handle(self, index, phase, label, False)
+        if self._rec.previews:
+            self._adopt(slot, handle.rec)
+        return handle
 
     consume = wait
+
+    def peek(self, slot=None) -> Preview:
+        """Wait until the stage the next ``wait`` takes is full and return a read-only
+        ``Preview`` of it, without advancing, arriving or opening a handle."""
+        self._probeable("peek")
+        index, phase, label = self._current(slot, "peek")
+        self._trace.record(self._chan.name, "peek", label)
+        with wait_range(self._trace, f"{self._chan.name}.peek"):
+            cute.arch.mbarrier_wait(self._full(index), phase)
+        preview = Preview(self, index, phase, slot)
+        self._rec.previews.append(preview)
+        if not self._rec.checked:
+            self._rec.checked = True
+            self._trace.checks.append(self._check_previews)
+        return preview
+
+    def _adopt(self, slot, rec: HandleRecord):
+        """The wait taking ``slot``'s next epoch owns the previews of that epoch."""
+        for preview in [p for p in self._rec.previews if p._key == slot]:
+            preview._adopt(rec)
+            self._rec.previews.remove(preview)
+
+    def _check_previews(self):
+        if self._rec.previews:
+            items = "; ".join(f"{p.describe()} at {p._site}" for p in self._rec.previews)
+            raise ProtocolError(
+                f"{self._trace.role_name}: previews no later wait consumes: {items}. A "
+                "wait() on the end, after the peek in trace order, must own and release the "
+                "previewed epoch (peel a loop's last iteration when the peek reads the next "
+                "iteration's epoch)"
+            )
 
     def _signal(self, index):
         chan = self._chan
@@ -1007,6 +1263,14 @@ class ConsumerEnd(_End):
             self._named_arrive(chan.named_ids[1], index)
             return
         self._arrive(chan.consumer, self._empty(index), chan.release_fence, chan.scope.empty_mask)
+
+
+def _wait(bar, phase, token):
+    """Blocking parity wait on ``bar``; with a token, only if its probe failed."""
+    if token is None:
+        cute.arch.mbarrier_wait(bar, phase)
+    else:
+        if_generate(token.ready == 0, lambda: cute.arch.mbarrier_wait(bar, phase))
 
 
 def _named_sync(barrier_id, threads: int):
