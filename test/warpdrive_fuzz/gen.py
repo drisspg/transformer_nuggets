@@ -202,11 +202,6 @@ class ChannelSpec:
     def tma_bytes(self) -> int:
         return self.tma_rows * TMA_COLS * 4
 
-    def handle_keys(self, side: str, bound: bool) -> list[int]:
-        if self.kind == "ring":
-            return list(range(self.mult))
-        return [BOUND] if bound else list(range(self.n))
-
 
 @dataclass(frozen=True)
 class StreamSpec:
@@ -1467,7 +1462,7 @@ def _role_params(spec: KernelSpec, r: RoleSpec) -> list[str]:
     return params
 
 
-def _by_stage(values: tuple, r: RoleSpec) -> str:
+def _by_stage(values: tuple) -> str:
     if len(set(values)) == 1:
         return str(values[0])
     return f"{tuple(values)}[stage]"
@@ -1559,7 +1554,7 @@ def _emit_body(src: _Src, spec: KernelSpec, r: RoleSpec, extra: bool):
                 offs, _ = payload_offsets(spec, c)
                 src(
                     f"D.write_words({words(key, True)}, {e}, tid, {slot(key)}, "
-                    f"{_by_stage(offs[r.name], r)}, {c.salt})"
+                    f"{_by_stage(offs[r.name])}, {c.salt})"
                 )
             elif c.producer == "tma":
                 mcast = f", mcast_mask=ctx.mc_{ch}" if c.multicast else ""
@@ -1580,7 +1575,7 @@ def _emit_body(src: _Src, spec: KernelSpec, r: RoleSpec, extra: bool):
                     )
         else:
             offs = tuple(lay.cons[(ch, r.name, i)] for i in range(r.instances))
-            log = f"base + {_by_stage(offs, r)} + 2"
+            log = f"base + {_by_stage(offs)} + 2"
             if c.mma == "ab":
                 acc = _hvar(("macc", "p", 0))
                 src(f"for kb in cutlass.range_constexpr({mma.k // 16}):")
@@ -1767,13 +1762,13 @@ def _emit_role(src: _Src, spec: KernelSpec, r: RoleSpec):
     src(f"@role(warps={warps}{regs}{cta}{raw})")
     src("@cute.jit")
     src.block(f"def {r.name}({', '.join(_role_params(spec, r))}):")
-    first = _by_stage(r.warps, r)
+    first = _by_stage(r.warps)
     src(f"tid = Int32(cute.arch.thread_idx()[0]) - {first} * 32")
     src("lead = tid == 0")
     src("rank = self.cluster.rank()")
     src(f"base = D.cta_id() * {lay.per_cta}")
     codes = tuple(presence_code(spec, r.name, i) for i in range(r.instances))
-    src(f"D.mark_warp(ctx.clog, base + {lay.presence}, {_by_stage(codes, r)})")
+    src(f"D.mark_warp(ctx.clog, base + {lay.presence}, {_by_stage(codes)})")
     _emit_role_setup(src, spec, r)
     src("it = Int32(0)")
     counters = []
@@ -1784,7 +1779,7 @@ def _emit_role(src: _Src, spec: KernelSpec, r: RoleSpec):
                 src(f"k_{ch.name}_{side} = Int32(0)")
                 if side == "c":
                     src(f"err_{ch.name} = Int32(0)")
-    ordinal = _by_stage(tuple(lay.instance_ids[(r.name, i)] for i in range(r.instances)), r)
+    ordinal = _by_stage(tuple(lay.instance_ids[(r.name, i)] for i in range(r.instances)))
 
     def iteration():
         _emit_body(src, spec, r, extra=False)
@@ -1803,7 +1798,7 @@ def _emit_role(src: _Src, spec: KernelSpec, r: RoleSpec):
         iteration()
         src.end()
     elif r.raw:  # OneShot: this unit's one item, as a managed cursor would start
-        items = _by_stage(tuple(lay.role_items[(r.name, i)] for i in range(r.instances)), r)
+        items = _by_stage(tuple(lay.role_items[(r.name, i)] for i in range(r.instances)))
         base_r, spread, a, b, c = s.rounds
         src("valid, (m, n, l) = self.work.single_item()")
         src("rounds = Int32(0)")
@@ -1815,7 +1810,7 @@ def _emit_role(src: _Src, spec: KernelSpec, r: RoleSpec):
         iteration()
         src.end()
     else:
-        items = _by_stage(tuple(lay.role_items[(r.name, i)] for i in range(r.instances)), r)
+        items = _by_stage(tuple(lay.role_items[(r.name, i)] for i in range(r.instances)))
         base_r, spread, a, b, c = s.rounds
         src("nitems = Int32(0)")
         src.block("while work.valid:")
@@ -1834,11 +1829,11 @@ def _emit_role(src: _Src, spec: KernelSpec, r: RoleSpec):
         src.end()
         src(f"D.put(ctx.clog, base + {items}, nitems, lead)")
     _emit_body(src, spec, r, extra=True)
-    it_off = _by_stage(tuple(lay.role_it[(r.name, i)] for i in range(r.instances)), r)
+    it_off = _by_stage(tuple(lay.role_it[(r.name, i)] for i in range(r.instances)))
     src(f"D.put(ctx.clog, base + {it_off}, it, lead)")
     for ch, side in counters:
         table = lay.cons if side == "c" else lay.prod
-        off = _by_stage(tuple(table[(ch, r.name, i)] for i in range(r.instances)), r)
+        off = _by_stage(tuple(table[(ch, r.name, i)] for i in range(r.instances)))
         src(f"D.put(ctx.clog, base + {off}, k_{ch}_{side}, lead)")
         if side == "c":
             src(f"D.add(ctx.clog, base + {off} + 1, err_{ch})")
