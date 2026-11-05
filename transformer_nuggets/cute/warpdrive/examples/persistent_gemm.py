@@ -51,6 +51,7 @@ from transformer_nuggets.cute.jit_cache import jit_cache
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
     Consumer,
+    NamedBarrier,
     Producer,
     Raster,
     Ring,
@@ -75,7 +76,6 @@ from transformer_nuggets.cute.warpdrive.examples.gemm import check_gemm_args
 CTA_TILE_M, TILE_K = 128, 64  # per-CTA output rows and K step; tile N is a constructor argument
 EPI_TILE_NS = (16, 32, 64)  # TMA store box widths: 32 B to 128 B bf16 rows, up to the SW128 atom
 MAX_C_STAGES = 8  # cp.async.bulk.wait_group takes a small immediate; 8 x 8 KB boxes is plenty
-EPI_BARRIER_ID = 3  # named barrier for the 4 epilogue warps (layer owns 1 and 2)
 
 
 def default_tile_n(cluster) -> int:
@@ -176,6 +176,9 @@ class PersistentGemm(WarpSpecialized):
             ab_stages, Tma(stage_bytes, multicast=multicast), Umma, buffer={"A": a, "B": b}
         )
         self.acc = Ring(acc_stages, Umma, Threads)
+        # The 4 epilogue warps meet before warp 0 stores a staged subtile and before any warp
+        # rewrites it.
+        self.epi_sync = NamedBarrier(threads=128)
         self.tmem_plan = TmemPlan().region("acc", cta_tile[1], acc_stages)
         self.work = WorkStream(
             mapping=mapping or Raster(swizzle=8), schedule=schedule or StaticPersistent()
@@ -294,14 +297,15 @@ class PersistentGemm(WarpSpecialized):
                     tRS_rC.store(r2s.retile(tTR_rAcc).load().to(self.dtype))
                     cute.copy(r2s, tRS_rC, tRS_sC[None, None, None, buf])
                     cute.arch.fence_view_async_shared()  # st.shared -> TMA store
-                    cute.arch.barrier(barrier_id=EPI_BARRIER_ID, number_of_threads=128)
+                    # Every epilogue thread reaches both syncs convergently: the aligned form.
+                    self.epi_sync.sync(aligned=True)
                     if warp == 0:
                         cute.copy(params.tma_c, bSG_sC[None, buf], dst[None, i])
                         cute.arch.cp_async_bulk_commit_group()
                         # Buffer `buf` is rewritten c_stages subtiles later; keep at most
                         # c_stages - 1 stores still reading SMEM.
                         cute.arch.cp_async_bulk_wait_group(self.c_stages - 1, read=True)
-                    cute.arch.barrier(barrier_id=EPI_BARRIER_ID, number_of_threads=128)
+                    self.epi_sync.sync(aligned=True)
             if cutlass.const_expr(rotate):
                 first = (first + subtiles) % self.c_stages
             work.advance()

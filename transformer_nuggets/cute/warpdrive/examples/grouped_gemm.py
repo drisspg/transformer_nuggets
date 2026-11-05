@@ -40,6 +40,7 @@ from transformer_nuggets.cute.jit_cache import jit_cache
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
     Consumer,
+    NamedBarrier,
     Producer,
     Ring,
     RoleConfig,
@@ -61,7 +62,6 @@ from transformer_nuggets.cute.warpdrive import (
 from transformer_nuggets.cute.warpdrive.examples.gemm import _overlaps
 from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import (
     CTA_TILE_M,
-    EPI_BARRIER_ID,
     EPI_TILE_NS,
     MAX_C_STAGES,
     TILE_K,
@@ -252,6 +252,9 @@ class GroupedGemm(WarpSpecialized):
         self.smem_plan.buffer("C", self.dtype, align=128)
         self.ab = Ring(ab_stages, Tma(stage_bytes), Umma, buffer={"A": a, "B": b})
         self.acc = Ring(acc_stages, Umma, Threads)
+        # The 4 epilogue warps meet before warp 0 stores a staged subtile and before any warp
+        # rewrites it.
+        self.epi_sync = NamedBarrier(threads=128)
         self.tmem_plan = TmemPlan().region("acc", cta_tile[1], acc_stages)
         # Every tile costs the same and the decode numbers the real tiles back to back, so a
         # static schedule balances as well as a claimed one, without a scheduler warp or
@@ -399,14 +402,15 @@ class GroupedGemm(WarpSpecialized):
                     tTR_rC.store(tTR_rAcc.load().to(self.dtype))
                     cute.copy(r2s, tRS_rC, tRS_sC[None, None, None, buf])
                     cute.arch.fence_view_async_shared()  # st.shared -> TMA store
-                    cute.arch.barrier(barrier_id=EPI_BARRIER_ID, number_of_threads=128)
+                    # Every epilogue thread reaches both syncs convergently: the aligned form.
+                    self.epi_sync.sync(aligned=True)
                     if warp == 0:
                         cute.copy(params.tma_c, bSG_sC[None, buf], bSG_gC[None, 0, i])
                         cute.arch.cp_async_bulk_commit_group()
                         # Buffer `buf` is rewritten c_stages subtiles later; keep at most
                         # c_stages - 1 stores still reading SMEM.
                         cute.arch.cp_async_bulk_wait_group(self.c_stages - 1, read=True)
-                    cute.arch.barrier(barrier_id=EPI_BARRIER_ID, number_of_threads=128)
+                    self.epi_sync.sync(aligned=True)
             if cutlass.const_expr(rotate):
                 first = (first + subtiles) % self.c_stages
             work.advance()
