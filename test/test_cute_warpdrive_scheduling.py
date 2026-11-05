@@ -13,6 +13,7 @@ import cutlass
 from cuda.bindings import driver as cuda
 from cutlass import Int32, cute
 
+from transformer_nuggets.cute.jit_cache import jit_cache
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
     AtomicPersistent,
@@ -366,25 +367,20 @@ class ScheduleToy(WarpSpecialized):
         )
 
 
-_TOYS = {}
-
-
+@jit_cache
 def compile_toy(op: ScheduleToy):
-    key = op.get_name()
-    if key not in _TOYS:
-        i32 = cutlass.Int32
-        _TOYS[key] = compile_tvm_ffi(
-            op,
-            make_fake_compact_tensor(i32, (2, cute.sym_int(), ScheduleToy.MAX_ITEMS)),
-            make_fake_compact_tensor(i32, (2, cute.sym_int())),
-            make_fake_compact_tensor(i32, (cute.sym_int(),)),
-            Int32(1),
-            Int32(1),
-            Int32(1),
-            Int32(1),
-            name=key,
-        )
-    return _TOYS[key]
+    i32 = cutlass.Int32
+    return compile_tvm_ffi(
+        op,
+        make_fake_compact_tensor(i32, (2, cute.sym_int(), ScheduleToy.MAX_ITEMS)),
+        make_fake_compact_tensor(i32, (2, cute.sym_int())),
+        make_fake_compact_tensor(i32, (cute.sym_int(),)),
+        Int32(1),
+        Int32(1),
+        Int32(1),
+        Int32(1),
+        name=op.get_name(),
+    )
 
 
 def run_toy(op, ext, max_ctas, reps=1, items=None):
@@ -564,12 +560,10 @@ class CountToy(WarpSpecialized):
         self.kernel(count, bound).launch(**self.launch_config(bound), stream=stream)
 
 
+@jit_cache
 def compile_count_toy(op: CountToy):
-    key = op.get_name()
-    if key not in _TOYS:
-        count, ws = (make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),)) for _ in range(2))
-        _TOYS[key] = compile_tvm_ffi(op, count, ws, Int32(1), Int32(1), Int32(1), Int32(1))
-    return _TOYS[key]
+    count, ws = (make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),)) for _ in range(2))
+    return compile_tvm_ffi(op, count, ws, Int32(1), Int32(1), Int32(1), Int32(1))
 
 
 COUNT_CASES = {

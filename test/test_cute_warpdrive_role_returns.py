@@ -13,6 +13,7 @@ import cutlass
 from cuda.bindings import driver as cuda
 from cutlass import cute
 
+from transformer_nuggets.cute.jit_cache import jit_cache
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
     AtomicPersistent,
@@ -93,6 +94,7 @@ class ReturnedProducer(WarpSpecialized):
         self.kernel(out, n).launch(**self.launch_config(grid=(2, 1, 1)), stream=stream)
 
 
+@jit_cache
 def compile_producer(op):
     return compile_tvm_ffi(
         op,
@@ -160,6 +162,7 @@ class ReturnedCursor(WarpSpecialized):
         self.kernel(out, bound).launch(**self.launch_config(bound), stream=stream)
 
 
+@jit_cache
 def compile_cursor(op):
     return compile_tvm_ffi(
         op,
@@ -227,6 +230,7 @@ class ReturnedTurn(WarpSpecialized):
         self.kernel(log, n).launch(grid=(1, 1, 1), block=(self.num_threads, 1, 1), stream=stream)
 
 
+@jit_cache
 def compile_turn(op):
     return compile_tvm_ffi(
         op,
@@ -292,10 +296,12 @@ def test_reordered_state_drives_pair_producer_tail(requires_blackwell):
     torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
 
 
-def test_no_python_profiler_needed(requires_blackwell, monkeypatch):
+def test_no_python_profiler_needed(requires_blackwell, monkeypatch, traced_compiles):
     def forbidden(*args):
         pytest.fail("role dispatch must not inspect Python frames through setprofile")
 
+    compile_producer.cache_clear()  # trace even if another test compiled the same keys
+    compile_cursor.cache_clear()
     monkeypatch.setattr(sys, "setprofile", forbidden)
     compile_producer(ReturnedProducer())
     compile_cursor(ReturnedCursor(StaticPersistent()).enable_iket())

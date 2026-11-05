@@ -13,6 +13,7 @@ import cutlass
 from cuda.bindings import driver as cuda
 from cutlass import cute
 
+from transformer_nuggets.cute.jit_cache import jit_cache
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
     Consumer,
@@ -253,6 +254,7 @@ class PoolOverflowToy(FullPoolToy):
         pass
 
 
+@jit_cache
 def compile_toy(op):
     out = make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),), assumed_align=4)
     return compile_tvm_ffi(op, out, cutlass.Int32(1), name="warpdrive_toy")

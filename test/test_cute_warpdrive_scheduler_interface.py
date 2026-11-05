@@ -35,6 +35,7 @@ from test_cute_warpdrive_scheduling import (
     run_toy,
 )
 
+from transformer_nuggets.cute.jit_cache import jit_cache
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
     AtomicPersistent,
@@ -564,6 +565,18 @@ class RawItemToy(WarpSpecialized):
         self.kernel(hits, em, en, bound).launch(**cfg, stream=stream)
 
 
+@jit_cache
+def compile_raw_item_toy(op: RawItemToy):
+    return compile_tvm_ffi(
+        op,
+        make_fake_compact_tensor(cutlass.Int32, (2, cute.sym_int())),
+        Int32(1),
+        Int32(1),
+        Int32(1),
+        name=op.get_name(),
+    )
+
+
 @pytest.mark.parametrize(
     "mapping, mode, ext, cluster",
     [
@@ -587,14 +600,7 @@ def test_raw_role_single_item(requires_blackwell, mapping, mode, ext, cluster):
     em, en, el = ext
     total = max(em * en * el, 0)
     hits = torch.zeros(2, max(total, 1), dtype=torch.int32, device="cuda")
-    fn = compile_tvm_ffi(
-        op,
-        make_fake_compact_tensor(cutlass.Int32, (2, cute.sym_int())),
-        Int32(1),
-        Int32(1),
-        Int32(1),
-        name=op.get_name(),
-    )
+    fn = compile_raw_item_toy(op)
     fn(hits, em, en, el)
     torch.cuda.synchronize()
     hits = hits.cpu()[:, :total]
@@ -763,6 +769,19 @@ class PackedToy(WarpSpecialized):
         )
 
 
+@jit_cache
+def compile_packed_toy(op: PackedToy):
+    i32 = cutlass.Int32
+    return compile_tvm_ffi(
+        op,
+        make_fake_compact_tensor(i32, (cute.sym_int(), 3)),
+        *(make_fake_compact_tensor(i32, (cute.sym_int(),)) for _ in range(2)),
+        make_fake_compact_tensor(i32, (2, cute.sym_int())),
+        *(make_fake_compact_tensor(i32, (cute.sym_int(),)) for _ in range(2)),
+        *(Int32(1) for _ in range(5)),
+    )
+
+
 @pytest.mark.parametrize("cluster", [SingleCta(), CtaPair()], ids=["single", "pair"])
 @pytest.mark.parametrize("schedule", ["oneshot", "static", "atomic", "clc"])
 def test_device_built_list_under_pdl(requires_blackwell, schedule, cluster):
@@ -777,15 +796,7 @@ def test_device_built_list_under_pdl(requires_blackwell, schedule, cluster):
         "clc": ClusterLaunchControl(stages=2),
     }
     op = PackedToy(schedules[schedule], cluster)
-    i32 = cutlass.Int32
-    fn = compile_tvm_ffi(
-        op,
-        make_fake_compact_tensor(i32, (cute.sym_int(), 3)),
-        *(make_fake_compact_tensor(i32, (cute.sym_int(),)) for _ in range(2)),
-        make_fake_compact_tensor(i32, (2, cute.sym_int())),
-        *(make_fake_compact_tensor(i32, (cute.sym_int(),)) for _ in range(2)),
-        *(Int32(1) for _ in range(5)),
-    )
+    fn = compile_packed_toy(op)
     em, en, el = 7, 5, 3
     total = em * en * el
     capacity = total + 23
@@ -954,6 +965,17 @@ class SplitKToy(WarpSpecialized):
         )
 
 
+@jit_cache
+def compile_split_k_toy(op: SplitKToy):
+    i32 = cutlass.Int32
+    return compile_tvm_ffi(
+        op,
+        *(make_fake_compact_tensor(i32, (cute.sym_int(), cute.sym_int())) for _ in range(2)),
+        *(make_fake_compact_tensor(i32, (cute.sym_int(),)) for _ in range(2)),
+        *(Int32(1) for _ in range(6)),
+    )
+
+
 @pytest.mark.parametrize("cluster", [SingleCta(), CtaPair()], ids=["single", "pair"])
 @pytest.mark.parametrize("schedule", ["oneshot", "static", "atomic", "clc"])
 def test_split_k_partials_reduce_on_the_host(requires_blackwell, schedule, cluster):
@@ -967,13 +989,7 @@ def test_split_k_partials_reduce_on_the_host(requires_blackwell, schedule, clust
         "clc": ClusterLaunchControl(stages=2),
     }
     op = SplitKToy(schedules[schedule], cluster)
-    i32 = cutlass.Int32
-    fn = compile_tvm_ffi(
-        op,
-        *(make_fake_compact_tensor(i32, (cute.sym_int(), cute.sym_int())) for _ in range(2)),
-        *(make_fake_compact_tensor(i32, (cute.sym_int(),)) for _ in range(2)),
-        *(Int32(1) for _ in range(6)),
-    )
+    fn = compile_split_k_toy(op)
     ws, _ = op.work.launch_args("cuda")
     em, en, el = 5, 3, 2
     tiles = em * en * el

@@ -11,6 +11,7 @@ import cutlass
 from cuda.bindings import driver as cuda
 from cutlass import cute
 
+from transformer_nuggets.cute.jit_cache import jit_cache
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
     Barriers,
@@ -94,6 +95,7 @@ class KeywordRaw(WarpSpecialized):
         )
 
 
+@jit_cache
 def compile_copy(op):
     return compile_tvm_ffi(
         op,

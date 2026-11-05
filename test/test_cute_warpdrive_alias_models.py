@@ -12,6 +12,7 @@ pytest.importorskip("cutlass.cute")
 import cutlass
 from cutlass import cute
 
+from transformer_nuggets.cute.jit_cache import jit_cache
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
     Consumer,
@@ -31,12 +32,17 @@ from transformer_nuggets.cute.warpdrive import (
 )
 
 
+@jit_cache
+def compile_toy(op, name: str):
+    unused = make_fake_compact_tensor(cutlass.Int32, (1,), assumed_align=4)
+    return compile_tvm_ffi(op, unused, cutlass.Int32(1), name=name)
+
+
 def compile_quietly(op, name: str):
     """Compile ``op`` (entry point ``(unused, n)``), returning the alias warnings."""
-    unused = make_fake_compact_tensor(cutlass.Int32, (1,), assumed_align=4)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        fn = compile_tvm_ffi(op, unused, cutlass.Int32(1), name=name)
+        fn = compile_toy(op, name)
     return fn, [str(w.message) for w in caught if "alias diagnostic" in str(w.message)]
 
 

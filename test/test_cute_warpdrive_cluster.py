@@ -15,6 +15,7 @@ from cuda.bindings import driver as cuda
 from cutlass import cute
 from cutlass.cute.nvgpu import tcgen05
 
+from transformer_nuggets.cute.jit_cache import jit_cache
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
     AtomicPersistent,
@@ -127,6 +128,7 @@ class PairToy(WarpSpecialized):
         self.kernel(out, n).launch(**self.launch_config(grid=(2, 1, 1)), stream=stream)
 
 
+@jit_cache
 def compile_toy(op):
     out = make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),), assumed_align=4)
     return compile_tvm_ffi(op, out, cutlass.Int32(1), name=f"warpdrive_pair_toy_{op.mode}")
@@ -393,19 +395,22 @@ class PairStream(WarpSpecialized):
         self.kernel(out, n_tiles, bound).launch(**self.launch_config(bound), stream=stream)
 
 
+@jit_cache
+def compile_pair_stream(op: PairStream, name: str):
+    def fake():
+        return make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),), assumed_align=4)
+
+    i32 = cutlass.Int32(1)
+    return compile_tvm_ffi(op, fake(), i32, i32, fake(), i32, name=name)
+
+
 @pytest.mark.parametrize("schedule", ["oneshot", "static", "atomic", "clc"])
 def test_pair_stream_with_leader_only_users(requires_blackwell, schedule):
     """All stream users leader-only: the broadcast ring is CTA-local to the leader, and its
     TMA-like publication still completes (st.async to the leader itself)."""
     op = PairStream(SCHEDULES[schedule], "leader")
 
-    def fake():
-        return make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),), assumed_align=4)
-
-    i32 = cutlass.Int32(1)
-    fn = compile_tvm_ffi(
-        op, fake(), i32, i32, fake(), i32, name=f"warpdrive_pair_stream_{schedule}"
-    )
+    fn = compile_pair_stream(op, f"warpdrive_pair_stream_{schedule}")
     for m_tiles, n_tiles, cap in [(1, 1, 148), (7, 9, 4), (40, 30, 148)]:
         out = torch.zeros(m_tiles * n_tiles, device="cuda", dtype=torch.int32)
         ws, _ = op.work.launch_args("cuda")

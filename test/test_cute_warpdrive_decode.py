@@ -17,6 +17,7 @@ pytest.importorskip("cutlass.cute")
 import cutlass
 from cutlass import cute
 
+from transformer_nuggets.cute.jit_cache import jit_cache
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive.channels import ConsumerEnd
 from transformer_nuggets.cute.warpdrive import (
@@ -136,6 +137,7 @@ class RoundRobinToy(WarpSpecialized):
         )
 
 
+@jit_cache
 def compile_toy(op):
     out = make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(), 3), assumed_align=4)
     who = make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),), assumed_align=4)
