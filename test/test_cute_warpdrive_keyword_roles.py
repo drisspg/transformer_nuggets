@@ -105,12 +105,6 @@ def compile_copy(op):
     )
 
 
-@pytest.fixture
-def requires_blackwell():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("requires a Blackwell GPU")
-
-
 @pytest.mark.parametrize("n", [1, 7])
 def test_keyword_dependencies_and_params(requires_blackwell, n):
     out = torch.zeros(64, device="cuda", dtype=torch.int32)

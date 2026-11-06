@@ -28,14 +28,6 @@ from transformer_nuggets.cute.warpdrive.examples.grouped_gemm import (
 )
 
 
-@pytest.fixture
-def requires_blackwell() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("warpdrive examples require SM100-family tcgen05")
-
-
 def _offsets(sizes: list[int]) -> torch.Tensor:
     return torch.tensor(sizes, device="cuda", dtype=torch.int64).cumsum(0).to(torch.int32)
 

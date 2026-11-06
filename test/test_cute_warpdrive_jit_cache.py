@@ -31,12 +31,6 @@ from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import (
 
 
 @pytest.fixture
-def requires_blackwell() -> None:
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("requires an SM100-family GPU")
-
-
-@pytest.fixture
 def isolated_cache(tmp_path, monkeypatch):
     monkeypatch.setenv("TRANSFORMER_NUGGETS_CUTE_CACHE_DIR", str(tmp_path))
     monkeypatch.delenv("CUTE_DSL_NO_CACHE", raising=False)

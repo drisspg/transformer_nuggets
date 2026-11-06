@@ -43,12 +43,6 @@ from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import (
 )
 
 
-@pytest.fixture
-def requires_blackwell():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("requires a Blackwell GPU")
-
-
 class ReturnedProducer(WarpSpecialized):
     def __init__(self, mode="renamed"):
         self.mode = mode

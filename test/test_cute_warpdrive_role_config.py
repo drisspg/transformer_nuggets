@@ -226,12 +226,6 @@ def test_raw_role_config_and_key():
     assert Raw(True).num_threads == 32
 
 
-@pytest.fixture
-def requires_blackwell():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("requires a Blackwell GPU")
-
-
 def test_configured_handoffs_and_cache_isolation(requires_blackwell):
     compile_copy.cache_clear()
     configs = [

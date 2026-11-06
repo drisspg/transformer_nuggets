@@ -40,14 +40,6 @@ from transformer_nuggets.cute.warpdrive.examples.gemm import gemm
 from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import persistent_gemm
 
 
-@pytest.fixture
-def requires_blackwell() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("warpdrive examples require SM100-family tcgen05")
-
-
 # --------------------------------------------------------------------------- #
 # A two-role toy kernel: producer warp 0 -> consumer warp 1 over two fixed slots with a
 # layer-owned SMEM payload. ``mode`` injects protocol violations at trace time.

@@ -52,14 +52,6 @@ SCHEDULES = {
 PAIRS_2X2 = Cluster(2, 2, pair=True)
 
 
-@pytest.fixture
-def requires_blackwell() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("cluster tests require SM100-family tcgen05 and clusters")
-
-
 # --------------------------------------------------------------------------- #
 # Declarations and geometry
 # --------------------------------------------------------------------------- #

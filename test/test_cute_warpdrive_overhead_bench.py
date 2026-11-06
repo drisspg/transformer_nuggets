@@ -6,14 +6,6 @@ pytest.importorskip("cutlass.cute")
 from transformer_nuggets.cute.warpdrive.examples import bench_overhead as bench
 
 
-@pytest.fixture
-def requires_blackwell() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("warpdrive examples require SM100-family tcgen05")
-
-
 HANDOFF_CASES = [("pingpong", k, 2 if k == "round_robin" else 1) for k in bench.HANDOFF_KINDS]
 STREAM_CASES = [("stream", k, s) for k in bench.STREAM_KINDS for s in (1, 4)]
 

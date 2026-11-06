@@ -46,14 +46,6 @@ CLUSTERS = 2  # clusters launched per toy run
 PAIRS_2X2 = Cluster(2, 2, pair=True)
 
 
-@pytest.fixture
-def requires_blackwell() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("cluster tests require SM100-family TMA multicast and clusters")
-
-
 # --------------------------------------------------------------------------- #
 # Toy: ``load`` puts tile ``(i % tiles) * size + key(d)`` into CTA d's stage i, where ``key(d)``
 # is d, or the first CTA of d's multicast line (the CTAs of a line share their tile). With

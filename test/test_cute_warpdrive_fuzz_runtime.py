@@ -30,14 +30,6 @@ CASE_TIMEOUT = 120.0  # seconds per generated kernel: compile + 2 launches + che
 MUTANT_TIMEOUT = 30.0  # a mutant that hangs is detected; don't wait longer than this
 
 
-@pytest.fixture
-def requires_blackwell() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("warpdrive runtime fuzzing requires SM100-family tcgen05 and CLC")
-
-
 def _covering_seeds(pool: range, limit: int, **force) -> list[int]:
     """Greedy seeds covering the generator's knob classes, skipping the >65535-CTA grids (their
     host check is slow; the long campaign runs them)."""

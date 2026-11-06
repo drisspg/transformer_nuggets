@@ -53,14 +53,6 @@ SCHEDULES = {
 PAIR = CtaPair()
 
 
-@pytest.fixture
-def requires_blackwell() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("2-CTA tests require SM100-family tcgen05 and clusters")
-
-
 # --------------------------------------------------------------------------- #
 # Toy pair protocol: producers in both CTAs -> leader-only "MMA" role -> sinks in both CTAs.
 # ``ch``: Threads producers (one per slot, both CTAs) joined on the leader's full barrier; the

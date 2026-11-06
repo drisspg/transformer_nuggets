@@ -67,14 +67,6 @@ pytestmark = pytest.mark.filterwarnings(
 )
 
 
-@pytest.fixture
-def requires_blackwell() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("scheduling tests require SM100-family (CLC)")
-
-
 def fa4_tile_scheduler():
     return pytest.importorskip("flash_attn.cute.tile_scheduler")
 

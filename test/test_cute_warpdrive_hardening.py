@@ -45,14 +45,6 @@ TILE_ROWS = 64  # one 64x64 bf16 TMA tile per stage
 TILE_BYTES = TILE_ROWS * 64 * 2
 
 
-@pytest.fixture
-def requires_blackwell() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("warpdrive tests require SM100-family tcgen05 and clusters")
-
-
 def _raises_protocol(match: str, fn):
     with pytest.raises(Exception, match=match) as info:
         fn()
