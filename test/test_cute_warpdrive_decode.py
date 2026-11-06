@@ -505,6 +505,22 @@ def test_decode_role_overrides(requires_blackwell, decode):
     check_against_reference(decode, (2, 1500, 32, 1, 8, [300, 1500], [8, 3]), roles=roles)
 
 
+def test_decode_unaligned_roles(requires_blackwell, decode):
+    """Softmax on warps 2-5 and 6-9 and correction on 10-13, no budgets: their TMEM rows
+    follow the hardware warp quadrant, so the partials still match the reference."""
+    from transformer_nuggets.cute.warpdrive import RoleConfig
+
+    roles = {
+        "mma_qk": RoleConfig(0),
+        "mma_pv": RoleConfig(1),
+        "softmax": RoleConfig((range(2, 6), range(6, 10))),
+        "correction": RoleConfig(range(10, 14)),
+        "load": RoleConfig(14),
+        "q_store": RoleConfig(15),
+    }
+    check_against_reference(decode, (2, 1500, 32, 1, 8, [300, 1500], [8, 3]), roles=roles)
+
+
 def test_decode_combines_wider_v(requires_blackwell, decode):
     """head_dim_v=256 through fa4_decode: the wider partials go through FA4's combine."""
     pytest.importorskip("flash_attn.cute.interface")

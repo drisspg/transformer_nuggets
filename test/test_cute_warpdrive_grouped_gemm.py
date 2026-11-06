@@ -144,6 +144,17 @@ def test_grouped_gemm_configs(requires_blackwell, config):
     _check([1000, 24, 0, 129, 128, 1, 256, 300], 520, 136, **config)
 
 
+def test_grouped_gemm_unaligned_epilogue(requires_blackwell):
+    """Epilogue on warps 2-5 (no budgets), straddling two warpgroups: its TMEM rows follow the
+    hardware warp quadrant, its TMA-store warp the role."""
+    roles = {
+        "load": RoleConfig(0),
+        "mma": RoleConfig(1, cta="leader"),
+        "epilogue": RoleConfig(range(2, 6)),
+    }
+    _check([1000, 24, 0, 129, 128, 1, 256, 300], 520, 136, roles=roles)
+
+
 def test_grouped_gemm_reuses_one_compile_across_shapes_and_offsets(requires_blackwell):
     """Shapes, G and the routing are runtime values of one compiled kernel."""
     _check([128], 256, 64)  # the default configuration is compiled (or loaded) once

@@ -14,7 +14,13 @@ pytest.importorskip("flash_attn.cute")
 
 from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd
 
-from transformer_nuggets.cute.warpdrive import Cluster, CtaPair, StaticPersistent, WorkStream
+from transformer_nuggets.cute.warpdrive import (
+    Cluster,
+    CtaPair,
+    RoleConfig,
+    StaticPersistent,
+    WorkStream,
+)
 from transformer_nuggets.cute.warpdrive.examples.fa4_bwd import (
     FlashAttentionBackward,
     FlashAttentionBackward2Cta,
@@ -107,6 +113,31 @@ def test_one_dq_staging_buffer(requires_blackwell):
     assert torch.allclose(base[0].float(), knob[0].float(), atol=2e-3, rtol=0)
     with pytest.raises(ValueError, match="dq_stages"):
         FlashAttentionBackward(dq_stages=4)
+
+
+# Every role off its default warps, without budgets: reduce leaves warp 0 and starts mid
+# warpgroup, compute (warps 6-13) straddles three warpgroups.
+MOVED_ROLES = {
+    "load": RoleConfig(0),
+    "mma": RoleConfig(1),
+    "reduce": RoleConfig(range(2, 6)),
+    "compute": RoleConfig(range(6, 14)),
+}
+
+
+@pytest.mark.parametrize("cluster", CLUSTERS, ids=cluster_id)
+def test_moved_roles_match_defaults(requires_blackwell, cluster):
+    """The TMEM rows follow the hardware warp quadrant and the other indices the role, so the
+    moved kernel computes the default's dK/dV bits (dQ: the same tile sums)."""
+    scale = D**-0.5
+    args = inputs(1, 2, 384, 256, scale, True)
+    roles = MOVED_ROLES
+    if cluster is not None:
+        roles = {**roles, "mma": RoleConfig(1, cta="leader"), "relay": RoleConfig(14)}
+    base = fa4_bwd(*args, scale, causal=True, cluster=cluster)
+    moved = fa4_bwd(*args, scale, causal=True, cluster=cluster, roles=roles)
+    assert torch.equal(base[1], moved[1]) and torch.equal(base[2], moved[2])
+    assert torch.allclose(base[0].float(), moved[0].float(), atol=2e-3, rtol=0)
 
 
 def test_describe_shows_the_derived_protocol():
