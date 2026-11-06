@@ -667,8 +667,8 @@ historical count was 924):
 
 | Source | Code lines |
 |---|---:|
-| Both ports, including wrapper/compile helper/checks | 1,394 |
-| `FlashAttentionBackward2Cta` alone | 332 |
+| Both ports, including wrapper/compile helper/checks | 1,299 |
+| `FlashAttentionBackward2Cta` alone (load and MMA schedules, relay warp) | 200 |
 | FA4 `flash_bwd_sm100.py` (all paths) | 4,448 |
 
 FA4's remaining paths include varlen, GQA, block-sparse, score-mod, deterministic, folded,

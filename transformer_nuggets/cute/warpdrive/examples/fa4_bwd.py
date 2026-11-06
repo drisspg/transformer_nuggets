@@ -11,7 +11,9 @@ accumulator) are FA4's own (``flash_attn.cute.interface._bwd_preprocess`` and
 ``_bwd_postprocess_convert``), reused as is; this file ports the main kernel,
 ``flash_attn/cute/flash_bwd_sm100.py`` at its 1-CTA, hdim-128 configuration (``split_P_dS``
 off, ``Q_stage=2``, ``dO_stage=1``, registers 152/136/88, or 136/144/88 when causal). The
-compute, epilogue and dQ reduce code is shared with the 2-CTA kernel.
+2-CTA kernel is a subclass with its own load and MMA schedules and a relay warp; the protocol
+declaration (``__init__``, with ``pair`` branches where the pair's differs), the MMA issue
+helpers, the compute warps, the epilogue and the dQ reduce are this class's.
 
 A work item is one 128-key K/V tile ``(n_block, head, batch)`` (FA4's ``SingleTileScheduler``
 order, which ``Raster`` over ``(n_blocks, heads, batch)`` reproduces). The CTA keeps K, V, dK and
@@ -209,61 +211,97 @@ class FlashAttentionBackward(WarpSpecialized):
         self,
         causal: bool = False,
         roles: dict[str, RoleConfig] | None = None,
-        dq_stages: int = 2,
+        dq_stages: int | None = None,
         trace: bool = False,
     ):
-        if dq_stages not in (1, 2):
-            raise ValueError(f"dq_stages must be 1 or 2 (SMEM), got {dq_stages}")
-        self.causal, self.dq_stages = causal, dq_stages
-        self.q_stages, self.dq_cols = Q_STAGE, DQ_COLS
-        # FA4's causal split moves 8 registers from the dQ reduce to the compute warps.
-        defaults = {}
-        if causal:
+        pair = self.cluster.size > 1  # the class's cluster (CtaPair on the subclass)
+        self.causal = causal
+        self.dq_stages = check_dq_stages(dq_stages, pair)
+        # Q stages and dQ columns per reduce-add (the pair: FA4's 2-CTA Q_stage, dQ_reduce_ncol).
+        self.q_stages, self.dq_cols = (1, PAIR_DQ_COLS) if pair else (Q_STAGE, DQ_COLS)
+        if pair:
+            # FA4's 2-CTA register split, causal or not: reduce and compute 136 (compute's @role
+            # default), the rest 104 (declared by the pair's load, mma and relay roles).
+            defaults = {"reduce": RoleConfig(range(4), regs=136)}
+        elif causal:
+            # FA4's causal split moves 8 registers from the dQ reduce to the compute warps.
             defaults = {
                 "reduce": RoleConfig(range(4), regs=136),
                 "compute": RoleConfig(range(4, 12), regs=144),
             }
+        else:
+            defaults = {}
         self.roles = {**defaults, **(roles or {})}  # by role name, over the @role defaults
         bf16 = cutlass.BFloat16
         self.smem_plan = plan = SmemPlan()
         lse_buf = plan.buffer("LSE", Float32, align=128)
         dpsum_buf = plan.buffer("dPsum", Float32, align=128)
+        # One CTA reads Q, K and dO MN-major in place (Qt, Kt, dOt); the pair splits those B
+        # operands along other dimensions than Q, K and dO, so it loads them separately.
         q_buf = plan.buffer("Q", bf16, align=1024)
-        qt_buf = plan.buffer("Qt", bf16, align=1024, overlaps=q_buf)
+        qt_buf = plan.buffer("Qt", bf16, align=1024, overlaps=None if pair else q_buf)
         k_buf = plan.buffer("K", bf16, align=1024)
-        kt_buf = plan.buffer("Kt", bf16, align=1024, overlaps=k_buf)
+        kt_buf = plan.buffer("Kt", bf16, align=1024, overlaps=None if pair else k_buf)
         v_buf = plan.buffer("V", bf16, align=1024)
         do_buf = plan.buffer("dO", bf16, align=1024)
-        dot_buf = plan.buffer("dOt", bf16, align=1024, overlaps=do_buf)
+        dot_buf = plan.buffer("dOt", bf16, align=1024, overlaps=None if pair else do_buf)
         ds_buf = plan.buffer("dS", bf16, align=1024)
+        if pair:
+            dsx_buf = plan.buffer("dSx", bf16, align=1024)  # the peer's half of dS, staged
         plan.buffer("dQacc", Float32, align=1024)
-        # FA4 stores dK over Q and dV over dO: both are dead once the item's last dK / dV MMA
-        # has committed (dkv), and one item per CTA means no later load refills them.
-        plan.buffer("dKepi", bf16, align=1024, overlaps=q_buf)
-        plan.buffer("dVepi", bf16, align=1024, overlaps=do_buf)
+        # FA4's epilogue tiles reuse operands that are dead once dkv publishes dK / dV, and one
+        # item per CTA means no later load refills them: dK over Q and dV over dO (read last by
+        # the dK / dV MMAs), or in the pair over K and V (read last by the S / dP MMAs).
+        plan.buffer("dKepi", bf16, align=1024, overlaps=k_buf if pair else q_buf)
+        plan.buffer("dVepi", bf16, align=1024, overlaps=v_buf if pair else do_buf)
         tile_bytes = TILE_M * HEAD_DIM * 2
-        self.k = Ring(1, Tma(tile_bytes), Umma, buffer={"K": k_buf, "Kt": kt_buf})
-        self.v = Ring(1, Tma(tile_bytes), Umma, buffer=v_buf)
-        self.q = Ring(Q_STAGE, Tma(tile_bytes), Umma, buffer={"Q": q_buf, "Qt": qt_buf})
-        self.do = Ring(1, Tma(tile_bytes), Umma, buffer={"dO": do_buf, "dOt": dot_buf})
-        # LSE/dPsum rows are read with ordinary loads and refilled by the async proxy.
+        if pair:
+            # Per CTA: its 128 keys of K and V, half the 256-key Kt, and 64 queries of each of
+            # Q, Qt, dO and dOt (dO and dOt share a stage).
+            self.k = Ring(1, Tma(tile_bytes), Umma, buffer=k_buf)
+            self.kt = Ring(1, Tma(tile_bytes), Umma, buffer=kt_buf)
+            self.v = Ring(1, Tma(tile_bytes), Umma, buffer=v_buf)
+            self.q = Ring(1, Tma(tile_bytes // 2), Umma, buffer=q_buf)
+            self.qt = Ring(1, Tma(tile_bytes // 2), Umma, buffer=qt_buf)
+            self.do = Ring(1, Tma(tile_bytes), Umma, buffer={"dO": do_buf, "dOt": dot_buf})
+        else:
+            self.k = Ring(1, Tma(tile_bytes), Umma, buffer={"K": k_buf, "Kt": kt_buf})
+            self.v = Ring(1, Tma(tile_bytes), Umma, buffer=v_buf)
+            self.q = Ring(Q_STAGE, Tma(tile_bytes), Umma, buffer={"Q": q_buf, "Qt": qt_buf})
+            self.do = Ring(1, Tma(tile_bytes), Umma, buffer={"dO": do_buf, "dOt": dot_buf})
+        # LSE/dPsum rows are read with ordinary loads and refilled by the async proxy. The pair's
+        # dpsum needs no release fence: make_ds fences (fence.proxy.async) and syncs every compute
+        # thread after its last dPsum read, before the release.
         self.lse = Ring(
-            Q_STAGE, Tma(TILE_M * 4), Warps, buffer=lse_buf, release_fence="smem_async"
+            self.q_stages, Tma(TILE_M * 4), Warps, buffer=lse_buf, release_fence="smem_async"
         )
-        self.dpsum = Ring(1, Tma(TILE_M * 4), Warps, buffer=dpsum_buf, release_fence="smem_async")
+        dpsum_fence = None if pair else "smem_async"
+        self.dpsum = Ring(1, Tma(TILE_M * 4), Warps, buffer=dpsum_buf, release_fence=dpsum_fence)
         self.s = Ring(1, Umma, Warps, release_fence="tmem_store")  # P stored over S
         self.dp = Ring(1, Umma, Warps, release_fence="tmem_store")  # dS stored over dP
-        # dS is handed over both in TMEM (tcgen05.st over dP) and in SMEM (sdS): both fences.
-        self.ds = Ring(1, Warps, Umma, buffer=ds_buf, commit_fence=("tmem_store", "smem_async"))
+        if pair:
+            # ds hands over sdS and sdSx (dS in TMEM reaches the dK MMA through dp). Its commits
+            # need no fence: make_ds fences the sdS stores before the exchange copy, and compute
+            # waits for its S loads (tcgen05.wait::ld) itself.
+            self.ds = Ring(1, Warps, Umma, buffer={"dS": ds_buf, "dSx": dsx_buf})
+        else:
+            # dS is handed over both in TMEM (tcgen05.st over dP) and in SMEM (sdS): both fences.
+            self.ds = Ring(
+                1, Warps, Umma, buffer=ds_buf, commit_fence=("tmem_store", "smem_async")
+            )
         self.dq = Ring(1, Umma, Warps)
         self.dkv = Slots(2, Umma, Warps)  # slot 0: dV, slot 1: dK
+        if pair:
+            # The dS exchange (raw: warpdrive has no channel one CTA fills for its peer). The
+            # peer's compute thread 0 arms it with the copy's bytes; the relay warp waits on it.
+            self.xchg = Barriers(1, counts=1)
         # Syncs inside a role: the 8 compute warps (P over S, dS over dP), the 4 reduce warps
         # (the dQ staging buffer), and each compute warpgroup's dK/dV epilogue tile.
         self.compute_sync = NamedBarrier(threads=256)
         self.reduce_sync = NamedBarrier(threads=128)
         self.epi_sync_wg0 = NamedBarrier(threads=128)
         self.epi_sync_wg1 = NamedBarrier(threads=128)
-        self.tmem_plan = (
+        tmem = (
             TmemPlan()
             .region("S", TILE_M)
             .region("dV", HEAD_DIM)
@@ -271,15 +309,19 @@ class FlashAttentionBackward(WarpSpecialized):
             .region("dK", HEAD_DIM)
             .alias("P", of="S", offset=0, cols=TILE_M // 2)
             .alias("dS", of="dP", offset=0, cols=TILE_M // 2)
-            .alias("dQ", of="dP", offset=0, cols=HEAD_DIM)
         )
+        if pair:  # this CTA's 64 dQ columns, over S's tail (FA4's 2-CTA map)
+            self.tmem_plan = tmem.alias("dQ", of="S", offset=TILE_M // 2, cols=HEAD_DIM // 2)
+        else:
+            self.tmem_plan = tmem.alias("dQ", of="dP", offset=0, cols=HEAD_DIM)
         self.work = WorkStream(mapping=Raster(), schedule=OneShot())
         self.trace_protocol = trace
 
     def get_name(self) -> str:
-        suffix = ("_causal" if self.causal else "") + (
-            f"_dq{self.dq_stages}" if self.dq_stages != 2 else ""
-        )
+        pair = self.cluster.size > 1
+        suffix = ("_pair" if pair else "") + ("_causal" if self.causal else "")
+        if not pair and self.dq_stages != 2:
+            suffix += f"_dq{self.dq_stages}"
         return (
             f"warpdrive_fa4_bwd{suffix}_{self.work.get_key()}{self.iket_key()}{self.trace_key()}"
         )
@@ -336,45 +378,29 @@ class FlashAttentionBackward(WarpSpecialized):
             q, do = q.views(Q=StageView(tQsQ, axis=1)), do.views(dO=StageView(tOsO, axis=1))
             # FA4's order: K, Q_0, LSE_0, V, dO_0, dPsum_0, then (Q, LSE, dO, dPsum) per tile.
             with k.produce() as h:
-                cute.copy(
-                    params.tma_k, tKgK, h.view("K", write=True, by="tma"), tma_bar_ptr=h.barrier
-                )
+                self.tma_load(params.tma_k, tKgK, h, "K")
             for m in cutlass.range(m_lo, m_hi, unroll=1):
                 with q.produce() as h:
-                    cute.copy(
-                        params.tma_q,
-                        tQgQ[None, m],
-                        h.view("Q", write=True, by="tma"),
-                        tma_bar_ptr=h.barrier,
-                    )
+                    self.tma_load(params.tma_q, tQgQ[None, m], h, "Q")
                 with lse.produce() as h, cute.arch.elect_one():
-                    cute.copy(
-                        copy_stats,
-                        gLSE[None, m],
-                        h.view(write=True, by="tma"),
-                        mbar_ptr=h.barrier,
-                    )
+                    self.bulk_load(copy_stats, gLSE[None, m], h)
                 if m == m_lo:
                     with v.produce() as h:
-                        cute.copy(
-                            params.tma_v, tVgV, h.view(write=True, by="tma"), tma_bar_ptr=h.barrier
-                        )
+                        self.tma_load(params.tma_v, tVgV, h, "V")
                 with do.produce() as h:
-                    cute.copy(
-                        params.tma_do,
-                        tOgO[None, m],
-                        h.view("dO", write=True, by="tma"),
-                        tma_bar_ptr=h.barrier,
-                    )
+                    self.tma_load(params.tma_do, tOgO[None, m], h, "dO")
                 with dpsum.produce() as h, cute.arch.elect_one():
-                    cute.copy(
-                        copy_stats,
-                        gdPsum[None, m],
-                        h.view(write=True, by="tma"),
-                        mbar_ptr=h.barrier,
-                    )
+                    self.bulk_load(copy_stats, gdPsum[None, m], h)
             work.advance()
         return k, v, q, do, lse, dpsum, work
+
+    def tma_load(self, atom, src, h, name):
+        """One TMA tile load into the stage of the open producer handle ``h`` (plain Python)."""
+        cute.copy(atom, src, h.view(name, write=True, by="tma"), tma_bar_ptr=h.barrier)
+
+    def bulk_load(self, atom, src, h):
+        """One LSE / dPsum row by bulk copy into the stage of ``h`` (plain Python)."""
+        cute.copy(atom, src, h.view(write=True, by="tma"), mbar_ptr=h.barrier)
 
     @role(warps=12, regs=88)
     @cute.jit
@@ -400,8 +426,8 @@ class FlashAttentionBackward(WarpSpecialized):
             m_lo, m_hi = self.m_block_range(params, n_block)
             kh = k.wait()
             dkv_h = (dkv.acquire(0), dkv.acquire(1))  # dV, dK of this item
-            with s.produce():  # S_0 = K Q_0^T
-                self.issue_s(params, q, kh, t, tmem)
+            with s.produce():  # S_0 = K Q_0^T; Q_0 is owned and released by tile 0's q.wait()
+                self.issue_s(params, q.peek(), kh, t, tmem)
             vh = v.wait()  # V lands after Q_0: S_0 does not wait for it
             # FA4's 1-CTA order, rotated so each handle closes in the iteration that opened it:
             # tile t issues dP_t, dV_t, S_{t+1}, dK_t, dQ_t.
@@ -463,14 +489,41 @@ class FlashAttentionBackward(WarpSpecialized):
             cta_group=self.cluster.size,
         )
 
-    def issue_s(self, params: BwdParams, q, kh, t, tmem):
-        """S^T = K Q^T for the q ring's next stage, which this previews without consuming: Q_t
-        is read by S_t, issued during tile t-1, and by dK_t, whose ``q.wait()`` handle (the
-        next wait on the end) owns and releases it (plain Python: inlined)."""
-        preview = q.peek()
+    # The five MMAs (plain Python: inlined). ``qh``, ``doh``: the handle (or ``peek`` preview)
+    # of the stage read; ``first``: the item's first tile zero-initializes dV and dK.
+
+    def issue_s(self, params: BwdParams, qh, kh, t, tmem):
+        """S^T = K Q^T."""
         tmem.access("S", write=True, by="umma")
-        sK, sQ = kh.view("K", read=True, by="umma"), preview.view("Q", read=True, by="umma")
+        sK, sQ = kh.view("K", read=True, by="umma"), qh.view("Q", read=True, by="umma")
         self.smem_mma(params.mma_s, t.thr.s, t.tS, sK, sQ, True)
+
+    def issue_dp(self, params: BwdParams, doh, vh, t, tmem):
+        """dP^T = V dO^T."""
+        tmem.access("dP", write=True, by="umma")
+        sV, sdOt = vh.view("V", read=True, by="umma"), doh.view("dOt", read=True, by="umma")
+        self.smem_mma(params.mma_dp, t.thr.dp, t.tdP, sV, sdOt, True)
+
+    def issue_dv(self, params: BwdParams, doh, t, tmem, first):
+        """dV += P^T dO, P from TMEM."""
+        tmem.access("P", read=True, by="umma")
+        tmem.access("dV", write=True, by="umma")
+        sdO = doh.view("dO", read=True, by="umma")
+        self.smem_mma(params.mma_dv, t.thr.dv, t.tdV, t.rP, sdO, first, tmem.ptr("P").toint())
+
+    def issue_dk(self, params: BwdParams, qth, t, tmem, first):
+        """dK += dS^T Q, dS from TMEM; ``qth`` holds Qt."""
+        tmem.access("dS", read=True, by="umma")
+        tmem.access("dK", write=True, by="umma")
+        sQt = qth.view("Qt", read=True, by="umma")
+        self.smem_mma(params.mma_dk, t.thr.dk, t.tdK, t.rdS, sQt, first, tmem.ptr("dS").toint())
+
+    def issue_dq(self, params: BwdParams, dsh, kth, t, tmem):
+        """dQ = dS K from sdS and Kt."""
+        tmem.access("dQ", write=True, by="umma")
+        sdS, sKt = dsh.view("dS", read=True, by="umma"), kth.view("Kt", read=True, by="umma")
+        rdS, rKt = t.thr.dq.make_fragment_A(sdS), t.thr.dq.make_fragment_B(sKt)
+        umma(params.mma_dq, t.tdQ, rdS, rKt, False)
 
     def mma_tile(
         self, params: BwdParams, q, do, s, dp, ds, dq, kh, vh, t, tmem, first, dkv_h=None
@@ -478,44 +531,28 @@ class FlashAttentionBackward(WarpSpecialized):
         """One Q tile t: dP_t, dV_t, S_{t+1}, dK_t, dQ_t. The last tile (``dkv_h``, the item's
         dV and dK handles) has no S_{t+1} and publishes dV and dK as soon as their last MMA is
         issued. Returns the ends (plain Python: inlined into the role)."""
+        last = dkv_h is not None
         qh, doh = q.wait(), do.wait()
         dqh = dq.acquire()  # dP_t overwrites dQ_{t-1}'s columns: the reduce warps have read them
         with dp.produce():  # dS_{t-1} was stored over dP_{t-1}
-            tmem.access("dP", write=True, by="umma")
-            sV, sdOt = vh.view("V", read=True, by="umma"), doh.view("dOt", read=True, by="umma")
-            self.smem_mma(params.mma_dp, t.thr.dp, t.tdP, sV, sdOt, True)
+            self.issue_dp(params, doh, vh, t, tmem)
         sh = s.acquire()  # P_t stored over S_t
-        tmem.access("P", read=True, by="umma")
-        tmem.access("dV", write=True, by="umma")
-        sdO = doh.view("dO", read=True, by="umma")
-        self.smem_mma(params.mma_dv, t.thr.dv, t.tdV, t.rP, sdO, first, tmem.ptr("P").toint())
+        self.issue_dv(params, doh, t, tmem, first)
         doh.release()
-        if cutlass.const_expr(dkv_h is not None):
+        if last:
             dkv_h[0].commit()  # dV final: the commit covers every MMA issued so far
             sh.retire()  # no S_{t+1}: one item per CTA, so nothing consumes this stage
         else:
-            # S_{t+1} overwrites P_t behind the dV MMA that read it (same-thread MMA order).
-            self.issue_s(params, q, kh, t, tmem)
+            # S_{t+1} previews Q_{t+1} (tile t+1's q.wait() owns and releases it) and overwrites
+            # P_t behind the dV MMA that read it (same-thread MMA order).
+            self.issue_s(params, q.peek(), kh, t, tmem)
             sh.commit()
         with ds.consume() as dsh:  # dS_t in TMEM (over dP_t) and in sdS
-            tmem.access("dS", read=True, by="umma")
-            tmem.access("dK", write=True, by="umma")
-            sQt = qh.view("Qt", read=True, by="umma")
-            self.smem_mma(
-                params.mma_dk, t.thr.dk, t.tdK, t.rdS, sQt, first, tmem.ptr("dS").toint()
-            )
+            self.issue_dk(params, qh, t, tmem, first)
             qh.release()
-            if cutlass.const_expr(dkv_h is not None):
+            if last:
                 dkv_h[1].commit()  # dK final
-            tmem.access("dQ", write=True, by="umma")
-            sdS, sKt = dsh.view("dS", read=True, by="umma"), kh.view("Kt", read=True, by="umma")
-            umma(
-                params.mma_dq,
-                t.tdQ,
-                t.thr.dq.make_fragment_A(sdS),
-                t.thr.dq.make_fragment_B(sKt),
-                False,
-            )
+            self.issue_dq(params, dsh, kh, t, tmem)
             dqh.commit()
         return q, do, s, dp, ds, dq
 
@@ -539,6 +576,7 @@ class FlashAttentionBackward(WarpSpecialized):
         work: WorkCursor,
         tmem: Tmem,
     ):
+        pair = self.cluster.size > 1
         c = self.compute_views(params, tmem)
         lse, dpsum = lse.views(LSE=c.lse_view), dpsum.views(dPsum=c.dpsum_view)
         while work.valid:
@@ -548,9 +586,24 @@ class FlashAttentionBackward(WarpSpecialized):
             for m in cutlass.range(m_lo, m_hi, unroll=1):
                 rS = cute.make_rmem_tensor(c.tScS_t2r.shape, Float32)
                 lse, s, lh, sh = self.load_s(c, lse, s, tmem, rS)
+                if cutlass.const_expr(pair):  # noqa: SIM102 (a static, then a dynamic test)
+                    if m > m_lo:
+                        # dQ_{m-1} overwrites the tail of S_m: dS_{m-1} is handed over once S_m
+                        # is read.
+                        cute.arch.fence_view_async_tmem_load()
+                        self.signal_ds(ds)
                 self.store_p(c, params, rS, lh, sh, tmem, n_block, m, key_oob)
                 dpsum, dp, ds, dsh = self.make_ds(c, params, rS, dpsum, dp, ds, tmem)
-                dsh.commit()  # layer fences the dS tcgen05.st and sdS stores for the dQ MMA
+                if cutlass.const_expr(pair):
+                    # The pair's commit is deferred to the next tile's signal_ds. A handle must
+                    # close in the iteration that opened it, and rotating the loop instead keeps
+                    # P_m in registers across the back edge (causal main kernel 1.5-2.4% slower
+                    # on GB300, November 2026; docs/examples.md#attention-backward).
+                    dsh.commit(signal=False)
+                else:
+                    dsh.commit()  # layer fences the dS tcgen05.st and sdS stores for the dQ MMA
+            if cutlass.const_expr(pair):
+                self.signal_ds(ds)  # the last tile's dS: no S_{m+1} to read first
             dkv = self.epilogue(params, dkv, tmem, c.tidx, n_block, head, batch)
             work.advance()
         return lse, dpsum, s, dp, ds, dkv, work
@@ -727,6 +780,35 @@ class FlashAttentionBackward(WarpSpecialized):
         if cutlass.const_expr(pair):
             self.send_ds(c, dsh)
         return dpsum, dp, ds, dsh
+
+    # The pair's dS handoff (see FlashAttentionBackward2Cta).
+
+    def signal_ds(self, ds):
+        """The raw signal of a ds commit closed with ``signal=False``: the channel's ``Warps``
+        count (every lane is done, then one elected arrival per warp) on the leader's full
+        barrier, its only target (rank 0: the kernel runs on one CTA pair). Needs no fence:
+        make_ds fenced the sdS stores, and the caller waits for its S loads (plain Python:
+        inlined)."""
+        cute.arch.sync_warp()
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive(ds.full_barrier(0), peer_cta_rank_in_cluster=Int32(0))
+
+    @cute.jit
+    def send_ds(self, c, dsh):
+        """Thread 0 copies the staged peer half of dS_t (sdSx) into the peer's sdS at this CTA's
+        key block, completing on the peer's xchg barrier, which it arms first (FA4's DSMEM
+        exchange). make_ds has fenced and synchronized every thread's sdSx stores."""
+        if c.tidx == 0:
+            peer = c.rank ^ 1
+            xchg = self.barrier_ptr("xchg")
+            src = dsh.view("dSx", read=True, by="tma").iterator
+            dst = dsh.view("dS").iterator + c.rank * XCHG_ELEMS  # in the peer's copy of sdS
+            cute.arch.mbarrier_arrive_and_expect_tx(
+                xchg, XCHG_BYTES, peer_cta_rank_in_cluster=peer
+            )
+            fa_copy_utils.cpasync_bulk_s2cluster(
+                src, dst, xchg, XCHG_BYTES, peer_cta_rank_in_cluster=peer
+            )
 
     @cute.jit
     def mask_causal(self, params: BwdParams, rS, tScS_t2r, n_block, m_block):
@@ -1079,7 +1161,8 @@ class FlashAttentionBackward2Cta(FlashAttentionBackward):
     item of 256 keys ``(n_block, head, batch)``, 128 per CTA, and the leader issues every MMA as
     a ``CtaGroup.TWO`` MMA over both CTAs' operands. S^T, dP^T, dV and dK are 256-row MMAs whose
     accumulator rows stay in their CTA, so the compute warps and the dK/dV epilogue are the 1-CTA
-    kernel's. The other MMA operands split differently across the pair:
+    kernel's (its ``compute`` and ``make_ds`` branch on the pair for the dS handoff below). The
+    other MMA operands split differently across the pair:
 
     * Q and dO are the B operands of S^T and dV (each CTA holds 64 query rows), while dK and dP^T
       read Q^T and dO^T split along the head dimension (resp. queries), and dQ = dS K reads K^T
@@ -1128,84 +1211,6 @@ class FlashAttentionBackward2Cta(FlashAttentionBackward):
     """
 
     cluster = CtaPair()
-
-    def __init__(
-        self,
-        causal: bool = False,
-        roles: dict[str, RoleConfig] | None = None,
-        trace: bool = False,
-    ):
-        self.causal = causal
-        # One stage of Q (FA4's 2-CTA Q_stage), and FA4's 2-CTA dQ reduce (dQ_reduce_ncol,
-        # sdQaccum_stage).
-        self.q_stages, self.dq_cols, self.dq_stages = 1, PAIR_DQ_COLS, PAIR_DQ_STAGES
-        # FA4's 2-CTA register split, causal or not: reduce and compute 136, the rest 104.
-        defaults = {"reduce": RoleConfig(range(4), regs=136)}
-        self.roles = {**defaults, **(roles or {})}
-        bf16 = cutlass.BFloat16
-        self.smem_plan = plan = SmemPlan()
-        lse_buf = plan.buffer("LSE", Float32, align=128)
-        dpsum_buf = plan.buffer("dPsum", Float32, align=128)
-        q_buf = plan.buffer("Q", bf16, align=1024)
-        qt_buf = plan.buffer("Qt", bf16, align=1024)
-        k_buf = plan.buffer("K", bf16, align=1024)
-        kt_buf = plan.buffer("Kt", bf16, align=1024)
-        v_buf = plan.buffer("V", bf16, align=1024)
-        do_buf = plan.buffer("dO", bf16, align=1024)
-        dot_buf = plan.buffer("dOt", bf16, align=1024)
-        ds_buf = plan.buffer("dS", bf16, align=1024)
-        dsx_buf = plan.buffer("dSx", bf16, align=1024)
-        plan.buffer("dQacc", Float32, align=1024)
-        # FA4's 2-CTA epilogue tiles: dK over K and dV over V, dead once the last S / dP MMA
-        # (issued before the last dK / dV MMA that dkv publishes) has read them.
-        plan.buffer("dKepi", bf16, align=1024, overlaps=k_buf)
-        plan.buffer("dVepi", bf16, align=1024, overlaps=v_buf)
-        kv_bytes = TILE_N * HEAD_DIM * 2  # per CTA: its 128 keys, or half the 256-key Kt
-        q_bytes = TILE_M * HEAD_DIM  # per CTA: half a bf16 Q / Qt / dO / dOt tile
-        self.k = Ring(1, Tma(kv_bytes), Umma, buffer=k_buf)
-        self.kt = Ring(1, Tma(kv_bytes), Umma, buffer=kt_buf)
-        self.v = Ring(1, Tma(kv_bytes), Umma, buffer=v_buf)
-        self.q = Ring(1, Tma(q_bytes), Umma, buffer=q_buf)
-        self.qt = Ring(1, Tma(q_bytes), Umma, buffer=qt_buf)
-        self.do = Ring(1, Tma(2 * q_bytes), Umma, buffer={"dO": do_buf, "dOt": dot_buf})
-        self.lse = Ring(1, Tma(TILE_M * 4), Warps, buffer=lse_buf, release_fence="smem_async")
-        # No release fence: make_ds already fences (fence.proxy.async) and syncs every compute
-        # thread after its last dPsum read, before the release.
-        self.dpsum = Ring(1, Tma(TILE_M * 4), Warps, buffer=dpsum_buf)
-        self.s = Ring(1, Umma, Warps, release_fence="tmem_store")  # P stored over S
-        self.dp = Ring(1, Umma, Warps, release_fence="tmem_store")  # dS stored over dP
-        # dS in TMEM goes to the dK MMA through dp; ds hands over sdS. Its commits need no
-        # fence: make_ds fences the sdS stores before the exchange copy, and compute waits for
-        # its S loads (tcgen05.wait::ld) itself.
-        self.ds = Ring(1, Warps, Umma, buffer={"dS": ds_buf, "dSx": dsx_buf})
-        self.dq = Ring(1, Umma, Warps)
-        self.dkv = Slots(2, Umma, Warps)  # slot 0: dV, slot 1: dK
-        # The dS exchange (raw: warpdrive has no channel one CTA fills for its peer). The peer's
-        # compute thread 0 arms it with the copy's bytes; the relay warp waits on it.
-        self.xchg = Barriers(1, counts=1)
-        self.compute_sync = NamedBarrier(threads=256)
-        self.reduce_sync = NamedBarrier(threads=128)
-        self.epi_sync_wg0 = NamedBarrier(threads=128)
-        self.epi_sync_wg1 = NamedBarrier(threads=128)
-        self.tmem_plan = (
-            TmemPlan()
-            .region("S", TILE_M)
-            .region("dV", HEAD_DIM)
-            .region("dP", TILE_M)
-            .region("dK", HEAD_DIM)
-            .alias("P", of="S", offset=0, cols=TILE_M // 2)
-            .alias("dS", of="dP", offset=0, cols=TILE_M // 2)
-            .alias("dQ", of="S", offset=TILE_M // 2, cols=HEAD_DIM // 2)
-        )
-        self.work = WorkStream(mapping=Raster(), schedule=OneShot())
-        self.trace_protocol = trace
-
-    def get_name(self) -> str:
-        suffix = "_causal" if self.causal else ""
-        return (
-            f"warpdrive_fa4_bwd_pair{suffix}_{self.work.get_key()}{self.iket_key()}"
-            f"{self.trace_key()}"
-        )
 
     # ------------------------------------------------------------------ roles
 
@@ -1296,27 +1301,23 @@ class FlashAttentionBackward2Cta(FlashAttentionBackward):
             work.advance()
         return k, kt, v, q, qt, do, lse, dpsum, work
 
-    def tma_load(self, atom, src, h, name):
-        """One TMA tile load into the stage of the open producer handle ``h`` (plain Python)."""
-        cute.copy(atom, src, h.view(name, write=True, by="tma"), tma_bar_ptr=h.barrier)
+    # The per-tile loads as helpers: the first tile is peeled (plain Python: inlined).
 
     def load_q_lse(self, params: BwdParams, q, lse, tQgQ, gLSE, copy_stats, m):
-        """Q_m and LSE_m; returns the ends (plain Python: inlined)."""
+        """Q_m and LSE_m; returns the ends."""
         with q.produce() as h:
             self.tma_load(params.tma_q, tQgQ[None, m], h, "Q")
         with lse.produce() as h, cute.arch.elect_one():
-            cute.copy(copy_stats, gLSE[None, m], h.view(write=True, by="tma"), mbar_ptr=h.barrier)
+            self.bulk_load(copy_stats, gLSE[None, m], h)
         return q, lse
 
     def load_do_dpsum(self, params: BwdParams, do, dpsum, tOgO, tOtgOt, gdPsum, copy_stats, m):
-        """dO_m and dOt_m (one do stage), then dPsum_m; returns the ends (plain Python)."""
+        """dO_m and dOt_m (one do stage), then dPsum_m; returns the ends."""
         with do.produce() as h:
             self.tma_load(params.tma_do, tOgO[None, m], h, "dO")
             self.tma_load(params.tma_dot, tOtgOt[None, m], h, "dOt")
         with dpsum.produce() as h, cute.arch.elect_one():
-            cute.copy(
-                copy_stats, gdPsum[None, m], h.view(write=True, by="tma"), mbar_ptr=h.barrier
-            )
+            self.bulk_load(copy_stats, gdPsum[None, m], h)
         return do, dpsum
 
     @role(warps=12, regs=104, cta="leader")
@@ -1347,13 +1348,11 @@ class FlashAttentionBackward2Cta(FlashAttentionBackward):
             dkv_h = (dkv.acquire(0), dkv.acquire(1))  # dV, dK of this item
             qh = q.wait()
             with s.produce():  # S_0 = K Q_0^T
-                tmem.access("S", write=True, by="umma")
-                sK, sQ = kh.view("K", read=True, by="umma"), qh.view("Q", read=True, by="umma")
-                self.smem_mma(params.mma_s, t.thr.s, t.tS, sK, sQ, True)
+                self.issue_s(params, qh, kh, t, tmem)
             qh.release()  # only S reads Q (dK reads Qt)
             vh = v.wait()
-            with dp.produce():  # dP_0 = V dO_0^T
-                self.issue_dp(params, do, vh, t, tmem)
+            with dp.produce():  # dP_0 = V dO_0^T; dO_0 is owned and released by tile 0's do.wait()
+                self.issue_dp(params, do.peek(), vh, t, tmem)
             kth = kt.wait()
             kv = (kh, vh, kth)
             for i in cutlass.range(m_hi - m_lo - 1, unroll=1):
@@ -1369,14 +1368,12 @@ class FlashAttentionBackward2Cta(FlashAttentionBackward):
             work.advance()
         return k, kt, v, q, qt, do, s, dp, ds, dq, dkv, work
 
-    def issue_dp(self, params: BwdParams, do, vh, t, tmem):
-        """dP^T = V dO^T for the do ring's next stage, which this previews: its dO half is read
-        by dV in the next tile, whose ``do.wait()`` handle owns and releases the stage (plain
-        Python: inlined)."""
-        preview = do.peek()
-        tmem.access("dP", write=True, by="umma")
-        sV, sdOt = vh.view("V", read=True, by="umma"), preview.view("dOt", read=True, by="umma")
-        self.smem_mma(params.mma_dp, t.thr.dp, t.tdP, sV, sdOt, True)
+    def issue_dq(self, params: BwdParams, dsh, kth, t, tmem):
+        """dQ = dS K over the pair's 256 keys: FA4's ``gemm_w_idx`` in two unroll groups."""
+        tmem.access("dQ", write=True, by="umma")
+        sdS, sKt = dsh.view("dS", read=True, by="umma"), kth.view("Kt", read=True, by="umma")
+        rdS, rKt = t.thr.dq.make_fragment_A(sdS), t.thr.dq.make_fragment_B(sKt)
+        fa_mma.gemm_w_idx(params.mma_dq, t.tdQ, rdS, rKt, zero_init=True, num_unroll_groups=2)
 
     def mma_tile(
         self, params: BwdParams, q, qt, do, s, dp, ds, dq, kv, t, tmem, first, dkv_h=None
@@ -1388,10 +1385,7 @@ class FlashAttentionBackward2Cta(FlashAttentionBackward):
         last = dkv_h is not None
         doh = do.wait()  # dO_t, which dP_t previewed
         sh = s.acquire()  # P_t stored over S_t
-        tmem.access("P", read=True, by="umma")
-        tmem.access("dV", write=True, by="umma")
-        sdO = doh.view("dO", read=True, by="umma")
-        self.smem_mma(params.mma_dv, t.thr.dv, t.tdV, t.rP, sdO, first, tmem.ptr("P").toint())
+        self.issue_dv(params, doh, t, tmem, first)
         doh.release()
         if last:
             dkv_h[0].commit()  # dV final: the commit covers every MMA issued so far
@@ -1401,17 +1395,12 @@ class FlashAttentionBackward2Cta(FlashAttentionBackward):
             # S_{t+1}'s last 64 columns hold dQ_{t-1}: the reduce warps have read it.
             dqh = dq.acquire()
             # S_{t+1} overwrites P_t behind the dV MMA that read it (same-thread MMA order).
-            tmem.access("S", write=True, by="umma")
-            sK, sQ = kh.view("K", read=True, by="umma"), qh.view("Q", read=True, by="umma")
-            self.smem_mma(params.mma_s, t.thr.s, t.tS, sK, sQ, True)
+            self.issue_s(params, qh, kh, t, tmem)
             sh.commit()
             qh.release()
         qth = qt.wait()
         dph = dp.acquire()  # dS_t stored over dP_t
-        tmem.access("dS", read=True, by="umma")
-        tmem.access("dK", write=True, by="umma")
-        sQt = qth.view("Qt", read=True, by="umma")
-        self.smem_mma(params.mma_dk, t.thr.dk, t.tdK, t.rdS, sQt, first, tmem.ptr("dS").toint())
+        self.issue_dk(params, qth, t, tmem, first)
         qth.release()
         if last:
             dkv_h[1].commit()  # dK final
@@ -1419,85 +1408,15 @@ class FlashAttentionBackward2Cta(FlashAttentionBackward):
             dsh = ds.wait()
             dqh = dq.acquire()
         else:
-            # dP_{t+1} overwrites dS_t behind the dK MMA that read it.
-            self.issue_dp(params, do, vh, t, tmem)
+            # dP_{t+1} previews dO_{t+1} (tile t+1's do.wait() owns and releases it) and
+            # overwrites dS_t behind the dK MMA that read it.
+            self.issue_dp(params, do.peek(), vh, t, tmem)
             dph.commit()
             dsh = ds.wait()  # dS_t in both CTAs' sdS, and S_{t+1} (under dQ_t) read
-        tmem.access("dQ", write=True, by="umma")
-        sdS, sKt = dsh.view("dS", read=True, by="umma"), kth.view("Kt", read=True, by="umma")
-        rdS, rKt = t.thr.dq.make_fragment_A(sdS), t.thr.dq.make_fragment_B(sKt)
-        fa_mma.gemm_w_idx(params.mma_dq, t.tdQ, rdS, rKt, zero_init=True, num_unroll_groups=2)
+        self.issue_dq(params, dsh, kth, t, tmem)
         dqh.commit()
         dsh.release()
         return q, qt, do, s, dp, ds, dq
-
-    @role(warps=range(4, 12), regs=136)
-    @cute.jit
-    def compute(
-        self,
-        params: BwdParams,
-        *,
-        lse: Consumer,
-        dpsum: Consumer,
-        s: Consumer,
-        dp: Consumer,
-        ds: Producer,
-        dkv: Consumer,
-        work: WorkCursor,
-        tmem: Tmem,
-    ):
-        c = self.compute_views(params, tmem)
-        lse, dpsum = lse.views(LSE=c.lse_view), dpsum.views(dPsum=c.dpsum_view)
-        while work.valid:
-            n_block, head, batch = work.item
-            m_lo, m_hi = self.m_block_range(params, n_block)
-            key_oob = c.key >= params.seqlen_k - n_block * TILE_N * self.cluster.size
-            for m in cutlass.range(m_lo, m_hi, unroll=1):
-                rS = cute.make_rmem_tensor(c.tScS_t2r.shape, Float32)
-                lse, s, lh, sh = self.load_s(c, lse, s, tmem, rS)
-                if m > m_lo:
-                    # dQ_{m-1} overwrites the tail of S_m: dS_{m-1} is handed over once S_m is
-                    # read.
-                    cute.arch.fence_view_async_tmem_load()
-                    self.signal_ds(ds)
-                self.store_p(c, params, rS, lh, sh, tmem, n_block, m, key_oob)
-                dpsum, dp, ds, dsh = self.make_ds(c, params, rS, dpsum, dp, ds, tmem)
-                # Dropped down: the commit is deferred to the next tile's signal_ds. A handle
-                # must close in the iteration that opened it, and rotating the loop instead
-                # keeps P_m in registers across the back edge (causal main kernel 1.5-2.4%
-                # slower on GB300, November 2026; docs/examples.md#attention-backward).
-                dsh.commit(signal=False)
-            self.signal_ds(ds)
-            dkv = self.epilogue(params, dkv, tmem, c.tidx, n_block, head, batch)
-            work.advance()
-        return lse, dpsum, s, dp, ds, dkv, work
-
-    def signal_ds(self, ds):
-        """The raw signal of a ds commit closed with ``signal=False``: the channel's ``Warps``
-        count (every lane is done, then one elected arrival per warp) on the leader's full
-        barrier, its only target (rank 0: the kernel runs on one CTA pair). Needs no fence:
-        make_ds fenced the sdS stores, and the caller waits for its S loads (plain Python:
-        inlined)."""
-        cute.arch.sync_warp()
-        with cute.arch.elect_one():
-            cute.arch.mbarrier_arrive(ds.full_barrier(0), peer_cta_rank_in_cluster=Int32(0))
-
-    @cute.jit
-    def send_ds(self, c, dsh):
-        """Thread 0 copies the staged peer half of dS_t (sdSx) into the peer's sdS at this CTA's
-        key block, completing on the peer's xchg barrier, which it arms first (FA4's DSMEM
-        exchange). make_ds has fenced and synchronized every thread's sdSx stores."""
-        if c.tidx == 0:
-            peer = c.rank ^ 1
-            xchg = self.barrier_ptr("xchg")
-            src = dsh.view("dSx", read=True, by="tma").iterator
-            dst = dsh.view("dS").iterator + c.rank * XCHG_ELEMS  # in the peer's copy of sdS
-            cute.arch.mbarrier_arrive_and_expect_tx(
-                xchg, XCHG_BYTES, peer_cta_rank_in_cluster=peer
-            )
-            fa_copy_utils.cpasync_bulk_s2cluster(
-                src, dst, xchg, XCHG_BYTES, peer_cta_rank_in_cluster=peer
-            )
 
     @role(warps=14, regs=104)
     @cute.jit
@@ -1556,7 +1475,7 @@ _OPS: dict = {}
 
 def _op(causal, roles, dq_stages, cluster) -> tuple:
     pair = is_pair(cluster)
-    dq_stages = check_dq_stages(dq_stages, pair)
+    dq_stages = check_dq_stages(dq_stages, pair)  # normalized: one compile key per kernel
     key = (causal, None if roles is None else tuple(sorted(roles.items())), dq_stages, pair)
     op = _OPS.get(key)
     if op is None:
@@ -1568,14 +1487,16 @@ def _op(causal, roles, dq_stages, cluster) -> tuple:
     return op, key
 
 
-def check_dq_stages(dq_stages, pair: bool):
-    """The 1-CTA kernel's dQ staging buffers (default 2); ``None`` for the pair, which has
+def check_dq_stages(dq_stages, pair: bool) -> int:
+    """The dQ staging buffers: the 1-CTA kernel's option (1 or 2, default 2); the pair has
     FA4's fixed 4 x 8 columns."""
-    if pair and dq_stages is not None:
-        raise ValueError("dq_stages is a 1-CTA option; the CTA pair uses FA4's 4 x 8 columns")
-    if not pair and dq_stages not in (None, 1, 2):
+    if pair:
+        if dq_stages is not None:
+            raise ValueError("dq_stages is a 1-CTA option; the CTA pair uses FA4's 4 x 8 columns")
+        return PAIR_DQ_STAGES
+    if dq_stages not in (None, 1, 2):
         raise ValueError(f"dq_stages must be 1 or 2 (SMEM), got {dq_stages}")
-    return None if pair else (2 if dq_stages is None else dq_stages)
+    return 2 if dq_stages is None else dq_stages
 
 
 def is_pair(cluster) -> bool:
