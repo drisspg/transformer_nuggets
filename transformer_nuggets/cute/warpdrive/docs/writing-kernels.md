@@ -161,6 +161,10 @@ Follow one input stage through the consumer:
 The MMA role holds `acc.produce()` around the **whole K reduction**, publishing once.
 Epilogue holds `acc.consume()` until it has finished reading that accumulator stage.
 
+Index threads through the role, not the hardware: take `me: Local` and use `me.tid` /
+`me.warp`, so a `roles=` override that moves the role keeps its indices; TMEM rows use
+`thread_idx()[0] % me.threads` ([role-local indices](roles.md#index-the-role-not-the-hardware)).
+
 Keep participation outside lane-dependent predicates. For a ragged output, every epilogue
 thread enters and releases its handle; only in-bounds lanes store. Guarding the whole
 exchange can strand a barrier whose count still includes the absent lanes.

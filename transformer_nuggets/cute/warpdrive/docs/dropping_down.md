@@ -179,10 +179,10 @@ With `counts=None`, initialize them yourself **between `begin_roles()` and `run_
 For example, a CUTLASS pipeline can take the storage with
 `cutlass.pipeline.PipelineUmmaAsync.create(barrier_storage=self.barrier_ptr(name), defer_sync=True)`.
 
-A `@role(raw=True)` role receives context and may take `Instance`, `Tmem` and `Barriers` or
-use `self.<NamedBarrier>`. It cannot take managed ends, work cursors or turnstile seats;
-return values are ignored. It has no managed handle checks or persistent-stream drain check.
-For a nonpersistent local schedule, get the item from `self.work.single_item()`. For a
+A `@role(raw=True)` role receives context and may take `Instance`, `Local`, `Tmem` and
+`Barriers` or use `self.<NamedBarrier>`. It cannot take managed ends, work cursors or turnstile
+seats; return values are ignored. It has no managed handle checks or persistent-stream drain
+check. For a nonpersistent local schedule, get the item from `self.work.single_item()`. For a
 persistent kernel, use a managed role with a raw body instead.
 
 ### Suppress one check
@@ -214,8 +214,8 @@ self.done = NamedBarrier(threads=96)  # 64 consumers + 32 watchers
 
 @role(warps=range(1, 3), raw=True)
 @cute.jit
-def consumer(self, ctx):
-    t = cute.arch.thread_idx()[0] - 32  # consumer-local thread 0..63
+def consumer(self, ctx, me: Local):
+    t = me.tid  # consumer-local thread 0..63
     full = self.barrier_ptr("ring")
     empty = full + self.stages
     state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.stages)

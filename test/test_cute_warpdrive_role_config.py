@@ -18,6 +18,7 @@ from transformer_nuggets.cute.warpdrive import (
     Consumer,
     CtaPair,
     Instance,
+    Local,
     Producer,
     ProtocolError,
     Ring,
@@ -299,3 +300,89 @@ def test_fa4_register_bucket(requires_blackwell):
     actual, actual_lse = fa4_fwd(q, k, v, roles=tuned)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     torch.testing.assert_close(actual_lse, expected_lse, rtol=0, atol=0)
+
+
+@dataclass(frozen=True)
+class ProbeCtx:
+    out: cute.Tensor  # (threads, 5): each thread's Local values at its hardware thread's row
+
+
+def record_local(out: cute.Tensor, me: Local):
+    row = cute.arch.thread_idx()[0]
+    for column, value in enumerate((me.tid, me.warp, me.lane, me.warps, me.threads)):
+        out[row, column] = cutlass.Int32(value)
+
+
+class LocalProbe(WarpSpecialized):
+    """A single-warp role, a two-instance role of unequal widths and a raw role, each
+    recording its role-local indices."""
+
+    def __init__(self, roles: dict | None = None):
+        self.roles = roles
+
+    def get_name(self) -> str:
+        return "warpdrive_local_probe"
+
+    @role(warps=0)
+    @cute.jit
+    def single(self, ctx: ProbeCtx, me: Local):
+        record_local(ctx.out, me)
+
+    @role(warps=[range(1, 3), range(3, 4)])
+    @cute.jit
+    def multi(self, ctx: ProbeCtx, *, me: Local):
+        record_local(ctx.out, me)
+
+    @role(warps=range(4, 6), raw=True)
+    @cute.jit
+    def bare(self, ctx: ProbeCtx, me: Local):
+        record_local(ctx.out, me)
+
+    @cute.kernel
+    def kernel(self, out: cute.Tensor):
+        self.begin_roles()
+        self.run_roles(ProbeCtx(out))
+
+    @cute.jit
+    def __call__(self, out: cute.Tensor, stream: cuda.CUstream):
+        self.kernel.set_name_prefix(self.get_name())
+        self.kernel(out).launch(grid=(1, 1, 1), block=(self.num_threads, 1, 1), stream=stream)
+
+
+@jit_cache
+def compile_probe(op: LocalProbe):
+    return compile_tvm_ffi(
+        op,
+        make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(), 5), assumed_align=4),
+        name=op.get_name(),
+    )
+
+
+PROBE_DEFAULTS = {
+    "single": [range(0, 1)],
+    "multi": [range(1, 3), range(3, 4)],
+    "bare": [range(4, 6)],
+}
+PROBE_MOVED = {  # every instance off its default first warp, warps 3-4 left idle
+    "single": RoleConfig(5),
+    "multi": RoleConfig([range(6, 8), range(2, 3)]),
+    "bare": RoleConfig(range(0, 2), raw=True),
+}
+
+
+@pytest.mark.parametrize("roles", [None, PROBE_MOVED], ids=["defaults", "moved"])
+def test_local_counts_from_each_instance(requires_blackwell, roles):
+    op = LocalProbe(roles)
+    placement = PROBE_DEFAULTS if roles is None else {k: c.warps for k, c in roles.items()}
+    out = torch.full((op.num_threads, 5), -1, device="cuda", dtype=torch.int32)
+    compile_probe(op)(out)
+    expected = torch.full_like(out, -1)
+    for ranges in placement.values():
+        for warps in ranges:
+            for t in range(32 * warps.start, 32 * warps.stop):
+                local = t - 32 * warps.start
+                expected[t] = torch.tensor(
+                    [local, local // 32, t % 32, len(warps), 32 * len(warps)]
+                )
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+

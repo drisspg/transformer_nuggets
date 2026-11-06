@@ -56,6 +56,8 @@ Follow the guide's lifecycle, prologue and launch sections. In particular:
 
 - Return current endpoints, cursors and turnstile seats; helpers return and callers reassign
   state. Do not restore a saved pre-loop snapshot.
+- Take role-local thread/warp indices from `me: Local`, not raw `thread_idx()`/`warp_idx()`,
+  so `roles=` overrides keep them right; TMEM rows use `thread_idx()[0] % me.threads`.
 - Keep the declared participants in each handoff; predicate data accesses, not lane-dependent
   participation. Account for epochs across work items, including odd trip counts.
 - Bind views to the buffers they actually partition. Handle stage projection is not a proof

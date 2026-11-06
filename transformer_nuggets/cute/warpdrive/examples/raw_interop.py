@@ -22,6 +22,7 @@ from cutlass import cute, pipeline
 from transformer_nuggets.cute.jit_cache import jit_cache
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
+    Local,
     NamedBarrier,
     Producer,
     Ring,
@@ -31,7 +32,6 @@ from transformer_nuggets.cute.warpdrive import (
 )
 
 WORDS = 64  # one word per consumer thread per stage
-CONSUMER_FIRST_THREAD = 32  # warp 1's lane 0
 
 
 class RawInterop(WarpSpecialized):
@@ -56,8 +56,8 @@ class RawInterop(WarpSpecialized):
 
     @role(warps=range(1, 3), raw=True)
     @cute.jit
-    def consumer(self, ctx):
-        t = cute.arch.thread_idx()[0] - CONSUMER_FIRST_THREAD
+    def consumer(self, ctx, me: Local):
+        t = me.tid
         bad, total = cutlass.Int32(0), cutlass.Int32(0)
         full = self.barrier_ptr("ring")  # full barriers at [0, n), empty at [n, 2n)
         empty = full + self.stages

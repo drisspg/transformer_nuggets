@@ -90,6 +90,7 @@ positional signatures also work.
 | `ab: Producer` / `ab: Consumer` | An end of `self.ab` |
 | `s: Producer[Instance]` / `s: Consumer[Instance]` | An end of `self.s`, bound to this instance's slot |
 | `stage: Instance` | Instance index as a Python int |
+| `me: Local` | This instance's [own indices](#index-the-role-not-the-hardware) and size |
 | `tmem: Tmem` | Kernel's TMEM view |
 | `work: WorkCursor` | Cursor for `self.work` |
 | `mufu: Turn` | A seat in the `self.mufu` turnstile |
@@ -98,6 +99,39 @@ positional signatures also work.
 
 Names matter for channels, streams, turnstiles and raw barriers. An instance-bound channel
 must be `Slots`, not `Ring`; you still pass the slot explicitly, as in `s.wait(stage)`.
+
+### Index the role, not the hardware
+
+`cute.arch.thread_idx()` and `warp_idx()` depend on where the role runs, and
+[`roles=` overrides](#choose-placement-in-the-constructor) move and resize roles. Role code
+that counts its own threads takes a `Local`:
+
+```python
+@role(warps=range(1, 3))
+@cute.jit
+def consumer(self, ctx, *, ring: Consumer, me: Local):
+    t = me.tid  # 0..63 wherever the two warps are placed
+    if me.warp == 0:
+        ...
+```
+
+| Attribute | Value |
+|---|---|
+| `me.tid` | Thread within the instance: hardware thread minus the instance's first thread |
+| `me.warp` | Warp within the instance, warp-uniform |
+| `me.lane` | Lane within the warp |
+| `me.warps`, `me.threads` | The instance's resolved size, as Python ints |
+
+Each instance of a multi-instance role counts from its own first warp. The offsets are
+constants, so an instance at warp 0 computes exactly the hardware ids. Raw roles accept
+`Local` too. Use `me.warps` to size per-warp work, or to raise `ProtocolError` when the
+math fixes the size an override could change.
+
+TMEM lanes are the exception: `tcgen05.ld`/`st` from hardware warp `w` reach lanes
+`32 * (w % 4)` onward, wherever the role is placed. Index TMEM rows with the hardware form
+`cute.arch.thread_idx()[0] % me.threads`. For a role of 4k warps it is correct for any
+contiguous placement; `me.tid` is correct only if the instance starts on a warpgroup
+boundary.
 
 ### Pass shared setup as params
 
@@ -208,6 +242,8 @@ values raise `ProtocolError` at collection. `describe()` shows the resolved budg
 Two boundaries matter:
 
 1. **Placement does not repartition tensors.** Update your partitions when moving work.
+   Indices from [`Local`](#index-the-role-not-the-hardware) follow the role; raw hardware
+   ids do not.
 2. **Collection freezes declarations.** The first `describe()`, trace or compile-cache lookup
    collects the kernel. Construct a new instance to change it; mutation or recollection is
    unsupported. Assigning `self.roles` after construction also makes the compile key raise,

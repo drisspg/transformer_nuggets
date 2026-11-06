@@ -120,6 +120,48 @@ class Instance:
     """Annotation: the role receives its instance index as a Python int (constexpr)."""
 
 
+class Local:
+    """Annotation and value: the role instance's own thread, warp and lane indices.
+
+    Hardware ids (``cute.arch.thread_idx()``, ``warp_idx()``) depend on where the role is
+    placed, and ``roles=`` overrides move and resize roles; role code that indexes by its own
+    threads uses these instead. ``tid`` and ``warp`` count from the instance's first thread and
+    warp (a constant subtracted from the hardware id, nothing at offset 0); ``warp`` is
+    warp-uniform. ``warps`` and ``threads`` are the instance's size as Python ints. TMEM lanes
+    follow the hardware warp instead (``tcgen05.ld`` from warp ``w`` reaches lanes
+    ``32 * (w % 4)``): index TMEM rows with ``thread_idx()[0] % threads``.
+    """
+
+    def __init__(self, first_warp: int, warps: int):
+        self._first_warp = first_warp
+        self.warps = warps
+        self.threads = warps * WARP_SIZE
+
+    # Holds no DSL values: a loop or branch that captures it carries nothing.
+    def __extract_mlir_values__(self):
+        return []
+
+    def __new_from_mlir_values__(self, values):
+        return self
+
+    @property
+    def tid(self) -> Int32:
+        """Thread index within the instance, ``0 .. threads - 1``."""
+        tid = cute.arch.thread_idx()[0]
+        return tid - self._first_warp * WARP_SIZE if self._first_warp else tid
+
+    @property
+    def warp(self) -> Int32:
+        """Warp index within the instance, ``0 .. warps - 1`` (warp-uniform)."""
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        return warp - self._first_warp if self._first_warp else warp
+
+    @property
+    def lane(self) -> Int32:
+        """Lane within the warp (instances are whole warps, so the hardware lane)."""
+        return cute.arch.lane_idx()
+
+
 class Turn:
     """Annotation: the role receives its seat at the turnstile with the parameter's name."""
 
@@ -141,12 +183,13 @@ _ANNOTATIONS = {
     "Consumer": Consumer,
     "Tmem": Tmem,
     "Instance": Instance,
+    "Local": Local,
     "Turn": Turn,
     "WorkCursor": WorkCursor,
     "Barriers": Barriers,
 }
 # Parameters a raw role may take: no channel ends, cursors, or seats (they carry protocol state).
-_RAW_ANNOTATIONS = (Instance, Tmem, Barriers, _Context)
+_RAW_ANNOTATIONS = (Instance, Local, Tmem, Barriers, _Context)
 # Layer classes a role might write in place of an annotation, and the annotation meant.
 _LOOKALIKES = (
     (ProducerEnd, "Producer"),
@@ -287,9 +330,10 @@ def role(
     A list of warp ranges instantiates the method once per range; an Instance parameter receives
     its index. ``cta="leader"`` restricts execution to the leader of each MMA pair (a no-op without
     pairs) and ``cta="rank0"`` to cluster rank 0; "all" is the default.
-    ``raw=True`` accepts Instance, Tmem, Barriers and a context, but no managed channel ends or
-    work cursors. Raw roles still take part in register allocation and TMEM teardown. Put this
-    decorator directly above ``@cute.jit``; CuTeDSL re-applies it when preprocessing the source.
+    ``raw=True`` accepts Instance, Local, Tmem, Barriers and a context, but no managed channel
+    ends or work cursors. Raw roles still take part in register allocation and TMEM teardown.
+    Put this decorator directly above ``@cute.jit``; CuTeDSL re-applies it when preprocessing
+    the source.
     """
     declaration = RoleConfig(warps, regs, cta, raw)
 
@@ -499,8 +543,8 @@ class WarpSpecialized(metaclass=_KernelType):
                 if raw and ann not in _RAW_ANNOTATIONS:
                     raise ProtocolError(
                         f"raw role {name}: parameter {pname} is {getattr(ann, '__name__', ann)}; "
-                        "raw roles take Instance, Tmem, Barriers, and the context only (drive "
-                        "edges through Barriers, or make the role managed)"
+                        "raw roles take Instance, Local, Tmem, Barriers, and the context only "
+                        "(drive edges through Barriers, or make the role managed)"
                     )
                 if ann is Barriers and pname not in raw_bars:
                     raise ProtocolError(f"role {name}: no Barriers named {pname!r}")
@@ -1698,6 +1742,8 @@ class WarpSpecialized(metaclass=_KernelType):
                 args.append(_Fetch(st.schedule, ends, self._ws_problems[pname]))
             elif ann is Instance:
                 args.append(r.index)
+            elif ann is Local:
+                args.append(Local(r.first_warp, r.num_warps))
             elif ann is Turn:
                 ts = self._ws_turns[pname]
                 seat = ts.parties.index(r)

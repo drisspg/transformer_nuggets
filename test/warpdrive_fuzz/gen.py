@@ -1444,7 +1444,7 @@ def _role_params(spec: KernelSpec, r: RoleSpec) -> list[str]:
         params.append("xraw: Barriers")
         if r.tmem:
             params.append("tmem: Tmem")
-        params.append("ctx")
+        params.extend(("me: Local", "ctx"))
         return params
     if r.instances > 1 or any(
         b for ch in spec.channels for rn, b in (*ch.producers, *ch.consumers) if rn == r.name
@@ -1463,7 +1463,7 @@ def _role_params(spec: KernelSpec, r: RoleSpec) -> list[str]:
         params.append("work: WorkCursor")
     if r.tmem:
         params.append("tmem: Tmem")
-    params.append("ctx")
+    params.extend(("me: Local", "ctx"))
     return params
 
 
@@ -1767,8 +1767,7 @@ def _emit_role(src: _Src, spec: KernelSpec, r: RoleSpec):
     src(f"@role(warps={warps}{regs}{cta}{raw})")
     src("@cute.jit")
     src.block(f"def {r.name}({', '.join(_role_params(spec, r))}):")
-    first = _by_stage(r.warps)
-    src(f"tid = Int32(cute.arch.thread_idx()[0]) - {first} * 32")
+    src("tid = me.tid")
     src("lead = tid == 0")
     src("rank = self.cluster.rank()")
     src(f"base = D.cta_id() * {lay.per_cta}")
@@ -1959,6 +1958,7 @@ def emit(spec: KernelSpec) -> str:
         "CtaPair",
         "IndexSchedule",
         "Instance",
+        "Local",
         "OneShot",
         "PdlWait",
         "Producer",
