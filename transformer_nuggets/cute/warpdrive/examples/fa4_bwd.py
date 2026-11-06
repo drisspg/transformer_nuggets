@@ -712,7 +712,8 @@ class FlashAttentionBackward(WarpSpecialized):
             sdSx = cute.make_tensor(dsh.view("dSx", write=True).iterator, c.sdS_epi)
             cute.autovec_copy(rdS_peer, c.thr_r2s.partition_D(sdSx)[None, 0])
             # Every thread's sdS / sdSx stores reach the async proxy before the exchange copy
-            # (and before the dQ MMA, which the ds commit hands them to).
+            # (and before the dQ MMA, which the ds commit hands them to). This also orders the
+            # dPsum reads before the release below: the pair's dpsum has no release fence.
             fence_async_shared()
             self.compute_sync.sync(aligned=True)
         dh.release()
@@ -1565,6 +1566,8 @@ def check_dq_stages(dq_stages, pair: bool):
     FA4's fixed 4 x 8 columns."""
     if pair and dq_stages is not None:
         raise ValueError("dq_stages is a 1-CTA option; the CTA pair uses FA4's 4 x 8 columns")
+    if not pair and dq_stages not in (None, 1, 2):
+        raise ValueError(f"dq_stages must be 1 or 2 (SMEM), got {dq_stages}")
     return None if pair else (2 if dq_stages is None else dq_stages)
 
 

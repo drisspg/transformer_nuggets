@@ -452,7 +452,7 @@ compute (both):  sdS written and S_{t+1} read --------------------- ds full (lea
                                                                     -> leader issues dQ_t
 ```
 
-Thirteen channels (all with an MMA side pair-scoped), one raw barrier, and TMEM S / dV / dP /
+Thirteen channels (those with an MMA side pair-scoped), one raw barrier, and TMEM S / dV / dP /
 dK with P over S, dS over dP and this CTA's 64 dQ columns over S's tail. Both
 [class docstrings](../examples/fa4_bwd.py) map channels, TMEM and MMA order.
 
@@ -498,8 +498,8 @@ the whole graph:
 | causal 1x16x8192x8192 | 511.0 | 480.2 | 544.4 | 536.6 | 1.064 | 0.939 | 1.014 | 1.059 |
 | causal 4x16x3000x2900 | 327.5 | 311.3 | 336.0 | 330.6 | 1.052 | 0.975 | 1.016 | 1.045 |
 
-The 2-CTA port is 4-6% faster than the 1-CTA port on the long shapes (1-2% slower on the short
-and the ragged non-causal ones, as FA4's 2-CTA kernel is barely faster there either), but trails
+The 2-CTA port is 4-6% faster than the 1-CTA port on the long shapes (1.3-1.5% slower on short
+causal and ragged non-causal, where FA4's 2-CTA kernel gains little over its 1-CTA one too), but trails
 FA4's 2-CTA kernel by 1.1-4.1% non-causal and 5.2-6.4% causal. A run-to-run repeat (another
 agent, another GPU, same commit) gave +6.2% for causal 1x16x8192. The 1-CTA port stays within
 0.1-2% of its FA4 kernel.
@@ -539,7 +539,7 @@ replay (`--cache-control none`, base clocks) of 1x16x8192 and 4x16x3000x2900:
 | Causal compute 144 registers (reduce 120), which removes the compute warps' causal spills | +0.8% with the deferred commit | No |
 | No `release_fence` on dpsum: make_ds fences and syncs every compute thread after its last dPsum read (the only layer-emitted sync op FA4 does not have, from the sync-skeleton diff below) | -0.3% to -1% on 5 of 6 shapes | Yes |
 | dQ MMA as `gemm_ptx_w_idx` or one unrolled `cute.gemm` instead of FA4's two-group `gemm_w_idx` | 214 / 108 local-memory instructions instead of 10 (compile only) | No |
-| One-tile items (64x16x128x256), the layer's fixed per-CTA costs | +3.5% (0.27 us per wave of 74 pairs) | — |
+| One-tile items (64x16x128x256), the layer's fixed per-CTA costs | +3.5% vs FA4 2-CTA (0.27 us per wave of 74 pairs) | — |
 
 The remaining gap is spread over the tile loop rather than fixed costs (it grows with the
 tiles per item: 1x16x8192 trails most), and it is not synchronization:
@@ -558,7 +558,7 @@ tiles per item: 1x16x8192 trails most), and it is not synchronization:
   change the time.
 - Each CTA keeps all 16 warps until the exit cluster barrier, and pair-scoped producers drain
   before it (FA4's warps exit as they finish). This shows as +10% NCU stall samples, all idle
-  warps at the barrier, but the gap does not track it (one-tile items are +3.5%).
+  warps at the barrier, but the gap does not track it (one-tile items are +3.5% vs FA4).
 
 **Without a reference.** On our 2-CTA kernel alone (1x16x8192 non-causal unless noted):
 
@@ -572,8 +572,8 @@ tiles per item: 1x16x8192 trails most), and it is not synchronization:
 Both views point at the compute warps as the critical role (the MMA waits on them, not on
 data), which is where the FA4 diff found the excess. Neither view alone separates "compute
 does too much work" from "compute is scheduled badly"; the instruction count per tile and the
-sync skeleton made that distinction, and only the reference made the 7% visible as a gap
-rather than as a 66% tensor-pipe figure.
+sync skeleton made that distinction. Only the reference turns a 66% busy tensor pipe into a
+known 3.8% (1x16x8192) shortfall.
 
 </details>
 
@@ -619,12 +619,12 @@ Layer gaps found by the 2-CTA port, with proposals:
 | Gap | Workaround here | Proposal |
 |---|---|---|
 | No channel one CTA fills for its pair peer (a peer exchange). `Tma(fills="pair")` only lets a leader fill both CTAs, and TMA producers must be single-warp roles. | Raw `Barriers(1, counts=1)`, remote arm + `cp.async.bulk.shared::cluster` from compute thread 0, relay warp waiting on it | `Tma(bytes, fills="peer")`: producers in every CTA, each arming its peer's full barrier and filling its stage (with `Cluster.fill(peer)` masks), consumers in every CTA; let a multi-warp producer issue it from one elected thread. The relay then becomes an ordinary consumer that produces on ds. |
-| A handle must close in the dynamic region that opened it, so a commit deferred past the loop's back edge (FA4's "dS_t is published once S_{t+1} is read") needs either a rotated loop, which carries P_t in registers across the back edge (+2-3% causal), or a raw signal. | `commit(signal=False)` + raw `signal_ds` | A checked carry for open handles, like try tokens: `pending = h.defer()` returns a loop-carried value whose `commit()` must happen before the end's next acquire, with the last one closed after the loop. |
+| A handle must close in the dynamic region that opened it, so a commit deferred past the loop's back edge (FA4's "dS_t is published once S_{t+1} is read") needs either a rotated loop, which carries P_t in registers across the back edge (1.5-2.4% slower causal), or a raw signal. | `commit(signal=False)` + raw `signal_ds` | A checked carry for open handles, like try tokens: `pending = h.defer()` returns a loop-carried value whose `commit()` must happen before the end's next acquire, with the last one closed after the loop. |
 | Raw signals need hand-written targets: the remote arrival on the leader takes a rank and a local pointer. | `mbarrier_arrive(ds.full_barrier(0), peer_cta_rank_in_cluster=0)` | `h.signal()` on a handle closed with `signal=False` (or `end.signal(index)`), emitting the managed signal (count, targets, fences) where the caller places it. |
 | No fence kind for TMEM loads: a release meaning "I have read this TMEM" needs `tcgen05.wait::ld` written by hand. | `fence_view_async_tmem_load()` before `signal_ds` | `release_fence="tmem_load"` / `commit_fence="tmem_load"`. |
 | `commit_fence` applies to every producer of a joined side; the relay would run the compute warps' fences. | ds declares no fence; compute fences before the exchange | Per-role fences on a joined side. |
 | The alias diagnostic does not model CTA pairs: every alias is `unverified`. | — | Already listed under [Still missing](#still-missing). |
-| Producers of pair-scoped channels tail and every CTA joins an exit cluster barrier, so idle warps stay resident; FA4's exit as they finish. | — | Measure an opt-out for `OneShot` kernels whose final waits already cover the peer's accesses (no regression found attributable to it here: one-tile items are +3.5%). |
+| Producers of pair-scoped channels tail and every CTA joins an exit cluster barrier, so idle warps stay resident; FA4's exit as they finish. | — | Measure an opt-out for `OneShot` kernels whose final waits already cover the peer's accesses (no regression found attributable to it here: one-tile items are +3.5% vs FA4). |
 
 Diagnostics that stay incomplete:
 
@@ -639,8 +639,9 @@ Diagnostics that stay incomplete:
 
 ### Size
 
-Code lines, excluding blank lines, comments and docstrings (this checkout's counter, which
-gives 948 for the 1-CTA port before the 2-CTA kernel; the historical count below was 924):
+Code lines: tokens other than comments, docstrings and blank lines, per line (Python's
+`tokenize` and `ast`; it gives 948 for the 1-CTA port before the 2-CTA kernel, where the
+historical count was 924):
 
 | Source | Code lines |
 |---|---:|
