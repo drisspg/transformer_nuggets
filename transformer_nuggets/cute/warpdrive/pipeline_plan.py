@@ -15,9 +15,6 @@ from transformer_nuggets.cute.warpdrive.describe import is_pair, rank_label
 ROLE_COLORS = ("#4f9cf9", "#5bc8a5", "#ef6a8a", "#c88bf2", "#f0b35b", "#63c7da", "#a0a0a0")
 
 
-# --------------------------------------------------------------------------- #
-
-
 def plan_from_warpdrive(kernel, *, cta: int = 0, name: str | None = None) -> PipelinePlan:
     """The kernel's roles, channels, and handoffs as a ``PipelinePlan`` for CTA rank ``cta``.
 
@@ -46,8 +43,8 @@ def plan_from_warpdrive(kernel, *, cta: int = 0, name: str | None = None) -> Pip
         name or _kernel_name(kernel),
         iteration_name="work item" if kernel._ws_streams else "launch",
     )
+    where = f" ({rank_label(cta, is_pair(cluster))})" if cluster.size > 1 else ""
     for i, r in enumerate(roles):
-        where = f" ({rank_label(cta, is_pair(cluster))})" if cluster.size > 1 else ""
         plan.add_role(
             Role(
                 r.name,
@@ -109,10 +106,9 @@ def _kernel_name(kernel) -> str:
 
 
 def _storage(ch) -> str:
-    if ch.payload is not None:
+    # Payloads and TMA-filled or MMA-read operand stages use SMEM.
+    if ch.payload is not None or isinstance(ch.producer, Tma) or ch.consumer is Umma:
         return "SMEM"
-    if isinstance(ch.producer, Tma) or ch.consumer is Umma:
-        return "SMEM"  # TMA-filled or MMA-read operand stages
     if ch.producer is Umma:
         return "TMEM"
     return "barrier"

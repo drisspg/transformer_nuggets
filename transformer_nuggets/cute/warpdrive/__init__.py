@@ -6,11 +6,10 @@ turnstiles, and a ``TmemPlan`` as attributes, and writes roles as methods decora
 set in ``__init__``, replaces those defaults per instance. The resolved configuration is fixed
 on first collection; ``jit_cache`` keys it through ``__cute_cache_key__``. Role parameters
 receive channel ends by name and annotation (``Producer``, ``Consumer``,
-``Consumer[Instance]``), the TMEM view
-(``Tmem``), the instance index (``Instance``), or a turnstile seat (``Turn``). The context
-passed to ``run_roles`` (a frozen dataclass of prologue values in the examples) goes to the
-parameter annotated with its type, or to the role's single unannotated parameter; any other
-annotation is a ``ProtocolError``.
+``Consumer[Instance]``), the TMEM view (``Tmem``), the instance index (``Instance``), or a
+turnstile seat (``Turn``). The context passed to ``run_roles`` (a frozen dataclass of prologue
+values in the examples) goes to the parameter annotated with its type, or to the role's single
+unannotated parameter; any other annotation is a ``ProtocolError``.
 ``Ring(..., consumer_sharing=Sharing.ROUND_ROBIN)`` (or ``producer_sharing=``) lets the
 instances of one role take a side's epochs in turn;
 ``Ring(..., consumer_sharing=Sharing.EXCLUSIVE)`` gives each epoch one owner among the consumer

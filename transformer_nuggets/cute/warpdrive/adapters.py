@@ -81,10 +81,6 @@ class CutlassRaster(WorkMap):
     def skips(self) -> bool:
         return self.swizzle > 1
 
-    @property
-    def _raster(self) -> Raster:
-        return Raster(along=self.along, swizzle=self.swizzle)
-
     def _pad(self, extents, round_up):
         """``extents`` with the banded axis (the one ``along`` does not name) rounded up to a
         multiple of ``swizzle``."""
@@ -106,7 +102,8 @@ class CutlassRaster(WorkMap):
 
     def decode(self, index, space, state):
         padded, (em, en, _) = space
-        _, (m, n, li), _ = self._raster.decode(index, padded, None)
+        raster = Raster(along=self.along, swizzle=self.swizzle)
+        _, (m, n, li), _ = raster.decode(index, padded, None)
         if self.swizzle == 1:  # no padding: every tile is inside the space
             return True, (m, n, li), state
         return (m < em) & (n < en), (m, n, li), state
