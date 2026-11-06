@@ -5,7 +5,6 @@ with keys stored after head RMSNorm and rotate-half RoPE. Positions are Python
 integers (static specializations for torch.compile); tokens are scalar tensors.
 """
 
-from collections.abc import Callable
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
 
@@ -106,7 +105,6 @@ def load_qwen3_weights(
 
 CachePair = tuple[torch.Tensor, torch.Tensor]
 DecodeState = tuple[CachePair, torch.Tensor, int]
-StepFn = Callable[[QwenWeights, torch.Tensor, int, torch.Tensor, torch.Tensor], torch.Tensor]
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -218,18 +216,6 @@ def make_decode_state(
         weights, prompt_tokens(weights, ctx_len, seed), 0, *caches, dtype=weights.embed.dtype
     )
     return caches, logits.argmax(), ctx_len
-
-
-@torch.no_grad()
-def greedy_tokens(
-    step_fn: StepFn, state: DecodeState, n: int, *, weights: QwenWeights
-) -> list[int]:
-    caches, token, pos = state
-    result = []
-    for offset in range(n):
-        token = step_fn(weights, token, pos + offset, *caches).argmax()
-        result.append(int(token))
-    return result
 
 
 def compare_logits(

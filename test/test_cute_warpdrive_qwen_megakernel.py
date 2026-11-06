@@ -4,6 +4,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+pytest.importorskip("cutlass.cute")
+
 from transformer_nuggets.cute.warpdrive.examples import qwen_megakernel as mk
 from transformer_nuggets.cute.warpdrive.examples.qwen_megakernel_ref import (
     compare_logits,
@@ -19,19 +21,16 @@ MAX_LEN = 256
 
 
 @pytest.fixture(scope="module")
-def weights(requires_blackwell_module):
+def weights():
+    """Load the checkpoint from the local HF cache; skip if it is missing, never download."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("the megakernel requires an SM100-family GPU")
     hub = pytest.importorskip("huggingface_hub")
     pytest.importorskip("safetensors")
     path = hub.try_to_load_from_cache("Qwen/Qwen3-0.6B", "model.safetensors")
     if not isinstance(path, str):
         pytest.skip("Qwen3-0.6B is not in the local HF cache")
     return load_qwen3_weights(path)
-
-
-@pytest.fixture(scope="module")
-def requires_blackwell_module():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("the megakernel requires an SM100-family GPU")
 
 
 def bf16_values(*shape, scale=1.0):
@@ -124,22 +123,14 @@ def test_oproj_instruction(weights):
     torch.manual_seed(1)
     runner = mk.QwenMegakernel(weights, MAX_LEN, ops=(mk.OPROJ,))
     o = torch.randn(runner.values("attn_o").shape, device="cuda")  # (L, kv head, split, head, d)
-    m = (
-        torch.randn(runner.values("attn_ml").shape[:-1], device="cuda") * 3
-    )  # (L, kvh, head, split)
+    m = torch.randn(runner.values("attn_ml").shape[:-1], device="cuda") * 3  # (L, kvh, head, sp)
     den = torch.rand(m.shape, device="cuda") + 0.5
     runner.set_values("attn_o", o)
     runner.set_values("attn_ml", torch.stack((m, den), -1))
     m, den = m.transpose(2, 3), den.transpose(2, 3)  # (L, kv head, split, head) like o
     runner.step_info.copy_(torch.tensor([0, 100], dtype=torch.int32))
-    runner.launch(
-        *[
-            torch.zeros(
-                mk.LAYERS, mk.KV_HEADS, MAX_LEN, mk.HEAD_DIM, device="cuda", dtype=torch.bfloat16
-            )
-            for _ in "kv"
-        ]
-    )
+    cache_shape = (mk.LAYERS, mk.KV_HEADS, MAX_LEN, mk.HEAD_DIM)
+    runner.launch(*[torch.zeros(cache_shape, device="cuda", dtype=torch.bfloat16) for _ in "kv"])
     torch.cuda.synchronize()
     scale = torch.exp2(m - m.amax(2, keepdim=True))
     attn = (o * scale[..., None]).sum(2) / (den * scale).sum(2)[..., None]

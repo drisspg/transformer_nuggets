@@ -286,10 +286,10 @@ def main() -> None:
             ("fast_graph", fast, True),
         ]
         if args.profile:
-            report.setdefault("profiles", {})[str(ctx_len)] = {"reference": profile_step(eager)}
+            profiles = report.setdefault("profiles", {}).setdefault(str(ctx_len), {})
+            profiles["reference"] = profile_step(eager)
             print(
-                f"ctx={ctx_len} reference_profile={json.dumps(report['profiles'][str(ctx_len)]['reference'])}",
-                flush=True,
+                f"ctx={ctx_len} reference_profile={json.dumps(profiles['reference'])}", flush=True
             )
         if not args.skip_compile:
             compiled = torch.compile(decode_step_fast, mode=args.compile_mode, fullgraph=True)
@@ -307,12 +307,8 @@ def main() -> None:
                 [("compiled", compiled_step, False), ("compiled_graph", compiled_step, True)]
             )
         if args.profile:
-            fastest = compiled_step if not args.skip_compile else fast
-            report["profiles"][str(ctx_len)]["fast"] = profile_step(fastest)
-            print(
-                f"ctx={ctx_len} fast_profile={json.dumps(report['profiles'][str(ctx_len)]['fast'])}",
-                flush=True,
-            )
+            profiles["fast"] = profile_step(fast if args.skip_compile else compiled_step)
+            print(f"ctx={ctx_len} fast_profile={json.dumps(profiles['fast'])}", flush=True)
         if not args.skip_megakernel:
             runner = QwenMegakernel(weights, max_len)
             for cache in caches:

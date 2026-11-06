@@ -40,8 +40,8 @@ Every per-step intermediate has its own (per-layer) buffer, so there are no writ
 hazards inside a launch. The new K/V row at ``pos`` is written by the one attention row whose
 TMA-loaded block holds it (masked), after those loads completed.
 
-At ctx 1024 on a GB300 one step takes ~470-480 us (torch.compile + CUDA graph: ~1230 us; the
-1.31 GB of weights and KV at the 6.15 TB/s read roofline: 213 us). It is latency-bound: about 140
+At ctx 1024 on a GB300 one step takes ~470-480 us (torch.compile + CUDA graph: ~1230-1365 us;
+the 1.31 GB of weights and KV at the ~6.14 TB/s read roofline: 213 us; docs/examples.md). It is latency-bound: about 140
 dependent phases of ~1 us input propagation plus 1-3 us row latency. ``timeline=True`` records
 per-row stamps and ``QwenMegakernel(iket="roles")`` IKET ranges to see where the time goes.
 """
@@ -90,12 +90,17 @@ LOG2E = 1.4426950408889634
 ROWS, TILE_K, BLOCK = 32, 256, 64
 STAGE_BYTES = ROWS * TILE_K * 2
 O_SPLITS, DOWN_SPLITS = 4, 4  # split-K of o_proj (heads 4s..4s+3) and down (768 columns)
+# Weight stages per 32-row tile: QKV, GATEUP and LMHEAD read all 1024 columns.
+HIDDEN_K_TILES = HIDDEN // TILE_K
+OPROJ_K_TILES = Q_HEADS * HEAD_DIM // TILE_K // O_SPLITS
+DOWN_K_TILES = INTER // TILE_K // DOWN_SPLITS
 LM_TILES = 8  # row tiles per LM-head item
 COMPUTE_WARPS = 8
 ROWS_PER_WARP = ROWS // COMPUTE_WARPS
 COMPUTE_THREADS = 32 * COMPUTE_WARPS
 
 QKV, ATTN, OPROJ, GATEUP, DOWN, LMHEAD = range(6)
+ALL_OPS = (QKV, ATTN, OPROJ, GATEUP, DOWN, LMHEAD)
 EVICT_FIRST = 0x12F0000000000000  # TMA L2 cache hint (CUTLASS CacheHintSm90::EVICT_FIRST)
 WORDS = 5  # op, layer, a, b, table row
 # Timeline columns (globaltimer ns, plus the CTA) recorded per row when timeline=True.
@@ -178,6 +183,24 @@ class MegakernelParams:
     v_cache: cute.Tensor
 
 
+# The MegakernelParams fields the kernel receives as argument tensors, in argument order.
+TENSOR_ARGS = (
+    "logits",
+    "state",
+    "step",
+    "timeline",
+    "embed",
+    "ln_in",
+    "ln_post",
+    "q_norm",
+    "k_norm",
+    "final_norm",
+    "rope",
+    "k_cache",
+    "v_cache",
+)
+
+
 # ------------------------------------------------------------------- tagged words
 
 
@@ -200,31 +223,23 @@ def publish(buf, index, value, epoch):
     cute.arch.store(buf.iterator + index, pack_tagged(value, epoch), sem="relaxed", scope="gpu")
 
 
+def load_vector(ptr, n: int) -> list:
+    """``n`` (2 or 4) int64 words from ``ptr`` (``8 * n``-byte aligned) in one relaxed load."""
+    vec = cute.arch.load(ptr, ir.VectorType.get([n], Int64.mlir_type), sem="relaxed", scope="gpu")
+    return [Int64(vector.extract(vec, dynamic_position=[], static_position=[k])) for k in range(n)]
+
+
 @cute.jit
 def load_words(buf, index, count: cutlass.Constexpr):
-    """``count`` tagged words from ``buf[index]`` with relaxed gpu-scope loads, two words
-    (16 B, ``index`` even) per load where possible: each strong load is its own L2 request,
-    so a poll costs one request per instruction and lane."""
+    """``count`` tagged words from ``buf[index]`` with relaxed gpu-scope loads: four words
+    (32 B), then two (16 B), then a scalar tail. Each strong load costs one L2 request per
+    lane. ``index`` must be a multiple of 4 when ``count >= 4`` and even when ``count >= 2``."""
     words = []
     quads = count // 4 * 4
     for e in cutlass.range_constexpr(0, quads, 4):
-        quad = cute.arch.load(
-            buf.iterator + (index + e),
-            ir.VectorType.get([4], Int64.mlir_type),
-            sem="relaxed",
-            scope="gpu",
-        )
-        for k in cutlass.range_constexpr(4):
-            words.append(Int64(vector.extract(quad, dynamic_position=[], static_position=[k])))
+        words += load_vector(buf.iterator + (index + e), 4)
     for e in cutlass.range_constexpr(quads, count - 1, 2):
-        pair = cute.arch.load(
-            buf.iterator + (index + e),
-            ir.VectorType.get([2], Int64.mlir_type),
-            sem="relaxed",
-            scope="gpu",
-        )
-        for k in cutlass.range_constexpr(2):
-            words.append(Int64(vector.extract(pair, dynamic_position=[], static_position=[k])))
+        words += load_vector(buf.iterator + (index + e), 2)
     if cutlass.const_expr(count % 2):
         last = buf.iterator + (index + count - 1)
         words.append(cute.arch.load(last, Int64, sem="relaxed", scope="gpu"))
@@ -233,8 +248,8 @@ def load_words(buf, index, count: cutlass.Constexpr):
 
 @cute.jit
 def fetch(segments, out, epoch):
-    """Spin until every word of ``segments`` (``(buffer, start, count)`` runs; an even count
-    needs an even start) carries ``epoch``; their values fill ``out`` in order."""
+    """Spin until every word of ``segments`` carries ``epoch``; their values fill ``out`` in
+    order. Segments are ``(buffer, start, count)`` runs aligned as ``load_words`` requires."""
     starts = []
     total = 0
     for s in cutlass.range_constexpr(len(segments)):
@@ -358,18 +373,18 @@ class QwenDecodeMegakernel(WarpSpecialized):
         stages: int = 12,
         splits: int = 16,
         schedule: str = "static",
-        schedule_stages: int = 1,
         timeline: bool = False,
     ):
-        """``stages``: 16 KB weight/KV ring depth. ``splits``: KV splits per kv head.
+        """``stages``: weight/KV ring depth in 16 KB stages. ``splits``: KV splits per kv head.
         ``schedule``: ``"static"`` runs a host-assigned per-CTA row list (``StaticPersistent``
         over a ``[slot][cta]`` table; needs every CTA resident), ``"atomic"`` claims rows in
-        dependency order (``AtomicPersistent``; ``schedule_stages`` rows decoded ahead).
+        dependency order (``AtomicPersistent``, one row decoded ahead).
         ``timeline``: record per-row globaltimer stamps (``TIMELINE`` columns)."""
         if schedule not in ("static", "atomic"):
             raise ValueError(f"schedule must be 'static' or 'atomic', got {schedule!r}")
-        if not 1 <= splits <= 32:  # combine_attention fetches a head's 2 * splits (m, l) words
-            raise ValueError(f"splits must be in [1, 32], got {splits}")  # with 64 threads
+        # combine_attention fetches a head's 2 * splits (m, l) words with 64 threads.
+        if not 1 <= splits <= 32:
+            raise ValueError(f"splits must be in [1, 32], got {splits}")
         self.stages, self.splits, self.timeline = stages, splits, timeline
         self.scratch_layout = ScratchLayout(splits)
         self.smem_plan = SmemPlan()
@@ -391,9 +406,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
         self.csync = NamedBarrier(threads=COMPUTE_THREADS)
         self.work = WorkStream(
             mapping=InstructionTable(),
-            schedule=StaticPersistent()
-            if schedule == "static"
-            else AtomicPersistent(stages=schedule_stages),
+            schedule=StaticPersistent() if schedule == "static" else AtomicPersistent(stages=1),
         )
 
     def get_name(self) -> str:
@@ -415,7 +428,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
         max_len = p.k_cache.shape[0] // (LAYERS * KV_HEADS)
         while work.valid:
             op, layer, a, b, row = work.item
-            self.stamp(p, row, 4)
+            self.stamp(p, row, "load_start")
             if op == ATTN:
                 blk0, blk1 = self.split_blocks(pos, b)
                 row0 = (layer * KV_HEADS + a) * (max_len // BLOCK)
@@ -423,19 +436,21 @@ class QwenDecodeMegakernel(WarpSpecialized):
                     w = self.load_tiles(w, tma_k, g_k, row0 + blk, 0, 1, "KV")
                     w = self.load_tiles(w, tma_v, g_v, row0 + blk, 0, 1, "KV")
             elif op == QKV:
-                w = self.load_tiles(w, tma_qkv, g_qkv, layer * (QKV_ROWS // ROWS) + a, 0, 4, "W")
+                tile = layer * (QKV_ROWS // ROWS) + a
+                w = self.load_tiles(w, tma_qkv, g_qkv, tile, 0, HIDDEN_K_TILES, "W")
             elif op == OPROJ:
-                kts = Q_HEADS * HEAD_DIM // TILE_K // O_SPLITS
-                w = self.load_tiles(w, tma_o, g_o, layer * (HIDDEN // ROWS) + a, b * kts, kts, "W")
+                tile = layer * (HIDDEN // ROWS) + a
+                w = self.load_tiles(w, tma_o, g_o, tile, b * OPROJ_K_TILES, OPROJ_K_TILES, "W")
             elif op == GATEUP:
-                w = self.load_tiles(w, tma_gu, g_gu, layer * (2 * INTER // ROWS) + a, 0, 4, "W")
+                tile = layer * (2 * INTER // ROWS) + a
+                w = self.load_tiles(w, tma_gu, g_gu, tile, 0, HIDDEN_K_TILES, "W")
             elif op == DOWN:
-                kts = INTER // TILE_K // DOWN_SPLITS
-                w = self.load_tiles(w, tma_d, g_d, layer * (HIDDEN // ROWS) + a, b * kts, kts, "W")
+                tile = layer * (HIDDEN // ROWS) + a
+                w = self.load_tiles(w, tma_d, g_d, tile, b * DOWN_K_TILES, DOWN_K_TILES, "W")
             else:
                 for rt in cutlass.range(a, a + b, unroll=1):
-                    w = self.load_tiles(w, tma_lm, g_lm, rt, 0, HIDDEN // TILE_K, "W")
-            self.stamp(p, row, 5)
+                    w = self.load_tiles(w, tma_lm, g_lm, rt, 0, HIDDEN_K_TILES, "W")
+            self.stamp(p, row, "load_end")
             work.advance()
         return w, work
 
@@ -472,7 +487,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
         xbuf = Int32(0)
         while work.valid:
             op, layer, a, b, row = work.item
-            self.stamp(p, row, 1)
+            self.stamp(p, row, "item")
             if op == ATTN:
                 w = self.attention(p, w, layer, a, b, pos, epoch, tid, warp, lane, row)
             else:
@@ -487,9 +502,9 @@ class QwenDecodeMegakernel(WarpSpecialized):
                             p, op, layer, a, ks, token, epoch, xbuf, tid, warp, lane, row
                         )
                         self.csync.sync()
-                self.stamp(p, row, 6)
+                self.stamp(p, row, "prologue")
                 w = self.gemv(p, w, op, layer, a, b, epoch, xbuf, warp, lane, row)
-            self.stamp(p, row, 3)
+            self.stamp(p, row, "done")
             work.advance()
         # Every CTA read the epoch before it finished; the last one advances it.
         if tid == 0:
@@ -503,20 +518,27 @@ class QwenDecodeMegakernel(WarpSpecialized):
 
     @cute.jit
     def stamp(self, p: MegakernelParams, row, column: cutlass.Constexpr):
+        """Stamp globaltimer into ``TIMELINE`` column ``column`` of table row ``row``
+        (timeline=True only)."""
         if cutlass.const_expr(self.timeline):
             # Thread 0 of the compute warps or the load warp.
             if cute.arch.thread_idx()[0] % COMPUTE_THREADS == 0:
-                if cutlass.const_expr(column == 1):
+                if cutlass.const_expr(column == "item"):
                     p.timeline[row, 0] = Int64(cute.arch.block_idx()[0])
-                p.timeline[row, column] = Int64(cute.arch.globaltimer())
+                p.timeline[row, TIMELINE.index(column)] = Int64(cute.arch.globaltimer())
 
     # ------------------------------------------------------------ compute helpers
 
     @cute.jit
+    def kv_blocks(self, pos):
+        """The KV block count of positions ``[0, pos)`` and the most blocks one split reads."""
+        blocks = (pos + BLOCK - 1) // BLOCK
+        return blocks, (blocks + self.splits - 1) // self.splits
+
+    @cute.jit
     def split_blocks(self, pos, split):
         """KV blocks ``[blk0, blk1)`` of positions ``[0, pos)`` that ``split`` reads."""
-        blocks = (pos + BLOCK - 1) // BLOCK
-        per = (blocks + self.splits - 1) // self.splits
+        blocks, per = self.kv_blocks(pos)
         blk0 = split * per
         blk1 = cutlass.min(blk0 + per, blocks)
         return blk0, cutlass.max(blk1, blk0)
@@ -541,21 +563,21 @@ class QwenDecodeMegakernel(WarpSpecialized):
                 load_into(x, p.embed[token, None], 4 * tid, 4)
             else:
                 self.residual(x, p.h_mid, p.d_part, layer - 1, epoch, tid)
-            self.stamp(p, row, 2)
+            self.stamp(p, row, "ready")
             if a == 0:
                 for e in cutlass.range_constexpr(4):
                     publish(p.h_in, hidden_index(layer, 4 * tid + e), x[e], epoch)
             self.rms_norm(p, x, norm_weight, xs, tid, warp, lane)
         elif op == GATEUP:
             self.residual(x, p.h_in, p.o_part, layer, epoch, tid)
-            self.stamp(p, row, 2)
+            self.stamp(p, row, "ready")
             if a == 0:
                 for e in cutlass.range_constexpr(4):
                     publish(p.h_mid, hidden_index(layer, 4 * tid + e), x[e], epoch)
             self.rms_norm(p, x, norm_weight, xs, tid, warp, lane)
         elif op == LMHEAD:
             self.residual(x, p.h_mid, p.d_part, LAYERS - 1, epoch, tid)
-            self.stamp(p, row, 2)
+            self.stamp(p, row, "ready")
             self.rms_norm(p, x, norm_weight, xs, tid, warp, lane)
         elif op == DOWN:
             span = INTER // DOWN_SPLITS
@@ -567,12 +589,12 @@ class QwenDecodeMegakernel(WarpSpecialized):
                 segments.append((p.act, index, 1))
             with self.trace_region("poll"):
                 fetch(segments, vals, epoch)
-            self.stamp(p, row, 2)
+            self.stamp(p, row, "ready")
             for i in cutlass.range_constexpr(count):
                 xs[i * COMPUTE_THREADS + tid] = BFloat16(vals[i])
         else:
             self.combine_attention(p, layer, ks, epoch, xs, tid)
-            self.stamp(p, row, 2)
+            self.stamp(p, row, "ready")
 
     @cute.jit
     def residual(self, x, base, parts, layer, epoch, tid):
@@ -653,11 +675,11 @@ class QwenDecodeMegakernel(WarpSpecialized):
     @cute.jit
     def gemv(self, p: MegakernelParams, w, op, layer, a, b, epoch, xbuf, warp, lane, row_index):
         """32-row tiles: warp w owns rows 4w..4w+3 of a stage, lane l columns 8l..8l+7."""
-        k_tiles = HIDDEN // TILE_K
+        k_tiles = HIDDEN_K_TILES
         if op == OPROJ:
-            k_tiles = Q_HEADS * HEAD_DIM // TILE_K // O_SPLITS
+            k_tiles = OPROJ_K_TILES
         if op == DOWN:
-            k_tiles = INTER // TILE_K // DOWN_SPLITS
+            k_tiles = DOWN_K_TILES
         row_tiles = cutlass.select_(op == LMHEAD, b, 1)
         for t in cutlass.range(row_tiles, unroll=1):
             # Even and odd columns accumulate separately, two per packed FFMA2.
@@ -688,7 +710,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
                             acc[r, 0], acc[r, 1] = a0, a1
                 for r in cutlass.range_constexpr(ROWS_PER_WARP):
                     acc[r, 0] = acc[r, 0] + acc[r, 1]
-            self.stamp(p, row_index, 7)
+            self.stamp(p, row_index, "mainloop")
             with self.trace_region("publish"):
                 v = warp_transpose_reduce(acc[None, 0], lane, ROWS_PER_WARP)
                 row = warp * ROWS_PER_WARP + lane // (32 // ROWS_PER_WARP)  # within the tile
@@ -753,7 +775,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
         raw = cute.make_rmem_tensor((2,), Float32)
         with self.trace_region("poll"):
             fetch([(p.qkv, qkv_index(layer, column), 2)], raw, epoch)
-        self.stamp(p, row_index, 2)
+        self.stamp(p, row_index, "ready")
         with self.trace_region("attn.norm"):
             p.qkvs[2 * tid] = raw[0]
             p.qkvs[2 * tid + 1] = raw[1]
@@ -769,7 +791,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
             for e in cutlass.range_constexpr(16):
                 q[0, e] = q0[e]
                 q[1, e] = q1[e]
-        self.stamp(p, row_index, 6)
+        self.stamp(p, row_index, "prologue")
         with self.trace_region("attn.blocks"):
             m = cute.make_rmem_tensor((2,), Float32)  # running max (log2 domain), warp-uniform
             lsum = cute.make_rmem_tensor((2,), Float32)  # this lane group's sum of p
@@ -815,13 +837,12 @@ class QwenDecodeMegakernel(WarpSpecialized):
                             for hq in cutlass.range_constexpr(2):
                                 for e in cutlass.range_constexpr(16):
                                     o[hq, e] = o[hq, e] + pr[hq, i] * vv[e]
-        self.stamp(p, row_index, 7)
+        self.stamp(p, row_index, "mainloop")
         with self.trace_region("attn.merge"):
-            # Append the new K/V row at pos. Only the split reading the KV block that holds pos
-            # TMA-loads that row (masked); it writes after its own loads completed, so no other CTA's
-            # async-proxy read races the generic store. When pos starts a block, nobody reads it.
-            blocks = (pos + BLOCK - 1) // BLOCK
-            per = (blocks + self.splits - 1) // self.splits
+            # Append the new K/V row at pos. Only the split whose KV block holds pos TMA-loads
+            # that row (attention masks it), and it writes after its own loads completed, so no
+            # async-proxy read races the generic store. When pos starts a block, no split reads it.
+            blocks, per = self.kv_blocks(pos)
             writer = cutlass.select_(pos // BLOCK < blocks, pos // BLOCK // per, self.splits - 1)
             if split == writer:
                 if tid < 8:  # warp 0, lane group 0
@@ -940,26 +961,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
     # ----------------------------------------------------------------- kernel
 
     @cute.kernel
-    def kernel(
-        self,
-        tma,
-        gtensors,
-        scratch,
-        logits,
-        state,
-        step,
-        timeline,
-        embed,
-        ln_in,
-        ln_post,
-        q_norm,
-        k_norm,
-        final_norm,
-        rope,
-        k_cache,
-        v_cache,
-        bound,
-    ):
+    def kernel(self, tma, gtensors, scratch, tensors, bound):
         layouts = {
             "W": cute.make_layout((ROWS, TILE_K, self.stages), stride=(TILE_K, 1, ROWS * TILE_K)),
             "KV": cute.make_layout(
@@ -977,38 +979,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
         # Materialize the argument tensors here: their iterators/layouts are created lazily on
         # first use, and a first use inside one role's dispatch branch would not dominate the
         # other roles' uses.
-        args = (
-            logits,
-            state,
-            step,
-            timeline,
-            embed,
-            ln_in,
-            ln_post,
-            q_norm,
-            k_norm,
-            final_norm,
-            rope,
-            k_cache,
-            v_cache,
-        )
-        (
-            logits,
-            state,
-            step,
-            timeline,
-            embed,
-            ln_in,
-            ln_post,
-            q_norm,
-            k_norm,
-            final_norm,
-            rope,
-            k_cache,
-            v_cache,
-        ) = (materialize(t) for t in args)
+        tensors = dict(zip(TENSOR_ARGS, (materialize(t) for t in tensors)))
         parts = tma_partitions(tma, gtensors, self.buffer("W"), self.buffer("KV"))
-        views = tagged_views(scratch, self.scratch_layout)
         params = MegakernelParams(
             tma=tuple(tma),
             gmem=tuple(part[1] for part in parts),
@@ -1019,20 +991,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
             att=self.buffer("ATT"),
             qkvs=self.buffer("QKVS"),
             mls=self.buffer("MLS"),
-            **views,
-            logits=logits,
-            state=state,
-            step=step,
-            timeline=timeline,
-            embed=embed,
-            ln_in=ln_in,
-            ln_post=ln_post,
-            q_norm=q_norm,
-            k_norm=k_norm,
-            final_norm=final_norm,
-            rope=rope,
-            k_cache=k_cache,
-            v_cache=v_cache,
+            **tagged_views(scratch, self.scratch_layout),
+            **tensors,
         )
         self.run_roles(params)
 
@@ -1064,11 +1024,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
     ):
         tma, gtensors = make_tma_atoms((wqkv, wo, wgu, wd, embed), (k_cache, v_cache))
         bound = self.work.bind(table, workspace, max_ctas)
-        self.kernel.set_name_prefix(self.get_name())
-        self.kernel(
-            tma,
-            gtensors,
-            scratch,
+        # In TENSOR_ARGS order.
+        tensors = (
             logits,
             state,
             step,
@@ -1082,8 +1039,11 @@ class QwenDecodeMegakernel(WarpSpecialized):
             rope,
             k_cache,
             v_cache,
-            bound,
-        ).launch(**self.launch_config(bound), stream=stream, cooperative=True)
+        )
+        self.kernel.set_name_prefix(self.get_name())
+        self.kernel(tma, gtensors, scratch, tensors, bound).launch(
+            **self.launch_config(bound), stream=stream, cooperative=True
+        )
 
 
 # Plain-Python helpers for the entry point and prologue: loops in a ``cute.jit`` body are
@@ -1175,7 +1135,7 @@ DEPENDENCY_LATENCY = 1.0
 
 
 def build_table(
-    op: QwenDecodeMegakernel, ctas: int, ops: tuple[int, ...] = tuple(range(6))
+    op: QwenDecodeMegakernel, ctas: int, ops: tuple[int, ...] = ALL_OPS
 ) -> torch.Tensor:
     """The decode step's instructions (``ops`` keeps a subset, for tests of single
     instructions). Rows are in dependency order for the atomic schedule; for the static one
@@ -1256,7 +1216,7 @@ class QwenMegakernel:
         self,
         weights,
         max_len: int,
-        ops: tuple[int, ...] | None = None,
+        ops: tuple[int, ...] = ALL_OPS,
         iket: str | None = None,
         **config,
     ):
@@ -1286,7 +1246,6 @@ class QwenMegakernel:
         self.state = torch.zeros(2, device=device, dtype=torch.int32)
         self.step_info = torch.zeros(2, device=device, dtype=torch.int32)
         self.workspace, self.max_ctas = self.op.work.launch_args(device)
-        ops = tuple(range(6)) if ops is None else ops
         self.table = build_table(self.op, self.max_ctas, ops).to(device)
         rows = self.table.shape[0] if self.op.timeline else 1  # unwritten without timeline
         self.timeline = torch.zeros(rows, len(TIMELINE), device=device, dtype=torch.int64)
@@ -1311,7 +1270,9 @@ class QwenMegakernel:
         words[..., 1::2] = self.state[0] + 1
 
     def launch(self, k_cache: torch.Tensor, v_cache: torch.Tensor):
-        """One decode step for the token and position in ``step_info``."""
+        """One decode step for the token and position in ``step_info``. The caller keeps
+        ``0 < pos < max_len`` and the token in the vocabulary (both are read on the device),
+        and runs one launch at a time: the scratch and epoch state belong to this runner."""
         shape = (LAYERS, KV_HEADS, self.max_len, HEAD_DIM)
         for cache in (k_cache, v_cache):
             if cache.shape != shape or cache.dtype != torch.bfloat16 or not cache.is_contiguous():
@@ -1344,7 +1305,10 @@ class QwenMegakernel:
         )
 
     def __call__(self, weights, token, pos: int, k_cache, v_cache) -> torch.Tensor:
-        """``decode_step_ref``'s signature: writes K/V at ``pos``, returns fp32 logits."""
+        """``decode_step_ref``'s signature: writes K/V at ``pos``, returns fp32 logits.
+        ``weights`` must be the runner's own: they are packed at construction."""
+        if weights is not self.weights:
+            raise ValueError("weights must be the ones this QwenMegakernel was built from")
         if not 0 < pos < self.max_len:
             raise ValueError(f"need 0 < pos < max_len = {self.max_len}, got {pos}")
         self.step_info[0] = token

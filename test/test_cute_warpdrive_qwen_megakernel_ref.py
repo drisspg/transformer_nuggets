@@ -5,6 +5,8 @@ from pathlib import Path
 import pytest
 import torch
 
+pytest.importorskip("cutlass.cute")  # the bench module imports the megakernel
+
 from transformer_nuggets.cute.warpdrive.examples.bench_qwen_megakernel import (
     decode_step_fast,
     prepare_fast_weights,
