@@ -690,12 +690,15 @@ class FlashAttentionBackward(WarpSpecialized):
             rdS = cute.make_fragment_like(rdP_st, cutlass.BFloat16)
             fa_utils.cvt_f16(rdP_st, rdS)
             if cutlass.const_expr(st == 0):
-                dsh = ds.acquire()  # the previous dQ MMA has read sdS
+                dsh = ds.acquire()  # the previous dQ MMA has read sdS and sdSx
                 tRS_sdS = c.thr_r2s.partition_D(
                     cute.make_tensor(dsh.view("dS", write=True).iterator, c.sdS_epi)
                 )
                 if cutlass.const_expr(pair):
-                    rdS_peer = cute.make_fragment_like(rdS)
+                    # The (key, query) tile's layout over the half-tile sdSx: only its first
+                    # 64-query block, the peer block's layout in sdS, is written.
+                    sdSx = cute.make_tensor(dsh.view("dSx", write=True).iterator, c.sdS_epi)
+                    tRS_sdSx = c.thr_r2s.partition_D(sdSx)
             tmem.access("dS", write=True, cols=lambda w, st=st: cols(w, st, 16))
             cute.copy(c.thr_st, cute.recast_tensor(rdS, Float32), c.tdPtdS_r2t[None, st, 0, 0])
             if cutlass.const_expr(not pair):
@@ -704,13 +707,13 @@ class FlashAttentionBackward(WarpSpecialized):
                 if st == c.rank:  # stage st is query half st: this CTA's rows of dQ
                     cute.autovec_copy(rdS, tRS_sdS[None, st])
                 else:
-                    cute.autovec_copy(rdS, rdS_peer)
+                    # Straight to sdSx, which the acquire also guards (the previous exchange
+                    # copy completed before its dQ MMA). FA4 holds this half in registers until
+                    # after the loop, which its serial schedule's sdSx-over-dQaccum alias needs;
+                    # here that costs 16 moves and two causal spills per tile.
+                    cute.autovec_copy(rdS, tRS_sdSx[None, 0])
         dph.release()  # layer fences the tcgen05.st of dS
         if cutlass.const_expr(pair):
-            # The (key, query) tile's layout over the half-tile sdSx: only its first 64-query
-            # block, the peer block's layout in sdS, is written.
-            sdSx = cute.make_tensor(dsh.view("dSx", write=True).iterator, c.sdS_epi)
-            cute.autovec_copy(rdS_peer, c.thr_r2s.partition_D(sdSx)[None, 0])
             # Every thread's sdS / sdSx stores reach the async proxy before the exchange copy
             # (and before the dQ MMA, which the ds commit hands them to). This also orders the
             # dPsum reads before the release below: the pair's dpsum has no release fence.
