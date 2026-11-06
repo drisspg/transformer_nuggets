@@ -476,7 +476,7 @@ Fixed-buffer CUDA-graph replays of one whole backward call (preprocess, main ker
 postprocess) per variant, seven interleaved rounds of 30 replays after three seconds of
 warmup; CUPTI gives the main kernel. Minimum round medians in microseconds, lower is better.
 GB300, CuTeDSL 4.8.0, PyTorch `2.15.0.dev20260922+cu132`, FA4 `00807a02`, normal DVFS,
-shared GPUs, November 2026; `fa4_bwd.py` SHA-256 prefix `21e79205ba496356`:
+shared GPUs, November 2026; `fa4_bwd.py` SHA-256 prefix `fa7ad2de9b7dd9f4`:
 
 ```bash
 gpu-run --timeout 600 auto -- timeout --signal=TERM --kill-after=10s 1500s \
@@ -489,20 +489,21 @@ the whole graph:
 
 | batch x heads x seqlen_q x seqlen_k | 2-CTA port | FA4 default (2-CTA) | 1-CTA port | FA4 1-CTA | 2-CTA port / FA4 2-CTA | 2-CTA / 1-CTA port | 1-CTA port / FA4 1-CTA | graph 2-CTA port / FA4 2-CTA |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 2x16x1024x1024 | 42.1 | 40.4 | 42.9 | 42.0 | 1.041 | 0.982 | 1.020 | 1.030 |
-| 4x16x4096x4096 | 916.1 | 905.9 | 976.2 | 974.8 | 1.011 | 0.938 | 1.001 | 1.010 |
-| 1x16x8192x8192 | 894.2 | 861.2 | 951.5 | 941.4 | 1.038 | 0.940 | 1.011 | 1.037 |
-| 4x16x3000x2900 | 544.4 | 524.6 | 536.4 | 531.7 | 1.038 | 1.015 | 1.009 | 1.033 |
-| causal 2x16x1024x1024 | 37.6 | 35.7 | 37.1 | 36.4 | 1.053 | 1.013 | 1.018 | 1.041 |
-| causal 4x16x4096x4096 | 537.7 | 510.6 | 560.8 | 552.9 | 1.053 | 0.959 | 1.014 | 1.045 |
-| causal 1x16x8192x8192 | 511.0 | 480.2 | 544.4 | 536.6 | 1.064 | 0.939 | 1.014 | 1.059 |
-| causal 4x16x3000x2900 | 327.5 | 311.3 | 336.0 | 330.6 | 1.052 | 0.975 | 1.016 | 1.045 |
+| 2x16x1024x1024 | 39.7 | 40.8 | 41.8 | 42.0 | 0.973 | 0.951 | 0.995 | 0.991 |
+| 4x16x4096x4096 | 868.0 | 895.4 | 976.7 | 973.1 | 0.969 | 0.889 | 1.004 | 0.971 |
+| 1x16x8192x8192 | 825.9 | 849.9 | 965.0 | 958.7 | 0.972 | 0.856 | 1.007 | 0.972 |
+| 4x16x3000x2900 | 514.3 | 521.8 | 533.2 | 530.9 | 0.986 | 0.965 | 1.004 | 0.989 |
+| causal 2x16x1024x1024 | 35.4 | 36.1 | 36.0 | 36.0 | 0.982 | 0.984 | 1.000 | 0.992 |
+| causal 4x16x4096x4096 | 503.0 | 510.7 | 551.1 | 551.3 | 0.985 | 0.913 | 1.000 | 0.986 |
+| causal 1x16x8192x8192 | 470.4 | 479.1 | 539.0 | 536.2 | 0.982 | 0.873 | 1.005 | 0.983 |
+| causal 4x16x3000x2900 | 306.2 | 311.1 | 330.5 | 330.2 | 0.984 | 0.926 | 1.001 | 0.989 |
 
-The 2-CTA port is 4-6% faster than the 1-CTA port on the long shapes (1.3-1.5% slower on short
-causal and ragged non-causal, where FA4's 2-CTA kernel gains little over its 1-CTA one too), but trails
-FA4's 2-CTA kernel by 1.1-4.1% non-causal and 5.2-6.4% causal. A run-to-run repeat (another
-agent, another GPU, same commit) gave +6.2% for causal 1x16x8192. The 1-CTA port stays within
-0.1-2% of its FA4 kernel.
+The 2-CTA port is 1.4-3.1% faster than FA4's 2-CTA kernel on every shape (0.8-2.9% for the
+whole graph) and 1.6-14% faster than the 1-CTA port; the 1-CTA port is within -0.5% to +0.7%
+of its FA4 kernel. The non-causal rows are a second run: in the first, FA4's 2-CTA kernel at
+4x16x4096 (935.9) and our 1-CTA kernel at 1x16x8192 (1033.3) were outliers on the shared GPU.
+Before the compute-loop changes below (SHA-256 prefix `21e79205ba496356`), the 2-CTA port
+trailed FA4's 2-CTA kernel by 1.1-4.1% non-causal and 5.2-6.4% causal.
 
 What was measured on the 1-CTA port (historical, at its SHA-256 prefix `ceb4035159cd5e55`,
 against FA4's 1-CTA kernel), 4x16x4096 unless noted (NCU 2025.4.1 kernel replay,
@@ -541,8 +542,24 @@ replay (`--cache-control none`, base clocks) of 1x16x8192 and 4x16x3000x2900:
 | dQ MMA as `gemm_ptx_w_idx` or one unrolled `cute.gemm` instead of FA4's two-group `gemm_w_idx` | 214 / 108 local-memory instructions instead of 10 (compile only) | No |
 | One-tile items (64x16x128x256), the layer's fixed per-CTA costs | +3.5% vs FA4 2-CTA (0.27 us per wave of 74 pairs) | — |
 
-The remaining gap is spread over the tile loop rather than fixed costs (it grows with the
-tiles per item: 1x16x8192 trails most), and it is not synchronization:
+The compute-loop changes (make_ds; A/Bs against FA4 at 4x16x4096 and 1x16x8192, both modes,
+each change on top of the ones kept before it):
+
+| Change | Effect | Kept? |
+|---|---|---|
+| The peer's query half of dS stored straight to sdSx, which the ds acquire already guards, instead of held in registers until after the stage loop (FA4's form, which its serial schedule needs: there sdSx aliases the dQ staging buffer) | -1.3% to -5%; compute loop 561 -> 541 instructions (619 -> 587 causal, causal spills gone) | Yes |
+| dPsum read before each stage's dP TMEM load and barrier instead of after | -1.2% to -2.3% | Yes |
+| ds acquired once both dS stages are in TMEM, then sdS / sdSx written, instead of at stage 0 before the first SMEM store (FA4's place, where the pair's compute warps waited for the previous dQ MMA: 881 NCU samples to FA4's 3) | -2% to -3.6%; loop 508 instructions (553 causal) | Yes |
+| ds acquired before the dP load | +2% to +4% | No |
+| dP released before that acquire | +0.4% to +2.6% | No |
+| One P-over-S barrier after both stages' exp2 | Non-causal within noise, causal +1.4% to +1.8% | No |
+| Stage 0's LSE read before the S wait | +2.8% to +3.5% (1x16x8192 non-causal within noise) | No |
+| Register split 96/152/112 instead of 136/136/104 (the best split on the earlier loop) | Within ±0.4% (11 rounds) | No |
+
+The kept changes also run in the 1-CTA kernel (shared code): within noise to 1.2% faster.
+
+Before those changes the gap to FA4 was spread over the tile loop rather than fixed costs (it
+grew with the tiles per item: 1x16x8192 trailed most), and it was not synchronization:
 
 - **Sync skeleton.** For each frequency class of instructions (a role's loop body) the
   ordered fences, barriers, mbarrier waits/arrivals, commits, TMEM loads/stores and MMAs of
@@ -550,17 +567,20 @@ tiles per item: 1x16x8192 trails most), and it is not synchronization:
   dQ reduce and MMA loops issue the same synchronization in the same order; FA4's compute loop
   has one more compute-wide barrier per tile. The only extra op in ours was the dPsum release
   fence (removed above).
-- **Code generation.** The compute loop executes 3% more instructions per tile (464 vs 451
+- **Code generation.** The compute loop executed 3% more instructions per tile (464 vs 451
   non-causal; extra register moves and re-read thread indices, and two spilled values when
-  causal) and spends ~6% more stall samples, half of them waiting at the fence and barrier
-  after the sdSx stores. ptxas also hoists five of the MMA warp's SMEM descriptors out of the
-  loop and spills them (FA4 spills none); removing that spill with a larger MMA budget did not
-  change the time.
+  causal) and spent ~6% more stall samples, half of them waiting at the fence and barrier
+  after the sdSx stores. The per-section NCU comparison then showed the same arithmetic in
+  both loops: the extra instructions were the sdSx staging moves and spills, and the largest
+  stall difference was the ds acquire, which the changes above remove or overlap. ptxas also
+  hoists five of the MMA warp's SMEM descriptors out of the loop and spills them (FA4 spills
+  none); removing that spill with a larger MMA budget did not change the time.
 - Each CTA keeps all 16 warps until the exit cluster barrier, and pair-scoped producers drain
   before it (FA4's warps exit as they finish). This shows as +10% NCU stall samples, all idle
   warps at the barrier, but the gap does not track it (one-tile items are +3.5% vs FA4).
 
-**Without a reference.** On our 2-CTA kernel alone (1x16x8192 non-causal unless noted):
+**Without a reference.** On our 2-CTA kernel alone, before the compute-loop changes (1x16x8192
+non-causal unless noted):
 
 - Roofline: 10 b h s_q s_k d FLOPs in 894 us is 1.54 PFLOP/s (FA4 1.60); NCU reports the tensor
   pipe 66% busy (FA4 73%, the same 1.57M UTCHMMA instructions) and SMs active 95%.
