@@ -40,7 +40,8 @@ warp holes run no user role.
 - Any numeric budget pads the launch to complete warpgroups. Padding warps take their
   group's budget; a wholly idle group takes 24.
 - Budget adjustment runs in a warpgroup-uniform branch before dispatch, including in a
-  pair's peer CTA.
+  pair's peer CTA. Adjacent warpgroups with one budget share a branch; non-adjacent ones
+  never do (see [configuration](configuration.md#placement-and-registers)).
 
 Redistribution cannot create registers. Every launched thread starts with
 `min(256, floor((65536 / threads) / 8) * 8)` registers; `None` counts as that budget.

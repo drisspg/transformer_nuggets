@@ -425,15 +425,16 @@ def test_register_holes_take_their_warpgroup_budget():
 
 
 def test_register_budget_branches_are_warpgroup_uniform():
-    """setmaxnreg is .sync.aligned per warpgroup: the layer emits one adjustment per budget
-    under a warpgroup-uniform branch, so every warpgroup lands in exactly one branch and each
-    role (and hole) is dispatched inside its warpgroup's branch."""
+    """setmaxnreg is .sync.aligned per warpgroup: the layer emits one adjustment per run of
+    adjacent warpgroups with one budget, under a warpgroup-uniform branch, so every warpgroup
+    lands in exactly one branch and each role (and hole) is dispatched inside its warpgroup's
+    branch. HoleToy's 56 / 232 / 56 split gets three branches: non-adjacent warpgroups never
+    share one (ptxas allocates a merged branch jointly, which spilled the FA4 backward's MMA
+    warp)."""
     kernel = HoleToy()
     kernel.describe()
     groups = kernel._ws_budget_groups
-    assert len({regs for regs, _, _ in groups}) == len(groups)
-    covered = sorted(g for _, wgs, _ in groups for g in wgs)
-    assert covered == list(range(kernel.num_warps // 4))
+    assert [(regs, wgs) for regs, wgs, _ in groups] == [(56, (0,)), (232, (1,)), (56, (2,))]
     for _, wgs, role_ids in groups:
         for i in role_ids:
             assert {w // 4 for w in kernel._ws_roles[i].warps} <= set(wgs)

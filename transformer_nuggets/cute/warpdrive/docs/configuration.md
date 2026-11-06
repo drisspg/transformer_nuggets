@@ -32,10 +32,15 @@ them.
 | Idle warps | Any numeric budget pads to whole warpgroups. Holes take their group's budget; a wholly idle group takes the hardware floor, 24 |
 | Scheduler warp | Lowest unclaimed warp by default; choose explicitly with `WorkStream(scheduler_warp=...)`. It uses its group's budget |
 
-Register dispatch is fixed by the implementation: one warpgroup-uniform branch per budget,
-then role branches inside it. `setmaxnreg` is `.sync.aligned` over a warpgroup; putting the
-adjustment before role branches lets `ptxas` allocate each role's code under its budget, as
-in CUTLASS. See [register accounting](roles.md#registers-belong-to-warpgroups).
+Register dispatch is fixed by the implementation: one warpgroup-uniform branch per run of
+adjacent warpgroups with one budget, then role branches inside it. `setmaxnreg` is
+`.sync.aligned` over a warpgroup; putting the adjustment before role branches lets `ptxas`
+allocate each role's code under its budget, as in CUTLASS. Non-adjacent warpgroups with the
+same budget get separate branches: `ptxas` allocates a merged branch jointly and can spill
+one role under the other's pressure. Until this rule, equal budgets in non-adjacent
+warpgroups shared one branch, which cost the 2-CTA FA4 backward 1.2–1.6% causal
+([measured](examples.md#attention-backward)). See
+[register accounting](roles.md#registers-belong-to-warpgroups).
 
 ### Channels and storage
 

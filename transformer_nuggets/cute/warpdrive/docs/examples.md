@@ -542,6 +542,7 @@ replay (`--cache-control none`, base clocks) of 1x16x8192 and 4x16x3000x2900:
 | No `release_fence` on dpsum: make_ds fences and syncs every compute thread after its last dPsum read (the only layer-emitted sync op FA4 does not have, from the sync-skeleton diff below) | -0.3% to -1% on 5 of 6 shapes | Yes |
 | dQ MMA as `gemm_ptx_w_idx` or one unrolled `cute.gemm` instead of FA4's two-group `gemm_w_idx` | 214 / 108 local-memory instructions instead of 10 (compile only) | No |
 | One-tile items (64x16x128x256), the layer's fixed per-CTA costs | +3.5% vs FA4 2-CTA (0.27 us per wave of 74 pairs) | — |
+| Register split 104/152/104 with reduce (warpgroup 0) and load/MMA (warpgroup 3) in one `setmaxnreg` dispatch branch, as the layer merged equal budgets before, vs the same split in two branches (4x16x4096 and 1x16x8192, GB300, 15 shuffled rounds) | Merged is +1.2% to +1.6% causal (ptxas spills seven of the MMA warp's hoisted descriptors inside its loop), +0.6% to +0.8% non-causal (within noise); 96/152/112 is another 2% faster causal. 104/152/112 and 112/152/104 do not fit the 65536-register pool | The layer never merges non-adjacent warpgroups now |
 
 The compute-loop changes (make_ds; A/Bs against FA4 at 4x16x4096 and 1x16x8192, both modes,
 each change on top of the ones kept before it):

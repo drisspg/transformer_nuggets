@@ -724,9 +724,10 @@ def test_mixed_managed_and_raw_gemm(requires_blackwell, m, n, k):
 
 
 def test_raw_role_runs_under_its_budget_branch(monkeypatch, traced_compiles):
-    """setmaxnreg is applied once per register budget, in the warpgroup-uniform budget branch; a
-    raw role is dispatched inside its branch like any role (it does not adjust registers itself),
-    and every IKET role range opens after its budget's adjustment (compile only)."""
+    """setmaxnreg is applied once per budget branch (a run of adjacent warpgroups with one
+    budget, under a warpgroup-uniform condition); a raw role is dispatched inside its branch
+    like any role (it does not adjust registers itself), and every IKET role range opens after
+    its budget's adjustment (compile only)."""
     from transformer_nuggets.cute.warpdrive import tracing
     from transformer_nuggets.cute.warpdrive.examples.gemm import compile_gemm
 
@@ -749,7 +750,7 @@ def test_raw_role_runs_under_its_budget_branch(monkeypatch, traced_compiles):
     compile_gemm.cache_clear()  # trace even if another test compiled the same key
     compile_gemm(op)
     budgets = [regs for regs, _, _ in op._ws_budget_groups]
-    assert [e for e in events if isinstance(e, int)] == budgets  # once per budget, raw included
+    assert [e for e in events if isinstance(e, int)] == budgets  # once per branch, raw included
     regs_of = {r.name: r.regs for r in op._ws_roles}
     assert regs_of["epilogue"] == 160
     current, seen = None, set()

@@ -863,21 +863,25 @@ class WarpSpecialized(metaclass=_KernelType):
                     f"register budgets need {total} registers, but {self._ws_num_warps} warps start "
                     f"with {self._ws_default_regs} each ({pool} in all; setmaxnreg can only move them)"
                 )
-        # (regs, warpgroups, role indices): one dispatch branch per register budget.
+        # (regs, warpgroups, role indices): one dispatch branch per run of adjacent warpgroups
+        # with one budget. Non-adjacent warpgroups never share a branch even when their
+        # budgets agree: ptxas allocates a merged branch jointly and can spill one role under
+        # the other's pressure (docs/configuration.md, "Placement and registers").
         wg_of = [w // WARPGROUP for w in range(self._ws_num_warps)]
         if self._ws_wg_regs:
-            budgets = list(dict.fromkeys(self._ws_wg_regs))
+            runs: list[tuple[int, list[int]]] = []
+            for g, regs in enumerate(self._ws_wg_regs):
+                if runs and runs[-1][0] == regs:
+                    runs[-1][1].append(g)
+                else:
+                    runs.append((regs, [g]))
             self._ws_budget_groups = [
                 (
-                    b,
-                    tuple(g for g, regs in enumerate(self._ws_wg_regs) if regs == b),
-                    tuple(
-                        i
-                        for i, r in enumerate(roles)
-                        if self._ws_wg_regs[wg_of[r.first_warp]] == b
-                    ),
+                    regs,
+                    tuple(wgs),
+                    tuple(i for i, r in enumerate(roles) if wg_of[r.first_warp] in wgs),
                 )
-                for b in budgets
+                for regs, wgs in runs
             ]
         else:
             self._ws_budget_groups = [
@@ -1263,9 +1267,9 @@ class WarpSpecialized(metaclass=_KernelType):
             for c in range(self.cluster.size)
         }
         # setmaxnreg is .sync.aligned over a warpgroup: every warp of a group must execute the
-        # same instruction. Branch once per register budget on a warpgroup-uniform condition,
-        # adjust there, then split into roles inside that branch (as CUTLASS does), so ptxas
-        # still allocates each role's code under its budget.
+        # same instruction. Branch once per run of adjacent warpgroups with one budget (a
+        # warpgroup-uniform condition), adjust there, then split into roles inside that branch
+        # (as CUTLASS does), so ptxas still allocates each role's code under its budget.
         groups = self._ws_budget_groups
         for gi in cutlass.range_constexpr(len(groups)):
             if _in_warpgroups(warp_idx, groups[gi][1]):
@@ -1954,12 +1958,8 @@ def _runs(warps: list[int]) -> list[range]:
 
 
 def _in_warpgroups(warp_idx, groups: tuple[int, ...]):
-    """Warpgroup-uniform predicate: does ``warp_idx`` fall in one of ``groups``?"""
-    cond = None
-    for run in _runs(list(groups)):
-        term = _in_warps(warp_idx, run.start * WARPGROUP, len(run) * WARPGROUP)
-        cond = term if cond is None else cond | term
-    return cond
+    """Warpgroup-uniform predicate: does ``warp_idx`` fall in the adjacent ``groups``?"""
+    return _in_warps(warp_idx, groups[0] * WARPGROUP, len(groups) * WARPGROUP)
 
 
 def _in_warps(warp_idx, first: int, count: int):
