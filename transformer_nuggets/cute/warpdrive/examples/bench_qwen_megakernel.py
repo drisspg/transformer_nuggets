@@ -1,0 +1,334 @@
+"""Qwen3 batch-one fixed-position decode baselines (setup excluded, reused buffers).
+
+The byte model counts weights once (tied embed/lm_head once), populated KV
+reads, new KV writes and logits. It is logical traffic, not measured DRAM
+traffic: eager's expanded GQA and intermediate tensors add traffic. Copy is a
+read+write sanity baseline; reduction is a read-dominated streaming baseline.
+Neither is a hard upper bound on every kernel. Clocks/power use default DVFS.
+"""
+
+import argparse
+import json
+from collections.abc import Callable
+from dataclasses import dataclass, fields
+from functools import partial
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+
+from transformer_nuggets.cute.warpdrive.examples.bench_support import provenance, settle
+from transformer_nuggets.cute.warpdrive.examples.qwen_megakernel_ref import (
+    QwenWeights,
+    compare_logits,
+    decode_step_ref,
+    load_qwen3_weights,
+    make_decode_state,
+    rms_norm,
+    rope,
+)
+from transformer_nuggets.utils.benchmark import CudaBenchmarkStats, benchmark_cuda_graph_stats
+
+
+@dataclass(frozen=True)
+class FastQwenWeights:
+    """Fused projections and RoPE tables; duplicate GEMM rows are not a batch."""
+
+    weights: QwenWeights
+    qkv: torch.Tensor
+    gate_up: torch.Tensor
+    cos: torch.Tensor
+    sin: torch.Tensor
+    positions: torch.Tensor
+    gemm_rows: int = 16
+
+
+@torch.no_grad()
+def prepare_fast_weights(
+    weights: QwenWeights, max_len: int, gemm_rows: int = 16
+) -> FastQwenWeights:
+    config = weights.config
+    positions = torch.arange(max_len, device=weights.embed.device).float()
+    inv_freq = 1.0 / (
+        config.rope_theta
+        ** (torch.arange(0, config.head_dim, 2, device=positions.device).float() / config.head_dim)
+    )
+    freqs = positions[:, None] * inv_freq[None]
+    angles = torch.cat((freqs, freqs), dim=-1)
+    return FastQwenWeights(
+        weights,
+        torch.cat((weights.q_proj, weights.k_proj, weights.v_proj), dim=1),
+        torch.cat((weights.gate, weights.up), dim=1),
+        angles.cos().to(torch.bfloat16),
+        angles.sin().to(torch.bfloat16),
+        torch.arange(max_len, device=weights.embed.device),
+        gemm_rows,
+    )
+
+
+def baseline_linear(x: torch.Tensor, weight: torch.Tensor, rows: int) -> torch.Tensor:
+    # Tensor-core GEMM instead of the bandwidth-poor single-row cuBLAS GEMV.
+    # All rows duplicate the ONE sequence; only its first output is consumed.
+    return F.linear(x.expand(rows, -1).contiguous(), weight)[:1]
+
+
+@torch.no_grad()
+def decode_step_fast(
+    packed: FastQwenWeights,
+    token: torch.Tensor,
+    pos: int,
+    k_cache: tuple[torch.Tensor, ...],
+    v_cache: tuple[torch.Tensor, ...],
+) -> torch.Tensor:
+    """SDPA baseline; per-layer cache views prevent Inductor copying whole caches.
+
+    Views alias the reference's fixed (28, 8, max_len, 128) cache storage. The
+    device index_copy_ writes only the new position, including under compile.
+    """
+    weights, config = packed.weights, packed.weights.config
+    x = F.embedding(token.reshape(1), weights.embed)
+    cos, sin = packed.cos[pos][None, None], packed.sin[pos][None, None]
+    for layer in range(config.num_layers):
+        norm = rms_norm(x, weights.input_ln[layer], config.rms_eps)
+        qkv = baseline_linear(norm, packed.qkv[layer], packed.gemm_rows)
+        q, k, v = qkv.split((2048, 1024, 1024), dim=-1)
+        q = rope(rms_norm(q.reshape(1, 16, 128), weights.q_norm[layer], config.rms_eps), cos, sin)
+        k = rope(rms_norm(k.reshape(1, 8, 128), weights.k_norm[layer], config.rms_eps), cos, sin)
+        k_cache[layer].index_copy_(1, packed.positions[pos : pos + 1], k.transpose(0, 1))
+        v_cache[layer].index_copy_(
+            1, packed.positions[pos : pos + 1], v.reshape(1, 8, 128).transpose(0, 1)
+        )
+        attention = F.scaled_dot_product_attention(
+            q.transpose(0, 1)[None],
+            k_cache[layer][:, : pos + 1][None],
+            v_cache[layer][:, : pos + 1][None],
+            enable_gqa=True,
+        ).reshape(1, 2048)
+        x = x + baseline_linear(attention, weights.o_proj[layer], packed.gemm_rows)
+        norm = rms_norm(x, weights.post_ln[layer], config.rms_eps)
+        gate, up = baseline_linear(norm, packed.gate_up[layer], packed.gemm_rows).chunk(2, dim=-1)
+        x = x + baseline_linear(F.silu(gate) * up, weights.down[layer], packed.gemm_rows)
+    x = rms_norm(x, weights.final_norm, config.rms_eps)
+    return baseline_linear(x, weights.lm_head, packed.gemm_rows).reshape(-1).float()
+
+
+@torch.no_grad()
+def profile_step(fn: Callable[[], torch.Tensor]) -> dict:
+    for _ in range(3):
+        fn()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fn()
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        graph.replay()
+        torch.cuda.synchronize()
+    kernels = {}
+    categories = {"gemm_gemv": 0.0, "attention": 0.0, "elementwise_other": 0.0}
+    for event in prof.events():
+        if event.device_type != torch.autograd.DeviceType.CUDA or event.device_time <= 0:
+            continue
+        kernels[event.name] = kernels.get(event.name, 0.0) + event.device_time
+        name = event.name.lower()
+        category = (
+            "attention"
+            if any(word in name for word in ("native_sdpa", "flash", "fmha", "lean_reduction"))
+            else "gemm_gemv"
+            if any(word in name for word in ("gemm", "gemv", "matmul", "nvjet", "_mm_"))
+            else "elementwise_other"
+        )
+        categories[category] += event.device_time
+    return {
+        "category_us": categories,
+        "top_kernel_us": sorted(kernels.items(), key=lambda item: item[1], reverse=True)[:15],
+        "kernel_count": sum(
+            1
+            for event in prof.events()
+            if event.device_type == torch.autograd.DeviceType.CUDA and event.device_time > 0
+        ),
+    }
+
+
+@torch.no_grad()
+def time_step(
+    fn: Callable[[], torch.Tensor],
+    *,
+    cuda_graph: bool = False,
+    warmup: int = 20,
+    iters: int = 100,
+    settle_seconds: float = 1.0,
+) -> CudaBenchmarkStats:
+    """Time one fixed-input step in us, including host gaps for non-graph calls.
+
+    fn must be capture-safe if cuda_graph is requested. Capture/compile/warmup
+    are excluded. Cache writes replay at the SAME position, not growing decode.
+    """
+    if warmup < 1:
+        raise ValueError("warmup must be positive (preflight is required before timing)")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(warmup):
+            expected = fn()
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    if cuda_graph:
+        expected = expected.clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = fn()
+        output.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, expected)
+        settle([graph], settle_seconds)
+        return benchmark_cuda_graph_stats(graph, num_iters=iters, warmup_iters=warmup)
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    for start, end in zip(starts, ends):
+        start.record()
+        fn()
+        end.record()
+    torch.cuda.synchronize()
+    return CudaBenchmarkStats.from_samples(
+        [start.elapsed_time(end) * 1e3 for start, end in zip(starts, ends)]
+    )
+
+
+def bytes_per_step(weights: QwenWeights, ctx_len: int) -> int:
+    weight_bytes = sum(
+        getattr(weights, field.name).numel() * getattr(weights, field.name).element_size()
+        for field in fields(weights)
+        if field.name != "config"
+    )
+    config = weights.config
+    kv_bytes = 2 * config.num_layers * config.num_kv_heads * config.head_dim * (ctx_len + 2) * 2
+    return weight_bytes + kv_bytes + config.vocab_size * 4
+
+
+@torch.no_grad()
+def measure_hbm_rooflines(buffer_gb: float = 2.0, iters: int = 100) -> dict[str, float]:
+    elements = int(buffer_gb * 1e9) // 2
+    source = torch.empty(elements, dtype=torch.bfloat16, device="cuda").uniform_(-1, 1)
+    destination = torch.empty_like(source)
+    copy = time_step(lambda: destination.copy_(source), cuda_graph=True, iters=iters)
+    read = time_step(lambda: source.sum(dtype=torch.float32), cuda_graph=True, iters=iters)
+    return {
+        "buffer_bytes": elements * 2,
+        "copy_read_write_GB_s": elements * 4 / copy.median_us / 1e3,
+        "read_reduction_GB_s": elements * 2 / read.median_us / 1e3,
+    }
+
+
+@torch.no_grad()
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    parser.add_argument("--contexts", nargs="+", type=int, default=[1024, 4096, 8192])
+    parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument("--warmup", type=int, default=20)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--buffer-gb", type=float, default=2.0)
+    parser.add_argument("--skip-compile", action="store_true")
+    parser.add_argument(
+        "--compile-mode", default="default", choices=["default", "max-autotune-no-cudagraphs"]
+    )
+    parser.add_argument("--gemm-rows", type=int, default=16)
+    parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--skip-roofline", action="store_true")
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args()
+    weights = load_qwen3_weights(args.model)
+    packed = prepare_fast_weights(weights, max(args.contexts) + 1, args.gemm_rows)
+    report = {
+        "metadata": provenance(
+            {
+                "bench": Path(__file__),
+                "reference": Path(__file__).with_name("qwen_megakernel_ref.py"),
+            },
+            vars(args),
+        ),
+        "rows": [],
+    }
+    print(json.dumps(report["metadata"], default=str), flush=True)
+    if not args.skip_roofline:
+        report["rooflines"] = measure_hbm_rooflines(args.buffer_gb, args.iters)
+        print(json.dumps(report["rooflines"]), flush=True)
+    print("ctx backend median_us p05_us p95_us bytes_step logical_GB_s", flush=True)
+    for ctx_len in args.contexts:
+        caches, token, pos = make_decode_state(weights, ctx_len, ctx_len + 1, args.seed)
+        eager = partial(decode_step_ref, weights, token, pos, *caches)
+        reference = eager().clone()
+        # The error-budget reference shares the quantized prefix and cache ABI.
+        high_weights = weights.to(torch.float32)
+        high = decode_step_ref(high_weights, token, pos, *caches, dtype=torch.float32)
+        del high_weights  # Release the upcast model before compilation/capture.
+        error = compare_logits(reference, reference, high)
+        print(f"ctx={ctx_len} error_budget={json.dumps(error)}", flush=True)
+        layer_caches = tuple(tuple(cache.unbind(0)) for cache in caches)
+        fast = partial(decode_step_fast, packed, token, pos, *layer_caches)
+        metrics = compare_logits(fast(), reference, high)
+        report.setdefault("correctness", {})[str(ctx_len)] = {"reference": error, "fast": metrics}
+        print(f"ctx={ctx_len} fast_correctness={json.dumps(metrics)}", flush=True)
+        if not metrics["passed"]:
+            raise AssertionError("Fast baseline exceeds the eager error budget")
+        variants = [
+            ("eager", eager, False),
+            ("eager_graph", eager, True),
+            ("fast_graph", fast, True),
+        ]
+        if args.profile:
+            report.setdefault("profiles", {})[str(ctx_len)] = {"reference": profile_step(eager)}
+            print(
+                f"ctx={ctx_len} reference_profile={json.dumps(report['profiles'][str(ctx_len)]['reference'])}",
+                flush=True,
+            )
+        if not args.skip_compile:
+            compiled = torch.compile(decode_step_fast, mode=args.compile_mode, fullgraph=True)
+            compiled_step = partial(compiled, packed, token, pos, *layer_caches)
+            for cache in caches:
+                cache[:, :, pos].fill_(float("nan"))
+            actual = compiled_step()
+            torch.cuda.synchronize()
+            metrics = compare_logits(actual, reference, high)
+            report["correctness"][str(ctx_len)]["compiled"] = metrics
+            print(f"ctx={ctx_len} compiled_correctness={json.dumps(metrics)}", flush=True)
+            if not metrics["passed"]:
+                raise AssertionError("Compiled baseline exceeds the eager error budget")
+            variants.extend(
+                [("compiled", compiled_step, False), ("compiled_graph", compiled_step, True)]
+            )
+        if args.profile:
+            fastest = compiled_step if not args.skip_compile else fast
+            report["profiles"][str(ctx_len)]["fast"] = profile_step(fastest)
+            print(
+                f"ctx={ctx_len} fast_profile={json.dumps(report['profiles'][str(ctx_len)]['fast'])}",
+                flush=True,
+            )
+        for name, fn, graph in variants:
+            stats = time_step(fn, cuda_graph=graph, iters=args.iters, warmup=args.warmup)
+            moved = bytes_per_step(weights, ctx_len)
+            row = {
+                "ctx": ctx_len,
+                "backend": name,
+                "median_us": stats.median_us,
+                "p05_us": stats.p05_us,
+                "p95_us": stats.p95_us,
+                "bytes_step": moved,
+                "logical_GB_s": moved / stats.median_us / 1e3,
+                "samples_us": stats.samples_us,
+                "error_budget": error,
+            }
+            report["rows"].append(row)
+            print(
+                f"{ctx_len} {name} {stats.median_us:.2f} {stats.p05_us:.2f} {stats.p95_us:.2f} "
+                f"{moved} {row['logical_GB_s']:.2f}",
+                flush=True,
+            )
+            if args.output:
+                args.output.write_text(json.dumps(report, indent=2, default=str) + "\n")
+        torch._dynamo.reset()
+
+
+if __name__ == "__main__":
+    main()
