@@ -141,16 +141,22 @@ def test_oproj_instruction(weights):
 
 
 @pytest.mark.parametrize(
-    "ctx, max_len, schedule",
-    [(100, 256, "static"), (127, 256, "static"), (127, 256, "atomic"), (1500, 1536, "static")],
+    "ctx, max_len, schedule, splits",
+    [
+        (100, 256, "static", 16),
+        (127, 256, "static", 16),
+        (127, 256, "atomic", 16),
+        (1500, 1536, "static", 16),
+        (1500, 1536, "static", 19),
+    ],
 )
-def test_decode_steps(weights, ctx, max_len, schedule):
+def test_decode_steps(weights, ctx, max_len, schedule, splits):
     """Teacher-forced steps under both schedules (ctx 127 -> position 128 starts a new KV
     block; ctx 1500 gives each KV split two blocks). Against an fp32 oracle on the same caches
     the kernel's logits and new K/V rows stay within the bf16 reference's error budget, it
     picks the oracle's token wherever that token leads by > 0.5, it writes only cache row pos
     (NaN-poisoned unused rows stay masked), and repeated launches are bitwise identical."""
-    runner = mk.QwenMegakernel(weights, max_len, schedule=schedule)
+    runner = mk.QwenMegakernel(weights, max_len, schedule=schedule, splits=splits)
     weights32 = weights.to(torch.float32)
     caches, token, pos = make_decode_state(weights, ctx, max_len, seed=ctx)
     for cache in caches:

@@ -379,7 +379,11 @@ class QwenDecodeMegakernel(WarpSpecialized):
         timeline: bool = False,
         roles: dict[str, RoleConfig] | None = None,
     ):
-        """``stages``: weight/KV ring depth in 16 KB stages. ``splits``: KV splits per kv head.
+        """``stages``: weight/KV ring depth in 16 KB stages. ``splits``: KV splits per kv head;
+        on a 152-SM GB300, 19 (8 x 19 attention items, one per SM) measured faster than 16 at
+        ctx 6208-8192 and slower at 1024-6144. The count is static and the position is read on
+        the device, so pick it for the contexts a runner decodes; the capacity alone does not
+        decide it.
         ``schedule``: ``"static"`` runs a host-assigned per-CTA row list (``StaticPersistent``
         over a ``[slot][cta]`` table; needs every CTA resident), ``"atomic"`` claims rows in
         dependency order (``AtomicPersistent``, one row decoded ahead).
