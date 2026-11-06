@@ -128,11 +128,11 @@ class Local:
     threads uses these instead. ``tid`` and ``warp`` count from the instance's first thread and
     warp (a constant subtracted from the hardware id, nothing at offset 0); ``warp`` is
     warp-uniform. ``warps`` and ``threads`` are the instance's size as Python ints. TMEM lanes
-    follow the hardware warp instead (``tcgen05.ld`` from warp ``w`` reaches lanes
-    ``32 * (w % 4)``): index TMEM rows with ``thread_idx()[0] % threads``.
+    follow the hardware warp instead: ``tmem_row`` is the TMEM row this thread may access.
     """
 
-    def __init__(self, first_warp: int, warps: int):
+    def __init__(self, role_name: str, first_warp: int, warps: int):
+        self._role_name = role_name
         self._first_warp = first_warp
         self.warps = warps
         self.threads = warps * WARP_SIZE
@@ -160,6 +160,21 @@ class Local:
     def lane(self) -> Int32:
         """Lane within the warp (instances are whole warps, so the hardware lane)."""
         return cute.arch.lane_idx()
+
+    @property
+    def tmem_row(self) -> Int32:
+        """This thread's TMEM row, ``0 .. threads - 1``, whose lane (``row % 128``) it may access.
+
+        ``tcgen05.ld``/``st`` from hardware warp ``w`` reach only lanes ``32 * (w % 4)`` onward,
+        wherever the role is placed, so the row is the thread index modulo the instance's size,
+        which is right for any contiguous placement of 4k warps. Tracing it in an instance whose
+        warp count is not a multiple of 4 raises ``ProtocolError``."""
+        if self.warps % WARPGROUP:
+            raise ProtocolError(
+                f"role {self._role_name}: tmem_row needs whole warpgroups (each covers the 128 "
+                f"TMEM lanes once), but the instance has {self.warps} warps"
+            )
+        return cute.arch.thread_idx()[0] % self.threads
 
 
 class Turn:
@@ -1743,7 +1758,7 @@ class WarpSpecialized(metaclass=_KernelType):
             elif ann is Instance:
                 args.append(r.index)
             elif ann is Local:
-                args.append(Local(r.first_warp, r.num_warps))
+                args.append(Local(r.name, r.first_warp, r.num_warps))
             elif ann is Turn:
                 ts = self._ws_turns[pname]
                 seat = ts.parties.index(r)

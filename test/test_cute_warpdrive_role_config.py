@@ -304,18 +304,20 @@ def test_fa4_register_bucket(requires_blackwell):
 
 @dataclass(frozen=True)
 class ProbeCtx:
-    out: cute.Tensor  # (threads, 5): each thread's Local values at its hardware thread's row
+    out: cute.Tensor  # (threads, 6): each thread's Local values at its hardware thread's row
+    reps: cutlass.Int32  # a dynamic trip count: the roles read Local inside a loop
 
 
-def record_local(out: cute.Tensor, me: Local):
+def record_local(out: cute.Tensor, me: Local, tmem_row: bool = False):
     row = cute.arch.thread_idx()[0]
-    for column, value in enumerate((me.tid, me.warp, me.lane, me.warps, me.threads)):
+    values = (me.tid, me.warp, me.lane, me.warps, me.threads)
+    for column, value in enumerate(values + ((me.tmem_row,) if tmem_row else ())):
         out[row, column] = cutlass.Int32(value)
 
 
 class LocalProbe(WarpSpecialized):
-    """A single-warp role, a two-instance role of unequal widths and a raw role, each
-    recording its role-local indices."""
+    """A single-warp role, a two-instance role of unequal widths, a raw role and a warpgroup
+    role, each recording its role-local indices (the warpgroup also its TMEM rows)."""
 
     def __init__(self, roles: dict | None = None):
         self.roles = roles
@@ -326,34 +328,46 @@ class LocalProbe(WarpSpecialized):
     @role(warps=0)
     @cute.jit
     def single(self, ctx: ProbeCtx, me: Local):
-        record_local(ctx.out, me)
+        for _ in cutlass.range(ctx.reps, unroll=1):
+            record_local(ctx.out, me)
 
     @role(warps=[range(1, 3), range(3, 4)])
     @cute.jit
     def multi(self, ctx: ProbeCtx, *, me: Local):
-        record_local(ctx.out, me)
+        for _ in cutlass.range(ctx.reps, unroll=1):
+            record_local(ctx.out, me)
 
     @role(warps=range(4, 6), raw=True)
     @cute.jit
     def bare(self, ctx: ProbeCtx, me: Local):
-        record_local(ctx.out, me)
+        for _ in cutlass.range(ctx.reps, unroll=1):
+            record_local(ctx.out, me)
+
+    @role(warps=range(6, 10))
+    @cute.jit
+    def rows(self, ctx: ProbeCtx, me: Local):
+        for _ in cutlass.range(ctx.reps, unroll=1):
+            record_local(ctx.out, me, tmem_row=True)
 
     @cute.kernel
-    def kernel(self, out: cute.Tensor):
+    def kernel(self, out: cute.Tensor, reps: cutlass.Int32):
         self.begin_roles()
-        self.run_roles(ProbeCtx(out))
+        self.run_roles(ProbeCtx(out, reps))
 
     @cute.jit
-    def __call__(self, out: cute.Tensor, stream: cuda.CUstream):
+    def __call__(self, out: cute.Tensor, reps: cutlass.Int32, stream: cuda.CUstream):
         self.kernel.set_name_prefix(self.get_name())
-        self.kernel(out).launch(grid=(1, 1, 1), block=(self.num_threads, 1, 1), stream=stream)
+        self.kernel(out, reps).launch(
+            grid=(1, 1, 1), block=(self.num_threads, 1, 1), stream=stream
+        )
 
 
 @jit_cache
 def compile_probe(op: LocalProbe):
     return compile_tvm_ffi(
         op,
-        make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(), 5), assumed_align=4),
+        make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(), 6), assumed_align=4),
+        cutlass.Int32(1),
         name=op.get_name(),
     )
 
@@ -362,29 +376,45 @@ PROBE_DEFAULTS = {
     "single": [range(0, 1)],
     "multi": [range(1, 3), range(3, 4)],
     "bare": [range(4, 6)],
+    "rows": [range(6, 10)],
 }
-PROBE_MOVED = {  # every instance off its default first warp, warps 3-4 left idle
+PROBE_MOVED = {  # every instance off its default first warp, warps 3, 4 and 8 left idle
     "single": RoleConfig(5),
     "multi": RoleConfig([range(6, 8), range(2, 3)]),
     "bare": RoleConfig(range(0, 2), raw=True),
+    "rows": RoleConfig(range(9, 13)),  # not on a warpgroup boundary
 }
+PROBE_WIDE = {**PROBE_MOVED, "rows": RoleConfig(range(9, 17))}  # 8 warps over 3 warpgroups
 
 
-@pytest.mark.parametrize("roles", [None, PROBE_MOVED], ids=["defaults", "moved"])
+@pytest.mark.parametrize(
+    "roles", [None, PROBE_MOVED, PROBE_WIDE], ids=["defaults", "moved", "wide"]
+)
 def test_local_counts_from_each_instance(requires_blackwell, roles):
     op = LocalProbe(roles)
     placement = PROBE_DEFAULTS if roles is None else {k: c.warps for k, c in roles.items()}
-    out = torch.full((op.num_threads, 5), -1, device="cuda", dtype=torch.int32)
-    compile_probe(op)(out)
+    out = torch.full((op.num_threads, 6), -1, device="cuda", dtype=torch.int32)
+    compile_probe(op)(out, 3)
     expected = torch.full_like(out, -1)
     for ranges in placement.values():
         for warps in ranges:
             for t in range(32 * warps.start, 32 * warps.stop):
                 local = t - 32 * warps.start
-                expected[t] = torch.tensor(
+                expected[t, :5] = torch.tensor(
                     [local, local // 32, t % 32, len(warps), 32 * len(warps)]
                 )
+    rows = range(32 * placement["rows"][0].start, 32 * placement["rows"][0].stop)
+    expected[rows, 5] = out[rows, 5]  # checked below by what TMEM rows must satisfy
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    tmem_rows = out[rows, 5].cpu()
+    assert sorted(tmem_rows.tolist()) == list(range(len(rows)))  # each row once
+    hardware_quadrant = torch.tensor([t // 32 % 4 for t in rows])
+    assert torch.equal(tmem_rows // 32 % 4, hardware_quadrant)  # lanes the warp can access
+
+
+def test_tmem_row_needs_whole_warpgroups(requires_blackwell):
+    with pytest.raises(ProtocolError, match="role rows: tmem_row needs whole warpgroups"):
+        compile_probe(LocalProbe({"rows": RoleConfig(range(6, 8))}))
 
 
 # Epilogue on the next warpgroup, and on warps 2-5 (no budgets), which straddle two warpgroups:

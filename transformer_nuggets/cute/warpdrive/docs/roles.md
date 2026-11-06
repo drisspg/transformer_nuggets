@@ -120,6 +120,7 @@ def consumer(self, ctx, *, ring: Consumer, me: Local):
 | `me.tid` | Thread within the instance: hardware thread minus the instance's first thread |
 | `me.warp` | Warp within the instance, warp-uniform |
 | `me.lane` | Lane within the warp |
+| `me.tmem_row` | The TMEM row this thread may access ([below](#tmem-rows-follow-the-hardware-warp)) |
 | `me.warps`, `me.threads` | The instance's resolved size, as Python ints |
 
 Each instance of a multi-instance role counts from its own first warp. The offsets are
@@ -127,11 +128,15 @@ constants, so an instance at warp 0 computes exactly the hardware ids. Raw roles
 `Local` too. Use `me.warps` to size per-warp work, or to raise `ProtocolError` when the
 math fixes the size an override could change.
 
-TMEM lanes are the exception: `tcgen05.ld`/`st` from hardware warp `w` reach lanes
-`32 * (w % 4)` onward, wherever the role is placed. Index TMEM rows with the hardware form
-`cute.arch.thread_idx()[0] % me.threads`. For a role of 4k warps it is correct for any
-contiguous placement; `me.tid` is correct only if the instance starts on a warpgroup
-boundary. The FA4 and GEMM examples follow this rule.
+#### TMEM rows follow the hardware warp
+
+`me.tid` and `me.warp` are role-local; TMEM lane access is not. `tcgen05.ld`/`st` from
+hardware warp `w` reach only lanes `32 * (w % 4)` onward, wherever the role is placed.
+`me.tmem_row` is the TMEM row this thread may access, `0 .. me.threads - 1` at lane
+`tmem_row % 128`: the hardware thread index modulo the instance's size. It is right for any
+contiguous placement of a role of 4k warps, while `me.tid` is right only for an instance that
+starts on a warpgroup boundary. Tracing `tmem_row` in an instance whose warp count is not a
+multiple of 4 raises `ProtocolError`.
 
 ### Pass shared setup as params
 
