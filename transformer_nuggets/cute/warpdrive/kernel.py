@@ -420,11 +420,7 @@ class WarpSpecialized(metaclass=_KernelType):
         chans = {k: v for k, v in vars(self).items() if isinstance(v, Channel)}
         turns = {k: v for k, v in vars(self).items() if isinstance(v, Turnstile)}
         raw_bars = {k: v for k, v in vars(self).items() if isinstance(v, Barriers)}
-        for name, b in raw_bars.items():
-            b.name = name
         named_bars = {k: v for k, v in vars(self).items() if isinstance(v, NamedBarrier)}
-        for name, nb in named_bars.items():
-            nb.name = name
         streams = {k: v for k, v in vars(self).items() if isinstance(v, WorkStream)}
         if len(streams) > 1:
             raise ProtocolError(
@@ -456,13 +452,13 @@ class WarpSpecialized(metaclass=_KernelType):
                             f"WorkStream {name}: attribute {k!r} is reserved for its scheduler"
                         )
                     chans[k] = ch
-        for name, obj in (*chans.items(), *turns.items()):
+        for name, obj in (*chans.items(), *turns.items(), *raw_bars.items(), *named_bars.items()):
             obj.name = name
-            if isinstance(obj, Channel):
-                obj.producers.clear()
-                obj.consumers.clear()
-            else:
-                obj.parties.clear()
+        for ch in chans.values():
+            ch.producers.clear()
+            ch.consumers.clear()
+        for ts in turns.values():
+            ts.parties.clear()
         plan = self.smem_plan
         for name, ch in chans.items():
             for key, buf in ch.buffers.items():
@@ -519,6 +515,7 @@ class WarpSpecialized(metaclass=_KernelType):
                     f"role {name}: parameters {ctx_params} would all receive the context; "
                     f"{_CTX_RULE}"
                 )
+            uses_tmem = any(a is Tmem for _, a in params)
             for idx, wr in enumerate(ranges):
                 inst = f"{name}[{idx}]" if len(ranges) > 1 else name
                 ri = RoleInstance(
@@ -530,11 +527,11 @@ class WarpSpecialized(metaclass=_KernelType):
                     regs,
                     fn,
                     params,
+                    uses_tmem=uses_tmem,
                     cta=cta,
                     raw=raw,
                     keyword_only=keyword_only,
                 )
-                ri.uses_tmem = any(a is Tmem for _, a in params)
                 roles.append(ri)
                 self._bind(ri, chans, turns)
         for t, site in ctx_types.items():
@@ -583,10 +580,6 @@ class WarpSpecialized(metaclass=_KernelType):
         stream user (and the scheduler) as a consumer of the work ring."""
         users = [r for r in roles if any(a is WorkCursor for _, a in r.params)]
         st.roles = [r.name for r in sorted(users, key=lambda r: r.first_warp)]
-        for r in users:
-            for pname, ann in r.params:
-                if ann is WorkCursor and pname != name:
-                    raise ProtocolError(f"role {r.name}: no WorkStream named {pname!r}")
         if st.schedule.persistent:
             idle = sorted({r.role for r in roles if not r.raw} - {r.role for r in users})
             if idle:
@@ -715,7 +708,6 @@ class WarpSpecialized(metaclass=_KernelType):
                                 f"{type(cluster).__name__} kernel CtaGroup.TWO MMAs are issued "
                                 "by the leader CTA only: pin it with @role(..., cta='leader')"
                             )
-        if cluster.size > 1:
             for name, ts in turns.items():
                 if len({cluster.ctas(r.cta) for r in ts.parties}) != 1:
                     raise ProtocolError(f"turnstile {name}: seats run in different CTAs")
@@ -835,18 +827,19 @@ class WarpSpecialized(metaclass=_KernelType):
         # (warps, regs) for each run of warps no role owns, holes included: they take their
         # warpgroup's budget (MIN_REGS for an all-idle warpgroup).
         self._ws_padding = []
-        # One budget per warpgroup, applied before role dispatch (see run_roles).
-        self._ws_wg_regs = []
+        # One setmaxnreg budget per warpgroup, applied before role dispatch (see run_roles).
+        # All entries stay None when no role sets regs.
+        wg_regs = [None] * -(-self._ws_num_warps // WARPGROUP)
         if uses_regs:
             regs_of = {w: r.regs for r in roles for w in r.warps}
-            for g in range(self._ws_num_warps // WARPGROUP):
+            for g in range(len(wg_regs)):
                 group = range(g * WARPGROUP, (g + 1) * WARPGROUP)
                 budgets = {owner[w]: regs_of[w] for w in group if w in owner}
                 vals = set(budgets.values())
                 if len(vals) > 1:
                     raise ValueError(f"warpgroup {g} has mixed register budgets {budgets}")
                 regs = vals.pop() if vals else MIN_REGS
-                self._ws_wg_regs.append(regs)
+                wg_regs[g] = regs
                 idle = [w for w in group if w not in owner]
                 self._ws_padding += [(run, regs) for run in _runs(idle)]
             total = sum(
@@ -867,26 +860,20 @@ class WarpSpecialized(metaclass=_KernelType):
         # with one budget. Non-adjacent warpgroups never share a branch even when their
         # budgets agree: ptxas allocates a merged branch jointly and can spill one role under
         # the other's pressure (docs/configuration.md, "Placement and registers").
-        wg_of = [w // WARPGROUP for w in range(self._ws_num_warps)]
-        if self._ws_wg_regs:
-            runs: list[tuple[int, list[int]]] = []
-            for g, regs in enumerate(self._ws_wg_regs):
-                if runs and runs[-1][0] == regs:
-                    runs[-1][1].append(g)
-                else:
-                    runs.append((regs, [g]))
-            self._ws_budget_groups = [
-                (
-                    regs,
-                    tuple(wgs),
-                    tuple(i for i, r in enumerate(roles) if wg_of[r.first_warp] in wgs),
-                )
-                for regs, wgs in runs
-            ]
-        else:
-            self._ws_budget_groups = [
-                (None, tuple(range(-(-self._ws_num_warps // WARPGROUP))), tuple(range(len(roles))))
-            ]
+        runs: list[tuple[int | None, list[int]]] = []
+        for g, regs in enumerate(wg_regs):
+            if runs and runs[-1][0] == regs:
+                runs[-1][1].append(g)
+            else:
+                runs.append((regs, [g]))
+        self._ws_budget_groups = [
+            (
+                regs,
+                tuple(wgs),
+                tuple(i for i, r in enumerate(roles) if r.first_warp // WARPGROUP in wgs),
+            )
+            for regs, wgs in runs
+        ]
 
     def role_config_key(self) -> tuple:
         """Resolved placement/budgets. First use collects and freezes the role configuration.
@@ -1561,9 +1548,7 @@ class WarpSpecialized(metaclass=_KernelType):
                         )
                     continue
                 # Native callers can be any thread that runs here (a role, or kernel code).
-                runs = (
-                    self.num_warps * WARP_SIZE if outside else sum(r.num_threads for r in in_rank)
-                )
+                runs = self.num_threads if outside else sum(r.num_threads for r in in_rank)
                 if runs < nb.threads:
                     raise ProtocolError(
                         f"NamedBarrier {name} counts {nb.threads} threads, but only {runs} run "
@@ -1598,14 +1583,13 @@ class WarpSpecialized(metaclass=_KernelType):
         for i in cutlass.range_constexpr(len(role_ids)):
             r = self._ws_roles[role_ids[i]]
             ctas = self.cluster.ctas(r.cta)
+            here = _in_warps(warp_idx, r.first_warp, r.num_warps)
+            if cutlass.const_expr(len(ctas) < size):
+                here = here & rank_in(rank, ctas, size)
             # Only a call on `self` inside the dynamic `if`: an assignment through `self`
             # would make the preprocessor carry `self` as an if-result.
-            if cutlass.const_expr(len(ctas) < size):
-                if _in_warps(warp_idx, r.first_warp, r.num_warps) & rank_in(rank, ctas, size):
-                    self._dispatch(r, ctx, tmem_threads)
-            else:
-                if _in_warps(warp_idx, r.first_warp, r.num_warps):
-                    self._dispatch(r, ctx, tmem_threads)
+            if here:
+                self._dispatch(r, ctx, tmem_threads)
 
     def _dispatch(self, r: RoleInstance, ctx, tmem_threads: dict[int, int]):
         # Plain Python (no dynamic control flow): runs at trace time inside the role's `if`.
@@ -1682,7 +1666,7 @@ class WarpSpecialized(metaclass=_KernelType):
             side = ann.side if isinstance(ann, _Bound) else ann
             if side is Producer or side is Consumer:
                 bound = r.index if isinstance(ann, _Bound) else None
-                args.append(self._make_end(pname, side is Producer, bound, trace, r.cta, r))
+                args.append(self._make_end(pname, side is Producer, bound, trace, r))
             elif ann is Tmem:
                 base = self._ws_tmem.retrieve_ptr(cutlass.Float32)
                 args.append(TmemView(base, self.tmem_plan, r.name, trace.log, trace))
@@ -1692,7 +1676,7 @@ class WarpSpecialized(metaclass=_KernelType):
                 st = self._ws_streams[pname]
                 end = None
                 if st.schedule.broadcast:
-                    end = self._make_end(f"{pname}_ring", False, None, trace, r.cta)
+                    end = self._make_end(f"{pname}_ring", False, None, trace, r)
                 args.append(
                     WorkCursor.create(
                         st,
@@ -1707,8 +1691,8 @@ class WarpSpecialized(metaclass=_KernelType):
                 st = self._ws_streams[pname]
                 ends = {
                     k: (
-                        self._make_end(f"{pname}_{k}", True, None, trace, r.cta),
-                        self._make_end(f"{pname}_{k}", False, None, trace, r.cta),
+                        self._make_end(f"{pname}_{k}", True, None, trace, r),
+                        self._make_end(f"{pname}_{k}", False, None, trace, r),
                     )
                     for k in st.schedule.fetch_channels()
                 }
@@ -1725,16 +1709,14 @@ class WarpSpecialized(metaclass=_KernelType):
                 args.append(ctx)
         return args
 
-    def _make_end(self, pname: str, is_prod: bool, bound, trace, cta: str = ALL, ri=None):
+    def _make_end(self, pname: str, is_prod: bool, bound, trace, ri: RoleInstance):
         chan = self._ws_chans[pname]
         side = "producer" if is_prod else "consumer"
         # Round-robin: instance j of k starts at epoch j and steps k epochs per operation.
         turns = chan.turns(side)
-        turn = (
-            [r for r, _ in (chan.producers if is_prod else chan.consumers)].index(ri)
-            if (turns > 1)
-            else 0
-        )
+        turn = 0
+        if turns > 1:
+            turn = [r for r, _ in (chan.producers if is_prod else chan.consumers)].index(ri)
         if chan.fixed:
             # Producers start each slot at phase 1 (a fresh empty barrier passes).
             state = Int32((1 << chan.n) - 1 if is_prod else 0)
@@ -1755,7 +1737,7 @@ class WarpSpecialized(metaclass=_KernelType):
             trace,
             bound,
             state,
-            cta,
+            ri.cta,
             stride=turns,
         )
         if chan.named and not is_prod:
@@ -1818,7 +1800,7 @@ def _returned_state(r: RoleInstance, result, state_args: list[tuple[str, object]
         if key in final:
             raise ProtocolError(f"{role_name}: returned the same state argument more than once")
         if not isinstance(value, TurnEnd):
-            value._check_current(returned_by=getattr(r.fn, "__name__", role_name))
+            value._check_current(returned_by=r.fn.__name__)
         final[key] = value
     missing = [name for name, arg in state_args if _state_identity(arg) not in final]
     if missing:
@@ -1854,8 +1836,7 @@ def _check_exclusive(name: str, chan):
     if len(consumers) < 2:
         raise ProtocolError(
             f"channel {name}: consumer_sharing=Sharing.EXCLUSIVE needs at least two consumer "
-            "instances, "
-            f"got {[r.name for r in consumers]}"
+            f"instances, got {[r.name for r in consumers]}"
         )
     missing = [role for role in chan.consumer_roles if all(r.role != role for r in consumers)]
     if missing:
