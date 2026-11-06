@@ -9,6 +9,7 @@ Neither is a hard upper bound on every kernel. Clocks/power use default DVFS.
 
 import argparse
 import json
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, fields
 from functools import partial
@@ -18,6 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from transformer_nuggets.cute.warpdrive.examples.bench_support import provenance, settle
+from transformer_nuggets.cute.warpdrive.examples.qwen_megakernel import QwenMegakernel
 from transformer_nuggets.cute.warpdrive.examples.qwen_megakernel_ref import (
     QwenWeights,
     compare_logits,
@@ -236,6 +238,9 @@ def main() -> None:
     parser.add_argument("--gemm-rows", type=int, default=16)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--skip-roofline", action="store_true")
+    parser.add_argument(
+        "--skip-megakernel", action="store_true", help="skip the warpdrive decode megakernel"
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     weights = load_qwen3_weights(args.model)
@@ -245,6 +250,7 @@ def main() -> None:
             {
                 "bench": Path(__file__),
                 "reference": Path(__file__).with_name("qwen_megakernel_ref.py"),
+                "megakernel": Path(__file__).with_name("qwen_megakernel.py"),
             },
             vars(args),
         ),
@@ -256,7 +262,9 @@ def main() -> None:
         print(json.dumps(report["rooflines"]), flush=True)
     print("ctx backend median_us p05_us p95_us bytes_step logical_GB_s", flush=True)
     for ctx_len in args.contexts:
-        caches, token, pos = make_decode_state(weights, ctx_len, ctx_len + 1, args.seed)
+        # The megakernel streams 64-position KV blocks: round the capacity up to one.
+        max_len = math.ceil((ctx_len + 1) / 64) * 64
+        caches, token, pos = make_decode_state(weights, ctx_len, max_len, args.seed)
         eager = partial(decode_step_ref, weights, token, pos, *caches)
         reference = eager().clone()
         # The error-budget reference shares the quantized prefix and cache ABI.
@@ -305,6 +313,21 @@ def main() -> None:
                 f"ctx={ctx_len} fast_profile={json.dumps(report['profiles'][str(ctx_len)]['fast'])}",
                 flush=True,
             )
+        if not args.skip_megakernel:
+            runner = QwenMegakernel(weights, max_len)
+            for cache in caches:
+                cache[:, :, pos].fill_(float("nan"))
+            metrics = compare_logits(runner(weights, token, pos, *caches), reference, high)
+            report["correctness"][str(ctx_len)]["megakernel"] = metrics
+            print(f"ctx={ctx_len} megakernel_correctness={json.dumps(metrics)}", flush=True)
+            if not metrics["passed"]:
+                raise AssertionError("The megakernel exceeds the eager error budget")
+
+            def megakernel_step(runner=runner):
+                runner.launch(*caches)  # step_info still holds (token, pos)
+                return runner.logits
+
+            variants.append(("megakernel_graph", megakernel_step, True))
         for name, fn, graph in variants:
             stats = time_step(fn, cuda_graph=graph, iters=args.iters, warmup=args.warmup)
             moved = bytes_per_step(weights, ctx_len)
