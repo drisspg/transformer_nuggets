@@ -15,6 +15,7 @@ PyTorch or FA4 feature.
 | Overlapping handles, `Warps` arrivals, TMEM/SMEM aliases, a 2-CTA pair with a DSMEM exchange and relay warp | [fa4_bwd.py](../examples/fa4_bwd.py) | [Backward](#attention-backward) |
 | Device-built work table: host capacity, device length | [packed_work.py](../examples/packed_work.py) | [Scheduling](scheduling.md) |
 | Split-KV items, per-sequence counts, round-robin softmax, named mailboxes, SMEM P | [fa4_decode_swapab.py](../examples/fa4_decode_swapab.py) | [Decode](#single-token-decode), [shared KV](#shared-kv-ring) |
+| Whole-model persistent decode: host instruction table, static schedule, cooperative launch, epoch-tagged words between CTAs | [qwen_megakernel.py](../examples/qwen_megakernel.py) | [Qwen3 megakernel](#qwen3-06b-decode-megakernel) |
 | Managed producer, raw `external="consumer"` with overridden count, native wait on a `NamedBarrier.id` | [raw_interop.py](../examples/raw_interop.py) | [Dropping down](dropping_down.md) |
 | Handoffs/fixed costs against raw twins | [bench_overhead.py](../examples/bench_overhead.py) | [Fixed costs](#warpdrive-fixed-costs) |
 | Schedules, clusters, widths and accumulator handoff against `torch.mm` | [bench_persistent_gemm.py](../examples/bench_persistent_gemm.py) | [Tile boundaries](#tile-boundaries) |
@@ -1247,6 +1248,151 @@ gpu-run --timeout 1800 auto -- timeout --signal=TERM --kill-after=5s 900s \
 ```
 
 </details>
+
+## Qwen3-0.6B decode megakernel
+
+```python
+from transformer_nuggets.cute.warpdrive.examples.qwen_megakernel import QwenMegakernel
+from transformer_nuggets.cute.warpdrive.examples.qwen_megakernel_ref import (
+    load_qwen3_weights,
+    make_decode_state,
+)
+
+weights = load_qwen3_weights()  # Qwen/Qwen3-0.6B from the HF hub, or a local checkpoint path
+caches, token, pos = make_decode_state(weights, ctx_len=1024, max_len=1088)  # random prompt
+runner = QwenMegakernel(weights, max_len=1088)  # one compile serves every max_len
+logits = runner(weights, token, pos, *caches)  # decode_step_ref's contract: writes K/V at pos
+```
+
+One persistent launch runs a whole batch-one decode step. The host lowers the step into a
+table of 20.3k instructions and assigns them to CTAs ahead of time:
+
+```text
+for layer in 28 layers:
+    QKV     128 items   32 rows of [Wq; Wk; Wv] x RMSNorm(h)            -> qkv
+    ATTN    8 x 16      kv head x KV split: q/k norm, RoPE, flash decode  -> attention partials
+    OPROJ   32 x 4      32 rows x 512-column slice of Wo (split K)        -> o partials
+    GATEUP  192         16 gate + 16 up rows x RMSNorm(h + o)             -> SiLU(g) * u
+    DOWN    32 x 4      32 rows x 768-column slice of Wd (split K)        -> down partials
+LMHEAD  594         8 x 32 rows of the tied embedding x final RMSNorm    -> logits
+```
+
+| Input | Contract |
+|---|---|
+| Model | Qwen3-0.6B shapes, bf16 weights, batch 1, one token per launch |
+| Caches | Contiguous bf16 `(28, 8, max_len, 128)`, `max_len` a multiple of 64, `0 < pos < max_len`; only row `pos` is written |
+| GPU | SM100 family; one CTA per SM, cooperative launch |
+| Not supported | Batch > 1, prefill, paging, other model shapes |
+
+- **Schedule.** `InstructionTable` is a `WorkMap` over the int32 table. `assign_static`
+  list-schedules rows onto CTAs with a row-latency model and lays the table out `[slot][cta]`
+  for `StaticPersistent`; `schedule="atomic"` claims rows in dependency order with
+  `AtomicPersistent` instead. Each CTA's rows stay in dependency order, so with every CTA
+  resident (the reason for `cooperative=True`) the earliest unfinished row can always run.
+- **Roles.** Eight compute warps and one TMA load warp. The load warp streams 16 KB weight
+  and KV stages through a 12-stage `Ring(Tma, Warps)` and never waits on activations, so it
+  prefetches the next rows' weights while compute polls for inputs. The GEMV is packed FFMA2
+  on CUDA cores; weights and KV carry an L2 evict-first hint.
+- **Dependencies between CTAs** are raw code: every activation is a 64-bit word
+  `(fp32 value, launch epoch)` published with one relaxed store, and consumers spin on relaxed
+  (mostly 16- and 32-byte vector) loads until each word carries the current epoch (NCCL's LL protocol). The
+  last CTA to finish advances the epoch. Acquire/release counters with separate waiter and
+  signal warps were slower (686 vs 546 us at the time).
+- **Numerics** follow HF's bf16 rounding boundaries with fp32 accumulation; every per-step
+  intermediate has its own buffer, so a launch has no write-after-read hazards.
+
+Median us per step (lower is better), one GB300 run of `bench_qwen_megakernel` on 2026-11-06
+(torch 2.15.0.dev20260922+cu132, CuTeDSL 4.8.0, CUDA-graph replay). The read roofline is the
+bench's logical bytes (weights once, KV read and new-row write, logits) at its measured 6.14
+TB/s read bandwidth:
+
+| ctx | eager + graph | torch.compile + graph | megakernel | read roofline | roofline / megakernel |
+|---:|---:|---:|---:|---:|---:|
+| 1024 | 4448 | 1365 | 476 | 213 | 45% |
+| 4096 | 5326 | 1417 | 552 | 271 | 49% |
+| 8192 | 6712 | 1488 | 648 | 347 | 54% |
+
+**What limits it** is latency between dependent phases, not bandwidth. A step has about 140
+dependent phases, and a bare flag handoff between SMs measured 0.5 us one way with relaxed
+accesses (0.75–0.9 us with acquire/release). At ctx 1024 a layer takes about 14.4 us against
+about 5 us of bytes; IKET shows compute almost never waits for weights (0.05 us per stage),
+while input polling takes 0.3–1.9 us per row. GATEUP's 192 rows on 152 SMs add a second wave
+(about 1.4 us per layer); at ctx 8192 attention grows to 9.3 us per layer. The LM head runs
+at bandwidth.
+
+<details>
+<summary>Run, bench and trace; how it got here</summary>
+
+Checkpoint tests skip unless Qwen3-0.6B is already in the local HF cache; they never download it
+(`hf download Qwen/Qwen3-0.6B` fetches it):
+
+```bash
+gpu-run --timeout 600 auto -- timeout --signal=TERM --kill-after=5s 600s \
+  .venv/bin/python -m pytest test/test_cute_warpdrive_qwen_megakernel.py \
+  test/test_cute_warpdrive_qwen_megakernel_ref.py
+gpu-run --timeout 600 auto -- timeout --signal=TERM --kill-after=5s 2400s \
+  .venv/bin/python -m transformer_nuggets.cute.warpdrive.examples.bench_qwen_megakernel \
+  --output agent_space/qwen_megakernel.json
+```
+
+`QwenMegakernel(..., timeline=True)` fills `runner.timeline` with globaltimer stamps per table
+row (columns `TIMELINE`: CTA, item start, inputs ready, done, load start/end, prologue and
+mainloop end; a row that reuses the previous row's GEMV input records no inputs-ready stamp). `iket="roles"` compiles IKET ranges for work items plus `trace_region`s
+(`prologue`, `poll`, `stream`, `publish`, `attn.norm`, `attn.blocks`, `attn.merge`);
+`iket="waits"` adds the layer's wait ranges. Disabled, both emit no instructions; with IKET, roles
+mode measured 480 us against 470–480 us unprofiled and waits mode 508 us. Capture one launch with `run-iket` as in
+[Tracing](tracing.md#iket). Traces at ctx 1024:
+[IKET roles](https://fburl.com/perfetto/3h1t248o),
+[IKET waits](https://fburl.com/perfetto/ak5nt8jt),
+[per-row timeline, one track per SM](https://fburl.com/perfetto/gxuo6bjz).
+
+At ctx 1024 the step went 1050 us (atomic claiming, counters) -> 668 (host static schedule)
+-> 640 (row-independent loads before waiting) -> 546 (tagged activations) -> 526 (FFMA2 GEMV)
+-> 515 (three-warp q/k norm) -> 490 (L2 evict-first) -> 470–480 (12 stages, 32-byte polls).
+An L2 prefetch of the LM head, poll backoff, probe-then-fetch, and 19 or 32 KV splits were
+no faster and were dropped.
+
+</details>
+
+### Layer gaps found
+
+Writing this kernel exposed these warpdrive gaps, most useful fix first:
+
+1. **No channel between CTAs.** Both the counter and tagged-word versions are raw code; a
+   tagged-slot or global-flag channel kind (any CTA produces, consumers spin on an epoch) is
+   the missing primitive.
+   `cute.arch.store(buf.iterator + i, pack_tagged(value, epoch), sem="relaxed", scope="gpu")`
+2. **A `Ring(Tma, Warps)` read with generic loads needs an explicit proxy fence.**
+   Without it TMA can refill a stage still being read; every test passed without it, and the
+   layer neither defaults it nor, without alias annotations, warns. The example sets it explicitly until a layer fix lands.
+   `Ring(stages, Tma(STAGE_BYTES), Warps, buffer=..., release_fence="smem_async")`
+3. **`Tma(tx_bytes)` fixes a ring's bytes per stage**, so every instruction loads exactly 16 KB
+   per stage; wider GATEUP items (which would avoid its second wave) need a per-handle
+   transaction count. `Ring(12, Tma(32 * 256 * 2), Warps, buffer={"W": w, "KV": kv})`
+4. **Argument tensors materialized lazily inside a role** fail with "operand does not
+   dominate this use" at an unrelated line; so do dicts of tensors in params and Python loops
+   in the kernel prologue. Materialize before `run_roles` and keep params flat.
+   `tensors = [cute.make_tensor(t.iterator, t.layout) for t in tensors]`
+5. **The launch config does not guarantee co-residency.** A static schedule over spinning CTAs needs
+   every CTA resident; `launch_args()`'s SM-count cap is only a capacity estimate.
+   `.launch(**self.launch_config(bound), stream=stream, cooperative=True)`
+6. **SMEM over-subscription fails only at launch**: `stages=13` compiles, then the launch fails
+   with `cudaErrorInvalidValue`; `describe()` cannot report bytes before compiling.
+   `QwenDecodeMegakernel(stages=13)`
+7. **Bit-level helpers need private MLIR imports.** fp32/int32 bitcasts, i64 packing and vector
+   relaxed loads have no `cute.arch` wrapper (nor does nanosleep). Each strong load is one L2
+   request per lane, so vector loads matter for polling.
+   `from cutlass._mlir_helpers.arith import bitcast`
+8. **IKET ranges are named after the role, not the instruction**, so heterogeneous items must
+   be matched back to the host table; every compute warp emits its own copy of a region (8x the
+   ranges), and `trace_region` is only a context manager.
+   `with self.trace_region("poll"): fetch(segments, vals, epoch)`
+9. **`plan_from_warpdrive` models only the CTA-local ring**: analyzed against the IKET
+   capture, it reports compute as critical and the load warp as blocked on reuse, but the
+   real critical path crosses CTAs and is invisible to the plan. `plan_from_warpdrive(op)  # one ring (w), two roles; no cross-CTA edges`
+10. **Two API traps.** A one-entry buffer dict makes `h.data` the bare tensor, and a rank-1
+    SMEM layout with an int shape crashes allocation.
+    `h.view("W")  # not h.data["W"]`; `cute.make_layout((3072,))  # not make_layout(3072)`
 
 ## warpdrive fixed costs
 

@@ -27,6 +27,8 @@ Then read the closest complete example, including its host wrapper, launch and c
   `SharedKVDecode` (`shared_kv=True` in the wrappers) exclusive consumers plus a named-barrier
   rendezvous; not a persistent template.
 - [Packed work](examples/packed_work.py): mapping a device-built list, not a complete kernel.
+- [Qwen3 decode megakernel](examples/qwen_megakernel.py): a whole decode step as one
+  persistent launch; host instruction table, static schedule and raw cross-CTA dependencies.
 
 Read the linked topic guide when using that feature. If investigating a fuzz report, resolve
 its labels in the [test case index](../../../test/warpdrive_fuzz/CASES.md). They are not library
