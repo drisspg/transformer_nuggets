@@ -618,10 +618,9 @@ class FlashAttentionBackward(WarpSpecialized):
                 f"compute: the TMEM copies span two warpgroups, got {me.warps} warps"
             )
         # Both warpgroups work on every tile: each thread holds 64 of a key row's 128 columns
-        # (FA4's make_tmem_copy with two warpgroups). tcgen05.ld/st reach the TMEM lanes of the
-        # hardware warp % 4, so tidx is the thread index modulo the role's 256 threads, right for
-        # any eight consecutive warps; by default tidx 0-127 are warps 8-11 (FA4's wg 0).
-        tidx = cute.arch.thread_idx()[0] % me.threads
+        # (FA4's make_tmem_copy with two warpgroups). By default tidx 0-127 are warps 8-11
+        # (FA4's wg 0).
+        tidx = me.tmem_row
         rank = self.cluster.rank()  # this CTA's TILE_N rows of the pair's S^T / dP^T
         tile = (TILE_N * self.cluster.size, TILE_M)
         thr_s, thr_dp = params.mma_s.get_slice(rank), params.mma_dp.get_slice(rank)
@@ -848,6 +847,7 @@ class FlashAttentionBackward(WarpSpecialized):
         ld_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), Float32
         )
+        # One warp per warpgroup: hardware warp % 4 is the TMEM lane quadrant, tidx % 128 // 32.
         leader = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4 == 0
         for j in cutlass.range_constexpr(2):  # slot 0: dV (scale 1), slot 1: dK (softmax_scale)
             name, mma, tma, mD, sD = (
@@ -900,9 +900,7 @@ class FlashAttentionBackward(WarpSpecialized):
             raise ProtocolError(
                 f"reduce: the dQ TMEM load covers 128 rows with 4 warps, got {me.warps}"
             )
-        # tcgen05.ld reaches the TMEM lanes of the hardware warp % 4: the thread index modulo the
-        # role's size is right for any four consecutive warps.
-        tidx = cute.arch.thread_idx()[0] % me.threads
+        tidx = me.tmem_row
         rank = self.cluster.rank()  # with a CTA pair, this CTA holds half of each dQ tile
         thr_dq = params.mma_dq.get_slice(rank)
         tdQ = self.acc(thr_dq, tmem, "dQ", (TILE_M, HEAD_DIM))

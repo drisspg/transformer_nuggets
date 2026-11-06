@@ -455,7 +455,7 @@ class FlashAttentionForward(WarpSpecialized):
         tmem: Tmem,
         me: Local,
     ):
-        tidx = self.tmem_row(me, "softmax")
+        tidx = self.tile_row(me, "softmax")
         thr_qk = params.mma_qk.get_slice(self.cluster.rank())
         tSAcc = cute.make_tensor(tmem.ptr("S", stage), params.s_layout)[(None, None), 0, 0]
         tStP = cute.make_tensor(
@@ -558,7 +558,7 @@ class FlashAttentionForward(WarpSpecialized):
         tmem: Tmem,
         me: Local,
     ):
-        tidx = self.tmem_row(me, "correction")
+        tidx = self.tile_row(me, "correction")
         rank = self.cluster.rank()
         thr_pv = params.mma_pv.get_slice(rank)
         tO = [cute.make_tensor(tmem.ptr("O", j), params.o_layout) for j in range(Q_STAGE)]
@@ -594,17 +594,14 @@ class FlashAttentionForward(WarpSpecialized):
             work.advance()
         return s, stats, epi, work
 
-    def tmem_row(self, me: Local, role_name: str):
-        """This thread's row of the 128-row tile: its TMEM lane (plain Python, inlined).
-
-        tcgen05.ld/st reach the lanes of the hardware warp % 4, so the lane is the thread index
-        modulo the role's 128 threads, which is right for any four consecutive warps."""
+    def tile_row(self, me: Local, role_name: str):
+        """This thread's row of the 128-row tile, its TMEM row (plain Python, inlined)."""
         if me.warps != 4:
             raise ProtocolError(
                 f"{role_name}: a {M_BLOCK}-row tile is one row per thread of 4 warps, got "
                 f"{me.warps} warps"
             )
-        return cute.arch.thread_idx()[0] % me.threads
+        return me.tmem_row
 
     @cute.jit
     def rescale_o(self, thr_pv, tO, tidx, scale):

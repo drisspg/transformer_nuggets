@@ -435,17 +435,14 @@ class SwapABDecode(WarpSpecialized):
             cute.make_tensor(tmem.ptr("O", 0), o_frag.layout),
         )
 
-    def tmem_row(self, me: Local, role_name: str):
-        """This thread's row of a 128-row TMEM subtile (plain Python, inlined).
-
-        tcgen05.ld/st reach the lanes of the hardware warp % 4, so the row is the thread index
-        modulo the role's 128 threads, which is right for any four consecutive warps."""
+    def tile_row(self, me: Local, role_name: str):
+        """This thread's row of a 128-row TMEM subtile (plain Python, inlined)."""
         if me.warps != WARPS_PER_WG:
             raise ProtocolError(
                 f"{role_name}: a {TILE_M}-row TMEM subtile is one row per thread of 4 warps, got "
                 f"{me.warps} warps"
             )
-        return cute.arch.thread_idx()[0] % me.threads
+        return me.tmem_row
 
     def vec_copies(self, tLtL, tidx):
         """TMEM <-> register copies of one N-column accumulator row per thread."""
@@ -717,7 +714,7 @@ class SwapABDecode(WarpSpecialized):
         me: Local,
     ):
         tile_hq, n = self.tile_hq, self.tile_hq_mma
-        tidx = self.tmem_row(me, "softmax")
+        tidx = self.tile_row(me, "softmax")
         lane = me.lane
         owns_head = lane < tile_hq
         tStS, tLtL, _ = self.tmem_tensors(params, tmem)
@@ -835,10 +832,10 @@ class SwapABDecode(WarpSpecialized):
         tile_hq = self.tile_hq
         lane = me.lane
         # The warp's TMEM lane quadrant (tidx // 32), which indexes its sRowSums row.
-        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % me.warps
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % WARPS_PER_WG
         owns_head = lane < tile_hq
         _, tLtL, tOtO = self.tmem_tensors(params, tmem)
-        tidx = self.tmem_row(me, "correction")
+        tidx = self.tile_row(me, "correction")
         t2r, r2t, thr_t2r, thr_r2t, vec_layout = self.vec_copies(tLtL, tidx)
         vec_size = cute.cosize(vec_layout)
         r2s_o = cute.make_tiled_copy_D(

@@ -154,9 +154,7 @@ class Gemm(WarpSpecialized):
             raise ProtocolError(
                 f"epilogue: the TMEM load covers 128 rows with 4 warps, got {me.warps}"
             )
-        # tcgen05.ld reaches the TMEM lanes of the hardware warp % 4, so the row is the thread
-        # index modulo the role's size: right for any four consecutive warps.
-        tidx = cute.arch.thread_idx()[0] % me.threads
+        tidx = me.tmem_row
         t2r = tcgen05.make_tmem_copy(
             cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition.x32), cutlass.Float32),
             cute.zipped_divide(params.acc_fake, params.epi_tiler)[None, 0],

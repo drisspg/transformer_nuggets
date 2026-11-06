@@ -136,7 +136,8 @@ hardware warp `w` reach only lanes `32 * (w % 4)` onward, wherever the role is p
 `tmem_row % 128`: the hardware thread index modulo the instance's size. It is right for any
 contiguous placement of a role of 4k warps, while `me.tid` is right only for an instance that
 starts on a warpgroup boundary. Tracing `tmem_row` in an instance whose warp count is not a
-multiple of 4 raises `ProtocolError`.
+multiple of 4 raises `ProtocolError`. The FA4 and GEMM examples index their TMEM accumulators
+and per-row data with it.
 
 ### Pass shared setup as params
 
