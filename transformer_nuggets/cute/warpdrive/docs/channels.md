@@ -644,7 +644,9 @@ and the causality axiom). Without one, the pending read may observe the next fil
 `fence.proxy.async` acts only within the thread that issues it, so every reading thread runs
 it before its arrival; a `Warps` side runs it in every lane before the warp's elected arrival.
 TMA completion covers the other direction: consumers may read the filled bytes after the full
-wait without a fence.
+wait without a fence. When the consumers release a producer in another CTA, the fence is still
+required. The arrival's memory scope does not change: it stays `remote_scope="cta"`, as in
+CUTLASS (see [Memory scope](clusters.md#memory-scope)).
 
 Declare `release_fence=()` only if the consumers make no generic access to what the producer
 fills, for example when they only issue TMA stores or MMAs from it. You can also declare it if
@@ -661,8 +663,8 @@ including a derived `release_fence`.
 The alias diagnostic credits fences by membership: a TMEM-store handoff without
 `"tmem_store"`, or an SMEM-store-to-async-reader handoff without `"smem_async"`, remains
 unverified. It compares declared overlaps of different buffers, not a ring refilling its own
-stage, so it cannot catch an incorrect `release_fence=()`. Other async work still needs its own completion waits/proxy fences, including
-TMA stores and TMEM alias accesses.
+stage, so it cannot catch an incorrect `release_fence=()`. Other async work still needs its
+own completion waits/proxy fences, including TMA stores and TMEM alias accesses.
 
 ## TMEM
 

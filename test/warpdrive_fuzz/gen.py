@@ -21,7 +21,8 @@ Validity (the contract's "valid managed program", section 1) is by construction:
   belong to one single-warp, single-instance role (leader-placed in a cluster of MMA pairs).
 * Payloads only ride on CTA-local channels with ``Threads`` or ``Tma`` producers and ``Threads``
   consumers; ``Umma`` and cross-CTA channels are tokens (counts only). TMA stages read by
-  threads declare ``release_fence="smem_async"`` (the U4 user obligation).
+  threads release with ``release_fence="smem_async"``, declared or (``implicit_release_fence``)
+  derived by the layer.
 * In a ``Cluster`` roles run in every CTA, the pair leaders or rank 0; cross-CTA channels and
   multicast TMA stay within the layer's derivable placements (R11), so each CTA runs the same
   per-iteration program and the argument above holds across CTAs.
@@ -162,6 +163,8 @@ class ChannelSpec:
     fill_two: bool = False
     commit_fence: str | None = None
     release_fence: str | None = None
+    # Tma -> Threads: leave release_fence to the layer's derived default instead of declaring it.
+    implicit_release_fence: bool = False
     remote_scope: str | None = None
     salt: int = 0
     # "raw" kind: a Barriers ring between raw roles; "auto" (Barriers(counts=...)) or "manual"
@@ -898,6 +901,7 @@ def generate(
     fill_rng = random.Random(f"wdfuzz-fill-{seed}")  # Tma(fills=...), added after ext
     warps_rng = random.Random(f"wdfuzz-warps-{seed}")  # Warps sides, added after fills
     wait_rng = random.Random(f"wdfuzz-wait-{seed}")  # try tokens and previews, added after Warps
+    fence_rng = random.Random(f"wdfuzz-fence-{seed}")  # derived release fences, added after waits
     cluster = tuple(cluster) if cluster is not None else ()
     if cluster:
         pair = cluster[2]
@@ -1050,6 +1054,7 @@ def generate(
         if ch["producer"] == "tma":
             ch["tma_rows"] = rng.choice([1, 2, 4, 8])
             ch["release_fence"] = "smem_async"
+            ch["implicit_release_fence"] = ch["consumer"] == "threads" and fence_rng.random() < 0.5
             ch["payload"] = False
         else:
             ch["payload"] = local and ch["consumer"] == "threads" and ch["producer"] == "threads"
@@ -2063,7 +2068,7 @@ def emit(spec: KernelSpec) -> str:
             args.append(f"payload=(Int32, ({width},))")
         if ch.commit_fence:
             args.append(f'commit_fence="{ch.commit_fence}"')
-        if ch.release_fence:
+        if ch.release_fence and not ch.implicit_release_fence:
             args.append(f'release_fence="{ch.release_fence}"')
         if ch.remote_scope:
             args.append(f'remote_scope="{ch.remote_scope}"')

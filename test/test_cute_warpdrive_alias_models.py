@@ -469,8 +469,8 @@ def test_commit_fences_are_emitted_in_declaration_order(monkeypatch, fences, sig
 
 
 class ReadsTmaFilledStage(Model):
-    """Thread consumers read each stage of a ring with generic loads; the producer refills it
-    (megakernel review finding: TMA could overwrite a stage still being read)."""
+    """Consumers read each stage of a ring with generic loads, then the producer refills it:
+    without a proxy fence a TMA refill may land in a stage still being read."""
 
     def __init__(self, producer, consumer, **fence):
         self.ring = Ring(2, producer, consumer, payload=(cutlass.Int32, (32,)), **fence)
@@ -498,9 +498,10 @@ class ReadsTmaFilledStage(Model):
         (Tma(128), Threads, {}, True),
         (Tma(128), Warps, {}, True),
         (Tma(128), Warps, {"release_fence": ()}, False),
+        (Tma(128), Umma, {}, False),
         (Threads, Threads, {}, False),
     ],
-    ids=["tma_threads", "tma_warps", "tma_warps_opt_out", "threads_threads"],
+    ids=["tma_threads", "tma_warps", "tma_warps_opt_out", "tma_umma", "threads_threads"],
 )
 def test_tma_refilled_stage_is_proxy_fenced_before_release(
     monkeypatch, producer, consumer, fence, fenced
@@ -519,15 +520,40 @@ def test_tma_refilled_stage_is_proxy_fenced_before_release(
         monkeypatch.setattr(cute.arch, name, record)
 
     op = ReadsTmaFilledStage(producer, consumer, **fence)
-    tag = f"{type(producer).__name__}_{consumer.__name__}_{len(fence)}".lower()
+    tag = f"{getattr(producer, '__name__', 'tma')}_{consumer.__name__}_{len(fence)}".lower()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # the Tma producer issues no copies
         compile_toy.__wrapped__(op, f"tma_refill_fence_{tag}")  # traced, not cached
     assert emitted.count("fence_view_async_shared") == fenced
     if fenced:  # the fence precedes the consumer's arrival on the empty barrier
         assert emitted[emitted.index("fence_view_async_shared") + 1] == "mbarrier_arrive"
-    if fence:
-        assert "release_fence smem_async -> none  (differs from derived)" in op.describe()
+
+
+@pytest.mark.parametrize(
+    "fence, shown",
+    [
+        (None, None),
+        ("smem_async", "release_fence smem_async -> smem_async\n"),
+        ((), "release_fence smem_async -> none  (differs from derived)"),
+        ("tmem_store", "release_fence smem_async -> tmem_store  (differs from derived)"),
+    ],
+    ids=["derived", "explicit_default", "opt_out", "replaced"],
+)
+def test_describe_shows_a_replaced_release_fence(fence, shown):
+    """An explicit release_fence replaces the derived one (it does not add to it), and
+    describe() shows what it replaced."""
+    op = ReadsTmaFilledStage(Tma(128), Warps, release_fence=fence)
+    text = op.describe()
+    assert ("release_fence smem_async ->" in text) == (shown is not None), text
+    if shown is not None:
+        assert shown in text, text
+
+
+def test_external_consumer_of_a_tma_ring_derives_no_release_fence():
+    """Raw code fences an external consumer itself: the layer derives nothing that the external
+    side's no-fences check would reject."""
+    ring = Ring(2, Tma(128), Threads, external="consumer", override={"empty_counts": 1})
+    assert ring.release_fence == ()
 
 
 class LoopInsideHandle(LoopCarriedMma):
