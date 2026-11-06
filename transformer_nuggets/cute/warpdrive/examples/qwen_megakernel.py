@@ -33,8 +33,8 @@ Roles of one CTA (9 warps; 10 with the atomic schedule's scheduler warp)::
 
 Numerics follow HF's bf16 boundaries: activations hold bf16-rounded values, GEMV accumulation
 is fp32 and is rounded once per output (split-K partials are summed in fp32 and rounded by
-their consumer), attention scores are rounded like the eager matmul, and the softmax uses
-flash-decoding partials in fp32.
+their consumer, down's by its last split), attention scores are rounded like the eager
+matmul, and the softmax uses flash-decoding partials in fp32.
 
 Every per-step intermediate has its own (per-layer) buffer, so there are no write-after-read
 hazards inside a launch. The new K/V row at ``pos`` is written by the one attention row whose
@@ -115,7 +115,7 @@ class ScratchLayout:
 
     def __init__(self, splits: int):
         self.shapes = {
-            "h_in": (LAYERS, HIDDEN),  # layer inputs (residual)
+            "h_in": (LAYERS + 1, HIDDEN),  # layer inputs (residual); [LAYERS]: LM head's
             "qkv": (LAYERS, QKV_ROWS),
             "attn_o": (LAYERS, KV_HEADS, splits, 2, HEAD_DIM),  # unnormalized partial O
             "attn_ml": (LAYERS, KV_HEADS, 2, splits, 2),  # (m, l) per head, split; log2 m
@@ -493,7 +493,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
         token = p.step[0]
         epoch = p.state[0] + 1
         # The GEMV input in xs[xbuf] is reused while consecutive rows share it (key); row 0
-        # of QKV and GATEUP always runs the prologue, which publishes the layer's residual.
+        # of GATEUP and of layer 0's QKV always runs the prologue, which publishes a residual.
         xkey = Int32(-1)
         xbuf = Int32(0)
         while work.valid:
@@ -504,7 +504,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
             else:
                 ks = cutlass.select_((op == OPROJ) | (op == DOWN), b, 0)
                 key = (op * LAYERS + layer) * 8 + ks
-                publishes = (a == 0) & ((op == QKV) | (op == GATEUP))
+                publishes = (a == 0) & ((op == GATEUP) | ((op == QKV) & (layer == 0)))
                 if (key != xkey) | publishes:
                     xkey = key
                     xbuf = 1 - xbuf
@@ -515,6 +515,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
                         self.csync.sync()
                 self.stamp(p, tid, row, "prologue")
                 w = self.gemv(p, w, op, layer, a, b, epoch, xbuf, tid, warp, lane, row)
+                if (op == DOWN) & (b == DOWN_SPLITS - 1) & (tid < ROWS):
+                    self.reduce_down(p, layer, a * ROWS + tid, epoch)
             self.stamp(p, tid, row, "done")
             work.advance()
         # Every CTA read the epoch before it finished; the last one advances it.
@@ -571,12 +573,12 @@ class QwenDecodeMegakernel(WarpSpecialized):
         if op == QKV:
             if layer == 0:
                 load_into(x, p.embed[token, None], 4 * tid, 4)
+                if a == 0:
+                    for e in cutlass.range_constexpr(4):
+                        publish(p.h_in, hidden_index(0, 4 * tid + e), x[e], epoch)
             else:
-                self.residual(x, p.h_mid, p.d_part, layer - 1, epoch, tid)
+                self.published_residual(x, p.h_in, layer, epoch, tid)
             self.stamp(p, tid, row, "ready")
-            if a == 0:
-                for e in cutlass.range_constexpr(4):
-                    publish(p.h_in, hidden_index(layer, 4 * tid + e), x[e], epoch)
             self.rms_norm(p, x, norm_weight, xs, tid, warp, lane)
         elif op == GATEUP:
             self.residual(x, p.h_in, p.o_part, layer, epoch, tid)
@@ -586,7 +588,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
                     publish(p.h_mid, hidden_index(layer, 4 * tid + e), x[e], epoch)
             self.rms_norm(p, x, norm_weight, xs, tid, warp, lane)
         elif op == LMHEAD:
-            self.residual(x, p.h_mid, p.d_part, LAYERS - 1, epoch, tid)
+            self.published_residual(x, p.h_in, LAYERS, epoch, tid)
             self.stamp(p, tid, row, "ready")
             self.rms_norm(p, x, norm_weight, xs, tid, warp, lane)
         elif op == DOWN:
@@ -621,6 +623,32 @@ class QwenDecodeMegakernel(WarpSpecialized):
             for k in cutlass.range_constexpr(1, splits):
                 total = total + vals[4 * (k + 1) + e]
             x[e] = bf16_round(vals[e] + bf16_round(total))
+
+    @cute.jit
+    def published_residual(self, x, buf, layer, epoch, tid):
+        """This thread's 4 elements of the residual ``buf[layer]``, published finished."""
+        with self.trace_region("poll"):
+            fetch([(buf, hidden_index(layer, 4 * tid), 4)], x, epoch)
+
+    @cute.jit
+    def reduce_down(self, p: MegakernelParams, layer, col, epoch):
+        """Publish the next layer's residual column ``col`` = bf16(h_mid + bf16(sum of the
+        down partials)), summed in split order as ``residual`` does.
+
+        The last down split runs it after publishing its own partial: that split finishes
+        last (its GATEUP rows are the second wave), and QKV and the LM head then fetch 1 word
+        per element instead of 5."""
+        vals = cute.make_rmem_tensor((DOWN_SPLITS + 1,), Float32)
+        segments = [(p.h_mid, hidden_index(layer, col), 1)]
+        for k in cutlass.range_constexpr(DOWN_SPLITS):
+            segments.append((p.d_part, part_index(layer, k, col), 1))
+        with self.trace_region("poll"):
+            fetch(segments, vals, epoch)
+        total = vals[1]
+        for k in cutlass.range_constexpr(2, DOWN_SPLITS + 1):
+            total = total + vals[k]
+        h = bf16_round(vals[0] + bf16_round(total))
+        publish(p.h_in, hidden_index(layer + 1, col), h, epoch)
 
     @cute.jit
     def rms_norm(self, p: MegakernelParams, x, wv, xs, tid, warp, lane):

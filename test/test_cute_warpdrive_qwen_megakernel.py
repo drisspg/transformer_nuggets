@@ -59,7 +59,8 @@ def test_single_instruction(weights, op):
     token, pos = 1234, 150  # three KV blocks, the last partial
     caches = [bf16_values(mk.LAYERS, mk.KV_HEADS, MAX_LEN, mk.HEAD_DIM).bfloat16() for _ in "kv"]
     inputs = {}
-    for name in ("h_in", "h_mid", "qkv", "act", "o_part", "d_part"):
+    # Not the down partials: the last split would take the others' as this launch's.
+    for name in ("h_in", "h_mid", "qkv", "act", "o_part"):
         shape = view(name).shape
         values = torch.randn(shape, device="cuda") / 4 if "part" in name else bf16_values(*shape)
         runner.set_values(name, values)  # tagged with this launch's epoch
@@ -72,13 +73,8 @@ def test_single_instruction(weights, op):
     w, eps = weights, 1e-6
     for layer in range(mk.LAYERS):
         if op == "qkv":
-            if layer == 0:
-                x = w.embed[token].float()
-            else:
-                x = (
-                    inputs["h_mid"][layer - 1] + inputs["d_part"][layer - 1].sum(0).bfloat16()
-                ).bfloat16()
-            norm = rms_norm(x.bfloat16(), w.input_ln[layer], eps)
+            x = w.embed[token] if layer == 0 else inputs["h_in"][layer].bfloat16()
+            norm = rms_norm(x, w.input_ln[layer], eps)
             expected = F.linear(
                 norm, torch.cat((w.q_proj[layer], w.k_proj[layer], w.v_proj[layer]))
             )
@@ -109,12 +105,15 @@ def test_single_instruction(weights, op):
             # SiLU(g) * u rounds g, SiLU(g), u and the product: a few bf16 ulps apart.
             torch.testing.assert_close(view("act")[layer], expected.float(), atol=1e-2, rtol=2e-2)
         elif op == "down":
-            expected = F.linear(inputs["act"][layer].bfloat16(), w.down[layer]).float()
+            # The last split sums the partials and publishes the next layer's residual.
+            out = F.linear(inputs["act"][layer].bfloat16(), w.down[layer])
             torch.testing.assert_close(
-                view("d_part")[layer].sum(0), expected, atol=1e-2, rtol=1e-2
+                view("d_part")[layer].sum(0), out.float(), atol=1e-2, rtol=1e-2
             )
+            h = (inputs["h_mid"][layer] + out).bfloat16()
+            torch.testing.assert_close(view("h_in")[layer + 1], h.float(), atol=2e-2, rtol=1e-2)
     if op == "lmhead":
-        x = (inputs["h_mid"][-1] + inputs["d_part"][-1].sum(0).bfloat16()).bfloat16()
+        x = inputs["h_in"][-1].bfloat16()
         expected = F.linear(rms_norm(x, w.final_norm, eps), w.embed).float()
         torch.testing.assert_close(runner.logits, expected, atol=2e-2, rtol=1e-2)
 
