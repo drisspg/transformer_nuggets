@@ -228,8 +228,8 @@ class FlashAttentionForward(WarpSpecialized):
             .region("O", head_dim, Q_STAGE)
             .alias("P", of="S", offset=tile_n // 2, cols=tile_n // 2)
         )
-        # Work items: (query block, head, batch); all query blocks of a head run back to back so
-        # its K/V stays in L2. Any WorkMap over that space swaps in.
+        # Work items: (query block, head, batch). The default Raster(along="m") keeps a head's
+        # query blocks adjacent for K/V L2 reuse. Any WorkMap over this space can replace it.
         self.work = WorkStream(mapping=mapping or Raster(along="m"), schedule=schedule)
         self.trace_protocol = trace
 

@@ -264,7 +264,7 @@ def raw_wait(style: cutlass.Constexpr, bar, phase):
 
 
 def raw_arrive(kind: str, bar):
-    """``tcgen05.commit`` for the ``umma`` kind, a thread arrival otherwise."""
+    """``tcgen05.commit`` from one elected lane for ``umma``; a per-thread arrive otherwise."""
     if cutlass.const_expr(kind == "umma"):
         with cute.arch.elect_one():
             cute.nvgpu.tcgen05.commit(bar)
