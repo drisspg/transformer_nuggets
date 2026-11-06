@@ -36,7 +36,8 @@ An override moves a role's code with it. Code that must survive `roles=` takes i
 [`Local`](roles.md#index-the-role-not-the-hardware): raw `thread_idx()`/`warp_idx()` values
 depend on placement. Where an example's math fixes a role's size, an override that changes it
 is rejected at construction or trace time: the GEMM epilogues, FA4 softmax/correction, decode
-softmax/correction and backward reduce need 4 warps, and the backward compute 8.
+softmax/correction and backward reduce need 4 warps, the backward compute 8, and the Qwen
+megakernel's compute one instance of 8.
 
 Register dispatch is fixed by the implementation: one warpgroup-uniform branch per run of
 adjacent warpgroups with one budget, then role branches inside it. `setmaxnreg` is

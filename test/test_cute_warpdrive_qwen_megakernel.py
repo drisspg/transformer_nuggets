@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 pytest.importorskip("cutlass.cute")
 
+from transformer_nuggets.cute.warpdrive import ProtocolError, RoleConfig
 from transformer_nuggets.cute.warpdrive.examples import qwen_megakernel as mk
 from transformer_nuggets.cute.warpdrive.examples.qwen_megakernel_ref import (
     compare_logits,
@@ -188,3 +189,21 @@ def test_decode_steps(weights, ctx, max_len, schedule):
             cache[:, :, pos + step] = source[:, :, pos + step].bfloat16()  # same inputs next step
     assert sum(errors) <= 2 * sum(ref_errors), (errors, ref_errors)
     assert runner.state.tolist() == [6, 0]  # one epoch per launch
+
+
+def test_moved_roles_match_defaults(weights):
+    """The roles index their own threads: moving compute off warp 0 changes no bit."""
+    moved = {"load": RoleConfig(0), "compute": RoleConfig(range(1, 1 + mk.COMPUTE_WARPS))}
+    caches, token, pos = make_decode_state(weights, 100, MAX_LEN, seed=0)
+    ours, theirs = [c.clone() for c in caches], [c.clone() for c in caches]
+    logits = mk.QwenMegakernel(weights, MAX_LEN, roles=moved)(weights, token, pos, *ours)
+    expected = mk.QwenMegakernel(weights, MAX_LEN)(weights, token, pos, *theirs)
+    assert torch.equal(logits, expected)
+    for mine, other in zip(ours, theirs):  # rows past pos are uninitialized
+        assert torch.equal(mine[:, :, : pos + 1], other[:, :, : pos + 1])
+
+
+@pytest.mark.parametrize("warps", [range(4), [range(8), range(9, 17)]], ids=["4", "2x8"])
+def test_compute_size_is_fixed(warps):
+    with pytest.raises(ProtocolError, match="one instance of 8 warps"):
+        mk.QwenDecodeMegakernel(roles={"compute": RoleConfig(warps)})
