@@ -694,7 +694,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
             acc = cute.make_rmem_tensor((ROWS_PER_WARP, 2), Float32)
             acc.fill(0.0)
             with self.trace_region("stream"):
-                for kt in cutlass.range(k_tiles, unroll=1):
+                # Unrolled: the rolled loop kept a 32-byte stack frame (12-20 us per step).
+                for kt in cutlass.range(k_tiles, unroll_full=True):
                     with w.consume() as h:
                         sW = h.data["W"]
                         wf = []
