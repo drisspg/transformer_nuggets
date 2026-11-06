@@ -49,8 +49,9 @@ dQ_t, FA4's order. Q_t is read by S_t (issued during tile t-1) and by dK_t, so S
 the q ring's next stage through ``q.peek()``, a read-only preview that the next tile's
 ``q.wait()`` handle owns and releases (the last tile is peeled, so the loop's final preview
 has a wait after it). With one Q stage that peek would wait for the release of Q_t, which
-comes after S_{t+1}: a deadlock, so ``Q_STAGE`` is fixed at 2. The last tile's s acquire is retired (there is no S_{t+1}),
-which is why the kernel runs one item per CTA, as FA4's 1-CTA kernel does.
+comes after S_{t+1}: a deadlock, so ``Q_STAGE`` is fixed at 2. The last tile's s acquire is
+retired (there is no S_{t+1}), which is why the kernel runs one item per CTA, as FA4's 1-CTA
+kernel does.
 
 TMEM (512 columns): S [0,128), dV [128,256), dP [256,384), dK [384,512). P (bf16 pairs) aliases
 S's first 64 columns, dS aliases dP's first 64, and dQ aliases all of dP (FA4's 1-CTA map).
@@ -160,7 +161,6 @@ class BwdParams:
     sV: cute.Tensor
     sdO: cute.Tensor
     sdOt: cute.Tensor
-    sdS: cute.Tensor
     sLSE: cute.Tensor
     sdPsum: cute.Tensor
     sdQacc: cute.Tensor
@@ -593,7 +593,7 @@ class FlashAttentionBackward(WarpSpecialized):
                         cute.arch.fence_view_async_tmem_load()
                         self.signal_ds(ds)
                 self.store_p(c, params, rS, lh, sh, tmem, n_block, m, key_oob)
-                dpsum, dp, ds, dsh = self.make_ds(c, params, rS, dpsum, dp, ds, tmem)
+                dpsum, dp, ds, dsh = self.make_ds(c, rS, dpsum, dp, ds, tmem)
                 if cutlass.const_expr(pair):
                     # The pair's commit is deferred to the next tile's signal_ds. A handle must
                     # close in the iteration that opened it, and rotating the loop instead keeps
@@ -715,7 +715,7 @@ class FlashAttentionBackward(WarpSpecialized):
         lh.release()
 
     @cute.jit
-    def make_ds(self, c, params: BwdParams, rS, dpsum, dp, ds, tmem):
+    def make_ds(self, c, rS, dpsum, dp, ds, tmem):
         """dS^T = P^T * (dP^T - dPsum_t) (``rS`` holds P^T in fp32), stored over dP's first
         columns for the dK MMA and into sdS for the dQ MMA; releases dP_t and dPsum_t. Returns
         the ends and the open ds handle. With a CTA pair, sdS holds this CTA's query half only: the
@@ -1002,7 +1002,6 @@ class FlashAttentionBackward(WarpSpecialized):
             sV=b("V"),
             sdO=b("dO"),
             sdOt=b("dOt"),
-            sdS=b("dS"),
             sLSE=b("LSE"),
             sdPsum=b("dPsum"),
             sdQacc=b("dQacc"),
