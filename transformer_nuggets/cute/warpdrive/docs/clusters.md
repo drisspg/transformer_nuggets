@@ -404,6 +404,7 @@ For a 2x2 cluster with pair fills and N multicast:
       full      rank 0 1 x2, rank 1 1 x2, rank 2 1 x2, rank 3 1 x2, tx 4096 B, rank 0 arms 0+1, rank 2 arms 2+3
       empty     rank 0 128 x2, rank 2 128 x2
       scope     cross-CTA, fills pair, multicast n, remote_scope cta
+      fences    release_fence smem_async
 ```
 
 Rank 1 receives half a tile from each leader, so it releases both, but only rank 0 arms its

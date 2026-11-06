@@ -55,7 +55,8 @@ snapshots, manually supplied raw state or turnstile seats, or all post-close acc
 `work.advance()` once directly at the end of the body. Return the cursor. The layer checks
 the traced loop structure, not matching runtime trip counts inside different roles.
 
-**Own the memory ordering.** A channel's declared fences run before its managed signal.
+**Own the memory ordering.** A channel's fences run before its managed signal: the declared ones,
+which default to `smem_async` on the release of a TMA-filled channel with thread consumers.
 Buffer binding does not add fences. TMA stores, raw async copies, TMEM aliases and storage
 shared across channels may need additional waits and proxy fences. Complete that work before
 reusing its storage or exiting. For ordinary writes read by another CTA, use the correct peer

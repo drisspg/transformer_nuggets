@@ -635,10 +635,33 @@ example, FA4 backward's dS uses `commit_fence=("tmem_store", "smem_async")` to h
 TMEM and SMEM stores. A string is a one-element tuple; the layer emits exactly that order.
 Unknown/repeated kinds and commit fences on TMA producers are rejected.
 
-`commit(signal=False)` and `release(signal=False)` omit **both signal and all its fences**.
+**A TMA-filled channel released by `Threads` or `Warps` defaults to
+`release_fence="smem_async"`.** Its consumers may read the stage with ordinary loads
+(`ld.shared`, `autovec_copy`, `ldmatrix`), and the next fill writes the same bytes through the
+async proxy. The release and the producer's acquire order the two, but PTX orders accesses of
+different proxies only through a proxy fence on that path (Memory Consistency Model, "Proxies"
+and the causality axiom). Without one, the pending read may observe the next fill.
+`fence.proxy.async` acts only within the thread that issues it, so every reading thread runs
+it before its arrival; a `Warps` side runs it in every lane before the warp's elected arrival.
+TMA completion covers the other direction: consumers may read the filled bytes after the full
+wait without a fence.
+
+Declare `release_fence=()` only if the consumers make no generic access to what the producer
+fills, for example when they only issue TMA stores or MMAs from it. You can also declare it if
+every reading thread runs `fence_async_shared()` after its last read and before the release,
+as the CTA-pair FA4 backward does for dPsum. Another value replaces the default rather than
+adding to it, so include `"smem_async"` when you also need `"tmem_store"`. `describe()` prints
+a replaced default as `override  release_fence smem_async -> ...`. `Umma` consumers read through
+the async proxy and get no default. A Threads-written stage that an MMA reads still needs an
+explicit `commit_fence="smem_async"`. The layer cannot tell whether the producer wrote SMEM or
+TMEM.
+
+`commit(signal=False)` and `release(signal=False)` omit **both signal and all its fences**,
+including a derived `release_fence`.
 The alias diagnostic credits fences by membership: a TMEM-store handoff without
 `"tmem_store"`, or an SMEM-store-to-async-reader handoff without `"smem_async"`, remains
-unverified. Other async work still needs its own completion waits/proxy fences, including
+unverified. It compares declared overlaps of different buffers, not a ring refilling its own
+stage, so it cannot catch an incorrect `release_fence=()`. Other async work still needs its own completion waits/proxy fences, including
 TMA stores and TMEM alias accesses.
 
 ## TMEM
