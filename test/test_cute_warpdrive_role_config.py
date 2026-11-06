@@ -386,3 +386,76 @@ def test_local_counts_from_each_instance(requires_blackwell, roles):
                 )
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
+
+# Epilogue on the next warpgroup, and on warps 2-5 (no budgets), which straddle two warpgroups:
+# the epilogue's TMEM rows follow the hardware warp quadrant, its other indices the role.
+GEMM_PLACEMENTS = {
+    "next_warpgroup": {
+        "load": RoleConfig(0, regs=40),
+        "mma": RoleConfig(1, regs=40, cta="leader"),
+        "epilogue": RoleConfig(range(4, 8), regs=160),
+    },
+    "unaligned": {
+        "load": RoleConfig(0),
+        "mma": RoleConfig(1, cta="leader"),
+        "epilogue": RoleConfig(range(2, 6)),
+    },
+}
+
+
+@pytest.mark.parametrize("placement", list(GEMM_PLACEMENTS))
+@pytest.mark.parametrize("example", ["gemm", "persistent_gemm"])
+def test_moved_gemm_roles_match_defaults(requires_blackwell, example, placement):
+    from transformer_nuggets.cute.warpdrive.examples.gemm import Gemm, compile_gemm
+    from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import persistent_gemm
+
+    roles = GEMM_PLACEMENTS[placement]
+    if example == "gemm":
+        roles = {**roles, "mma": replace(roles["mma"], cta="all")}
+
+        def run(a, b, roles=None):
+            out = a.new_empty(a.shape[0], b.shape[0])
+            compile_gemm(Gemm(roles=roles))(a, b, out)
+            return out
+    else:
+        run = persistent_gemm
+    torch.manual_seed(0)
+    a = torch.randn(300, 136, device="cuda", dtype=torch.bfloat16)  # ragged M, N and K tiles
+    b = torch.randn(520, 136, device="cuda", dtype=torch.bfloat16)
+    expected = run(a, b)
+    torch.testing.assert_close(expected.float(), a.float() @ b.float().T, atol=0.1, rtol=1e-2)
+    torch.testing.assert_close(run(a, b, roles=roles), expected, rtol=0, atol=0)
+
+
+def test_gemm_epilogue_size_is_checked(requires_blackwell):
+    from transformer_nuggets.cute.warpdrive.examples.gemm import Gemm, compile_gemm
+
+    roles = {
+        "epilogue": RoleConfig(range(8), regs=160),
+        "load": RoleConfig(8, regs=40),
+        "mma": RoleConfig(9, regs=40),
+    }
+    with pytest.raises(ProtocolError, match="128 rows with 4 warps, got 8"):
+        compile_gemm(Gemm(roles=roles))
+
+
+def test_fa4_unaligned_softmax(requires_blackwell):
+    """Softmax instances on warps 2-5 and 6-9 (no budgets): their TMEM rows follow the
+    hardware warp quadrant, so the output matches the default placement bit for bit."""
+    pytest.importorskip("flash_attn.cute")
+    from transformer_nuggets.cute.warpdrive.examples.fa4_fwd import fa4_fwd
+
+    torch.manual_seed(0)
+    q = torch.randn(1, 512, 2, 128, device="cuda", dtype=torch.bfloat16)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+    moved = {
+        "mma": RoleConfig(0, cta="leader"),
+        "epilogue": RoleConfig(1),
+        "softmax": RoleConfig((range(2, 6), range(6, 10))),
+        "correction": RoleConfig(range(10, 14)),
+        "load": RoleConfig(14),
+    }
+    expected, expected_lse = fa4_fwd(q, k, v)
+    actual, actual_lse = fa4_fwd(q, k, v, roles=moved)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual_lse, expected_lse, rtol=0, atol=0)

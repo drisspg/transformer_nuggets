@@ -51,8 +51,10 @@ from transformer_nuggets.cute.jit_cache import jit_cache
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
     Consumer,
+    Local,
     NamedBarrier,
     Producer,
+    ProtocolError,
     Raster,
     Ring,
     RoleConfig,
@@ -256,15 +258,27 @@ class PersistentGemm(WarpSpecialized):
     @role(warps=range(4), regs=160)
     @cute.jit
     def epilogue(
-        self, params: PersistentGemmParams, *, acc: Consumer, work: WorkCursor, tmem: Tmem
+        self,
+        params: PersistentGemmParams,
+        *,
+        acc: Consumer,
+        work: WorkCursor,
+        tmem: Tmem,
+        me: Local,
     ):
         """TMEM -> registers -> swizzled SMEM -> TMA store, one ``epi_tile`` subtile at a time
         through ``c_stages`` SMEM buffers. TMA clips the ragged edges, so partial tiles cost the
         same. With ``early_release`` the accumulator goes back to the MMA as soon as its last
         subtile's ``tcgen05.ld`` has completed (``tcgen05.wait::ld``), so the next tile's
         mainloop is not held up by this tile's last SMEM staging round and TMA store."""
-        tidx, _, _ = cute.arch.thread_idx()
-        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        if cutlass.const_expr(me.warps != 4):
+            raise ProtocolError(
+                f"epilogue: the TMEM load covers 128 rows with 4 warps, got {me.warps}"
+            )
+        # tcgen05.ld reaches the TMEM lanes of the hardware warp % 4, so the row is the thread
+        # index modulo the role's size: right for any four consecutive warps.
+        tidx = cute.arch.thread_idx()[0] % me.threads
+        warp = me.warp
         # This CTA's rows of the tile.
         thr_mma = params.tiled_mma.get_slice(self.cluster.coords(self.cluster.rank())[0])
         tAcc = transform_partitioned_tensor_layout(

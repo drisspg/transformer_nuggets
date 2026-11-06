@@ -91,9 +91,11 @@ from transformer_nuggets.cute.warpdrive import (
     Barriers,
     Consumer,
     CtaPair,
+    Local,
     NamedBarrier,
     OneShot,
     Producer,
+    ProtocolError,
     Raster,
     Ring,
     RoleConfig,
@@ -574,9 +576,10 @@ class FlashAttentionBackward(WarpSpecialized):
         dkv: Consumer,
         work: WorkCursor,
         tmem: Tmem,
+        me: Local,
     ):
         pair = self.cluster.size > 1
-        c = self.compute_views(params, tmem)
+        c = self.compute_views(params, tmem, me)
         lse, dpsum = lse.views(LSE=c.lse_view), dpsum.views(dPsum=c.dpsum_view)
         while work.valid:
             n_block, head, batch = work.item
@@ -607,12 +610,18 @@ class FlashAttentionBackward(WarpSpecialized):
             work.advance()
         return lse, dpsum, s, dp, ds, dkv, work
 
-    def compute_views(self, params: BwdParams, tmem):
+    def compute_views(self, params: BwdParams, tmem, me: Local):
         """The compute warps' partitions of S, P, dP and dS in TMEM, of the LSE / dPsum rows and
         of sdS (plain Python: inlined into the role, from converged code)."""
+        if me.warps != 8:
+            raise ProtocolError(
+                f"compute: the TMEM copies span two warpgroups, got {me.warps} warps"
+            )
         # Both warpgroups work on every tile: each thread holds 64 of a key row's 128 columns
-        # (FA4's make_tmem_copy with two warpgroups). tidx 0-127 are warps 8-11 (FA4's wg 0).
-        tidx = cute.arch.thread_idx()[0] % 256
+        # (FA4's make_tmem_copy with two warpgroups). tcgen05.ld/st reach the TMEM lanes of the
+        # hardware warp % 4, so tidx is the thread index modulo the role's 256 threads, right for
+        # any eight consecutive warps; by default tidx 0-127 are warps 8-11 (FA4's wg 0).
+        tidx = cute.arch.thread_idx()[0] % me.threads
         rank = self.cluster.rank()  # this CTA's TILE_N rows of the pair's S^T / dP^T
         tile = (TILE_N * self.cluster.size, TILE_M)
         thr_s, thr_dp = params.mma_s.get_slice(rank), params.mma_dp.get_slice(rank)
@@ -886,8 +895,14 @@ class FlashAttentionBackward(WarpSpecialized):
 
     @role(warps=range(4), regs=152)
     @cute.jit
-    def reduce(self, params: BwdParams, *, dq: Consumer, work: WorkCursor, tmem: Tmem):
-        tidx = cute.arch.thread_idx()[0] % 128
+    def reduce(self, params: BwdParams, *, dq: Consumer, work: WorkCursor, tmem: Tmem, me: Local):
+        if cutlass.const_expr(me.warps != 4):
+            raise ProtocolError(
+                f"reduce: the dQ TMEM load covers 128 rows with 4 warps, got {me.warps}"
+            )
+        # tcgen05.ld reaches the TMEM lanes of the hardware warp % 4: the thread index modulo the
+        # role's size is right for any four consecutive warps.
+        tidx = cute.arch.thread_idx()[0] % me.threads
         rank = self.cluster.rank()  # with a CTA pair, this CTA holds half of each dQ tile
         thr_dq = params.mma_dq.get_slice(rank)
         tdQ = self.acc(thr_dq, tmem, "dQ", (TILE_M, HEAD_DIM))
@@ -901,7 +916,7 @@ class FlashAttentionBackward(WarpSpecialized):
         ).shape
         thr_r2s = fa_copy_utils.tiled_copy_1d(Float32, 128, num_copy_elems=4).get_slice(tidx)
         tdQsdQ = thr_r2s.partition_D(params.sdQacc)
-        tma_warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) == 0
+        tma_warp = me.warp == 0
         # This CTA's dQ columns, reduce-added dq_cols at a time: chunks rank * chunks + c of the
         # tile's flat fp32 accumulator (FA4's TMEM_FRAG_1CTA / TMEM_FRAG_2CTA orders).
         chunks = HEAD_DIM // self.cluster.size // self.dq_cols

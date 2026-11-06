@@ -32,6 +32,12 @@ them.
 | Idle warps | Any numeric budget pads to whole warpgroups. Holes take their group's budget; a wholly idle group takes the hardware floor, 24 |
 | Scheduler warp | Lowest unclaimed warp by default; choose explicitly with `WorkStream(scheduler_warp=...)`. It uses its group's budget |
 
+An override moves a role's code with it. Code that must survive `roles=` takes its indices from
+[`Local`](roles.md#index-the-role-not-the-hardware): raw `thread_idx()`/`warp_idx()` values
+depend on placement. Where an example's math fixes a role's size, an override that changes it
+is rejected at construction or trace time: the GEMM epilogues, FA4 softmax/correction, decode
+softmax/correction and backward reduce need 4 warps, and the backward compute 8.
+
 Register dispatch is fixed by the implementation: one warpgroup-uniform branch per run of
 adjacent warpgroups with one budget, then role branches inside it. `setmaxnreg` is
 `.sync.aligned` over a warpgroup; putting the adjustment before role branches lets `ptxas`

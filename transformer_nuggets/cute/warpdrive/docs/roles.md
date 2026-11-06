@@ -131,7 +131,7 @@ TMEM lanes are the exception: `tcgen05.ld`/`st` from hardware warp `w` reach lan
 `32 * (w % 4)` onward, wherever the role is placed. Index TMEM rows with the hardware form
 `cute.arch.thread_idx()[0] % me.threads`. For a role of 4k warps it is correct for any
 contiguous placement; `me.tid` is correct only if the instance starts on a warpgroup
-boundary.
+boundary. The FA4 and GEMM examples follow this rule.
 
 ### Pass shared setup as params
 

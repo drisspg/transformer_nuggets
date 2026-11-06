@@ -83,10 +83,12 @@ from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_te
 from transformer_nuggets.cute.warpdrive import (
     Consumer,
     Instance,
+    Local,
     NamedBarrier,
     OneShot,
     PdlWait,
     Producer,
+    ProtocolError,
     Ring,
     RoleConfig,
     Sharing,
@@ -433,7 +435,19 @@ class SwapABDecode(WarpSpecialized):
             cute.make_tensor(tmem.ptr("O", 0), o_frag.layout),
         )
 
-    def vec_copies(self, tLtL):
+    def tmem_row(self, me: Local, role_name: str):
+        """This thread's row of a 128-row TMEM subtile (plain Python, inlined).
+
+        tcgen05.ld/st reach the lanes of the hardware warp % 4, so the row is the thread index
+        modulo the role's 128 threads, which is right for any four consecutive warps."""
+        if me.warps != WARPS_PER_WG:
+            raise ProtocolError(
+                f"{role_name}: a {TILE_M}-row TMEM subtile is one row per thread of 4 warps, got "
+                f"{me.warps} warps"
+            )
+        return cute.arch.thread_idx()[0] % me.threads
+
+    def vec_copies(self, tLtL, tidx):
         """TMEM <-> register copies of one N-column accumulator row per thread."""
         tLtL_0 = tLtL[(None, None), 0, 0, 0]
         rep = tcgen05.Repetition(self.tile_hq)
@@ -443,7 +457,6 @@ class SwapABDecode(WarpSpecialized):
         r2t = tcgen05.make_tmem_copy(
             cute.make_copy_atom(tcgen05.St32x32bOp(rep, tcgen05.Unpack.NONE), Float32), tLtL_0
         )
-        tidx = cute.arch.thread_idx()[0] % WG_SIZE
         thr_t2r, thr_r2t = t2r.get_slice(tidx), r2t.get_slice(tidx)
         vec_layout = thr_t2r.partition_D(tLtL_0).layout
         return t2r, r2t, thr_t2r, thr_r2t, vec_layout
@@ -701,13 +714,14 @@ class SwapABDecode(WarpSpecialized):
         mufu: Turn,
         work: WorkCursor,
         tmem: Tmem,
+        me: Local,
     ):
         tile_hq, n = self.tile_hq, self.tile_hq_mma
-        tidx = cute.arch.thread_idx()[0] % WG_SIZE
-        lane = cute.arch.lane_idx()
+        tidx = self.tmem_row(me, "softmax")
+        lane = me.lane
         owns_head = lane < tile_hq
         tStS, tLtL, _ = self.tmem_tensors(params, tmem)
-        _, r2t, _, thr_r2t, vec_layout = self.vec_copies(tLtL)
+        _, r2t, _, thr_r2t, vec_layout = self.vec_copies(tLtL, tidx)
         vec_size = cute.cosize(vec_layout)
         # Each thread owns one token row of each 128-token subtile and tile_hq head columns.
         tStS_0 = tStS[(None, None), 0, 0, None, 0]
@@ -816,15 +830,17 @@ class SwapABDecode(WarpSpecialized):
         epi: Producer,
         work: WorkCursor,
         tmem: Tmem,
+        me: Local,
     ):
         tile_hq = self.tile_hq
-        lane = cute.arch.lane_idx()
-        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % WARPS_PER_WG
+        lane = me.lane
+        # The warp's TMEM lane quadrant (tidx // 32), which indexes its sRowSums row.
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % me.warps
         owns_head = lane < tile_hq
         _, tLtL, tOtO = self.tmem_tensors(params, tmem)
-        t2r, r2t, thr_t2r, thr_r2t, vec_layout = self.vec_copies(tLtL)
+        tidx = self.tmem_row(me, "correction")
+        t2r, r2t, thr_t2r, thr_r2t, vec_layout = self.vec_copies(tLtL, tidx)
         vec_size = cute.cosize(vec_layout)
-        tidx = cute.arch.thread_idx()[0] % WG_SIZE
         r2s_o = cute.make_tiled_copy_D(
             cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32), t2r
         )

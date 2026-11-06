@@ -20,8 +20,10 @@ from transformer_nuggets.cute.jit_cache import jit_cache
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
     Consumer,
+    Local,
     OneShot,
     Producer,
+    ProtocolError,
     Ring,
     RoleConfig,
     SmemPlan,
@@ -145,8 +147,16 @@ class Gemm(WarpSpecialized):
 
     @role(warps=range(4), regs=160)
     @cute.jit
-    def epilogue(self, params: GemmParams, *, acc: Consumer, work: WorkCursor, tmem: Tmem):
-        tidx, _, _ = cute.arch.thread_idx()
+    def epilogue(
+        self, params: GemmParams, *, acc: Consumer, work: WorkCursor, tmem: Tmem, me: Local
+    ):
+        if cutlass.const_expr(me.warps != 4):
+            raise ProtocolError(
+                f"epilogue: the TMEM load covers 128 rows with 4 warps, got {me.warps}"
+            )
+        # tcgen05.ld reaches the TMEM lanes of the hardware warp % 4, so the row is the thread
+        # index modulo the role's size: right for any four consecutive warps.
+        tidx = cute.arch.thread_idx()[0] % me.threads
         t2r = tcgen05.make_tmem_copy(
             cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition.x32), cutlass.Float32),
             cute.zipped_divide(params.acc_fake, params.epi_tiler)[None, 0],
