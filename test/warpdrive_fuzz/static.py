@@ -95,27 +95,16 @@ def collect_pair(
     cluster=None,
     producer_warps=0,
     consumer_warps=1,
-    producer_cta="all",
     consumer_cta="all",
     producer_ann=Producer,
-    consumer_ann=Consumer,
 ):
-    cls = type(
-        "DeclarationProbe",
-        (WarpSpecialized,),
+    return collect_roles(
         {
-            "prod": declaration_role(
-                producer_warps, cta=producer_cta, params=(("ch", producer_ann),)
-            ),
-            "cons": declaration_role(
-                consumer_warps, cta=consumer_cta, params=(("ch", consumer_ann),)
-            ),
+            "prod": declaration_role(producer_warps, params=(("ch", producer_ann),)),
+            "cons": declaration_role(consumer_warps, cta=consumer_cta, params=(("ch", Consumer),)),
         },
+        {"ch": channel, "cluster": cluster or SingleCta()},
     )
-    op = cls()
-    op.ch = channel
-    op.cluster = cluster or SingleCta()
-    return op.describe()
 
 
 def collect_roles(roles, declarations=None):
