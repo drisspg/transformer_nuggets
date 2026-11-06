@@ -696,25 +696,26 @@ class FlashAttentionBackward(WarpSpecialized):
         # acquires before its first SMEM store, after stage 0, and the pair waits there;
         # acquiring once both stages are in TMEM overlaps that wait with stage 1.
         dsh = ds.acquire()  # the previous dQ MMA has read sdS (and sdSx)
-        sdS = c.thr_r2s.partition_D(
+        tRS_sdS = c.thr_r2s.partition_D(
             cute.make_tensor(dsh.view("dS", write=True).iterator, c.sdS_epi)
         )
         if cutlass.const_expr(pair):
             # The (key, query) tile's layout over the half-tile sdSx: only its first 64-query
             # block, the peer block's layout in sdS, is written.
-            sdSx = cute.make_tensor(dsh.view("dSx", write=True).iterator, c.sdS_epi)
-            sdSx = c.thr_r2s.partition_D(sdSx)
+            tRS_sdSx = c.thr_r2s.partition_D(
+                cute.make_tensor(dsh.view("dSx", write=True).iterator, c.sdS_epi)
+            )
         for st in cutlass.range_constexpr(c.n_stages):
             if cutlass.const_expr(not pair):
-                cute.autovec_copy(rdS[st], sdS[None, st])
+                cute.autovec_copy(rdS[st], tRS_sdS[None, st])
             else:
                 if st == c.rank:  # stage st is query half st: this CTA's rows of dQ
-                    cute.autovec_copy(rdS[st], sdS[None, st])
+                    cute.autovec_copy(rdS[st], tRS_sdS[None, st])
                 else:
                     # Straight to sdSx, which the acquire also guards (the previous exchange
                     # copy completed before its dQ MMA). FA4 holds this half in registers until
                     # after the loop, which its serial schedule's sdSx-over-dQaccum alias needs.
-                    cute.autovec_copy(rdS[st], sdSx[None, 0])
+                    cute.autovec_copy(rdS[st], tRS_sdSx[None, 0])
         dph.release()  # layer fences the tcgen05.st of dS
         if cutlass.const_expr(pair):
             # Every thread's sdS / sdSx stores reach the async proxy before the exchange copy

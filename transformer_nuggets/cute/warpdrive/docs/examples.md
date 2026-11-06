@@ -476,7 +476,8 @@ Fixed-buffer CUDA-graph replays of one whole backward call (preprocess, main ker
 postprocess) per variant, seven interleaved rounds of 30 replays after three seconds of
 warmup; CUPTI gives the main kernel. Minimum round medians in microseconds, lower is better.
 GB300, CuTeDSL 4.8.0, PyTorch `2.15.0.dev20260922+cu132`, FA4 `00807a02`, normal DVFS,
-shared GPUs, November 2026; `fa4_bwd.py` SHA-256 prefix `fa7ad2de9b7dd9f4`:
+shared GPUs, November 2026; `fa4_bwd.py` SHA-256 prefix `fa7ad2de9b7dd9f4` (SASS identical to
+`de18eb84fb39c0c7`, which renames two locals):
 
 ```bash
 gpu-run --timeout 600 auto -- timeout --signal=TERM --kill-after=10s 1500s \
@@ -547,9 +548,9 @@ each change on top of the ones kept before it):
 
 | Change | Effect | Kept? |
 |---|---|---|
-| The peer's query half of dS stored straight to sdSx, which the ds acquire already guards, instead of held in registers until after the stage loop (FA4's form, which its serial schedule needs: there sdSx aliases the dQ staging buffer) | -1.3% to -5%; compute loop 561 -> 541 instructions (619 -> 587 causal, causal spills gone) | Yes |
+| The peer's query half of dS stored straight to sdSx, which the ds acquire already guards, instead of held in registers until after the stage loop (FA4's form, which its serial schedule needs: there sdSx aliases the dQ staging buffer) | -1.3% to -5%; the 2-CTA compute loop's static SASS from 561 to 541 instructions (619 to 587 causal; FA4's causal loop has 583), causal spills gone | Yes |
 | dPsum read before each stage's dP TMEM load and barrier instead of after | -1.2% to -2.3% | Yes |
-| ds acquired once both dS stages are in TMEM, then sdS / sdSx written, instead of at stage 0 before the first SMEM store (FA4's place, where the pair's compute warps waited for the previous dQ MMA: 881 NCU samples to FA4's 3) | -2% to -3.6%; loop 508 instructions (553 causal) | Yes |
+| ds acquired once both dS stages are in TMEM, then sdS / sdSx written, instead of at stage 0 before the first SMEM store (FA4's place, where the pair's compute warps waited for the previous dQ MMA: 881 NCU samples at causal 1x16x8192 to FA4's 3, whose compute warps reach it later after waiting longer for S, 1790 samples to our 989) | -2% to -3.6%; static loop 508 instructions (553 causal) | Yes |
 | ds acquired before the dP load | +2% to +4% | No |
 | dP released before that acquire | +0.4% to +2.6% | No |
 | One P-over-S barrier after both stages' exp2 | Non-causal within noise, causal +1.4% to +1.8% | No |
@@ -589,10 +590,10 @@ non-causal unless noted):
   the compute warps wait 27-29% (12% at `compute_sync`, 3% each on s, dp, lse, dPsum and ds);
   the load warp waits 92% (on stage reuse).
 
-Both views point at the compute warps as the critical role (the MMA waits on them, not on
-data), which is where the FA4 diff found the excess. Neither view alone separates "compute
+Both views pointed at the compute warps as the critical role (the MMA waited on them, not on
+data), which is where the FA4 diff found the excess. Neither view alone separated "compute
 does too much work" from "compute is scheduled badly"; the instruction count per tile and the
-sync skeleton made that distinction. Only the reference turns a 66% busy tensor pipe into a
+sync skeleton made that distinction. Only the reference turned a 66% busy tensor pipe into a
 known 3.8% (1x16x8192) shortfall.
 
 </details>
