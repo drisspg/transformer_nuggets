@@ -395,14 +395,9 @@ class QwenDecodeMegakernel(WarpSpecialized):
         self.smem_plan.buffer("ATT", Float32, align=16)
         self.smem_plan.buffer("QKVS", Float32, align=16)
         self.smem_plan.buffer("MLS", Float32, align=16)
-        # Compute reads stages with generic loads before TMA refills them: fence.proxy.async.
-        self.w = Ring(
-            stages,
-            Tma(STAGE_BYTES),
-            Warps,
-            buffer={"W": w, "KV": kv},
-            release_fence="smem_async",
-        )
+        # Compute reads stages with generic loads before TMA refills them; the layer derives the
+        # fence.proxy.async release fence for a Tma-filled ring released by Warps.
+        self.w = Ring(stages, Tma(STAGE_BYTES), Warps, buffer={"W": w, "KV": kv})
         self.csync = NamedBarrier(threads=COMPUTE_THREADS)
         self.work = WorkStream(
             mapping=InstructionTable(),

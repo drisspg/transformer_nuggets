@@ -1362,10 +1362,11 @@ Writing this kernel exposed these warpdrive gaps, most useful fix first:
    tagged-slot or global-flag channel kind (any CTA produces, consumers spin on an epoch) is
    the missing primitive.
    `cute.arch.store(buf.iterator + i, pack_tagged(value, epoch), sem="relaxed", scope="gpu")`
-2. **A `Ring(Tma, Warps)` read with generic loads needs an explicit proxy fence.**
-   Without it TMA can refill a stage still being read; every test passed without it, and the
-   layer neither defaults it nor, without alias annotations, warns. The example sets it explicitly until a layer fix lands.
-   `Ring(stages, Tma(STAGE_BYTES), Warps, buffer=..., release_fence="smem_async")`
+2. **A `Ring(Tma, Warps)` read with generic loads needed an explicit proxy fence** (fixed).
+   Without it TMA can refill a stage still being read (PTX 9.5 §8.9.5, §8.10.6); every test
+   passed without it. The layer now derives `release_fence="smem_async"` for Tma-filled
+   channels released by `Threads`/`Warps` (`release_fence=()` opts out); see channels.md.
+   `Ring(stages, Tma(STAGE_BYTES), Warps, buffer=...)`
 3. **`Tma(tx_bytes)` fixes a ring's bytes per stage**, so every instruction loads exactly 16 KB
    per stage; wider GATEUP items (which would avoid its second wave) need a per-handle
    transaction count. `Ring(12, Tma(32 * 256 * 2), Warps, buffer={"W": w, "KV": kv})`
