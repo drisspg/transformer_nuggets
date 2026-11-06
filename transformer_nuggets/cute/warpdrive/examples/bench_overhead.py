@@ -263,8 +263,9 @@ def raw_wait(style: cutlass.Constexpr, bar, phase):
         cute.arch.mbarrier_wait(bar, phase)
 
 
-def raw_arrive(mech: str, bar):
-    if cutlass.const_expr(mech == "umma"):
+def raw_arrive(kind: str, bar):
+    """``tcgen05.commit`` for the ``umma`` kind, a thread arrival otherwise."""
+    if cutlass.const_expr(kind == "umma"):
         with cute.arch.elect_one():
             cute.nvgpu.tcgen05.commit(bar)
     else:
@@ -335,7 +336,6 @@ class RawProbe:
         kind, stages, style = self.kind, self.stages, self.wait_style
         prod = pipeline.PipelineUserType.Producer
         cons = pipeline.PipelineUserType.Consumer
-        fwd_commit = "umma" if kind == "umma" else "threads"
         if warp == 0:
             f = pipeline.make_pipeline_state(prod, stages)
             b = pipeline.make_pipeline_state(cons, stages)
@@ -347,11 +347,11 @@ class RawProbe:
                         cute.arch.mbarrier_arrive_and_expect_tx(full_f + f.index, TMA_BYTES)
                     tma_load(ctx, buf[None, f.index], full_f + f.index)
                 else:
-                    raw_arrive(fwd_commit, full_f + f.index)
+                    raw_arrive(kind, full_f + f.index)
                 f.advance()
                 if cutlass.const_expr(self.mode == "pingpong"):
                     raw_wait(style, full_b + b.index, b.phase)
-                    raw_arrive("umma" if kind == "umma" else "threads", empty_b + b.index)
+                    raw_arrive(kind, empty_b + b.index)
                     b.advance()
             t1, g1 = cute.arch.clock64(), cute.arch.globaltimer()
             stamp(ctx.stamps, 0, t0)

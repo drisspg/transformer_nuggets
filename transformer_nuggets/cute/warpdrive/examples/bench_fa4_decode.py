@@ -260,8 +260,8 @@ def main():
         ref = reference(q, k, v, used)
         err_port = (out.float() - ref).abs().max().item()
         err_fa4 = (out_fa4.float() - ref).abs().max().item()
-        g_fa4 = graph_of(
-            partial(
+        calls = {
+            "fa4": partial(
                 interface._flash_attn_fwd,
                 q,
                 k,
@@ -270,30 +270,25 @@ def main():
                 max_seqlen_k=s,
                 num_splits=0,
                 return_lse=True,
-            )
-        )
-        # The port's wrapper fills seqused_k when it is None; build it outside the graph.
-        used_port = used if used is not None else torch.full((b,), s, device="cuda").int()
-        g_port = graph_of(partial(fa4_decode, q, k, v, splits, seqused_k=used_port, **port))
+            ),
+            # The port's wrapper fills seqused_k when it is None; build it outside the graph.
+            "port": partial(
+                fa4_decode,
+                q,
+                k,
+                v,
+                splits,
+                seqused_k=used if used is not None else torch.full((b,), s, device="cuda").int(),
+                **port,
+            ),
+        }
+        graphs = {name: graph_of(call) for name, call in calls.items()}
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
-            g_fa4.replay()
-            g_port.replay()
+            for graph in graphs.values():
+                graph.replay()
             torch.cuda.synchronize()
         if args.profile:
-            calls = {
-                "fa4": partial(
-                    interface._flash_attn_fwd,
-                    q,
-                    k,
-                    v,
-                    seqused_k=used,
-                    max_seqlen_k=s,
-                    num_splits=0,
-                    return_lse=True,
-                ),
-                "port": partial(fa4_decode, q, k, v, splits, seqused_k=used_port, **port),
-            }
             launch_order = []
             torch.cuda.cudart().cudaProfilerStart()
             try:
@@ -323,7 +318,6 @@ def main():
             )
             continue
         rounds = {"fa4": [], "port": []}
-        graphs = {"fa4": g_fa4, "port": g_port}
         for round_index in range(args.rounds):
             order = ("fa4", "port") if round_index % 2 == 0 else ("port", "fa4")
             for variant in order:

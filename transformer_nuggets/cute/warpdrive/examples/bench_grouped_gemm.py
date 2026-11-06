@@ -112,7 +112,7 @@ def kernels_per_call(call) -> list[str]:
     return [e.key for e in prof.key_averages() if e.device_time_total > 0]
 
 
-def variants_for(a, b, offsets, sizes, labels: list[str]) -> dict:
+def variants_for(a, b, offsets, labels: list[str]) -> dict:
     calls = {}
     bt = b.transpose(1, 2)  # (G, K, N) with K contiguous: the layout every baseline takes
     for label in labels:
@@ -167,7 +167,7 @@ def run_shape(groups, tokens, n, k, labels, samples, rounds) -> dict:
     a = torch.randn(tokens, k, device="cuda", dtype=torch.bfloat16)
     b = torch.randn(groups, n, k, device="cuda", dtype=torch.bfloat16) / k**0.5
     ref = grouped_gemm_reference(a, b, offsets)
-    calls = variants_for(a, b, offsets, sizes, labels)
+    calls = variants_for(a, b, offsets, labels)
     kernels = {}
     for label, call in calls.items():
         out = call()
