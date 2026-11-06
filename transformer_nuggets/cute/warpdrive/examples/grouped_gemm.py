@@ -65,6 +65,7 @@ from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import (
     EPI_TILE_NS,
     MAX_C_STAGES,
     TILE_K,
+    _frozen_roles,
 )
 from transformer_nuggets.cute.warpdrive.examples.tma_tiles import tma_partition_tiles
 
@@ -562,7 +563,7 @@ def check_grouped_gemm_args(
         raise TypeError(f"offsets must be int32, got {offsets.dtype}")
     if a.ndim != 2 or b.ndim != 3 or a.shape[1] != b.shape[2]:
         raise ValueError(f"incompatible shapes {tuple(a.shape)}, {tuple(b.shape)}")
-    if a.shape[0] + (b.shape[0] + 1) * MAX_TILE_M > 2**31 - 1:
+    if a.shape[0] + (b.shape[0] + 1) * MAX_TILE_M > INT32_MAX:
         raise ValueError(f"total_M + (G + 1) * {MAX_TILE_M} must fit in int32")
     if offsets.ndim != 1 or offsets.shape[0] != b.shape[0]:
         raise ValueError(f"offsets must have shape ({b.shape[0]},), got {tuple(offsets.shape)}")
@@ -591,10 +592,6 @@ def check_grouped_gemm_args(
 
 
 _OPS: dict = {}
-
-
-def _frozen_roles(roles):
-    return None if roles is None else tuple(sorted(roles.items()))
 
 
 def grouped_gemm(

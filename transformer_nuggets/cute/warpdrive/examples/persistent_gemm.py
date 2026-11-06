@@ -72,6 +72,7 @@ from transformer_nuggets.cute.warpdrive import (
     role,
 )
 from transformer_nuggets.cute.warpdrive.examples.gemm import check_gemm_args
+from transformer_nuggets.cute.warpdrive.examples.tma_tiles import tma_partition_tiles
 
 CTA_TILE_M, TILE_K = 128, 64  # per-CTA output rows and K step; tile N is a constructor argument
 EPI_TILE_NS = (16, 32, 64)  # TMA store box widths: 32 B to 128 B bf16 rows, up to the SW128 atom
@@ -283,12 +284,8 @@ class PersistentGemm(WarpSpecialized):
         )
         tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.dtype)
         r2s, tRS_rC, tRS_sC = epilogue_smem_copy_and_partition(self, t2r, tTR_rC, tidx, params.sC)
-        bSG_sC, bSG_gC = cpasync.tma_partition(
-            params.tma_c,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(params.sC, 0, 2),
-            cute.group_modes(cute.flat_divide(gC, params.epi_tile), 0, 2),
+        bSG_sC, bSG_gC = tma_partition_tiles(
+            params.tma_c, params.sC, cute.flat_divide(gC, params.epi_tile), tile_rank=2
         )
         tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc) - 1)  # (..., SUB, STAGE)
         subtiles = cute.size(tTR_tAcc, mode=[3])
