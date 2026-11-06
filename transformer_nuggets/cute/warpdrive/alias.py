@@ -363,12 +363,11 @@ def _bulk_done(role: RoleEvents, seq: list[int], pos_a: int, pos_e: int) -> bool
     return False
 
 
-def _completion(
-    a: Access, seq: list[int], pos_a: int, pos_e: int, close, other: str
-) -> Finding | None:
+def _completion(a: Access, seq: list[int], pos_a: int, pos_e: int, other: str) -> Finding | None:
     """None when access ``a`` (at ``pos_a``) has completed, and is published to a thread
     synchronizing with the signal at ``pos_e`` (a close event), for a conflicting access by
     agent ``other``; otherwise the missing edge."""
+    close = a.role.events[seq[pos_e]]
     rec = close.data["handle"]
     chan = rec.chan
     side = "producer" if rec.producer else "consumer"
@@ -452,14 +451,9 @@ def _pipelined(first: Access, second: Access) -> bool:
     )
 
 
-def _same_period(
-    a: Access, b: Access, warp_pairs, between=None, first_is_a=None
-) -> Finding | None:
+def _same_period(first: Access, second: Access, warp_pairs, between=None) -> Finding | None:
     """Program order inside one thread set: ``between`` are the events separating the two
     (default: the trace order of one handle period)."""
-    if first_is_a is None:
-        first_is_a = a.index < b.index
-    first, second = (a, b) if first_is_a else (b, a)
     if between is None:
         between = first.role.events[first.index + 1 : second.index]
     barrier = any(
@@ -539,7 +533,7 @@ def _handoff(a: Access, b: Access, chan, slot, warp_pairs) -> Finding | None:
             and close < _open_before(second.role, second.index, hs)
         )
         if not separated:
-            found = _same_period(a, b, warp_pairs)
+            found = _same_period(first, second, warp_pairs)
             if found is not None:
                 return found
     elif ha.producer == hb.producer and not (chan.exclusive and not ha.producer):
@@ -559,7 +553,7 @@ def _handoff(a: Access, b: Access, chan, slot, warp_pairs) -> Finding | None:
             return Finding(
                 UNVERIFIED, f"{x.describe()}: its {chan.name} handle never closes", "channel"
             )
-        found = _completion(x, seq, x.index, close, x.role.events[close], other.agent)
+        found = _completion(x, seq, x.index, close, other.agent)
         if found is not None:
             return found
     return None
@@ -715,7 +709,8 @@ class _Graph:
         if equal:
             # A ring is exact only when no channel op sits in an inner loop.
             if not chan.fixed and any(
-                len(releases.get(i, [])) != len(set(self._events(src, releases.get(i, []))))
+                len(releases.get(i, []))
+                != len({self.seq[id(src)][p][0] for p in releases.get(i, [])})
                 for i in span
             ):
                 return
@@ -731,9 +726,6 @@ class _Graph:
             nxt = acquires.get(i + 1, [])
             for r in releases.get(i, []) if chan.fixed and nxt else []:
                 self._edge(src, r, dst, nxt[0])
-
-    def _events(self, role, positions):
-        return [self.seq[id(role)][p][0] for p in positions]
 
     def _edge(self, src, p, dst, q):
         close = src.events[self.seq[id(src)][p][0]]
@@ -858,11 +850,6 @@ def _mismatch(label, src, src_ops, src_what, dst, dst_ops, dst_what) -> str:
     )
 
 
-def _soft(finding: Finding) -> bool:
-    """A failure that is a visibility or modeling gap, not an established missing edge."""
-    return RAW_ONLY in finding.text or finding.rule == EPOCHS
-
-
 def _prefer(first: Finding | None, found: Finding) -> Finding:
     """The unverified finding to keep across instance pairs: the first one, unless it is only
     an unknown epoch correspondence and ``found`` names something more concrete."""
@@ -940,8 +927,7 @@ def _reach(graph: _Graph, x: Access, px: int, other: str) -> tuple:
 
         def check(pos_e):
             if pos_e not in verdicts:
-                close = x.role.events[seq[pos_e]]
-                verdicts[pos_e] = _completion(x, seq, px, pos_e, close, other)
+                verdicts[pos_e] = _completion(x, seq, px, pos_e, other)
                 if verdicts[pos_e] is not None:
                     failures.append(verdicts[pos_e])
             return verdicts[pos_e] is None
@@ -1011,12 +997,12 @@ def _same_role(graph: _Graph, a: Access, b: Access, warp_pairs) -> Finding | Non
         for pb in graph.pos.get((id(b.role), b.index), []):
             x, px, y, py = (a, pa, b, pb) if pa < pb else (b, pb, a, pa)
             between = [a.role.events[e] for e, _ in seq[px + 1 : py]]
-            found = _same_period(a, b, warp_pairs, between, first_is_a=x is a)
+            found = _same_period(x, y, warp_pairs, between)
             if found is None:
                 continue
             ordered, failures = _graph_order(graph, x, px, y, py)
             if not ordered:
-                soft = failures and _soft(failures[0])
+                soft = failures and (RAW_ONLY in failures[0].text or failures[0].rule == EPOCHS)
                 found = failures[0] if failures and (found.severity != HAZARD or soft) else found
                 if found.severity == HAZARD:
                     found = _unclosed(graph, a, b) or found
