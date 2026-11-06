@@ -160,14 +160,6 @@ def required_group(chan, cluster) -> str | None:
     return "ONE"
 
 
-def expected_stage_bytes(chan) -> int:
-    """Bytes one producing CTA's copies must deliver per stage for the armed transaction count
-    (a multicast copy delivers its box to every CTA of its mask): one CTA's bytes for each CTA
-    it fills."""
-    sc = chan.scope
-    return sc.tx // chan.derived_scope.tx_ctas * _fill_count(chan)
-
-
 def _fill_count(chan) -> int:
     return len(chan.cluster.filled(0, chan.producer.fills))
 
@@ -261,10 +253,12 @@ def check_role(trace, cluster, reports: dict) -> None:
             report.unverified.append(f"bytes of {rec.what} at {rec.site}: {why[0]}")
         if why or stage.opted_out or use.chan.name in opted_out_chans:
             continue
-        got, want = sum(cp.nbytes for cp in stage.copies), expected_stage_bytes(use.chan)
+        got = sum(cp.nbytes for cp in stage.copies)
+        # One producing CTA's share of the armed bytes, for each CTA it fills.
+        want = use.chan.scope.tx // use.chan.derived_scope.tx_ctas * filled
         if got != want:
             raise ProtocolError(_bytes_message(trace.role_name, use, stage.copies, got, want))
-        report.stage_bytes.add(got // _fill_count(use.chan))  # per CTA, like Tma.tx_bytes
+        report.stage_bytes.add(got // filled)  # per CTA, like Tma.tx_bytes
 
 
 def _copies(use: TmaUse) -> tuple[list[_Copy], list, str | None]:
@@ -398,7 +392,7 @@ def _copy_ops(set_value) -> list:
     return out
 
 
-def _copy_bytes(copy_op, copy_bits, bulk: bool = False) -> int | None:
+def _copy_bytes(copy_op, copy_bits, bulk: bool) -> int | None:
     """Bytes one ``cute.copy`` delivers: every element of its static SMEM destination, which
     must be a whole number of ``copy_bits`` boxes (a bulk copy without ``copy_bits`` moves the
     destination in one instruction). None when the type is not recognized."""
@@ -408,18 +402,16 @@ def _copy_bytes(copy_op, copy_bits, bulk: bool = False) -> int | None:
     dst = re.search(r'!cute\.memref<([a-z]+)(\d+)\w*, smem[^"]*"([^"]*)">\) -> \(\)\s*$', text)
     if "operandSegmentSizes = array<i32: 1, 1, 1, 0>" not in text or dst is None:
         return None
-    shape = _parse_shape(dst.group(3).split(":")[0])
-    if shape is None:
+    size = _shape_size(dst.group(3).split(":")[0])
+    if size is None:
         return None
-    bits = int(dst.group(2))
-    for leaf in _leaves(shape):
-        bits *= leaf
+    bits = int(dst.group(2)) * size
     box = int(copy_bits.group(1)) if copy_bits is not None else 8
     return bits // 8 if bits % box == 0 and bits % 8 == 0 else None
 
 
-def _parse_shape(text: str):
-    """Nested tuple of ints for a CuTe shape string; None if any extent is dynamic."""
+def _shape_size(text: str) -> int | None:
+    """Product of extents in a CuTe shape string; None if dynamic or unrecognized."""
     if "?" in text:
         return None
     tokens = re.findall(r"\(|\)|\d+", text)
@@ -431,24 +423,16 @@ def _parse_shape(text: str):
         pos += 1
         if tok != "(":
             return int(tok)
-        items = []
+        size = 1
         while tokens[pos] != ")":
-            items.append(parse())
+            size *= parse()
         pos += 1
-        return tuple(items)
+        return size
 
     try:
         return parse()
     except (IndexError, ValueError):
         return None
-
-
-def _leaves(shape):
-    if isinstance(shape, int):
-        yield shape
-        return
-    for s in shape:
-        yield from _leaves(s)
 
 
 def _group_message(role: str, use: TmaUse, cp: _Copy, need: str, cluster) -> str:

@@ -910,10 +910,6 @@ class Token:
         self._carried_in = None  # a body copy: the loop body it was carried into
         self._crossed = []  # blocks this value left a region from (entering a loop or branch)
 
-    def _fresh(self) -> bool:
-        """Does this token still name its end's next epoch (of its slot)?"""
-        return self._why_stale() is None
-
     def _why_stale(self) -> str | None:
         if self._stale is not None:
             return self._stale
@@ -949,7 +945,7 @@ class Token:
         if block in self._crossed:  # out of a branch, which merges values of unknown freshness
             copy._stale = "a branch merged it"
             return copy
-        if not self._fresh():
+        if self._why_stale() is not None:
             copy._stale = self._stale or (
                 f"the value entering at {user_site()} (probed at {self._site}) is stale"
             )
@@ -1584,14 +1580,9 @@ def _parent_block(block):
 def _stale_back_edge(rec: _EndRecord, key, body) -> str | None:
     """Why a token a loop ``body`` passes to its next iteration (or out of the loop) may not
     name the end's next epoch: an acquire/wait on the end after its probe. None if fresh."""
-    stale = [
-        (site, why)
-        for block, k, why, site in rec.token_exports
-        if block == body and k == key and why is not None
-    ]
-    if stale:
-        site, why = stale[0]
-        return f"the value one iteration passes to the next (probed at {site}) is stale: {why}"
+    for block, k, why, site in rec.token_exports:
+        if block == body and k == key and why is not None:
+            return f"the value one iteration passes to the next (probed at {site}) is stale: {why}"
     return None
 
 
@@ -1621,21 +1612,17 @@ def cluster_rank():
     return cute.arch.block_idx_in_cluster()
 
 
-def _arm_one(full, tx: int, cta):
-    """Arm ``cta``'s barrier: this CTA's own (None), a rank, or ``((arming rank, target),
-    ...)`` for targets that depend on the arming CTA's rank."""
-    if cta is None:  # this CTA's own barrier
-        cute.arch.mbarrier_arrive_and_expect_tx(full, tx)
-        return
-    if isinstance(cta, tuple):
-        cta = rank_value(dict(cta), cluster_rank)
-    cute.arch.mbarrier_arrive_and_expect_tx(full, tx, cta)
-
-
 def _arm_targets(full, tx: int, targets):
+    """Arm each target: None (this CTA), a rank, or ``((arming rank, target), ...)``
+    for a target that depends on the arming CTA's rank."""
     with cute.arch.elect_one():
-        for c in targets:
-            _arm_one(full, tx, c)
+        for cta in targets:
+            if cta is None:
+                cute.arch.mbarrier_arrive_and_expect_tx(full, tx)
+            else:
+                if isinstance(cta, tuple):
+                    cta = rank_value(dict(cta), cluster_rank)
+                cute.arch.mbarrier_arrive_and_expect_tx(full, tx, cta)
 
 
 @cute.jit

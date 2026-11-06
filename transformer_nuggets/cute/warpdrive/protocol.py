@@ -137,14 +137,6 @@ def current_block():
     return ir.InsertionPoint.current.block
 
 
-def _block_depth(block, root) -> int | None:
-    try:
-        blocks = _ancestors(block, root)
-        return len(blocks) - 1 if blocks and blocks[-1] == root else None
-    except (AttributeError, ValueError, RuntimeError):
-        return None
-
-
 def _ancestors(block, root) -> list:
     """``block`` and its enclosing blocks up to ``root`` (innermost first)."""
     chain = []
@@ -351,8 +343,12 @@ class RoleTrace:
         return True
 
     def depth(self) -> int:
-        d = _block_depth(current_block(), self.root)
-        return 0 if d is None else d
+        block = current_block()
+        try:
+            blocks = _ancestors(block, self.root)
+            return len(blocks) - 1 if blocks and blocks[-1] == self.root else 0
+        except (AttributeError, ValueError, RuntimeError):
+            return 0
 
     def record(self, chan, op, slot, count: int | None = 1, order: int | None = None):
         # Blocks are captured while live: a region the tracer later discards must not be
@@ -405,8 +401,8 @@ class RoleTrace:
         return (regions.pop() if regions else None), seq
 
     def opened(self, handle):
-        if active_opt_out("unclosed") is not None:
-            handle.unclosed_ok = active_opt_out("unclosed")
+        if (opt := active_opt_out("unclosed")) is not None:
+            handle.unclosed_ok = opt
         self.open.append(handle)
 
     def closed(self, handle, op: str):
