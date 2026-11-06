@@ -365,14 +365,14 @@ def derive_scope(chan, cluster, *, internal: bool = False) -> Scope:
     bound = [*chan.producers, *chan.consumers]
     ranks = range(cluster.size)
     placed = {ri.name: cluster.ctas(ri.cta) for ri, _ in bound}
-    tma = chan.producer if isinstance(chan.producer, Tma) else Tma(1)
-    if tma.fills == "pair" and not cluster.pair:
+    tma = chan.producer if isinstance(chan.producer, Tma) else None
+    if tma is not None and tma.fills == "pair" and not cluster.pair:
         raise ProtocolError(
             f"channel {chan.name}: Tma(fills='pair') fills both CTAs of an MMA pair, but "
             f"{type(cluster).__name__} has no pairs; use fills='cluster' from a rank0 producer"
         )
     # Whether a copy lands in another CTA: multicast, or issued for the CTAs a producer fills.
-    crosses = any(
+    crosses = tma is not None and any(
         len(cluster.reach(d, tma.multicast)) > 1 or len(cluster.filled(r, tma.fills)) > 1
         for r in ranks
         for d in cluster.filled(r, tma.fills)
@@ -381,7 +381,7 @@ def derive_scope(chan, cluster, *, internal: bool = False) -> Scope:
     if same and not crosses:
         full = chan.slot_counts("producer")
         empty = chan.slot_counts("consumer")
-        tx = chan.producer.tx_bytes if isinstance(chan.producer, Tma) else None
+        tx = tma.tx_bytes if tma is not None else None
         self_targets = {c: (c,) for c in ranks}
 
         def local_mask(mech, signalers):
@@ -420,17 +420,17 @@ def derive_scope(chan, cluster, *, internal: bool = False) -> Scope:
     else:
         unit = {r: tuple(ranks) for r in ranks}
     tx, tx_ctas = None, 1
-    if isinstance(chan.producer, Tma) and not internal:
+    if tma is not None and not internal:
         full_targets, empty_targets, tx_ctas = _tma_targets(
             chan, cluster, full_ctas, empty_ctas, unit
         )
-        tx = chan.producer.tx_bytes * tx_ctas
+        tx = tma.tx_bytes * tx_ctas
     else:
         full_targets = {p: tuple(c for c in full_ctas if c in unit[p]) for p in empty_ctas}
         # A consumer releases every producing CTA whose signals reach the CTAs it reads.
         empty_targets = {c: tuple(p for p in empty_ctas if p in unit[c]) for c in full_ctas}
-        if isinstance(chan.producer, Tma):  # the internal work ring: unscaled payload bytes
-            tx = chan.producer.tx_bytes
+        if tma is not None:  # the internal work ring: unscaled payload bytes
+            tx = tma.tx_bytes
 
     def counts(mech, signalers, targets):
         out = {}
@@ -535,7 +535,7 @@ def _tma_targets(chan, cluster, consumers: tuple, producers: tuple, unit: dict):
         )
     arm = {}
     for b in sorted(set(bar.values())):
-        arm[b] = filler.get(b) if tma.fills is not None else (b if b in producers else None)
+        arm[b] = filler.get(b)
         if arm[b] is None:
             raise ProtocolError(
                 f"channel {name}: multicast copies land in CTA {b}, but no producer runs there to "

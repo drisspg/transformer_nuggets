@@ -184,11 +184,10 @@ class WorkMap:
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
-        # A subclass that replaces decode (e.g. a Raster that reads a table) does not inherit
-        # the opt-in; it must state decodes_any_index again.
-        if "decode" in vars(cls) and "decodes_any_index" not in vars(cls):
-            cls.decodes_any_index = False
         if "decode" in vars(cls):
+            # A replacement decoder must opt into speculative decoding itself.
+            if "decodes_any_index" not in vars(cls):
+                cls.decodes_any_index = False
             params = inspect.signature(cls.decode).parameters
             if len(params) != 4 and not any(p.kind is p.VAR_POSITIONAL for p in params.values()):
                 raise TypeError(
@@ -1027,8 +1026,13 @@ class _CursorRecord:
                 "exactly once, unconditionally, at the end of the work loop body"
             )
         site, block = self.advances[0]
+        op = block.owner
         conditions = [
-            (cond, value) for cond, value in self.valid_reads if _is_while_body(block, cond)
+            (cond, value)
+            for cond, value in self.valid_reads
+            if op.name == "scf.while"
+            and block == op.regions[1].blocks[0]
+            and cond == op.regions[0].blocks[0]
         ]
         if not conditions:
             raise ProtocolError(
@@ -1041,17 +1045,6 @@ class _CursorRecord:
                 f"{self.role}: the work-loop condition must be exactly {self.cursor}.valid; "
                 "an extra condition can leave the stream undrained"
             )
-
-
-def _is_while_body(block, cond_block) -> bool:
-    """``block`` is the body (after region) of the ``scf.while`` whose condition (before
-    region) is ``cond_block``."""
-    op = block.owner
-    return (
-        op.name == "scf.while"
-        and block == op.regions[1].blocks[0]
-        and cond_block == op.regions[0].blocks[0]
-    )
 
 
 @functools.cache
@@ -1186,11 +1179,6 @@ class WorkCursor:
 
     def _enter_item(self):
         """Bookkeeping at the start of each item: the record log and the item's IKET range."""
-        self._log()
-        if self._iket is not None:
-            push_if(self.index < self._problem.total, self._iket)
-
-    def _log(self):
         if self._count is not None:
             _record(
                 self._problem.workspace,
@@ -1201,6 +1189,8 @@ class WorkCursor:
                 self._stream.record,
             )
             self._count = self._count + 1
+        if self._iket is not None:
+            push_if(self.index < self._problem.total, self._iket)
 
     def __extract_mlir_values__(self):
         values = [self.index.ir_value()] + [w.ir_value() for w in self._words]
