@@ -671,6 +671,9 @@ class FlashAttentionBackward(WarpSpecialized):
         dh, dph = dpsum.wait(), dp.wait()
         dsh = None
         for st in cutlass.range_constexpr(c.n_stages):
+            # dPsum is read before the dP load and the barrier, which hide its latency.
+            rdPsum = cute.make_rmem_tensor(c.tScS_t2r[None, 0, 0, 0].shape, Float32)
+            cute.autovec_copy(dh.view(None, None, st, 0, 0, read=True), rdPsum)
             rdP = cute.make_rmem_tensor(c.tScS_t2r[None, 0, None, None].shape, Float32)
             tmem.access("dP", read=True, cols=lambda w, st=st: cols(w, st, 32))
             cute.copy(c.thr_ld, c.tdPtdP_t2r[None, st, None, None], rdP)
@@ -678,8 +681,6 @@ class FlashAttentionBackward(WarpSpecialized):
             # dS overwrites dP columns the other warpgroup may still be loading.
             self.compute_sync.sync(aligned=True)
             rdP_st, rS_st = rdP[None, 0, 0], rS[None, st, 0, 0]
-            rdPsum = cute.make_rmem_tensor(c.tScS_t2r[None, 0, 0, 0].shape, Float32)
-            cute.autovec_copy(dh.view(None, None, st, 0, 0, read=True), rdPsum)
             for e in cutlass.range_constexpr(cute.size(rdP_st) // 2):
                 rdP_st[2 * e], rdP_st[2 * e + 1] = cute.arch.sub_packed_f32x2(
                     (rdP_st[2 * e], rdP_st[2 * e + 1]), (rdPsum[2 * e], rdPsum[2 * e + 1])
