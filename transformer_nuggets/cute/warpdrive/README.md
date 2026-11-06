@@ -18,6 +18,11 @@ item, connect the roles, and validate the handoffs. The [safety contract](GUARAN
 what warpdrive handles and what you must establish. Compilation alone does not prove liveness.
 For agent-assisted implementation, use the repo-local [authoring skill](SKILL.md).
 
+**To relearn the vocabulary,** read the [tour notebook](docs/tour.ipynb): it builds from a
+two-warp producer/consumer kernel to the pipelined GEMM, then schedules, clusters, storage
+aliases and the checkers, with saved `describe()` output, PTX excerpts and checks against
+PyTorch.
+
 ## A GEMM
 
 [gemm.py](examples/gemm.py) computes BF16 `D = A @ B.T`. Warp 4 loads A/B, warp 5 issues MMA,
@@ -121,6 +126,7 @@ budgets, every channel's per-CTA arrival counts, masks and TMA bytes, the schedu
 
 ## More examples and details
 
+- [Tour](docs/tour.ipynb): every noun and verb on small runnable kernels, executed on a GB300.
 - [Roles](docs/roles.md): placement, params, returned state and register budgets.
 - [Scheduling](docs/scheduling.md): launch setup, custom work lists and CUTLASS/FA4 mappings.
 - [Channels](docs/channels.md): rings, slots, round-robin instances, exclusive consumers,
