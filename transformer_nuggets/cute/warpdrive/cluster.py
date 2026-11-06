@@ -358,8 +358,9 @@ def _masks(targets: dict) -> int | dict:
     return values.pop() if len(values) == 1 else masks
 
 
-def derive_scope(chan, cluster, *, internal: bool = False) -> Scope:
+def derive_scope(chan, cluster) -> Scope:
     """Derive ``chan``'s scope from the placement of its bound role instances."""
+    internal = chan.internal
     from transformer_nuggets.cute.warpdrive.channels import Threads, Tma, Umma, Warps, arrivals
 
     bound = [*chan.producers, *chan.consumers]

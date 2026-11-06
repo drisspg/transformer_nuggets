@@ -721,7 +721,7 @@ class WarpSpecialized(metaclass=_KernelType):
                 )
         for name, ch in chans.items():
             ch.cluster = cluster
-            ch.derived_scope = derive_scope(ch, cluster, internal=ch.internal)
+            ch.derived_scope = derive_scope(ch, cluster)
             ch.scope = apply_overrides(ch, ch.derived_scope, cluster)
             if ch.scope.pair and ch.external:
                 managed = "consumer" if ch.external == "producer" else "producer"
@@ -928,8 +928,7 @@ class WarpSpecialized(metaclass=_KernelType):
         if not getattr(self, "_ws_traced", False):
             return None
         smem = {
-            name: replace(res, buffer=None, tensor=None, outer=None)
-            for name, res in self._ws_smem.items()
+            name: replace(res, buffer=None, tensor=None) for name, res in self._ws_smem.items()
         }
         return {
             "tma": self._ws_tma,

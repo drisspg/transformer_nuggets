@@ -123,9 +123,9 @@ def pair_join_short():
     """Pair-scoped Threads joins expect one warp fewer on the leader's barrier."""
     orig = cluster.derive_scope
 
-    def derive_scope(chan, clu, *, internal=False):
-        scope = orig(chan, clu, internal=internal)
-        if scope.pair and not internal:
+    def derive_scope(chan, clu):
+        scope = orig(chan, clu)
+        if scope.pair and not chan.internal:
             for counts, mech in (
                 (scope.full_counts, chan.producer),
                 (scope.empty_counts, chan.consumer),

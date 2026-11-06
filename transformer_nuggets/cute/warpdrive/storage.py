@@ -120,7 +120,6 @@ class ResolvedBuffer:
 
     buffer: SmemBuffer
     tensor: object
-    outer: object  # the layout without its swizzle
     nbytes: int | None
     stages: int | None
     stage_stride: int | None = None  # bytes between consecutive stages
@@ -161,7 +160,7 @@ def allocate(smem, buf: SmemBuffer, layout, resolved: dict) -> ResolvedBuffer:
         )
     stages = cute.size(outer, mode=[axis])
     stride = _stage_stride(outer.shape[axis], outer.stride[axis])
-    out = ResolvedBuffer(buf, tensor, outer, nbytes, stages if isinstance(stages, int) else None)
+    out = ResolvedBuffer(buf, tensor, nbytes, stages if isinstance(stages, int) else None)
     if nbytes is not None and isinstance(stages, int) and stride is not None:
         stage_stride = stride * width // 8
         stage_bytes = nbytes - (stages - 1) * stage_stride
