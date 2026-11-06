@@ -29,6 +29,7 @@ from transformer_nuggets.cute.warpdrive import (
     TmemPlan,
     Umma,
     WarpSpecialized,
+    Warps,
     fence_async_shared,
     named_barrier,
     role,
@@ -465,6 +466,68 @@ def test_commit_fences_are_emitted_in_declaration_order(monkeypatch, fences, sig
         compile_toy.__wrapped__(Op(fences), f"fence_order_{tag}")  # traced, not cached
     expected = list(fences if isinstance(fences, tuple) else (fences,)) if signal else []
     assert emitted == expected
+
+
+class ReadsTmaFilledStage(Model):
+    """Thread consumers read each stage of a ring with generic loads; the producer refills it
+    (megakernel review finding: TMA could overwrite a stage still being read)."""
+
+    def __init__(self, producer, consumer, **fence):
+        self.ring = Ring(2, producer, consumer, payload=(cutlass.Int32, (32,)), **fence)
+
+    @role(warps=0)
+    @cute.jit
+    def prod(self, ctx, *, ring: Producer):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            with ring.produce():
+                pass
+        return ring
+
+    @role(warps=1)
+    @cute.jit
+    def cons(self, ctx, *, ring: Consumer):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            with ring.consume() as h:
+                h.data[cute.arch.lane_idx()] += 1  # generic ld/st.shared of the stage
+        return ring
+
+
+@pytest.mark.parametrize(
+    "producer, consumer, fence, fenced",
+    [
+        (Tma(128), Threads, {}, True),
+        (Tma(128), Warps, {}, True),
+        (Tma(128), Warps, {"release_fence": ()}, False),
+        (Threads, Threads, {}, False),
+    ],
+    ids=["tma_threads", "tma_warps", "tma_warps_opt_out", "threads_threads"],
+)
+def test_tma_refilled_stage_is_proxy_fenced_before_release(
+    monkeypatch, producer, consumer, fence, fenced
+):
+    """A generic read of a TMA-filled stage is ordered before the next fill only by
+    fence.proxy.async in the reading thread before its release, so every consumer release of a
+    Tma ring emits one unless the channel declares ``release_fence=()``."""
+    emitted = []
+    for name in ("fence_view_async_shared", "mbarrier_arrive"):
+        original = getattr(cute.arch, name)
+
+        def record(*args, _name=name, _original=original, **kwargs):
+            emitted.append(_name)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(cute.arch, name, record)
+
+    op = ReadsTmaFilledStage(producer, consumer, **fence)
+    tag = f"{type(producer).__name__}_{consumer.__name__}_{len(fence)}".lower()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # the Tma producer issues no copies
+        compile_toy.__wrapped__(op, f"tma_refill_fence_{tag}")  # traced, not cached
+    assert emitted.count("fence_view_async_shared") == fenced
+    if fenced:  # the fence precedes the consumer's arrival on the empty barrier
+        assert emitted[emitted.index("fence_view_async_shared") + 1] == "mbarrier_arrive"
+    if fence:
+        assert "release_fence smem_async -> none  (differs from derived)" in op.describe()
 
 
 class LoopInsideHandle(LoopCarriedMma):

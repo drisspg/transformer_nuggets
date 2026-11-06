@@ -209,6 +209,14 @@ class Channel:
     an ordered tuple of both when a side hands over TMEM stores and SMEM stores at once; the
     layer emits exactly those fences, in that order, before every managed arrive on that side.
 
+    ``release_fence`` defaults to ``"smem_async"`` on a ``Tma``-filled channel released by
+    ``Threads`` or ``Warps``: those threads may read the stage with generic loads, and the next
+    fill writes it through the async proxy, a write the read may otherwise observe (PTX ISA,
+    Memory Consistency Model: Proxies and the causality axiom). Each reading thread fences
+    before its arrival. ``release_fence=()`` declares that the consumers made no generic access
+    to what the producer fills (they only issued TMA stores or MMAs from it, or fenced
+    themselves); ``describe()`` prints any value that replaces the default.
+
     ``remote_scope``: memory scope of thread arrivals on a pair-scoped channel's barriers in the
     other CTA. ``"cta"`` (default without a payload; what CUTLASS and FA4 pipelines use) only
     counts arrivals: right for TMEM/TMA/MMA handoffs ordered by their own fences and for
@@ -266,6 +274,8 @@ class Channel:
     cluster: object = field(default=None, init=False, repr=False)
     derived_remote_scope: str = field(default="cta", init=False, repr=False)
     remote_scope_overridden: bool = field(default=False, init=False, repr=False)
+    derived_release_fence: tuple = field(default=(), init=False, repr=False)
+    release_fence_overridden: bool = field(default=False, init=False, repr=False)
     # Layer-owned channels (the scheduler's rings) publish without TMA copies.
     internal: bool = field(default=False, init=False, repr=False)
     # ``buffer`` normalized to {name: SmemBuffer}; a single buffer is keyed by its plan name.
@@ -288,6 +298,7 @@ class Channel:
         if isinstance(self.consumer, Tma):
             raise ValueError("TMA is a producer mechanism")  # noqa: TRY004
         self.commit_fence = _fences("commit_fence", self.commit_fence)
+        self.release_fence_overridden = self.release_fence is not None
         self.release_fence = _fences("release_fence", self.release_fence)
         if isinstance(self.producer, Tma) and self.commit_fence:
             raise ValueError("TMA producers do not arrive, so they have no commit to fence")
@@ -407,6 +418,15 @@ class Channel:
         self.remote_scope_overridden = self.remote_scope is not None
         if self.remote_scope is None:
             self.remote_scope = self.derived_remote_scope
+        # A generic read followed, through the release and the producer's acquire, by an
+        # async-proxy write of the same bytes is ordered only through fence.proxy.async in the
+        # reading thread (a proxy fence acts within one thread). TMA completion fences only the
+        # opposite direction, its bytes before the consumers' reads.
+        refilled_by_tma = isinstance(self.producer, Tma) and self.consumer in (Threads, Warps)
+        if refilled_by_tma and self.external != "consumer":
+            self.derived_release_fence = ("smem_async",)
+        if not self.release_fence_overridden:
+            self.release_fence = self.derived_release_fence
 
     @property
     def named(self) -> bool:

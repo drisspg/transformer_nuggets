@@ -269,13 +269,12 @@ class FlashAttentionBackward(WarpSpecialized):
             self.v = Ring(1, Tma(tile_bytes), Umma, buffer=v_buf)
             self.q = Ring(Q_STAGE, Tma(tile_bytes), Umma, buffer={"Q": q_buf, "Qt": qt_buf})
             self.do = Ring(1, Tma(tile_bytes), Umma, buffer={"dO": do_buf, "dOt": dot_buf})
-        # LSE/dPsum rows are read with ordinary loads and refilled by the async proxy. The pair's
-        # dpsum needs no release fence: make_ds fences (fence.proxy.async) and syncs every compute
-        # thread after its last dPsum read, before the release.
-        self.lse = Ring(
-            self.q_stages, Tma(TILE_M * 4), Warps, buffer=lse_buf, release_fence="smem_async"
-        )
-        dpsum_fence = None if pair else "smem_async"
+        # LSE/dPsum rows are read with ordinary loads and refilled by the async proxy, so their
+        # releases take the derived smem_async fence. The pair's dpsum opts out: make_ds fences
+        # (fence.proxy.async) and syncs every compute thread after its last dPsum read, before
+        # the release.
+        self.lse = Ring(self.q_stages, Tma(TILE_M * 4), Warps, buffer=lse_buf)
+        dpsum_fence = () if pair else None
         self.dpsum = Ring(1, Tma(TILE_M * 4), Warps, buffer=dpsum_buf, release_fence=dpsum_fence)
         self.s = Ring(1, Umma, Warps, release_fence="tmem_store")  # P stored over S
         self.dp = Ring(1, Umma, Warps, release_fence="tmem_store")  # dS stored over dP

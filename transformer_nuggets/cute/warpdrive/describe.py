@@ -302,6 +302,11 @@ def _overrides(ch, cluster) -> list[str]:
         ours, theirs = ch.derived_remote_scope, ch.remote_scope
         note = "  (differs from derived)" if ours != theirs else ""
         out.append(f"remote_scope {ours} -> {theirs}{note}")
+    # Layer channels choose their fences (the st.async work ring needs none).
+    if ch.derived_release_fence and ch.release_fence_overridden and not ch.internal:
+        ours, theirs = ch.derived_release_fence, ch.release_fence
+        note = "  (differs from derived)" if ours != theirs else ""
+        out.append(f"release_fence {'+'.join(ours)} -> {'+'.join(theirs) or 'none'}{note}")
     return out
 
 

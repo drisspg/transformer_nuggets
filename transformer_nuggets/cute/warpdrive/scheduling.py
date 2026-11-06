@@ -536,8 +536,9 @@ class ClusterLaunchControl(IndexSchedule):
     def fetch_channels(self) -> dict:
         # The scheduler's private response slot: try_cancel completes 16 bytes on the full
         # barrier (like a TMA load). The response is read through the generic proxy and the next
-        # try_cancel overwrites it through the async proxy, so the release is fenced.
-        clc = Slots(1, Tma(16), Threads, payload=(Int32, (4,)), release_fence="smem_async")
+        # try_cancel overwrites it through the async proxy, so the release is fenced (the
+        # release_fence a Tma-filled channel derives for thread consumers).
+        clc = Slots(1, Tma(16), Threads, payload=(Int32, (4,)))
         clc.internal = True  # completed by try_cancel, not by TMA copies
         return {"clc": clc}
 
@@ -634,7 +635,15 @@ class WorkStream:
         payload = (Int32, (self.payload_words,))
         if self.cluster_size == 1:
             return Ring(self.schedule.stages, Threads, Threads, payload=payload)
-        ring = Ring(self.schedule.stages, Tma(4 * self.payload_words), Threads, payload=payload)
+        # st.async writes through the generic proxy (PTX ISA, st.async), so unlike a TMA fill
+        # it needs no proxy fence after the consumers' reads.
+        ring = Ring(
+            self.schedule.stages,
+            Tma(4 * self.payload_words),
+            Threads,
+            payload=payload,
+            release_fence=(),
+        )
         ring.internal = True  # leader-only producer filling consumer CTAs (no multicast TMA)
         return ring
 

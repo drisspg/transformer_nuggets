@@ -147,7 +147,10 @@ class PingPong(ProbeBase):
         sync = "named" if kind == "named" else "mbarrier"
         buffer = self.tma_buffer(kind)
         back_consumer = Umma if kind == "umma" else Threads
-        self.fwd = Ring(stages, fwd_producer(kind), Threads, sync=sync, buffer=buffer)
+        # The consumer never reads the stage: no release fence, like the hand-written twins.
+        self.fwd = Ring(
+            stages, fwd_producer(kind), Threads, sync=sync, buffer=buffer, release_fence=()
+        )
         self.back = Ring(stages, Threads, back_consumer, sync=sync)
 
     @role(warps=0)
@@ -221,7 +224,10 @@ class Stream(ProbeBase):
         self.kind, self.stages = kind, stages
         sync = "named" if kind == "named" else "mbarrier"
         buffer = self.tma_buffer(kind)
-        self.fwd = Ring(stages, fwd_producer(kind), Threads, sync=sync, buffer=buffer)
+        # The consumer never reads the stage: no release fence, like the hand-written twins.
+        self.fwd = Ring(
+            stages, fwd_producer(kind), Threads, sync=sync, buffer=buffer, release_fence=()
+        )
 
     @role(warps=0)
     @cute.jit
