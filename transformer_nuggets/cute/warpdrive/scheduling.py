@@ -744,6 +744,76 @@ class WorkStream:
             ws[4:].fill_(-1)
         return ws, max_ctas or sms
 
+    def assignment(self, space, max_ctas: int | None = None, decode=None) -> list[list[tuple]]:
+        """The items each CTA runs, in order, computed on the host: ``[cta][slot]`` is
+        ``(index, item)``.
+
+        Only a local schedule (``OneShot``, ``StaticPersistent``, or a custom one whose
+        ``first_index`` and ``next_index`` are plain arithmetic on ``problem``) fixes the
+        sequences before the launch; claimed indices depend on run-time order. The sequences
+        are the schedule's own, run on a host ``problem`` whose ``units()`` and
+        ``first_unit()`` are ints. ``space`` and ``max_ctas`` are the launch's (host values:
+        ``Raster`` takes int extents); a persistent schedule needs ``max_ctas``. CTA ``c`` is
+        ``blockIdx.x`` of the 1-D launch grid, in work unit ``c // cs`` of ``cs`` CTAs per
+        cluster, every CTA of a unit running its items (a ``OneShot`` tile-grid launch places
+        unit ``u`` at ``(u % m_tiles, (u // m_tiles) % n_tiles, ...)`` instead).
+
+        ``decode(index) -> (keep, item)`` is the host counterpart of ``mapping.decode``, for a
+        mapping that reads tables or device data. By default a ``decodes_any_index`` mapping
+        (a pure function of the space, like ``Raster``) decodes itself and the item is its
+        words; any other keeps every index with item ``None``, so one that ``skips`` items
+        needs ``decode``. Items the decode drops are left out, as the roles skip them. A space
+        the launch would reject (past Int32) raises.
+        """
+        schedule, mapping = self.schedule, self.mapping
+        if schedule.broadcast:
+            raise ValueError(
+                f"{schedule.describe()} claims indices at run time; only a local schedule has a "
+                "host-side assignment"
+            )
+        space = mapping.bind(space)
+        count = int(mapping.count64(space))
+        total = int(_narrow(count))
+        cs = self.cluster_size
+        cap = None
+        if schedule.uses_max_ctas:
+            if max_ctas is None:
+                raise ValueError(f"{schedule.describe()} needs max_ctas")
+            cap = max(max_ctas // cs, 1)
+        units = int(schedule.launch_units(total, cap))
+        if schedule.index_limit(count, units, cs) > INT32_MAX:
+            raise ValueError(f"the space's {count} items exceed what a launch indexes in Int32")
+        if decode is None and mapping.skips and not mapping.decodes_any_index:
+            raise ValueError(
+                f"{type(mapping).__name__} drops items by data the host cannot read; pass its "
+                "host counterpart as decode=(index -> (keep, item))"
+            )
+        if decode is None and mapping.decodes_any_index:
+
+            def decode(index):
+                keep, words, _ = mapping.decode(index, space, mapping.start(space))
+                return keep, tuple(int(w) for w in words)
+
+        elif decode is None:
+
+            def decode(index):
+                return True, None
+
+        rows = []
+        for unit in range(units):
+            problem = _HostProblem(space, total, cs, units, unit)
+            items = []
+            index = int(schedule.first_index(problem))
+            for _ in range(total):  # a unit runs each index at most once
+                if index >= total:
+                    break
+                keep, item = decode(index)
+                if keep:
+                    items.append((index, item))
+                index = int(schedule.next_index(index, problem))
+            rows += [list(items) for _ in range(cs)]
+        return rows
+
     def timeline(self, workspace, ctas: int) -> dict:
         """Decode a ``record`` workspace: ``{role: [[(index, t_ns), ...] per CTA]}`` with times
         relative to the earliest event (``%globaltimer_lo`` wraps every ~4.3 s)."""
@@ -768,6 +838,25 @@ class WorkStream:
                 for b in range(ctas)
             ]
         return out
+
+
+@dataclass(frozen=True)
+class _HostProblem:
+    """What a local schedule reads of ``BoundWork``, for one work unit on the host
+    (``WorkStream.assignment``): the launch's unit count and this unit, as ints."""
+
+    space: object
+    total: int
+    cs: int
+    launched: int
+    unit: int
+    workspace = None
+
+    def units(self) -> int:
+        return self.launched
+
+    def first_unit(self) -> int:
+        return self.unit
 
 
 class BoundWork:

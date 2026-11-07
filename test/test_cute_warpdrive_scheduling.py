@@ -34,6 +34,7 @@ from transformer_nuggets.cute.warpdrive import (
     role,
     scheduling,
 )
+from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import PersistentGemm
 from transformer_nuggets.cute.warpdrive.scheduling import tile_grid_dims
 
 SCHEDULES = {
@@ -496,6 +497,91 @@ def test_all_items_skipped_terminates(requires_blackwell, schedule):
     op = ScheduleToy(SCHEDULES[schedule], mapping=SkipAll(), mode="skipall")
     _, hits, ws = run_toy(op, (5, 4, 1), 3, reps=2)
     assert (hits == 0).all() and ws[:2].tolist() == [0, 0]
+
+
+# --------------------------------------------------------------------------- #
+# WorkStream.assignment: the host's view of which CTA runs which items
+# --------------------------------------------------------------------------- #
+
+
+def test_static_assignment_strides_by_the_grid():
+    """CTA b of min(total, max_ctas) runs indices b, b + grid, ... in Raster order."""
+    rows = WorkStream(schedule=StaticPersistent()).assignment((3, 2, 1), max_ctas=4)
+    assert rows == [
+        [(0, (0, 0, 0)), (4, (1, 1, 0))],
+        [(1, (1, 0, 0)), (5, (2, 1, 0))],
+        [(2, (2, 0, 0))],
+        [(3, (0, 1, 0))],
+    ]
+
+
+def test_oneshot_assignment_runs_one_item_per_cta():
+    rows = WorkStream(mapping=Raster(along="n")).assignment((2, 3, 2))
+    tiles = itertools.product(range(2), range(2), range(3))  # (l, m, n): n fastest
+    assert rows == [[(i, (m, n, li))] for i, (li, m, n) in enumerate(tiles)]
+    assert WorkStream().assignment((0, 4, 1)) == [[]]  # an empty space: one idle CTA
+
+
+def test_cluster_assignment_gives_every_cta_of_a_unit_its_items():
+    """max_ctas counts CTAs: 6 CTAs are 3 pairs, and pair u runs u, u + 3, ..."""
+    op = PersistentGemm(cluster=CtaPair())
+    rows = op.work.assignment((4, 3, 1), max_ctas=6)
+    assert [[i for i, _ in row] for row in rows] == [
+        [u, u + 3, u + 6, u + 9] for u in (0, 0, 1, 1, 2, 2)
+    ]
+    assert all(rows[2 * u] == rows[2 * u + 1] for u in range(3))
+
+
+def test_assignment_leaves_out_dropped_items():
+    """A dropped item leaves its CTA's list and no other: the schedule only sees indices. Only
+    a pure (``decodes_any_index``) mapping decodes itself on the host; another one that drops
+    items needs its host counterpart (``decode``)."""
+    ext, stride = (5, 3, 1), 4
+    tiles = [(m, n, 0) for n in range(3) for m in range(5)]
+    stream = WorkStream(mapping=SkipOdd(), schedule=StaticPersistent())
+    with pytest.raises(ValueError, match="pass its host counterpart as decode"):
+        stream.assignment(ext, stride)
+    rows = stream.assignment(ext, stride, decode=lambda i: (sum(tiles[i]) % 2 == 0, tiles[i]))
+    assert rows == [
+        [(i, tiles[i]) for i in range(b, 15, stride) if sum(tiles[i]) % 2 == 0]
+        for b in range(stride)
+    ]
+
+
+def test_assignment_needs_a_local_schedule_and_its_cap():
+    for schedule in (AtomicPersistent(), ClusterLaunchControl()):
+        with pytest.raises(ValueError, match="claims indices at run time"):
+            WorkStream(schedule=schedule).assignment((2, 2, 1), max_ctas=4)
+    with pytest.raises(ValueError, match="needs max_ctas"):
+        WorkStream(schedule=StaticPersistent()).assignment((2, 2, 1))
+    with pytest.raises(ValueError, match="exceed what a launch indexes in Int32"):
+        WorkStream().assignment((2**16, 2**15, 1))
+
+
+@pytest.mark.parametrize(
+    "schedule,mapping,mode",
+    [
+        (StaticPersistent(), None, "ok"),
+        (OneShot(), None, "ok"),
+        (StaticPersistent(), SkipOdd(swizzle=2), "skip"),
+        (OneShot(), SkipOdd(swizzle=2), "skip"),
+    ],
+    ids=["static", "oneshot", "static_skip", "oneshot_skip"],
+)
+def test_assignment_matches_the_device(requires_blackwell, schedule, mapping, mode):
+    """Each CTA logs the tiles it ran, in order; the host assignment lists the same."""
+    op = ScheduleToy(schedule, mapping=mapping, mode=mode)
+    ext, max_ctas = (9, 7, 2), 16
+    log, _, _ = run_toy(op, ext, max_ctas)
+    decode = None
+    if mapping is not None:  # SkipOdd's decode is plain arithmetic: its own host counterpart
+        decode = lambda index: mapping.decode(index, ext, None)[:2]  # noqa: E731
+    rows = op.work.assignment(ext, max_ctas, decode)
+    assert len(rows) == log.shape[1]
+    for cta, row in enumerate(rows):
+        want = [(li * ext[1] + n) * ext[0] + m for _, (m, n, li) in row]
+        got = log[0, cta].tolist()
+        assert got[: len(want)] == want and set(got[len(want) :]) <= {-1}, cta
 
 
 class CountToy(WarpSpecialized):
