@@ -17,9 +17,12 @@ from cuda.bindings import driver as cuda
 from cutlass import Int32, cute
 
 from transformer_nuggets.cute.jit_cache import jit_cache
+from perfetto_trace import read_slices
+
+from transformer_nuggets.cute.profiler import parse_iket
 from transformer_nuggets.cute.profiler.pipeline import (
     analyze_pipeline,
-    load_iket_capture,
+    join,
     write_pipeline_perfetto,
 )
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
@@ -196,7 +199,7 @@ def test_plan_joins_capture_end_to_end(tmp_path, iket_recorder):
     timeline = plan.schedule(iterations=3)
     trace = tmp_path / "capture.trace.json"
     _synthetic_capture(trace, plan, 3, warps_per_role=2)
-    measured = load_iket_capture(trace, timeline)
+    measured = join(parse_iket(trace), timeline)
     analysis = analyze_pipeline(timeline, measured)
     write_pipeline_perfetto(tmp_path / "pipeline.pftrace", timeline, measured, analysis=analysis)
     assert {r.role for r in measured.regions} == set(plan.roles)
@@ -281,17 +284,15 @@ def _run_traced(op, num_ctas, **kwargs):
 
 def test_globaltimer_ranges_decode_per_cta_and_role(requires_blackwell, tmp_path):
     op = TracedRing().enable_trace("globaltimer")
-    session = _run_traced(
-        op, CTAS, trace_path=str(tmp_path / "ring.json"), trace_format="chrome_json"
-    )
-    events = session.events
-    warps = {"cons": 0, "prod": 2, "idle": 3}  # each role's first warp records, as its tid
+    session = _run_traced(op, CTAS, trace_path=tmp_path / "ring.pftrace")
+    ranges = session.ranges
+    warps = {"cons": 0, "prod": 2, "idle": 3}  # each role's first warp records, as its warp
     for cta in range(CTAS):
         items = list(range(cta, ITEMS, CTAS))
-        mine = [e for e in events if e.unit_id == cta]
+        mine = [e for e in ranges if e.cta == (cta,)]
         by_name = {}
         for e in mine:
-            by_name.setdefault(e.tag_name, []).append(e)
+            by_name.setdefault(e.name, []).append(e)
         # Work-item ranges carry the item index; the region carries its own payload.
         assert sorted(e.payload for e in by_name["prod"]) == items
         assert sorted(e.payload for e in by_name["cons"]) == items
@@ -300,33 +301,29 @@ def test_globaltimer_ranges_decode_per_cta_and_role(requires_blackwell, tmp_path
         waits = {"ring.acquire": "prod", "ring.wait": "cons"}
         for name, owner in waits.items():
             assert len(by_name[name]) == len(items)
-            assert {e.tid for e in by_name[name]} == {warps[owner]}
+            assert {e.warp for e in by_name[name]} == {warps[owner]}
         for name, owner in warps.items():
-            assert {e.tid for e in by_name[name]} == {owner}
+            assert {e.warp for e in by_name[name]} == {owner}
         # Nested ranges sit inside their item's range.
         for item in by_name["cons"]:
             inner = [e for e in by_name["store"] if e.payload == 10 * item.payload]
             assert len(inner) == 1
             assert item.start_ns <= inner[0].start_ns
-            assert inner[0].start_ns + inner[0].dur_ns <= item.start_ns + item.dur_ns
-    threads = {
-        (ev["pid"], ev["args"]["name"])
-        for ev in session.trace["traceEvents"]
-        if ev.get("name") == "thread_name"
-    }
-    assert threads == {(cta, name) for cta in range(CTAS) for name in warps}
+            assert inner[0].end_ns <= item.end_ns
+    tracks = {(item.process, item.track) for item in read_slices(tmp_path / "ring.pftrace")}
+    assert tracks == {(f"CTA {cta}", name) for cta in range(CTAS) for name in warps}
 
 
 def test_globaltimer_short_buffer_and_capacity(requires_blackwell):
     """A buffer with fewer units than CTAs records the first CTAs only; a role past its
     records drops later ranges and the session warns."""
     session = _run_traced(TracedRing().enable_trace("globaltimer", waits=False), CTAS - 1)
-    assert {e.unit_id for e in session.events} == set(range(CTAS - 1))
-    assert not {e.tag_name for e in session.events} & {"ring.acquire", "ring.wait"}
+    assert {e.cta for e in session.ranges} == {(cta,) for cta in range(CTAS - 1)}
+    assert not {e.name for e in session.ranges} & {"ring.acquire", "ring.wait"}
     op = TracedRing().enable_trace("globaltimer", events_per_role=2)
     with pytest.warns(UserWarning, match="filled their 2 records"):
         session = _run_traced(op, CTAS)
-    assert max(Counter((e.unit_id, e.tid) for e in session.events).values()) == 2
+    assert max(Counter((e.cta, e.warp) for e in session.ranges).values()) == 2
 
 
 def test_globaltimer_tags_restored_from_cache(requires_blackwell):
@@ -339,7 +336,7 @@ def test_globaltimer_tags_restored_from_cache(requires_blackwell):
     hits = compile_traced_ring.cache_info().hits
     session = _run_traced(cached, CTAS)
     assert compile_traced_ring.cache_info().hits == hits + 1
-    names = {e.tag_name for e in session.events}
+    names = {e.name for e in session.ranges}
     assert names == {"prod", "cons", "idle", "store", "ring.acquire", "ring.wait"}
 
 

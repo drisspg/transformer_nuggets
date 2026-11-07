@@ -101,20 +101,20 @@ def test_megakernel_model_waits_for_gates_and_ctas():
     assert data["critical"] == path and sum(map(len, data["rows"])) == len(rows)
 
 
-def test_megakernel_overlay_from_trace_events():
+def test_megakernel_overlay_from_trace_ranges():
     """Compute work items become [table row, CTA, start, end] in us from the first start; load
     items and regions are not spans. The overlay lands on the rows' drawn items."""
     from types import SimpleNamespace
 
-    from transformer_nuggets.cute.profiler import Event
+    from transformer_nuggets.cute.profiler import Range
 
     ctas, splits = 61, 4
     runner = SimpleNamespace(max_ctas=ctas, op=SimpleNamespace(splits=splits))
     events = [
-        Event(5_000, 2_000, 0, "compute", 0, unit_id=1, payload=1),
-        Event(1_000, 1_500, 0, "compute", 0, unit_id=0, payload=0),
-        Event(900, 100, 1, "load", 8, unit_id=0, payload=0),
-        Event(1_200, 300, 2, "poll", 0, unit_id=0, payload=0),
+        Range("compute", 5_000, 7_000, (1,), payload=1),
+        Range("compute", 1_000, 2_500, (0,), payload=0),
+        Range("load", 900, 1_000, (0,), warp=8, payload=0),
+        Range("poll", 1_200, 1_500, (0,), payload=0),
     ]
     data = mkv.overlay(events, runner)
     assert data == {

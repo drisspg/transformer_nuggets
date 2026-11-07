@@ -18,7 +18,7 @@ origin. ``overlay`` writes one from the compute work items of a ``trace="globalt
     runner(weights, token, pos, *caches)  # compile, warm, and set the step's token and position
     with trace_session(runner) as session:
         runner.launch(*caches)
-    Path("capture.json").write_text(json.dumps(overlay(session.events, runner)))
+    Path("capture.json").write_text(json.dumps(overlay(session.ranges, runner)))
 
 Draw it::
 
@@ -30,7 +30,7 @@ import argparse
 import json
 from pathlib import Path
 
-from transformer_nuggets.cute.profiler import Event
+from transformer_nuggets.cute.profiler import Range
 from transformer_nuggets.cute.warpdrive.examples import qwen_megakernel as mk
 from transformer_nuggets.cute.warpdrive.examples.qwen_megakernel_trace import item_ranges
 from transformer_nuggets.cute.warpdrive.schedule_html import Item, schedule_html
@@ -130,19 +130,16 @@ def megakernel_view(ctas: int, splits: int = 16, measured: dict | None = None) -
     )
 
 
-def overlay(events: list[Event], runner: mk.QwenMegakernel) -> dict:
+def overlay(ranges: list[Range], runner: mk.QwenMegakernel) -> dict:
     """The ``--timeline`` JSON of one traced launch of ``runner``: each table row's compute
     work item on its CTA, in us from the earliest one's start."""
-    items = sorted(item_ranges(events).items())
+    items = sorted(item_ranges(ranges).items())
     if not items:
         raise ValueError(
             "no compute work-item ranges: trace a launch of a trace='globaltimer' runner"
         )
     t0 = min(e.start_ns for _, e in items)
-    spans = [
-        [row, e.unit_id, (e.start_ns - t0) / 1e3, (e.start_ns + e.dur_ns - t0) / 1e3]
-        for row, e in items
-    ]
+    spans = [[row, e.cta[0], (e.start_ns - t0) / 1e3, (e.end_ns - t0) / 1e3] for row, e in items]
     return {"unit": "us", "ctas": runner.max_ctas, "splits": runner.op.splits, "spans": spans}
 
 

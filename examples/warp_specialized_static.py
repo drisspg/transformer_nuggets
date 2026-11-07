@@ -16,9 +16,7 @@ from transformer_nuggets.cute.base import CuteOp
 from transformer_nuggets.cute.profiler import (
     compact_anchor_init,
     compact_profile_region,
-    group_by_unit,
     profile_session,
-    rename_processes,
     summarize_by_tag,
 )
 
@@ -120,8 +118,6 @@ def run():
     trace_path = transformer_nuggets.DATA_DIR / "profiler_warp_static_trace.pftrace"
     trace_path.parent.mkdir(parents=True, exist_ok=True)
 
-    process_names = {i: f"CTA {i}" for i in range(NUM_BLOCKS)}
-
     with profile_session(
         max_events_per_unit=MAX_EVENTS_PER_UNIT,
         num_units=(NUM_BLOCKS, "CTA"),
@@ -130,13 +126,11 @@ def run():
         device=device,
         compact=True,
         expected_events_per_unit=2,
-        post_process_events=group_by_unit,
-        post_process_trace=rename_processes(process_names),
     ) as session:
         kernel = WarpSpecializedStaticProfile()
         kernel.interface(output, session.prof.tensor, session.prof.max_events_per_unit)
 
-    for name, summary in summarize_by_tag(session.events).items():
+    for name, summary in summarize_by_tag(session.ranges).items():
         print(f"{name}: count={summary.count}, median={summary.p50_ns:.0f} ns")
 
     print(f"Trace: {trace_path}")

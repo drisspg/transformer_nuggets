@@ -192,10 +192,10 @@ class TestSgemm:
             assert sgemm(a, b, out=profiled, profile_buffer=session.prof.tensor) is profiled
 
         assert_matches_fp64(profiled, a, b)
-        assert Counter(event.tag_name for event in session.events) == dict.fromkeys(
+        assert Counter(item.name for item in session.ranges) == dict.fromkeys(
             SGEMM_PROFILE_TAGS, sampled_tiles
         )
-        assert all(event.unit_id == 0 and event.dur_ns >= 0 for event in session.events)
+        assert all(item.cta == (0,) and item.duration_ns >= 0 for item in session.ranges)
 
         monkeypatch.setenv("SGEMM_PROFILE", "0")
         torch.testing.assert_close(sgemm(a, b), profiled, atol=0, rtol=0)

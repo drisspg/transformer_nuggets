@@ -1,88 +1,54 @@
-"""Host side of the profiler: allocate profile buffers, decode records, write Perfetto traces.
+"""Host side of the profiler: allocate profile buffers and decode their records into ranges.
 
 Usage:
     with profile_session(
         64,
-        num_units=4,
+        num_units=(num_ctas, "CTA"),
         tag_names=["produce", "consume"],
         trace_path="trace.pftrace",
         compact=True,
     ) as session:
         produce_tag = session.tags.id("produce")
         kernel(x, session.prof.tensor, session.prof.max_events_per_unit, produce_tag)
-    session.events  # decoded after the block
+    session.ranges  # decoded after the block
 
 The buffer layouts are described in ``ops.py``.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from collections.abc import Callable, Iterator
-from typing import Literal
+from pathlib import Path
 
 import torch
 
 from transformer_nuggets.cute.profiler.ops import PAYLOAD_FLAG
-from transformer_nuggets.utils.perfetto import write_perfetto_trace
-
+from transformer_nuggets.cute.profiler.perfetto import write_ranges
+from transformer_nuggets.cute.profiler.ranges import Range
 
 __all__ = [
     "ProfileBuf",
-    "TagTable",
-    "Event",
-    "PostProcessContext",
     "ProfileSession",
+    "TagTable",
     "allocate_profile_buffer",
-    "decode_events",
-    "events_to_perfetto",
+    "decode_ranges",
     "profile_session",
-    "validate_event_counts",
 ]
 
 
 @dataclass
-class Event:
-    """A decoded profiling event.
-
-    Attributes:
-        start_ns: Event start time in nanoseconds.
-        dur_ns: Event duration in nanoseconds.
-        tag_id: Integer tag ID from the kernel.
-        tag_name: Human-readable tag name from TagTable.
-        tid: Thread/lane ID (used as Perfetto tid).
-        unit_id: Profiling unit ID (e.g., block index).
-        event_idx: Static or allocated slot index within the profiling unit.
-        pid: Process ID for grouping in Perfetto (e.g., CTA/block grouping).
-        extra_args: Optional dict of extra args to include in Perfetto trace.
-        payload: Runtime int32 the region was recorded with (legacy records only), else None.
-    """
-
-    start_ns: int
-    dur_ns: int
-    tag_id: int
-    tag_name: str
-    tid: int
-    unit_id: int = 0
-    pid: int | None = None
-    extra_args: dict | None = None
-    event_idx: int | None = None
-    payload: int | None = None
-
-
-@dataclass
 class ProfileBuf:
-    """Profile buffer wrapper with helper methods.
+    """Profile buffer wrapper.
 
     Attributes:
-        tensor: The underlying torch.int64 tensor.
-        max_events_per_unit: Maximum number of events per profiling unit.
-        num_units: Number of profiling units (e.g., blocks, warps).
-        unit_name: Name for units in trace output (e.g., "Block", "Warp").
-        compact: ``True`` if events use the 1xi64 packed format
-            ``[tag(8) | dur_ns(24) | ts_lo32(32)]`` with slot 0 holding a
-            64-bit anchor; ``False`` for the legacy 4xi64 record format.
+        tensor: The underlying torch.int64 tensor; pass it to the kernel.
+        max_events_per_unit: Record slots per profiling unit.
+        num_units: Number of profiling units (e.g., CTAs).
+        unit_name: Name for units in trace output (e.g., "CTA", "Block").
+        compact: ``True`` for 1xi64 compact records (slot 0 of each unit holds a 64-bit
+            anchor); ``False`` for 4xi64 full records (see ``ops.py``).
     """
 
     tensor: torch.Tensor
@@ -99,58 +65,31 @@ class ProfileBuf:
         return 1 + 4 * self.max_events_per_unit
 
     def reset(self) -> None:
-        """Reset the buffer (zero all event counts and data)."""
+        """Zero the buffer, e.g. between a warmup launch and the recorded one."""
         self.tensor.zero_()
 
 
 class TagTable:
-    """Mapping between tag names and integer IDs.
-
-    Use this to define named events on the host and get the corresponding
-    integer IDs to pass to kernels.
+    """Mapping between tag names and the integer IDs kernels record.
 
     Example:
         tag_table = TagTable(["produce", "consume", "wait_lock"])
         produce_tag = tag_table.id("produce")
-        consume_tag = tag_table.id("consume")
     """
 
     def __init__(self, tag_names: list[str]):
-        """Initialize the tag table.
-
-        Args:
-            tag_names: List of tag names. IDs are assigned in order (0, 1, 2, ...).
-        """
         self._names = list(tag_names)
         self._name_to_id = {name: i for i, name in enumerate(self._names)}
 
     def id(self, name: str) -> int:
-        """Get the integer ID for a tag name.
-
-        Args:
-            name: Tag name.
-
-        Returns:
-            Integer tag ID.
-
-        Raises:
-            KeyError: If name is not in the tag table.
-        """
+        """The integer ID of ``name`` (KeyError if it is not in the table)."""
         return self._name_to_id[name]
 
     def name(self, tag_id: int) -> str:
-        """Get the tag name for an integer ID.
-
-        Args:
-            tag_id: Integer tag ID.
-
-        Returns:
-            Tag name.
-
-        Raises:
-            IndexError: If tag_id is out of range.
-        """
-        return self._names[tag_id]
+        """The name of ``tag_id``, or ``unknown_<id>`` for an ID outside the table."""
+        if 0 <= tag_id < len(self._names):
+            return self._names[tag_id]
+        return f"unknown_{tag_id}"
 
     @property
     def names(self) -> list[str]:
@@ -161,73 +100,33 @@ class TagTable:
         return len(self._names)
 
 
-@dataclass
-class ProfileSession:
-    """A profiling context's buffer and tags; ``events`` and ``trace`` are set when it exits."""
-
-    prof: ProfileBuf
-    tags: TagTable
-    events: list[Event] = field(default_factory=list)
-    trace: dict | None = None
-
-
-@dataclass
-class PostProcessContext:
-    """Context passed to post-processing callbacks.
-
-    Attributes:
-        tag_table: TagTable for mapping tag IDs to names.
-        prof_buf: The ProfileBuf containing raw event data.
-        unit_name: Name for units in trace output (e.g., "Block", "Warp").
-    """
-
-    tag_table: TagTable
-    prof_buf: ProfileBuf
-    unit_name: str
-
-
 def allocate_profile_buffer(
     max_events_per_unit: int,
     num_units: int | tuple[int, str],
     device: torch.device | str | None = None,
     compact: bool = False,
 ) -> ProfileBuf:
-    """Allocate a profile buffer for intra-kernel profiling.
+    """Allocate a zeroed profile buffer.
 
-    Each profiling unit (block, warp, ...) owns a pre-allocated slice of the
-    buffer; no atomics are needed on the recording path.
+    Each profiling unit (CTA, warp, ...) owns a slice of ``max_events_per_unit`` static record
+    slots; no atomics are needed on the recording path.
 
     Args:
-        max_events_per_unit: Maximum events each unit can record.
-        num_units: ``int`` (count, uses ``"Unit"`` as label) or
-            ``(count, name)`` for nicer trace labels (e.g. ``(4, "Block")``).
-        device: Device to allocate on. Defaults to current CUDA device.
-        compact: ``True`` selects the 1xi64 packed record format used by
-            :func:`compact_event_stop` (slice size = ``1 + max_events``).
-            ``False`` keeps the legacy 4xi64 records (slice size =
-            ``1 + 4 * max_events``).
-
-    Returns:
-        ProfileBuf with the allocated tensor.
+        max_events_per_unit: Record slots per unit.
+        num_units: ``int`` (count, labeled ``"Unit"``) or ``(count, name)`` for trace labels.
+        device: Device to allocate on. Defaults to the current CUDA device.
+        compact: ``True`` selects compact records (slice size ``1 + max_events_per_unit``),
+            ``False`` full records (slice size ``1 + 4 * max_events_per_unit``).
     """
     if isinstance(num_units, tuple):
         num_units_count, unit_name = num_units
     else:
-        num_units_count = num_units
-        unit_name = "Unit"
-
-    if device is None:
-        device = torch.device("cuda")
-    elif isinstance(device, str):
-        device = torch.device(device)
-
-    slice_size = (1 + max_events_per_unit) if compact else (1 + 4 * max_events_per_unit)
-    total_size = num_units_count * slice_size
-
-    tensor = torch.zeros(total_size, dtype=torch.int64, device=device)
-
+        num_units_count, unit_name = num_units, "Unit"
+    slice_size = 1 + (1 if compact else 4) * max_events_per_unit
     return ProfileBuf(
-        tensor=tensor,
+        tensor=torch.zeros(
+            num_units_count * slice_size, dtype=torch.int64, device=device or "cuda"
+        ),
         max_events_per_unit=max_events_per_unit,
         num_units=num_units_count,
         unit_name=unit_name,
@@ -235,96 +134,49 @@ def allocate_profile_buffer(
     )
 
 
-def decode_events(buf: ProfileBuf, tag_table: TagTable) -> list[Event]:
-    """Decode profiling events from the buffer.
+def decode_ranges(buf: ProfileBuf, tag_table: TagTable) -> list[Range]:
+    """Decode every recorded slot of ``buf`` into a ``Range``, unit by unit, slot by slot.
 
-    Dispatches on ``buf.compact``: legacy 4xi64 records or the 1xi64 packed
-    format produced by :func:`compact_event_stop`. Empty slots are skipped.
-
-    Args:
-        buf: Profile buffer (ProfileBuf).
-        tag_table: TagTable for mapping tag IDs to names.
-
-    Returns:
-        List of Event objects from all units.
+    A range's ``cta`` is ``(unit,)`` and its ``slot`` the record's slot; full records also
+    carry their warp and payload. Empty slots are skipped.
     """
     if buf.compact:
-        return _decode_events_compact(buf, tag_table)
-    return _decode_events_legacy(buf, tag_table)
+        return _decode_compact(buf, tag_table)
+    return _decode_full(buf, tag_table)
 
 
-def _tag_name_or_unknown(tag_table: TagTable, tag_id: int) -> str:
-    if 0 <= tag_id < len(tag_table):
-        return tag_table.name(tag_id)
-    return f"unknown_{tag_id}"
+def _decode_full(buf: ProfileBuf, tag_table: TagTable) -> list[Range]:
+    grid = buf.tensor.cpu().view(buf.num_units, buf.slice_size)[:, 1:]
+    records = grid.reshape(buf.num_units, buf.max_events_per_unit, 4)
+    start_ns, dur_ns, tag_words, warps = records.unbind(dim=2)
+    units, slots = torch.nonzero((start_ns != 0) | (dur_ns != 0), as_tuple=True)
+    ranges = []
+    for unit, slot, start, dur, word, warp in zip(
+        units.tolist(),
+        slots.tolist(),
+        start_ns[units, slots].tolist(),
+        dur_ns[units, slots].tolist(),
+        tag_words[units, slots].tolist(),
+        warps[units, slots].tolist(),
+        strict=True,
+    ):
+        tag, payload = word, None
+        if word & PAYLOAD_FLAG:
+            tag, payload = word & (PAYLOAD_FLAG - 1), word >> 32
+        ranges.append(Range(tag_table.name(tag), start, start + dur, (unit,), warp, slot, payload))
+    return ranges
 
 
-def _decode_events_legacy(buf: ProfileBuf, tag_table: TagTable) -> list[Event]:
-    cpu_buf = buf.tensor.cpu().numpy()
-    slice_size = buf.slice_size
-    events = []
-
-    for unit_id in range(buf.num_units):
-        unit_offset = unit_id * slice_size
-
-        for i in range(buf.max_events_per_unit):
-            base = unit_offset + 1 + 4 * i
-            start_ns = int(cpu_buf[base + 0])
-            dur_ns = int(cpu_buf[base + 1])
-            tag_word = int(cpu_buf[base + 2])
-            tid = int(cpu_buf[base + 3])
-
-            if start_ns == 0 and dur_ns == 0:
-                continue
-            tag_id, payload = tag_word, None
-            if tag_word & PAYLOAD_FLAG:
-                tag_id, payload = tag_word & (PAYLOAD_FLAG - 1), tag_word >> 32
-
-            events.append(
-                Event(
-                    start_ns=start_ns,
-                    dur_ns=dur_ns,
-                    tag_id=tag_id,
-                    tag_name=_tag_name_or_unknown(tag_table, tag_id),
-                    tid=tid,
-                    unit_id=unit_id,
-                    event_idx=i,
-                    payload=payload,
-                )
-            )
-
-    return events
-
-
-def _decode_events_compact(buf: ProfileBuf, tag_table: TagTable) -> list[Event]:
-    """Decode the 1xi64 packed records, reconstructing 64-bit ts from each unit's anchor.
-
-    Bit-unpacks every slot in one shot with torch, masks out empty / unitless
-    rows, and only iterates Python over the surviving valid events.
-    """
+def _decode_compact(buf: ProfileBuf, tag_table: TagTable) -> list[Range]:
+    """Decode compact records, rebasing each start on its unit's 64-bit anchor."""
     mask32 = (1 << 32) - 1
     mask24 = (1 << 24) - 1
 
-    grid = buf.tensor.cpu().to(torch.int64).view(buf.num_units, buf.slice_size)
+    grid = buf.tensor.cpu().view(buf.num_units, buf.slice_size)
     anchors = grid[:, 0]
     records = grid[:, 1:]
 
-    # CTAs in the same launch start within microseconds, so all real anchors
-    # should agree to within a small window. An anchor diverging from the
-    # median by >1s almost certainly means a caller event_idx overflowed and
-    # clobbered the next unit's anchor slot.
     valid_anchor = anchors != 0
-    if valid_anchor.any():
-        median = anchors[valid_anchor].median()
-        suspect = valid_anchor & ((anchors - median).abs() > 1_000_000_000)
-        if suspect.any():
-            bad = suspect.nonzero(as_tuple=True)[0].tolist()
-            raise RuntimeError(
-                f"Compact-mode anchors for units {bad} diverge from the median by >1s; "
-                "likely an event_idx >= max_events_per_unit overflow clobbered the next "
-                "unit's anchor. Bump max_events_per_unit or fix caller slot allocation."
-            )
-
     unanchored = (~valid_anchor & (records != 0).any(dim=1)).nonzero(as_tuple=True)[0]
     if len(unanchored):
         counts = (records[unanchored] != 0).sum(dim=1).tolist()
@@ -333,13 +185,10 @@ def _decode_events_compact(buf: ProfileBuf, tag_table: TagTable) -> list[Event]:
             "record(s) but no anchor: warp 0 must run compact_anchor_init (or "
             "compact_prepare_smem) with the same record predicate as the events"
         )
-    valid = (records != 0) & valid_anchor.unsqueeze(1)
-    if not valid.any():
-        return []
 
     ts_lo = records & mask32
     dur_ns = (records >> 32) & mask24
-    tag_ids = (records >> 56) & 0xFF
+    tags = (records >> 56) & 0xFF
     # A start within 2^31 ns of its unit's anchor, before it (another warp read its timer
     # first) or after it (across a 2^32 ns boundary), is the anchor plus the signed
     # 32-bit difference of their low halves.
@@ -347,173 +196,41 @@ def _decode_events_compact(buf: ProfileBuf, tag_table: TagTable) -> list[Event]:
     delta = delta - ((delta >> 31) << 32)
     start_ns = anchors.unsqueeze(1) + delta
 
-    starts = start_ns[valid].tolist()
-    durs = dur_ns[valid].tolist()
-    tags = tag_ids[valid].tolist()
-    unit_indices, slot_indices = torch.nonzero(valid, as_tuple=True)
-    units = unit_indices.tolist()
-    event_indices = slot_indices.tolist()
-
-    events = []
-    for s, d, t, u, i in zip(starts, durs, tags, units, event_indices):
-        events.append(
-            Event(
-                start_ns=s,
-                dur_ns=d,
-                tag_id=t,
-                tag_name=_tag_name_or_unknown(tag_table, t),
-                tid=u,
-                unit_id=u,
-                event_idx=i,
-            )
+    units, slots = torch.nonzero(records != 0, as_tuple=True)
+    return [
+        Range(tag_table.name(tag), start, start + dur, (unit,), slot=slot)
+        for unit, slot, start, dur, tag in zip(
+            units.tolist(),
+            slots.tolist(),
+            start_ns[units, slots].tolist(),
+            dur_ns[units, slots].tolist(),
+            tags[units, slots].tolist(),
+            strict=True,
         )
-    return events
+    ]
 
 
-def events_to_perfetto(
-    events: list[Event],
-    trace_path: str | None = None,
-    pid: int = 0,
-    unit_name: str = "Unit",
-    split_overlaps: bool = True,
-    trace_format: Literal["chrome_json", "track_event"] = "track_event",
-) -> dict:
-    """Export events to a Perfetto trace.
-
-    Native TrackEvent ``.pftrace`` output is the default. Pass
-    ``trace_format="chrome_json"`` to write legacy Chrome JSON/JSON.GZ.
-
-    Timestamps are normalized relative to the first event and converted to
-    microseconds in the intermediate trace dict.
-
-    If an event has a custom `pid` set, it will be used instead of the default pid,
-    enabling grouping (e.g., one process per CTA/block with warps as threads).
-
-    Args:
-        events: List of Event objects from decode_events.
-        trace_path: Path to write the trace file. If None, just returns the
-            intermediate trace dict.
-        pid: Default process ID (e.g., GPU rank). Used as 'pid' in trace unless event.pid is set.
-        unit_name: Name for units in trace (e.g., "Block", "Warp"). Defaults to "Unit".
-        split_overlaps: If true, split overlapping duration slices on the same
-            track into sibling lanes/tracks before writing the trace.
-        trace_format: ``"track_event"`` writes native Perfetto ``.pftrace`` output;
-            ``"chrome_json"`` writes Chrome JSON/JSON.GZ output.
-
-    Returns:
-        The trace dict (can be further modified before writing).
-    """
-    if not events:
-        trace = {"traceEvents": []}
-        if trace_path is not None:
-            write_perfetto_trace(trace_path, trace, trace_format=trace_format)
-        return trace
-
-    trace_events = []
-
-    min_start_ns = min(e.start_ns for e in events)
-
-    has_custom_pids = any(e.pid is not None for e in events)
-
-    unique_pids = sorted({e.pid if e.pid is not None else pid for e in events})
-
-    pid_tid_to_name: dict[tuple[int, int], str] = {}
-    for e in events:
-        event_pid = e.pid if e.pid is not None else pid
-        key = (event_pid, e.tid)
-        if key in pid_tid_to_name:
-            continue
-        thread_name = e.tag_name if e.pid is not None else f"{unit_name} {e.tid}"
-        pid_tid_to_name[key] = thread_name
-
-    pid_tid_pairs = sorted(pid_tid_to_name.keys())
-
-    for p in unique_pids:
-        process_name = f"{unit_name} {p}" if has_custom_pids or p != pid else f"GPU {p}"
-        trace_events.append(
-            {
-                "name": "process_name",
-                "ph": "M",
-                "pid": p,
-                "args": {"name": process_name},
-            }
-        )
-
-    for p, t in pid_tid_pairs:
-        thread_name = pid_tid_to_name[(p, t)]
-        trace_events.append(
-            {
-                "name": "thread_name",
-                "ph": "M",
-                "pid": p,
-                "tid": t,
-                "args": {"name": thread_name},
-            }
-        )
-
-    for event in events:
-        event_pid = event.pid if event.pid is not None else pid
-        ts_us = (event.start_ns - min_start_ns) / 1000.0
-        dur_us = event.dur_ns / 1000.0
-
-        args = {
-            "tag_id": event.tag_id,
-            "start_ns": event.start_ns,
-            "dur_ns": event.dur_ns,
-            "unit_id": event.unit_id,
-        }
-        if event.event_idx is not None:
-            args["event_idx"] = event.event_idx
-        if event.payload is not None:
-            args["payload"] = event.payload
-        if event.extra_args:
-            args.update(event.extra_args)
-
-        trace_events.append(
-            {
-                "name": event.tag_name,
-                "cat": "profile",
-                "ph": "X",
-                "ts": ts_us,
-                "dur": dur_us,
-                "pid": event_pid,
-                "tid": event.tid,
-                "args": args,
-            }
-        )
-
-    trace = {
-        "traceEvents": trace_events,
-    }
-
-    if trace_path is not None:
-        write_perfetto_trace(
-            trace_path,
-            trace,
-            trace_format=trace_format,
-            split_overlaps=split_overlaps,
-        )
-
-    return trace
-
-
-def validate_event_counts(
-    events: list[Event], num_units: int, expected_events_per_unit: int
-) -> None:
-    """Raise when any profiling unit has an unexpected decoded event count."""
+def check_counts(ranges: list[Range], num_units: int, expected_per_unit: int) -> None:
+    """Raise when any profiling unit decoded a count other than ``expected_per_unit``."""
     counts = [0] * num_units
-    for event in events:
-        counts[event.unit_id] += 1
+    for item in ranges:
+        counts[item.cta[0]] += 1
     mismatches = [
-        f"unit {unit_id}: {count}"
-        for unit_id, count in enumerate(counts)
-        if count != expected_events_per_unit
+        f"unit {unit}: {count}" for unit, count in enumerate(counts) if count != expected_per_unit
     ]
     if mismatches:
-        details = ", ".join(mismatches)
         raise RuntimeError(
-            f"Expected {expected_events_per_unit} events per profiling unit; got {details}"
+            f"Expected {expected_per_unit} events per profiling unit; got {', '.join(mismatches)}"
         )
+
+
+@dataclass
+class ProfileSession:
+    """A profiling context's buffer and tags; ``ranges`` is set when it exits."""
+
+    prof: ProfileBuf
+    tags: TagTable
+    ranges: list[Range] = field(default_factory=list)
 
 
 @contextmanager
@@ -521,123 +238,44 @@ def profile_session(
     max_events_per_unit: int,
     num_units: int | tuple[int, str],
     tag_names: list[str],
-    trace_path: str | None = None,
+    trace_path: str | Path | None = None,
     device: torch.device | str | None = None,
-    pid: int = 0,
-    post_process_events: Callable[[list[Event], PostProcessContext], list[Event]] | None = None,
-    post_process_trace: Callable[[dict, PostProcessContext], dict] | None = None,
-    split_overlaps: bool = True,
-    trace_format: Literal["chrome_json", "track_event"] = "track_event",
     compact: bool = False,
     expected_events_per_unit: int | None = None,
 ) -> Iterator[ProfileSession]:
-    """Context manager for profiling a kernel session.
-
-    Allocates a profile buffer, yields it for use in kernel launches,
-    then decodes events and optionally writes to Perfetto trace.
+    """Allocate a profile buffer for the block's launches; decode it when the block exits.
 
     Example:
-        with profile_session(
-            max_events_per_unit=64,
-            num_units=(num_blocks, "Block"),  # Named units for nicer traces
-            tag_names=["produce", "consume"],
-            trace_path="trace.pftrace",
-            compact=True,
-        ) as session:
-            TAG_PRODUCE = session.tags.id("produce")
-            kernel(x, session.prof.tensor, session.prof.max_events_per_unit, TAG_PRODUCE)
-
-    Post-processing example (group by block/warp):
-        def group_by_block_warp(events, ctx):
-            warps_per_block = 4
-            for e in events:
-                block_id = e.unit_id
-                warp_id = e.tid
-                e.pid = block_id  # group rows under the CTA/block
-                e.tid = warp_id   # one lane per warp
-                e.tag_name = f"warp {warp_id}: {e.tag_name}"
-            return events
-
-        with profile_session(..., post_process_events=group_by_block_warp) as session:
-            ...
+        with profile_session(64, (num_ctas, "CTA"), ["produce"], compact=True) as session:
+            kernel(x, session.prof.tensor, session.prof.max_events_per_unit,
+                   session.tags.id("produce"))
+        summarize_by_tag(session.ranges)
 
     Args:
-        max_events_per_unit: Maximum events each unit can record.
-        num_units: Number of profiling units. Can be:
-            - int: Just the count (uses "Unit" as name in traces)
-            - tuple[int, str]: (count, name) for nicer trace labels (e.g., (4, "Block"))
-        tag_names: List of tag names for this session.
-        trace_path: Optional path to write the Perfetto trace. If None, no file is
-            written, but ``session.trace`` still contains the in-memory trace dict.
+        max_events_per_unit: Record slots per unit.
+        num_units: ``int`` or ``(count, name)``; the name labels the trace's processes.
+        tag_names: The session's tag names; kernels record their ``TagTable`` IDs.
+        trace_path: Optional Perfetto trace path, written with one process per unit and one
+            track per warp (or per tag for compact records). For another layout, call
+            ``perfetto.write_ranges`` on ``session.ranges``.
         device: Device to allocate on.
-        pid: Process ID for trace (e.g., GPU rank).
-        post_process_events: Optional callback to mutate events before Perfetto conversion.
-            Signature: (events, context) -> events. Can rename, filter, or regroup events.
-        post_process_trace: Optional callback to mutate the Perfetto trace dict before writing.
-            Signature: (trace_dict, context) -> trace_dict. Can add flow events, counters, etc.
-        split_overlaps: If true, split overlapping duration slices on the same
-            Perfetto track into sibling lanes/tracks before writing the trace.
-        trace_format: ``"track_event"`` writes native Perfetto ``.pftrace`` output;
-            ``"chrome_json"`` writes Chrome JSON/JSON.GZ output.
-        compact: Use the 1xi64 packed record format (paired with
-            ``compact_event_stop`` / ``compact_anchor_init`` on the device
-            side). Slot 0 of each unit's slice is the 64-bit anchor; the
-            decoder reconstructs full timestamps from the anchor + each
-            record's low-32-bit timer reading.
-        expected_events_per_unit: Optional exact decoded event count required
-            for every allocated profiling unit. Validation runs before event
-            post-processing so filters cannot hide missing or overwritten slots.
-            With sparse sampling, allocate buffer units only for sampled units or
-            omit this validation when unsampled zero-event units remain allocated.
+        compact: Compact (1xi64) rather than full (4xi64) records.
+        expected_events_per_unit: Optional exact decoded count required of every unit.
+            With sparse sampling, allocate buffer units only for sampled units.
 
     Yields:
-        ProfileSession, whose ``events`` and ``trace`` are set after the context exits.
+        ProfileSession, whose ``ranges`` are set after the block exits.
     """
     if expected_events_per_unit is not None and expected_events_per_unit < 0:
         raise ValueError("expected_events_per_unit must be non-negative")
 
-    prof = allocate_profile_buffer(
-        max_events_per_unit=max_events_per_unit,
-        num_units=num_units,
-        device=device,
-        compact=compact,
-    )
-    tag_table = TagTable(tag_names)
-    session = ProfileSession(prof=prof, tags=tag_table)
-
+    prof = allocate_profile_buffer(max_events_per_unit, num_units, device, compact)
+    session = ProfileSession(prof=prof, tags=TagTable(tag_names))
     yield session
 
     torch.cuda.synchronize()
-
-    events = decode_events(prof, tag_table)
+    session.ranges = decode_ranges(prof, session.tags)
     if expected_events_per_unit is not None:
-        validate_event_counts(events, prof.num_units, expected_events_per_unit)
-
-    ctx = PostProcessContext(
-        tag_table=tag_table,
-        prof_buf=prof,
-        unit_name=prof.unit_name,
-    )
-
-    if post_process_events is not None:
-        events = post_process_events(events, ctx)
-    session.events = events
-
-    trace = events_to_perfetto(
-        events,
-        trace_path=None,
-        pid=pid,
-        unit_name=prof.unit_name,
-        split_overlaps=False,
-    )
-    if post_process_trace is not None:
-        trace = post_process_trace(trace, ctx)
-    session.trace = trace
-
+        check_counts(session.ranges, prof.num_units, expected_events_per_unit)
     if trace_path is not None:
-        write_perfetto_trace(
-            trace_path,
-            trace,
-            trace_format=trace_format,
-            split_overlaps=split_overlaps,
-        )
+        write_ranges(trace_path, session.ranges, process=lambda r: f"{prof.unit_name} {r.cta[0]}")

@@ -20,14 +20,7 @@ from transformer_nuggets.cute.blockscaled_tma import (
     GridScheduler,
 )
 from transformer_nuggets.cute.cache import compile_tvm_ffi_and_cache
-from transformer_nuggets.cute.profiler import (
-    compose,
-    group_by_unit,
-    profile_session,
-    rename_processes,
-    rename_threads,
-)
-from transformer_nuggets.cute.profiler.host import Event, PostProcessContext
+from transformer_nuggets.cute.profiler import Range, profile_session, write_ranges
 from transformer_nuggets.cute.utils import (
     make_fake_compact_tensor,
     tensor_supports_contiguous_dim,
@@ -1011,22 +1004,20 @@ def make_nvfp4_profile_inputs(
     )
 
 
-def group_persistent_cta_zero(events: list[Event], ctx: PostProcessContext) -> list[Event]:
-    """Merge sampled persistent rounds onto physical CTA 0's semantic warp tracks."""
-    producer_tags = {
-        "tma_prologue",
-        "tma_refill",
-        "input_scale_acquire",
-        "input_scale_copy",
-    }
-    for event in events:
-        event.pid = 0
-        event.tid = 0 if event.tag_name in producer_tags else 1
-        event.extra_args = {
-            "persistent_tile_round": event.unit_id,
-            "physical_cta": 0,
-        }
-    return events
+PRODUCER_TAGS = frozenset(
+    {"tma_prologue", "tma_refill", "input_scale_acquire", "input_scale_copy"}
+)
+
+
+def write_persistent_cta_zero(path: Path, ranges: list[Range]) -> Path:
+    """Merge sampled persistent rounds onto physical CTA 0's load and compute warp tracks."""
+    return write_ranges(
+        path,
+        ranges,
+        process=lambda _: "Physical CTA 0",
+        thread=lambda item: "Load warp" if item.name in PRODUCER_TAGS else "Compute warp",
+        args=lambda item: {"persistent_tile_round": item.cta[0], "physical_cta": 0},
+    )
 
 
 app = typer.Typer(help="Run the NVFP4 TMA GEMV with labeled intra-kernel profiling.")
@@ -1092,18 +1083,9 @@ def profile_nvfp4_tma(
         max_events_per_unit=op.max_profile_events_per_cta,
         num_units=(op.num_profile_units, "Persistent CTA"),
         tag_names=list(op.profile_tags),
-        trace_path=str(output),
+        trace_path=None if trace_cta_zero_only else output,
         device=torch_device,
         compact=True,
-        post_process_events=group_persistent_cta_zero if trace_cta_zero_only else group_by_unit,
-        post_process_trace=(
-            compose(
-                rename_processes({0: "Physical CTA 0"}),
-                rename_threads({0: "Load warp", 1: "Compute warp"}),
-            )
-            if trace_cta_zero_only
-            else None
-        ),
     ) as session:
         result = torch.empty((1, n), dtype=torch.bfloat16, device=torch_device)
         for _ in range(warmups):
@@ -1125,6 +1107,8 @@ def profile_nvfp4_tma(
             output=result,
             profile_buffer=session.prof.tensor,
         )
+    if trace_cta_zero_only:
+        output = write_persistent_cta_zero(output, session.ranges)
 
     typer.echo(f"Wrote {output.resolve()}")
 

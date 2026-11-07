@@ -10,13 +10,13 @@ layer emits nothing, so the generated code is unchanged. The backends of
 * ``"globaltimer"``: the profiler's full records (``%globaltimer``, 32 bytes each, in static
   slots) in a profile buffer the kernel passes to ``run_roles(..., trace_buffer=...)``.
   One profiling unit per CTA; lane 0 of each role instance's first warp records its ranges into
-  its share of the unit's slots, with that warp as the record's ``tid``.
-  ``trace_session.trace_session(kernel, num_ctas)`` allocates the buffer and decodes it with
-  ``profile_session`` (one Perfetto process per CTA, one thread per role), so the profiler's
-  ``summarize_by_tag``, ``overlap_between`` and ``dependency_gaps`` apply. This module imports
-  only the profiler's device ops: every kernel's compile key hashes the modules it imports.
+  its share of the unit's slots, with that warp as the record's warp.
+  ``trace_session.trace_session(kernel, num_ctas)`` allocates the buffer and decodes it into
+  the profiler's ``Range``s (one Perfetto process per CTA, one track per role). This module
+  imports only the profiler's device ops: every kernel's compile key hashes the modules it
+  imports.
 
-Range names are stable:
+Range names are stable (the profiler's pipeline join relies on the role and wait names):
 
 * ``<role>``: one range per work item of a role that loops over a ``WorkStream`` (from the
   cursor's start to its ``advance()``), else one range over the whole role. Role instances keep
@@ -34,8 +34,9 @@ Range names are stable:
 (``transformer_nuggets.cute.profiler.pipeline``): one ``Role`` and one ``Region`` per role
 instance, both named like the role range, one ``Resource`` per channel, and per channel a data
 dependency producer -> consumer plus a reuse dependency back. The plan's iteration is the work
-item, so ``load_iket_capture``, ``analyze_pipeline``, and ``write_pipeline_perfetto`` consume an
-IKET capture of the kernel with no hand annotations.
+item, so ``pipeline.join`` of either backend's ranges, ``analyze_pipeline``, and
+``write_pipeline_perfetto`` analyze a capture of the kernel with no hand annotations; the wait
+ranges become the regions' measured waits.
 """
 
 from __future__ import annotations

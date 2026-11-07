@@ -1084,7 +1084,7 @@ class WarpSpecialized(metaclass=_KernelType):
     def trace_region(self, name: str, payload=None):
         """``with self.trace_region("exp", payload=row):`` inside a role: a named range when a
         trace backend is enabled, nothing otherwise. ``payload``: an optional runtime ``Int32``
-        recorded with the range (globaltimer: ``Event.payload``; IKET: the range's payload,
+        recorded with the range (globaltimer: ``Range.payload``; IKET: the range's payload,
         ``payloadVal`` in the capture), e.g. the work item it belongs to. The globaltimer
         backend records per role; IKET ranges may also sit outside the roles."""
         if self.trace_backend is None:

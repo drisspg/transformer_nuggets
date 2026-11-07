@@ -337,14 +337,14 @@ def test_mxfp8_tma_gemv_profiles_labeled_regions(grid_scheduler, num_persistent_
         dequantize_mxfp8(q_input, input_scale) @ dequantize_mxfp8(weight, weight_scale).T
     ).bfloat16()
     torch.testing.assert_close(actual, expected, atol=1.0, rtol=0.05)
-    events = session.events
+    events = session.ranges
     assert len(events) == op.num_profile_units * op.profile_events_per_cta
-    assert {event.tag_name for event in events} == set(MXFP8_TMA_PROFILE_TAGS) - {
+    assert {event.name for event in events} == set(MXFP8_TMA_PROFILE_TAGS) - {
         "input_scale_acquire",
         "input_scale_copy",
         "input_scale_wait",
     }
-    assert {event.unit_id for event in events} == set(range(op.num_profile_units))
+    assert {event.cta for event in events} == {(u,) for u in range(op.num_profile_units)}
 
 
 @pytest.mark.parametrize(("input_byte", "weight_byte"), [(254, 0), (0, 254)])

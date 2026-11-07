@@ -30,7 +30,7 @@ from transformer_nuggets.cute.profiler import (
     read_globaltimer,
     read_globaltimer_lo32,
 )
-from transformer_nuggets.cute.profiler.host import decode_events, events_to_perfetto
+from perfetto_trace import read_slices
 
 
 NUM_BLOCKS = 4
@@ -65,30 +65,31 @@ def _launch_full(prof_buf, max_events):
 
 
 def test_full_record_roundtrip(tmp_path):
-    """Full records keep their slot, warp and tag; a payload decodes as Event.payload (and
-    Perfetto args), and plain records in the same buffer keep payload None."""
+    """Full records keep their slot, warp and tag; a payload decodes as Range.payload (and a
+    Perfetto arg), and plain records in the same buffer keep payload None."""
+    trace_path = tmp_path / "payload.pftrace"
     with profile_session(
         max_events_per_unit=NUM_ITERS,
         num_units=(NUM_BLOCKS, "Block"),
         tag_names=["unused", "plain", "item"],
-        trace_path=str(tmp_path / "payload.json"),
-        trace_format="chrome_json",
+        trace_path=trace_path,
     ) as session:
         _launch_full(from_dlpack(session.prof.tensor), Int32(session.prof.max_events_per_unit))
 
-    events = session.events
-    assert len(events) == NUM_BLOCKS * NUM_ITERS
-    for e in events:
-        assert e.start_ns > 0 and e.tid == 1
-        if e.event_idx % 2 == 0:
-            assert (e.tag_name, e.payload) == ("plain", None)
+    ranges = session.ranges
+    assert len(ranges) == NUM_BLOCKS * NUM_ITERS
+    for r in ranges:
+        assert r.start_ns > 0 and r.warp == 1
+        if r.slot % 2 == 0:
+            assert (r.name, r.payload) == ("plain", None)
         else:
-            assert (e.tag_name, e.payload) == ("item", (e.event_idx - 4) * 1000 + e.unit_id)
-    payloads = [
-        ev["args"].get("payload") for ev in session.trace["traceEvents"] if ev.get("ph") == "X"
-    ]
-    assert sorted(p for p in payloads if p is not None) == sorted(
-        e.payload for e in events if e.payload is not None
+            assert (r.name, r.payload) == ("item", (r.slot - 4) * 1000 + r.cta[0])
+    slices = read_slices(trace_path)
+    assert {(s.process, s.track) for s in slices} == {
+        (f"Block {block}", "warp 1") for block in range(NUM_BLOCKS)
+    }
+    assert sorted(s.args["payload"] for s in slices if "payload" in s.args) == sorted(
+        r.payload for r in ranges if r.payload is not None
     )
 
 
@@ -115,7 +116,7 @@ def _launch_compact_gmem(prof_buf, max_events):
 
 
 def test_compact_gmem_roundtrip(tmp_path):
-    """Compact events populate the session result and preserve their static slots."""
+    """Compact records decode with their static slots; the trace has one track per tag."""
     trace_path = tmp_path / "compact_gmem.pftrace"
     with profile_session(
         max_events_per_unit=NUM_ITERS + 1,
@@ -123,29 +124,27 @@ def test_compact_gmem_roundtrip(tmp_path):
         tag_names=[f"t{i}" for i in range(NUM_ITERS)],
         compact=True,
         expected_events_per_unit=NUM_ITERS,
-        trace_path=str(trace_path),
+        trace_path=trace_path,
     ) as session:
         _launch_compact_gmem(
             from_dlpack(session.prof.tensor), Int32(session.prof.max_events_per_unit)
         )
 
-    events = session.events
-    assert session.trace is not None
-    assert trace_path.exists()
-    assert len(events) == NUM_BLOCKS * NUM_ITERS
-    for unit_id in range(NUM_BLOCKS):
-        assert {e.event_idx for e in events if e.unit_id == unit_id} == set(range(NUM_ITERS))
-    for e in events:
-        # Anchors put all events near the same 64-bit timer band.
-        assert e.start_ns > (1 << 40), "start_ns should be a reconstructed 64-bit globaltimer"
-
-    trace = events_to_perfetto([events[0]], split_overlaps=False)
-    duration_event = next(event for event in trace["traceEvents"] if event.get("ph") == "X")
-    assert duration_event["args"]["event_idx"] == events[0].event_idx
+    ranges = session.ranges
+    assert len(ranges) == NUM_BLOCKS * NUM_ITERS
+    for unit in range(NUM_BLOCKS):
+        assert {r.slot for r in ranges if r.cta == (unit,)} == set(range(NUM_ITERS))
+    for r in ranges:
+        # Anchors put all ranges near the same 64-bit timer band.
+        assert r.start_ns > (1 << 40), "start_ns should be a reconstructed 64-bit globaltimer"
+    slices = read_slices(trace_path)
+    assert {(s.process, s.track, s.args["slot"]) for s in slices} == {
+        (f"Block {r.cta[0]}", r.name, r.slot) for r in ranges
+    }
 
 
 def test_expected_event_count_validation_rejects_missing_events():
-    """profile_session validates raw decoded counts before post-processing."""
+    """profile_session checks every unit's decoded count."""
     with pytest.raises(RuntimeError, match=f"Expected {NUM_ITERS + 1} events"):
         with profile_session(
             max_events_per_unit=NUM_ITERS + 1,
@@ -207,16 +206,14 @@ def test_compact_smem_roundtrip():
             from_dlpack(session.prof.tensor), Int32(session.prof.max_events_per_unit)
         )
 
-    events = session.events
-    assert len(events) == NUM_BLOCKS * NUM_ITERS
-    units_seen = {e.unit_id for e in events}
-    assert units_seen == set(range(NUM_BLOCKS))
-    tags_seen = {e.tag_id for e in events}
-    assert tags_seen == set(range(NUM_ITERS))
-    for unit_id in range(NUM_BLOCKS):
-        assert {e.event_idx for e in events if e.unit_id == unit_id} == set(range(NUM_ITERS))
-    for e in events:
-        assert e.start_ns > (1 << 40)
+    ranges = session.ranges
+    assert len(ranges) == NUM_BLOCKS * NUM_ITERS
+    assert {r.cta for r in ranges} == {(unit,) for unit in range(NUM_BLOCKS)}
+    assert {r.name for r in ranges} == {f"t{i}" for i in range(NUM_ITERS)}
+    for unit in range(NUM_BLOCKS):
+        assert {r.slot for r in ranges if r.cta == (unit,)} == set(range(NUM_ITERS))
+    for r in ranges:
+        assert r.start_ns > (1 << 40)
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +244,7 @@ def test_compact_out_of_range_slots_are_dropped():
     ) as session:
         _launch_compact_slots(from_dlpack(session.prof.tensor), Int32(2))
     # Block 0 records slot 0 of unit 1 twice; block 1's slots -1 and 2 of unit 0 are dropped.
-    assert [(e.unit_id, e.event_idx) for e in session.events] == [(1, 0)]
+    assert [(r.cta, r.slot) for r in session.ranges] == [((1,), 0)]
     anchors = session.prof.tensor.view(2, 3)[:, 0]
     assert (anchors > 1 << 50).all(), "an out-of-range record overwrote an anchor"
 
@@ -287,40 +284,5 @@ def test_compact_smem_slot_past_the_slice_is_dropped():
         max_events_per_unit=1, num_units=1, tag_names=["t"], compact=True
     ) as session:
         _launch_compact_smem_slot(from_dlpack(session.prof.tensor), from_dlpack(out))
-    assert session.events == []
+    assert session.ranges == []
     assert out.item() == SENTINEL
-
-
-# ---------------------------------------------------------------------------
-# Decoder overflow detection
-# ---------------------------------------------------------------------------
-
-
-def test_compact_decode_detects_event_idx_overflow():
-    """If a caller's event_idx overflows past max_events_per_unit, the decoder yells."""
-    # Hand-craft a buffer that mimics overflow: unit 0 anchor is sane, unit 1 anchor
-    # was clobbered by a stray event store (so its value is wildly different).
-    from transformer_nuggets.cute.profiler.host import ProfileBuf
-
-    max_events = 4
-    slice_size = 1 + max_events
-    num_units = 2
-    flat = torch.zeros(num_units * slice_size, dtype=torch.int64, device="cuda")
-    # Unit 0: real anchor + one event.
-    flat[0] = 1_000_000_000_000_000_000  # plausible ns timestamp
-    flat[1] = 1 | (10 << 32) | (3 << 56)  # ts_lo=1, dur=10, tag=3
-    # Unit 1: anchor slot clobbered by a packed record (low bits != a real timer hi).
-    flat[slice_size + 0] = 5 | (20 << 32) | (4 << 56)  # looks like an event
-
-    from transformer_nuggets.cute.profiler.host import TagTable
-
-    tags = TagTable([f"t{i}" for i in range(8)])
-    buf = ProfileBuf(
-        tensor=flat,
-        max_events_per_unit=max_events,
-        num_units=num_units,
-        unit_name="Block",
-        compact=True,
-    )
-    with pytest.raises(RuntimeError, match="diverge from the median"):
-        decode_events(buf, tags)

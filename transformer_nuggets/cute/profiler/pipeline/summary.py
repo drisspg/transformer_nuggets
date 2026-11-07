@@ -11,12 +11,12 @@ from collections import defaultdict
 import statistics
 
 from transformer_nuggets.cute.profiler.pipeline.analysis import PipelineAnalysis
-from transformer_nuggets.cute.profiler.pipeline.iket import MeasuredCapture
+from transformer_nuggets.cute.profiler.pipeline.measure import MeasuredCapture
 from transformer_nuggets.cute.profiler.pipeline.plan import Timeline
 
 # Approximate cost of one IKET range push/pop pair on the issuing warp (GB200,
 # CuTeDSL 4.7). Regions shorter than twice this are dominated by instrumentation.
-RANGE_OVERHEAD_NS = 50
+IKET_RANGE_OVERHEAD_NS = 50
 
 
 def steady_iterations(iterations: int) -> range:
@@ -32,12 +32,18 @@ def report(
     analysis: PipelineAnalysis | None = None,
     *,
     unprofiled_iteration_ns: float | None = None,
+    range_overhead_ns: float | None = None,
 ) -> str:
-    """Render per-region medians, one steady-state iteration, and scheduler findings."""
+    """Render per-region medians, one steady-state iteration, and scheduler findings.
+
+    ``range_overhead_ns``: the recorder's cost per range (``IKET_RANGE_OVERHEAD_NS`` for
+    IKET); regions shorter than twice it are flagged as dominated by instrumentation.
+    RecMII and ResMII are in the plan's logical weight units, not nanoseconds.
+    """
     iterations = timeline.iterations
     steady = steady_iterations(iterations)
     lines = [
-        f"kernel {measured.kernel_name[:72]}",
+        f"plan {timeline.plan_name[:72]}",
         f"cta {measured.cta}  duration {measured.duration_ns} ns  "
         f"iterations {iterations}  per iteration ~{measured.duration_ns / iterations:.0f} ns"
         + (
@@ -54,16 +60,21 @@ def report(
         if region.iteration in steady:
             durations[(region.role, region.name)].append(region.median_duration_ns)
     role_order = {role.name: position for position, role in enumerate(timeline.roles)}
+    flagged = (
+        f"; * = under 2x the ~{range_overhead_ns:.0f} ns range overhead"
+        if range_overhead_ns is not None
+        else ""
+    )
     lines.append(
-        f"steady-state iterations {steady.start}..{steady.stop - 1}, ns per region "
-        f"(median / min / max; * = under 2x the ~{RANGE_OVERHEAD_NS} ns range overhead)"
+        f"interior iterations {steady.start}..{steady.stop - 1}, ns per region "
+        f"(median / min / max{flagged})"
     )
     lines.append(f"  {'role':8} {'region':32} {'median':>8} {'min':>7} {'max':>7}")
     for (role, name), values in sorted(
         durations.items(), key=lambda item: (role_order[item[0][0]], item[0][1])
     ):
         median = statistics.median(values)
-        flag = "*" if median < 2 * RANGE_OVERHEAD_NS else " "
+        flag = "*" if range_overhead_ns is not None and median < 2 * range_overhead_ns else " "
         lines.append(
             f"  {role:8} {name:32} {median:8.0f} {min(values):7.0f} {max(values):7.0f} {flag}"
         )
@@ -88,7 +99,10 @@ def report(
         summary = analysis.perfetto_summary()
         lines.append("")
         lines.append("scheduler")
-        lines.append(f"  RecMII {summary['recurrence_mii']}  ResMII {summary['resource_mii']}")
+        lines.append(
+            f"  RecMII {summary['recurrence_mii']}  ResMII {summary['resource_mii']} "
+            "(logical weight units)"
+        )
         lines.append(f"  critical cycle: {summary['critical_cycle']}")
         for ring in analysis.rings:
             if ring.reuse_wait_ns or ring.peak_occupancy == ring.depth:

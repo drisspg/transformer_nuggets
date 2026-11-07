@@ -17,11 +17,11 @@ from transformer_nuggets.cute.profiler.pipeline.plan import (
 )
 
 _LAZY_EXPORTS = {
-    "MeasuredCapture": ("iket", "MeasuredCapture"),
-    "MeasuredRegion": ("iket", "MeasuredRegion"),
+    "MeasuredCapture": ("measure", "MeasuredCapture"),
+    "MeasuredRegion": ("measure", "MeasuredRegion"),
     "PipelineAnalysis": ("analysis", "PipelineAnalysis"),
     "analyze_pipeline": ("analysis", "analyze_pipeline"),
-    "load_iket_capture": ("iket", "load_iket_capture"),
+    "join": ("measure", "join"),
     "report": ("summary", "report"),
     "write_pipeline_perfetto": ("perfetto", "write_pipeline_perfetto"),
 }
@@ -55,7 +55,7 @@ __all__ = [
     "Timeline",
     "analyze_pipeline",
     "extract_plan",
-    "load_iket_capture",
+    "join",
     "report",
     "write_pipeline_perfetto",
 ]

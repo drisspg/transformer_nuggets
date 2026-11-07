@@ -432,9 +432,9 @@ def test_nvfp4_tma_profiles_common_pipeline_regions(use_runtime_k_loop):
             profile_buffer=session.prof.tensor,
         )
     torch.testing.assert_close(actual, expected, atol=2.0, rtol=0.05)
-    events = session.events
+    events = session.ranges
     assert len(events) == op.num_profile_units * op.profile_events_per_cta
-    assert {event.tag_name for event in events} == set(NVFP4_TMA_PROFILE_TAGS) - {
+    assert {event.name for event in events} == set(NVFP4_TMA_PROFILE_TAGS) - {
         "input_scale_acquire",
         "input_scale_copy",
         "input_scale_wait",
@@ -467,9 +467,9 @@ def test_nvfp4_tma_profiles_sampled_ctas():
             profile_buffer=session.prof.tensor,
         )
     torch.testing.assert_close(actual, expected, atol=2.0, rtol=0.05)
-    events = session.events
+    events = session.ranges
     assert len(events) == op.num_profile_units * op.profile_events_per_cta
-    assert {event.unit_id for event in events} == set(range(op.num_profile_units))
+    assert {event.cta for event in events} == {(u,) for u in range(op.num_profile_units)}
 
 
 def test_nvfp4_tma_profiles_dedicated_persistent_tiles():
@@ -502,9 +502,9 @@ def test_nvfp4_tma_profiles_dedicated_persistent_tiles():
             profile_buffer=session.prof.tensor,
         )
     torch.testing.assert_close(actual, expected, atol=2.0, rtol=0.05)
-    events = session.events
+    events = session.ranges
     assert len(events) == op.num_profile_units * op.profile_events_per_cta
-    assert {event.unit_id for event in events} == set(range(op.num_profile_units))
+    assert {event.cta for event in events} == {(u,) for u in range(op.num_profile_units)}
 
 
 @pytest.mark.parametrize(

@@ -21,13 +21,14 @@ import shutil
 import subprocess
 import sys
 
+from transformer_nuggets.cute.profiler.iket import parse_iket
 from transformer_nuggets.cute.profiler.pipeline import (
     analyze_pipeline,
     extract_plan,
-    load_iket_capture,
+    join,
     write_pipeline_perfetto,
 )
-from transformer_nuggets.cute.profiler.pipeline.summary import report
+from transformer_nuggets.cute.profiler.pipeline.summary import IKET_RANGE_OVERHEAD_NS, report
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -96,11 +97,15 @@ def main(argv: list[str] | None = None) -> int:
         for raw in run_dir.glob("*.pftrace"):
             shutil.copy(raw, artifact(".raw_iket.pftrace"))
 
-    measured = load_iket_capture(trace, timeline, cta=cta)
+    measured = join(parse_iket(trace), timeline, cta=cta)
     analysis = analyze_pipeline(timeline, measured)
     write_pipeline_perfetto(artifact(".enriched.pftrace"), timeline, measured, analysis=analysis)
     text = report(
-        timeline, measured, analysis, unprofiled_iteration_ns=args.unprofiled_iteration_ns
+        timeline,
+        measured,
+        analysis,
+        unprofiled_iteration_ns=args.unprofiled_iteration_ns,
+        range_overhead_ns=IKET_RANGE_OVERHEAD_NS,
     )
     artifact(".report.txt").write_text(text + "\n")
     print(text)

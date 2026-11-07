@@ -18,7 +18,7 @@ from transformer_nuggets.cute.blockscaled_tma import (
     ProfileTag as ProfileTag,
 )
 from transformer_nuggets.cute.cache import compile_tvm_ffi_and_cache
-from transformer_nuggets.cute.profiler import group_by_unit, profile_session
+from transformer_nuggets.cute.profiler import profile_session
 from transformer_nuggets.cute.utils import (
     make_fake_compact_tensor,
     tensor_supports_contiguous_dim,
@@ -581,7 +581,6 @@ def profile_mxfp8_tma(
         trace_path=str(output),
         device=torch_device,
         compact=True,
-        post_process_events=group_by_unit,
     ) as session:
         result = torch.empty((1, n), dtype=torch.bfloat16, device=torch_device)
         for _ in range(warmups):

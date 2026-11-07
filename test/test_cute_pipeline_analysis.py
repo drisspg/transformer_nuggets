@@ -25,10 +25,11 @@ from transformer_nuggets.cute.profiler.pipeline import (
     Role,
     analyze_pipeline,
     extract_plan,
-    load_iket_capture,
+    join,
     report,
     write_pipeline_perfetto,
 )
+from transformer_nuggets.cute.profiler import parse_iket
 from transformer_nuggets.cute.profiler.pipeline.analysis import ring_occupancy_samples
 from transformer_nuggets.utils.merge_traces import merge_traces
 
@@ -88,8 +89,6 @@ def logical_capture(timeline, *, tick_ns: int = 100) -> MeasuredCapture:
         for item in timeline.regions
     )
     return MeasuredCapture(
-        "logical test capture",
-        timeline.plan_name,
         (0, 0, 0),
         0,
         timeline.logical_duration * tick_ns,
@@ -181,7 +180,7 @@ def test_iket_json_join(tmp_path: Path) -> None:
         )
     )
 
-    measured = load_iket_capture(path, timeline)
+    measured = join(parse_iket(path), timeline)
 
     assert len(measured.regions) == len(timeline.regions)
     assert measured.duration_ns == timeline.logical_duration * 10
@@ -232,7 +231,7 @@ def test_iket_join_rejects_extra_occurrences(tmp_path: Path) -> None:
         [("work", warp, 100 * i, 100 * i + 50) for warp in (0, 1) for i in range(3)],
     )
     with pytest.raises(ValueError, match=r"warp 0 recorded 'work' 3 times.*iterations=3"):
-        load_iket_capture(path, timeline)
+        join(parse_iket(path), timeline)
 
 
 def test_iket_join_rejects_a_warp_missing_an_occurrence(tmp_path: Path) -> None:
@@ -243,7 +242,7 @@ def test_iket_join_rejects_a_warp_missing_an_occurrence(tmp_path: Path) -> None:
     ranges += [("work", 1, 100 * i, 100 * i + 50) for i in (0, 2)]
     path = write_iket(tmp_path / "missing.json", ranges)
     with pytest.raises(ValueError, match=r"warp 1 recorded 'work' 2 times"):
-        load_iket_capture(path, timeline)
+        join(parse_iket(path), timeline)
 
 
 def test_analysis_and_perfetto_direct_flows(tmp_path: Path) -> None:
@@ -350,8 +349,6 @@ def test_ring_slot_is_free_after_its_last_release(first: str) -> None:
         for name, start, end in (("load", 0, 100), ("fast", 100, 300), ("slow", 100, 600))
     ]
     measured = MeasuredCapture(
-        "measured",
-        "fanout",
         (0, 0, 0),
         0,
         1200,
@@ -376,8 +373,6 @@ def test_perfetto_splits_crossing_role_envelopes_and_normalizes_suffix(
     plan.add_region(Region("b", "role", "B", 1, 1))
     timeline = plan.schedule(iterations=1)
     measured = MeasuredCapture(
-        "measured",
-        "crossing",
         (0, 0, 0),
         0,
         15,
@@ -419,7 +414,7 @@ def test_perfetto_zero_duration_slice_begins_before_it_ends(tmp_path: Path) -> N
         MeasuredRegion("a", "role", 0, 5, 5, 0.0, 1),
         MeasuredRegion("b", "role", 0, 5, 9, 4.0, 1),
     )
-    measured = MeasuredCapture("measured", "empty", (0, 0, 0), 5, 4, regions)
+    measured = MeasuredCapture((0, 0, 0), 5, 4, regions)
 
     trace = Trace()
     trace.ParseFromString(

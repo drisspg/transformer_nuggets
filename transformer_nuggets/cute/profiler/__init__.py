@@ -23,31 +23,18 @@ Quick Start:
         compact=True,
     ) as session:
         my_kernel(output, session.prof.tensor, session.prof.max_events_per_unit)
-    session.events  # decoded after the block
+    session.ranges  # decoded after the block
 """
 
 from transformer_nuggets.cute.profiler.host import (
     ProfileBuf,
-    TagTable,
-    Event,
-    PostProcessContext,
     ProfileSession,
+    TagTable,
     allocate_profile_buffer,
-    decode_events,
-    events_to_perfetto,
+    decode_ranges,
     profile_session,
-    validate_event_counts,
 )
-
-from transformer_nuggets.cute.profiler.analysis import (
-    EventSummary,
-    OverlapSummary,
-    DependencyGapSummary,
-    summarize_by_tag,
-    overlap_between,
-    dependency_gaps,
-)
-
+from transformer_nuggets.cute.profiler.iket import parse_iket
 from transformer_nuggets.cute.profiler.ops import (
     compact_anchor_init,
     compact_event_stop,
@@ -59,50 +46,39 @@ from transformer_nuggets.cute.profiler.ops import (
     read_globaltimer,
     read_globaltimer_lo32,
 )
-
-from transformer_nuggets.cute.profiler.postprocessors import (
-    group_by_unit,
-    compose,
-    rename_processes,
-    rename_threads,
-    link_dependency_flow,
-    link_payload_flow,
+from transformer_nuggets.cute.profiler.perfetto import write_ranges
+from transformer_nuggets.cute.profiler.ranges import (
+    OverlapSummary,
+    Range,
+    RangeSummary,
+    overlap_between,
+    summarize_by_tag,
 )
 
 __all__ = [
-    # Host-side
-    "ProfileBuf",
-    "TagTable",
-    "Event",
-    "PostProcessContext",
-    "ProfileSession",
-    # Host-side analysis
-    "EventSummary",
-    "OverlapSummary",
-    "DependencyGapSummary",
-    "summarize_by_tag",
-    "overlap_between",
-    "dependency_gaps",
-    "allocate_profile_buffer",
-    "decode_events",
-    "events_to_perfetto",
-    "profile_session",
-    "validate_event_counts",
-    # Device-side
+    # Device
+    "compact_anchor_init",
+    "compact_event_stop",
+    "compact_event_stop_smem",
+    "compact_flush_smem_to_gmem",
+    "compact_prepare_smem",
+    "compact_profile_region",
+    "event_stop",
     "read_globaltimer",
     "read_globaltimer_lo32",
-    "event_stop",
-    "compact_event_stop",
-    "compact_anchor_init",
-    "compact_event_stop_smem",
-    "compact_prepare_smem",
-    "compact_flush_smem_to_gmem",
-    "compact_profile_region",
-    # Post-processors
-    "group_by_unit",
-    "compose",
-    "rename_processes",
-    "rename_threads",
-    "link_dependency_flow",
-    "link_payload_flow",
+    # Host capture
+    "ProfileBuf",
+    "ProfileSession",
+    "TagTable",
+    "allocate_profile_buffer",
+    "decode_ranges",
+    "profile_session",
+    # Ranges, statistics and traces
+    "OverlapSummary",
+    "Range",
+    "RangeSummary",
+    "overlap_between",
+    "parse_iket",
+    "summarize_by_tag",
+    "write_ranges",
 ]

@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 import statistics
 from collections.abc import Mapping
 
-from transformer_nuggets.cute.profiler.pipeline.iket import MeasuredCapture
+from transformer_nuggets.cute.profiler.pipeline.measure import MeasuredCapture
 from transformer_nuggets.cute.profiler.pipeline.plan import Dependency, Timeline
 
 NodeKey = tuple[str, int]
@@ -36,7 +36,11 @@ class CriticalPath:
 
 @dataclass(frozen=True)
 class StageBlocker:
-    """Measured wait/busy decomposition and latest-arriving predecessor."""
+    """Measured wait/busy decomposition and latest-arriving predecessor.
+
+    ``wait_source`` is ``"measured"`` when ``wait_inside_ns`` sums the region's traced wait
+    ranges, ``"inferred"`` when it is the overlap with the latest predecessor's end.
+    """
 
     name: str
     iteration: int
@@ -51,6 +55,7 @@ class StageBlocker:
     blocker_kind: str | None
     blocker_resource: str | None
     blocker_robustness_ns: int | None
+    wait_source: str
     slack_ns: float
     critical: bool
 
@@ -116,6 +121,7 @@ class PipelineAnalysis:
                 "wait_inside_ns": stage.wait_inside_ns,
                 "ready_delay_ns": stage.ready_delay_ns,
                 "busy_ns": stage.busy_ns,
+                "wait_source": stage.wait_source,
                 "blocker": format_node(stage.blocker),
                 "blocker_kind": stage.blocker_kind or "none",
                 "blocker_resource": stage.blocker_resource or "none",
@@ -155,6 +161,9 @@ def analyze_pipeline(
     cycle_cap: int = 10_000,
 ) -> PipelineAnalysis:
     """Analyze the unrolled logical plan and one wait-inclusive measured capture.
+
+    A region's wait is its measured ``wait_ns`` when the capture traced waits, else inferred
+    from the latest predecessor's end (within ``timer_epsilon_ns`` counts as none).
 
     ``cycle_cap`` bounds the simple-cycle enumeration behind the critical cycle; densely
     annotated plans (tens of regions per role) can need a few million.
@@ -313,7 +322,8 @@ def measured_blockers(
     *,
     timer_epsilon_ns: int,
 ) -> tuple[tuple[StageBlocker, ...], dict[NodeKey, float]]:
-    """Attribute wait-inclusive overlap to each stage's latest-arriving predecessor."""
+    """Split each stage into wait and busy time; attribute a wait to the latest-arriving
+    predecessor."""
     measured_by_key = {(item.name, item.iteration): item for item in measured.regions}
     predecessors: dict[NodeKey, list[ConcreteEdge]] = defaultdict(list)
     for edge in edges:
@@ -336,11 +346,15 @@ def measured_blockers(
         ready_ns = arrivals[-1][0] if arrivals else 0
         binding = arrivals[-1][1] if arrivals else None
         robustness = ready_ns - arrivals[-2][0] if len(arrivals) > 1 else None
-        wait_inside_ns = min(max(ready_ns - start_ns, 0), end_ns - start_ns)
-        if wait_inside_ns <= timer_epsilon_ns:
-            wait_inside_ns = 0
         ready_delay_ns = max(start_ns - ready_ns, 0)
-        busy_ns = max(end_ns - max(start_ns, ready_ns), 0)
+        if item.wait_ns is None:
+            wait_inside_ns = min(max(ready_ns - start_ns, 0), end_ns - start_ns)
+            if wait_inside_ns <= timer_epsilon_ns:
+                wait_inside_ns = 0
+            busy_ns = max(end_ns - max(start_ns, ready_ns), 0)
+        else:
+            wait_inside_ns = min(item.wait_ns, end_ns - start_ns)
+            busy_ns = end_ns - start_ns - wait_inside_ns
         weights[key] = float(busy_ns + ready_delay_ns)
         blockers.append(
             StageBlocker(
@@ -357,6 +371,7 @@ def measured_blockers(
                 blocker_kind=binding.kind if binding and wait_inside_ns else None,
                 blocker_resource=binding.resource if binding and wait_inside_ns else None,
                 blocker_robustness_ns=robustness,
+                wait_source="inferred" if item.wait_ns is None else "measured",
                 slack_ns=0.0,
                 critical=False,
             )
@@ -514,11 +529,11 @@ def critical_cycle(
     cycle_cap: int = 10_000,
 ) -> CriticalCycle:
     """Enumerate compact simple cycles and return the maximum weight/distance ratio."""
+    weights_by_region: dict[str, list[float]] = defaultdict(list)
+    for (name, _), weight in logical_weights.items():
+        weights_by_region[name].append(weight)
     region_weights = {
-        name: statistics.median(
-            weight for (region_name, _), weight in logical_weights.items() if region_name == name
-        )
-        for name, _ in logical_weights
+        name: statistics.median(weights) for name, weights in weights_by_region.items()
     }
     symbolic: dict[str, list[tuple[str, str, int]]] = defaultdict(list)
     roles: dict[str, list[object]] = defaultdict(list)

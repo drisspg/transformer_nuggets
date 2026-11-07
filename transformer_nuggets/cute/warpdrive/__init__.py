@@ -88,9 +88,9 @@ after the declarations: ``<role>`` per work item (or per role body), ``<channel>
 ``with self.trace_region(name, payload=...)`` user regions (``waits=False``: role ranges and
 regions only), recorded by the profiler's ``"iket"`` backend (``enable_iket()``) or its
 ``"globaltimer"`` backend (decoded by ``trace_session.trace_session``). Disabled, it emits
-nothing. ``plan_from_warpdrive(kernel, cta=0)`` exports the matching ``PipelinePlan``, so a ``run-iket``
-capture feeds ``load_iket_capture``, ``analyze_pipeline``, and ``write_pipeline_perfetto`` from
-``transformer_nuggets.cute.profiler.pipeline`` with no hand annotations (``tracing.py``).
+nothing. ``plan_from_warpdrive(kernel, cta=0)`` exports the matching ``PipelinePlan``, so a
+capture of either backend feeds ``join``, ``analyze_pipeline``, and ``write_pipeline_perfetto``
+from ``transformer_nuggets.cute.profiler.pipeline`` with no hand annotations (``tracing.py``).
 
 Cluster memory scope: thread arrivals that cross CTAs default to ``remote_scope="cta"`` (what
 CUTLASS and FA4 use), which counts the arrival but does not order ordinary memory. A pair-scoped

@@ -234,8 +234,8 @@ def trace_megakernel(weights, max_len: int, token, pos: int, caches, path: Path)
         runner.launch(*caches)
     return {
         "trace": str(path),
-        "phase_span_us": qwen_megakernel_trace.phase_spans(session.events, runner.table),
-        "input_wait_us": qwen_megakernel_trace.input_waits(session.events, runner.table),
+        "phase_span_us": qwen_megakernel_trace.phase_spans(session.ranges, runner.table),
+        "input_wait_us": qwen_megakernel_trace.input_waits(session.ranges, runner.table),
     }
 
 

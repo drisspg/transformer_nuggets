@@ -8,7 +8,7 @@ the row as payload: ``poll`` (waiting for the row's inputs; it ends when they ar
 
     with trace_session(runner, trace_path="step.pftrace") as session:
         runner(weights, token, pos, *caches)  # one launch
-    phase_spans(session.events, runner.table)  # {"QKV": 1.9, ...} us per layer
+    phase_spans(session.ranges, runner.table)  # {"QKV": 1.9, ...} us per layer
 
 The Perfetto trace has one process per CTA (SM) and one thread per role; work items are named
 after their instruction (``QKV``, ``load QKV``, ...) with ``layer``/``a``/``b`` in their args,
@@ -24,7 +24,7 @@ from contextlib import contextmanager
 
 import torch
 
-from transformer_nuggets.cute.profiler import Event, link_payload_flow
+from transformer_nuggets.cute.profiler import Range
 from transformer_nuggets.cute.warpdrive.examples.qwen_megakernel import (
     ATTN,
     DOWN,
@@ -37,6 +37,7 @@ from transformer_nuggets.cute.warpdrive.examples.qwen_megakernel import (
     row_groups,
 )
 from transformer_nuggets.cute.warpdrive.trace_session import trace_session as kernel_session
+from transformer_nuggets.cute.warpdrive.trace_session import write_trace
 
 # The instruction kind each phase waits for (QKV: the previous layer's down; the LM head: the
 # last layer's).
@@ -44,43 +45,46 @@ PRODUCER = {QKV: DOWN, ATTN: QKV, OPROJ: ATTN, GATEUP: OPROJ, DOWN: GATEUP, LMHE
 
 
 @contextmanager
-def trace_session(runner, **kwargs):
+def trace_session(runner, *, trace_path=None, device=None):
     """``trace_session.trace_session`` for one launch of a ``trace="globaltimer"`` runner: the
-    runner records into the session's buffer inside the block. ``kwargs`` go to
-    ``profile_session`` (``trace_path``, ...)."""
-    rows = runner.table.tolist()
-    with kernel_session(
-        runner.op, runner.max_ctas, post_process_trace=label_rows(rows), **kwargs
-    ) as session:
+    runner records into the session's buffer inside the block. ``trace_path``: also write the
+    step's Perfetto trace (``write_step_trace``)."""
+    with kernel_session(runner.op, runner.max_ctas, device=device) as session:
         previous, runner.trace_buffer = runner.trace_buffer, session.prof.tensor
         try:
             yield session
         finally:
             runner.trace_buffer = previous
+    if trace_path is not None:
+        write_step_trace(trace_path, runner, session.ranges)
 
 
-def label_rows(rows: list[list[int]]):
-    """Trace post-processor: name each work item after its instruction and link each row to the
-    last-finishing producer row of every group it waits for."""
+def write_step_trace(path, runner, ranges: list[Range]):
+    """The step's trace: each work item named after its instruction, with its row's words in
+    its args, and an arrow from the last-finishing producer row of every group a row waits
+    for to that row."""
+    rows = runner.table.tolist()
 
-    def label(trace: dict, ctx) -> dict:
-        done: dict[int, float] = {}
-        for event in trace["traceEvents"]:
-            row = event.get("args", {}).get("payload")
-            if event.get("ph") != "X" or row is None or event["name"] not in ("compute", "load"):
-                continue
-            op, layer, a, b, _ = rows[row]
-            event["args"].update(op=OP_NAMES[op], layer=layer, a=a, b=b)
-            if event["name"] == "compute":
-                event["name"] = OP_NAMES[op]
-                done[row] = event["ts"] + event["dur"]
-            else:
-                event["name"] = f"load {OP_NAMES[op]}"
-        for (source, target), edges in input_edges(rows, done).items():
-            trace = link_payload_flow(edges, source, target, flow_name="input")(trace, ctx)
-        return trace
+    def name(item: Range) -> str:
+        if item.payload is None or item.name not in ("compute", "load"):
+            return item.name
+        op = OP_NAMES[rows[item.payload][0]]
+        return op if item.name == "compute" else f"load {op}"
 
-    return label
+    def args(item: Range) -> dict:
+        if item.payload is None or item.name not in ("compute", "load"):
+            return {}
+        op, layer, a, b, _ = rows[item.payload]
+        return {"op": OP_NAMES[op], "layer": layer, "a": a, "b": b}
+
+    computed = item_ranges(ranges)
+    done = {row: item.end_ns for row, item in computed.items()}
+    flows = [
+        (computed[source], computed[target])
+        for edges in input_edges(rows, done).values()
+        for source, target in edges
+    ]
+    return write_trace(path, runner.op, ranges, name=name, args=args, flows=flows)
 
 
 def input_edges(rows: list[list[int]], done: dict[int, float]) -> dict[tuple, list]:
@@ -103,20 +107,20 @@ def input_edges(rows: list[list[int]], done: dict[int, float]) -> dict[tuple, li
     return edges
 
 
-def item_ranges(events: list[Event], role: str = "compute") -> dict[int, Event]:
+def item_ranges(ranges: list[Range], role: str = "compute") -> dict[int, Range]:
     """Each table row's work-item range of ``role``, by row."""
-    return {e.payload: e for e in events if e.tag_name == role and e.payload is not None}
+    return {r.payload: r for r in ranges if r.name == role and r.payload is not None}
 
 
-def phase_spans(events: list[Event], table: torch.Tensor) -> dict[str, float]:
+def phase_spans(ranges: list[Range], table: torch.Tensor) -> dict[str, float]:
     """Mean us per layer of each instruction kind from its producer phase's last row done to its
     own last row done (QKV from layer 1, whose producer is the previous layer's down)."""
     rows = table.tolist()
     last: dict[tuple[int, int], int] = {}
-    for row, e in item_ranges(events).items():
+    for row, item in item_ranges(ranges).items():
         op, layer = rows[row][:2]
         key = (op, LAYERS if op == LMHEAD else layer)
-        last[key] = max(last.get(key, 0), e.start_ns + e.dur_ns)
+        last[key] = max(last.get(key, 0), item.end_ns)
     spans: dict[str, list[int]] = {}
     for (op, layer), end in last.items():
         producer_layer = layer - 1 if op in (QKV, LMHEAD) else layer
@@ -126,15 +130,15 @@ def phase_spans(events: list[Event], table: torch.Tensor) -> dict[str, float]:
     return {name: sum(v) / len(v) / 1e3 for name, v in spans.items()}
 
 
-def input_waits(events: list[Event], table: torch.Tensor) -> dict[str, float]:
+def input_waits(ranges: list[Range], table: torch.Tensor) -> dict[str, float]:
     """Median us per instruction kind from a row's start to its inputs being ready (the end of
     its first ``poll``). Rows that reuse the previous row's GEMV input poll nothing."""
     rows = table.tolist()
-    starts = {row: e.start_ns for row, e in item_ranges(events).items()}
+    starts = {row: item.start_ns for row, item in item_ranges(ranges).items()}
     ready: dict[int, float] = {}
-    for e in events:
-        if e.tag_name == "poll" and e.payload is not None:
-            ready[e.payload] = min(ready.get(e.payload, math.inf), e.start_ns + e.dur_ns)
+    for item in ranges:
+        if item.name == "poll" and item.payload is not None:
+            ready[item.payload] = min(ready.get(item.payload, math.inf), item.end_ns)
     waits: dict[str, list[int]] = {}
     for row, end in ready.items():
         if row in starts:

@@ -9,7 +9,9 @@ Run with:
     python examples/cute_profiler_buffering.py
 
 The script checks correctness, reports unprofiled latency, summarizes the sampled
-CTA's compact shared-memory records, and writes one Perfetto trace per variant.
+CTA's compact shared-memory records, joins them to the kernel's pipeline plan (stage reuse
+as a ``num_stages``-tile dependency), and writes one Perfetto trace per variant with the
+plan's dependency arrows and the stage ring's occupancy.
 """
 
 from collections.abc import Callable
@@ -28,21 +30,22 @@ from transformer_nuggets import DATA_DIR
 from transformer_nuggets.cute.base import CuteOp
 from transformer_nuggets.cute.cache import compile_and_cache
 from transformer_nuggets.cute.profiler import (
-    Event,
-    PostProcessContext,
     compact_flush_smem_to_gmem,
     compact_prepare_smem,
     compact_profile_region,
-    dependency_gaps,
     overlap_between,
     profile_session,
     summarize_by_tag,
 )
-from transformer_nuggets.cute.profiler.postprocessors import (
-    compose,
-    link_dependency_flow,
-    rename_processes,
-    rename_threads,
+from transformer_nuggets.cute.profiler.pipeline import (
+    Dependency,
+    PipelinePlan,
+    Region,
+    Resource,
+    Role,
+    analyze_pipeline,
+    join,
+    write_pipeline_perfetto,
 )
 from transformer_nuggets.utils.benchmark import benchmark_cuda_function_in_microseconds
 
@@ -288,12 +291,23 @@ class WarpSpecializedTransform(CuteOp):
         self.compile(src, dst, profile_gmem)()
 
 
-def group_profile_roles(events: list[Event], _ctx: PostProcessContext) -> list[Event]:
-    """Place producer and consumer events on stable Perfetto lanes."""
-    for event in events:
-        event.pid = event.unit_id
-        event.tid = PRODUCER_WARP if event.tag_id <= ProfileTag.PRODUCER_LOAD else CONSUMER_WARP
-    return events
+def buffering_plan(num_stages: int) -> PipelinePlan:
+    """The kernel's pipeline: the consumer waits for a loaded tile, and the producer acquires
+    a stage the consumer released ``num_stages`` tiles earlier."""
+    plan = PipelinePlan(f"{num_stages}-stage CTA {PROFILED_CTA}", iteration_name="tile")
+    plan.add_role(Role("producer", "Producer warp", PRODUCER_WARP, PRODUCER_WARP + 1))
+    plan.add_role(Role("consumer", "Consumer warp", CONSUMER_WARP, CONSUMER_WARP + 1))
+    plan.add_resource(Resource("tile", "tile stages", num_stages))
+    for tag in ProfileTag:
+        role = "producer" if tag <= ProfileTag.PRODUCER_LOAD else "consumer"
+        plan.add_region(Region(PROFILE_TAGS[tag], role, PROFILE_TAGS[tag], tag % 2, 1))
+    plan.add_dependency(Dependency("producer_load", "consumer_wait", "tile"))
+    plan.add_dependency(
+        Dependency(
+            "consumer_compute_store", "producer_acquire", "tile", distance=num_stages, kind="reuse"
+        )
+    )
+    return plan
 
 
 def benchmark_unprofiled(
@@ -313,29 +327,15 @@ def benchmark_unprofiled(
 def capture_profile(
     num_stages: int, src: torch.Tensor, dst: torch.Tensor, trace_path: Path
 ) -> dict[str, float]:
-    """Capture one warmed profiled launch and return decoded summary statistics."""
+    """Capture one warmed profiled launch, join it to the kernel's pipeline plan, write the
+    trace, and return summary statistics."""
     op = WarpSpecializedTransform(num_stages=num_stages, enable_profiling=True)
     with profile_session(
         max_events_per_unit=MAX_PROFILE_EVENTS,
         num_units=(1, "CTA"),
         tag_names=list(PROFILE_TAGS),
-        trace_path=str(trace_path),
         compact=True,
         expected_events_per_unit=MAX_PROFILE_EVENTS,
-        post_process_events=group_profile_roles,
-        post_process_trace=compose(
-            rename_processes({PROFILE_UNIT: f"{num_stages}-stage CTA {PROFILED_CTA}"}),
-            rename_threads({PRODUCER_WARP: "Producer warp", CONSUMER_WARP: "Consumer warp"}),
-            link_dependency_flow("producer_acquire", "producer_load"),
-            link_dependency_flow("producer_load", "consumer_wait"),
-            link_dependency_flow("consumer_wait", "consumer_compute_store"),
-            link_dependency_flow(
-                "consumer_compute_store",
-                "producer_acquire",
-                successor_offset=num_stages,
-                flow_name="stage_release_to_reacquire",
-            ),
-        ),
     ) as session:
         launch = op.compile(src, dst, session.prof.tensor)
         for _ in range(3):
@@ -344,21 +344,18 @@ def capture_profile(
         session.prof.reset()
         launch()
 
-    summaries = summarize_by_tag(session.events)
-    overlap = overlap_between(
-        session.events,
-        ProfileTag.PRODUCER_LOAD,
-        ProfileTag.CONSUMER_COMPUTE_STORE,
-    )
-    wait_to_compute = dependency_gaps(
-        session.events,
-        ProfileTag.CONSUMER_WAIT,
-        ProfileTag.CONSUMER_COMPUTE_STORE,
-    )
+    timeline = buffering_plan(num_stages).schedule(iterations=TILES_PER_CTA)
+    measured = join(session.ranges, timeline)
+    analysis = analyze_pipeline(timeline, measured)
+    write_pipeline_perfetto(trace_path, timeline, measured, analysis=analysis)
+
+    summaries = summarize_by_tag(session.ranges)
+    overlap = overlap_between(session.ranges, "producer_load", "consumer_compute_store")
+    (ring,) = analysis.rings
     return {
-        **{tag.name.lower(): summaries[tag.name.lower()].p50_ns for tag in ProfileTag},
+        **{name: summaries[name].p50_ns for name in PROFILE_TAGS},
         "producer_load_overlap_pct": 100.0 * overlap.left_fraction,
-        "wait_to_compute_gap_ns": wait_to_compute.p50_ns or 0.0,
+        "stage_reuse_wait_ns": ring.reuse_wait_ns,
     }
 
 
@@ -416,7 +413,7 @@ def main() -> None:
             f"load={values['producer_load']:.0f}, wait={values['consumer_wait']:.0f}, "
             f"compute_store={values['consumer_compute_store']:.0f}, "
             f"load_overlap={values['producer_load_overlap_pct']:.1f}%, "
-            f"wait_to_compute_gap={values['wait_to_compute_gap_ns']:.0f}"
+            f"stage_reuse_wait={values['stage_reuse_wait_ns']:.0f}"
         )
         print(f"    trace: {trace_dir / f'buffering_{stages}_stage.pftrace'}")
 

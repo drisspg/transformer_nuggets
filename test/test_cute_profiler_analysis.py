@@ -1,56 +1,50 @@
+"""Host-only tests of the profiler's range model: decoding, statistics, joins and traces."""
+
+from pathlib import Path
+
 import pytest
 
 pytest.importorskip("cutlass")  # transformer_nuggets.cute imports CuTeDSL
 
-from pathlib import Path
-
 import torch
+from perfetto_trace import read_slices
 
+from transformer_nuggets.cute.jit_cache._key import module_closure
 from transformer_nuggets.cute.profiler import (
-    Event,
+    Range,
     TagTable,
     allocate_profile_buffer,
-    decode_events,
-    dependency_gaps,
-    link_dependency_flow,
-    link_payload_flow,
+    decode_ranges,
     overlap_between,
     summarize_by_tag,
-    validate_event_counts,
+    write_ranges,
 )
+from transformer_nuggets.cute.profiler.host import check_counts
 from transformer_nuggets.cute.profiler.ops import PAYLOAD_FLAG
-from transformer_nuggets.cute.jit_cache._key import module_closure
+from transformer_nuggets.cute.profiler.pipeline import (
+    Dependency,
+    PipelinePlan,
+    Region,
+    Resource,
+    Role,
+    analyze_pipeline,
+    join,
+)
 
 
-def make_event(
-    start_ns: int,
-    dur_ns: int,
-    tag_id: int,
-    tag_name: str,
-    event_idx: int,
-    unit_id: int = 0,
-) -> Event:
-    """Construct one decoded event for host-side analysis tests."""
-    return Event(
-        start_ns=start_ns,
-        dur_ns=dur_ns,
-        tag_id=tag_id,
-        tag_name=tag_name,
-        tid=0,
-        unit_id=unit_id,
-        event_idx=event_idx,
-    )
+def span(name: str, start_ns: int, dur_ns: int, cta: int = 0, **fields) -> Range:
+    return Range(name, start_ns, start_ns + dur_ns, (cta,), **fields)
 
 
 def test_summarize_by_tag_reports_duration_statistics():
-    events = [
-        make_event(0, 10, 0, "load", 0),
-        make_event(20, 20, 0, "load", 1),
-        make_event(50, 30, 0, "load", 2),
-        make_event(90, 5, 1, "store", 3),
+    ranges = [
+        span("load", 0, 10),
+        span("load", 20, 20),
+        span("load", 50, 30),
+        span("store", 90, 5),
     ]
 
-    summaries = summarize_by_tag(events)
+    summaries = summarize_by_tag(ranges)
 
     assert summaries["load"].count == 3
     assert summaries["load"].total_ns == 60
@@ -62,16 +56,16 @@ def test_summarize_by_tag_reports_duration_statistics():
     assert summaries["store"].p50_ns == 5
 
 
-def test_overlap_between_merges_intervals_and_isolates_units():
-    events = [
-        make_event(0, 10, 0, "load", 0),
-        make_event(20, 10, 0, "load", 1),
-        make_event(5, 10, 1, "compute", 2),
-        make_event(25, 10, 1, "compute", 3),
-        make_event(0, 100, 1, "compute", 0, unit_id=1),
+def test_overlap_between_merges_intervals_and_isolates_ctas():
+    ranges = [
+        span("load", 0, 10),
+        span("load", 20, 10),
+        span("compute", 5, 10),
+        span("compute", 25, 10),
+        span("compute", 0, 100, cta=1),
     ]
 
-    overlap = overlap_between(events, "load", "compute")
+    overlap = overlap_between(ranges, "load", "compute")
 
     assert overlap.overlap_ns == 10
     assert overlap.left_total_ns == 20
@@ -79,113 +73,31 @@ def test_overlap_between_merges_intervals_and_isolates_units():
     assert overlap.left_fraction == 0.5
     assert overlap.right_fraction == 10 / 120
 
-    global_overlap = overlap_between(events, "load", "compute", same_unit=False)
+    global_overlap = overlap_between(ranges, "load", "compute", same_cta=False)
     assert global_overlap.overlap_ns == 20
     assert global_overlap.left_fraction == 1.0
 
 
-def test_validate_event_counts_reports_too_few_and_too_many():
-    events = [
-        make_event(0, 10, 0, "load", 0, unit_id=0),
-        make_event(20, 10, 0, "load", 1, unit_id=0),
-        make_event(0, 10, 0, "load", 0, unit_id=1),
-    ]
+def test_check_counts_reports_too_few_and_too_many():
+    ranges = [span("load", 0, 10), span("load", 20, 10), span("load", 0, 10, cta=1)]
 
     with pytest.raises(RuntimeError, match="Expected 2 events.*unit 1: 1"):
-        validate_event_counts(events, num_units=2, expected_events_per_unit=2)
+        check_counts(ranges, num_units=2, expected_per_unit=2)
     with pytest.raises(RuntimeError, match="Expected 1 events.*unit 0: 2"):
-        validate_event_counts(events, num_units=2, expected_events_per_unit=1)
+        check_counts(ranges, num_units=2, expected_per_unit=1)
 
 
-def test_dependency_gaps_pair_by_event_order_and_support_pipeline_offset():
-    events = [
-        make_event(0, 10, 0, "produce", 1),
-        make_event(20, 10, 0, "produce", 5),
-        make_event(15, 5, 1, "consume", 3),
-        make_event(35, 5, 1, "consume", 7),
-        make_event(55, 5, 1, "consume", 11),
-    ]
-
-    direct = dependency_gaps(events, "produce", "consume")
-    offset = dependency_gaps(events, "produce", "consume", successor_offset=1)
-
-    assert direct.gaps_ns == (5, 5)
-    assert direct.count == 2
-    assert direct.p50_ns == 5
-    assert offset.gaps_ns == (25, 25)
-
-
-def test_dependency_gaps_empty_and_invalid_offset():
-    assert dependency_gaps([], "produce", "consume").count == 0
-
-    with pytest.raises(ValueError, match="successor_offset must be non-negative"):
-        dependency_gaps([], "produce", "consume", successor_offset=-1)
-
-
-def test_link_dependency_flow_pairs_static_slots_with_pipeline_offset():
-    def trace_slice(name: str, event_idx: int, ts: float, tid: int) -> dict:
-        return {
-            "name": name,
-            "ph": "X",
-            "ts": ts,
-            "dur": 1.0,
-            "pid": 0,
-            "tid": tid,
-            "args": {"unit_id": 0, "event_idx": event_idx},
-        }
-
-    first_compute = trace_slice("compute", 3, 3.0, 1)
-    second_compute = trace_slice("compute", 7, 7.0, 1)
-    first_acquire = trace_slice("acquire", 0, 0.0, 0)
-    second_acquire = trace_slice("acquire", 4, 4.0, 0)
-    third_acquire = trace_slice("acquire", 8, 8.0, 0)
-    trace = {
-        "traceEvents": [
-            second_compute,
-            first_acquire,
-            third_acquire,
-            first_compute,
-            second_acquire,
-        ]
-    }
-
-    processed = link_dependency_flow(
-        "compute",
-        "acquire",
-        successor_offset=1,
-        flow_name="release_to_reacquire",
-    )(trace, None)
-
-    flows = [event for event in processed["traceEvents"] if event.get("cat") == "pipeline"]
-    assert [(event["ph"], event["id"], event["name"]) for event in flows] == [
-        ("s", 1, "release_to_reacquire"),
-        ("f", 1, "release_to_reacquire"),
-        ("s", 2, "release_to_reacquire"),
-        ("f", 2, "release_to_reacquire"),
-    ]
-    assert first_compute["args"]["unblocks"] == "acquire[1]"
-    assert second_acquire["args"]["depends_on"] == "compute[0]"
-    assert second_compute["args"]["unblocks"] == "acquire[2]"
-    assert third_acquire["args"]["depends_on"] == "compute[1]"
-
-
-def test_link_dependency_flow_rejects_negative_offset():
-    with pytest.raises(ValueError, match="successor_offset must be non-negative"):
-        link_dependency_flow("produce", "consume", successor_offset=-1)
-
-
-def test_decode_legacy_payload_records():
+def test_decode_full_records_with_payloads():
     """A tag word with PAYLOAD_FLAG carries a signed payload in its high half; one without
-    decodes as before (payload None)."""
+    decodes with payload None."""
     prof = allocate_profile_buffer(2, 2, device="cpu")
     buf = prof.tensor.view(2, prof.slice_size)
-    buf[0, 1:5] = torch.tensor([100, 5, 1, 3])  # plain record: tag 1, tid 3
+    buf[0, 1:5] = torch.tensor([100, 5, 1, 3])  # plain record: tag 1, warp 3
     word = 2 | PAYLOAD_FLAG | (-7 << 32)
     buf[1, 5:9] = torch.tensor([200, 6, word, 4])  # slot 1 of unit 1: tag 2, payload -7
-    events = decode_events(prof, TagTable(["a", "plain", "item"]))
-    assert [(e.unit_id, e.event_idx, e.tag_name, e.tid, e.payload) for e in events] == [
-        (0, 0, "plain", 3, None),
-        (1, 1, "item", 4, -7),
+    assert decode_ranges(prof, TagTable(["a", "plain", "item"])) == [
+        Range("plain", 100, 105, (0,), warp=3, slot=0),
+        Range("item", 200, 206, (1,), warp=4, slot=1, payload=-7),
     ]
 
 
@@ -217,46 +129,113 @@ def test_compact_decode_reconstructs_starts_around_the_anchor():
         max_events=2,
     )
 
-    events = decode_events(prof, TagTable(["early", "late"]))
-
-    assert [(e.unit_id, e.start_ns, e.dur_ns, e.tag_name) for e in events] == [
-        (0, anchor - 100, 20, "early"),
-        (0, anchor + 500, 5, "late"),
-        (1, wrapped_anchor + 80, 10, "late"),
+    assert decode_ranges(prof, TagTable(["early", "late"])) == [
+        Range("early", anchor - 100, anchor - 80, (0,), slot=0),
+        Range("late", anchor + 500, anchor + 505, (0,), slot=1),
+        Range("late", wrapped_anchor + 80, wrapped_anchor + 90, (1,), slot=0),
     ]
 
 
 def test_compact_decode_rejects_records_without_an_anchor():
     prof = compact_buffer([[1 << 40, compact_record(1, 2, 0)], [0, compact_record(1, 2, 0)]], 1)
     with pytest.raises(RuntimeError, match=r"units \[1\] hold 1 record\(s\) but no anchor"):
-        decode_events(prof, TagTable(["t"]))
+        decode_ranges(prof, TagTable(["t"]))
 
 
-def test_link_payload_flow_links_slices_across_units():
-    def trace_slice(name: str, payload: int | None, ts: float, pid: int) -> dict:
-        args = {"unit_id": pid} if payload is None else {"unit_id": pid, "payload": payload}
-        return {"name": name, "ph": "X", "ts": ts, "dur": 2.0, "pid": pid, "tid": 0, "args": args}
+def test_write_ranges_lays_out_processes_tracks_and_flows(tmp_path):
+    """One process per CTA in CTA order and one track per warp; crossing ranges on one warp
+    split into an overlap lane, nested ones stay on it, and a flow joins its two slices."""
+    producer = span("row", 0, 10, cta=0, warp=1, payload=7)
+    consumer = span("row", 20, 10, cta=1, warp=1, payload=8)
+    ranges = [
+        consumer,
+        producer,
+        span("inner", 2, 3, cta=0, warp=1),  # nested in the producer
+        span("crossing", 5, 10, cta=0, warp=1),  # crosses the producer's end
+        span("empty", 10, 0, cta=0, warp=1),  # empty, where the producer ends
+        span("other", 1, 1, cta=0, warp=0),
+    ]
 
-    producer = trace_slice("row", 10, 0.0, 0)
-    consumer = trace_slice("row", 11, 5.0, 1)
-    other = trace_slice("poll", 11, 4.0, 1)  # another tag with the same payload
-    plain = trace_slice("row", None, 1.0, 2)
-    trace = {"traceEvents": [producer, consumer, other, plain]}
+    path = write_ranges(
+        tmp_path / "ranges.json",
+        ranges,
+        name=lambda r: f"{r.name} {r.payload}" if r.payload is not None else r.name,
+        flows=[(producer, consumer)],
+    )
 
-    processed = link_payload_flow([(10, 11), (10, 99)], "row", flow_name="dep")(trace, None)
+    assert path.suffix == ".pftrace"
+    slices = {item.name: item for item in read_slices(path)}
+    assert {name: (s.process, s.track) for name, s in slices.items()} == {
+        "row 7": ("CTA 0", "warp 1"),
+        "row 8": ("CTA 1", "warp 1"),
+        "inner": ("CTA 0", "warp 1"),
+        "crossing": ("CTA 0", "warp 1 overlap"),
+        "empty": ("CTA 0", "warp 1"),
+        "other": ("CTA 0", "warp 0"),
+    }
+    assert (slices["row 7"].start_ns, slices["row 8"].end_ns) == (0, 30)
+    assert slices["row 7"].args["payload"] == 7
+    assert slices["row 7"].flows_out == slices["row 8"].flows_in != ()
 
-    flows = [event for event in processed["traceEvents"] if event.get("cat") == "pipeline"]
-    assert [(e["ph"], e["id"], e["pid"], e["ts"]) for e in flows] == [
-        ("s", 1, 0, 1.0),
-        ("f", 1, 1, 6.0),
-    ]  # (10, 99) has no target slice
-    assert producer["args"]["unblocks"] == "row[11]"
-    assert consumer["args"]["depends_on"] == "row[10]"
-    assert "depends_on" not in other["args"]
 
-    duplicate = {"traceEvents": [producer, dict(producer, args=dict(producer["args"]))]}
-    with pytest.raises(ValueError, match="payload 10"):
-        link_payload_flow([(10, 10)], "row")(duplicate, None)
+def warp_plan(iteration_name: str = "item") -> PipelinePlan:
+    """A producer warp and a consumer warp handing items over a two-slot ring."""
+    plan = PipelinePlan("ring", iteration_name=iteration_name)
+    plan.add_role(Role("prod", "Producer", 2, 3))
+    plan.add_role(Role("cons", "Consumer", 0, 2))
+    plan.add_resource(Resource("ring", "ring", 2))
+    plan.add_region(Region("prod", "prod", "prod", 0, 1))
+    plan.add_region(Region("cons", "cons", "cons", 0, 1))
+    plan.add_dependency(Dependency("prod", "cons", "ring"))
+    plan.add_dependency(Dependency("cons", "prod", "ring", distance=2, kind="reuse"))
+    return plan
+
+
+def test_join_uses_the_waits_traced_inside_a_region():
+    """Globaltimer-style ranges (one recording warp per role): the consumer's nested
+    ``ring.wait`` is its measured wait, other nested ranges are not waits, and a role without
+    traced waits keeps an inferred one."""
+    ranges = [
+        span("prod", 0, 100, warp=2),
+        span("prod", 100, 100, warp=2),
+        span("cons", 50, 150, warp=0),
+        span("ring.wait", 50, 60, warp=0),
+        span("store", 120, 10, warp=0),  # a user region, not a wait
+        span("cons", 200, 150, warp=0),
+        span("ring.wait", 200, 10, warp=0),
+        span("ring.wait", 220, 5, warp=0),
+        span("cons", 0, 10, cta=1, warp=0),  # another CTA
+    ]
+    timeline = warp_plan().schedule(iterations=2)
+
+    measured = join(ranges, timeline)
+
+    assert measured.cta == (0,)
+    waits = {(r.name, r.iteration): r.wait_ns for r in measured.regions}
+    assert waits == {("prod", 0): None, ("prod", 1): None, ("cons", 0): 60, ("cons", 1): 15}
+    blockers = {(b.name, b.iteration): b for b in analyze_pipeline(timeline, measured).blockers}
+    consumer = blockers[("cons", 0)]
+    assert (consumer.wait_source, consumer.wait_inside_ns, consumer.busy_ns) == (
+        "measured",
+        60,
+        90,
+    )
+    assert blockers[("prod", 1)].wait_source == "inferred"
+
+
+def test_join_treats_compact_ranges_as_one_recorder_per_role():
+    ranges = [
+        span(name, 100 * i + offset, 40)
+        for i in range(3)
+        for name, offset in [("prod", 0), ("cons", 50)]
+    ]
+    measured = join(ranges, warp_plan().schedule(iterations=3))
+    assert [(r.name, r.iteration, r.sample_count) for r in measured.regions][:2] == [
+        ("prod", 0, 1),
+        ("cons", 0, 1),
+    ]
+    with pytest.raises(ValueError, match="role 'cons' recorded 'cons' 3 times"):
+        join(ranges, warp_plan().schedule(iterations=2))
 
 
 PROFILER = Path(__file__).resolve().parents[1] / "transformer_nuggets" / "cute" / "profiler"

@@ -28,15 +28,10 @@ import torch
 import typer
 
 from transformer_nuggets.cute.profiler import (
-    Event,
-    PostProcessContext,
+    Range,
     profile_session,
     summarize_by_tag,
-)
-from transformer_nuggets.cute.profiler.postprocessors import (
-    compose,
-    rename_processes,
-    rename_threads,
+    write_ranges,
 )
 from transformer_nuggets.cute.sgemm import (
     SGEMM_PROFILE_EVENTS,
@@ -144,17 +139,27 @@ def main(
     producer_warp = cfg.num_threads // 32
     sampled_tiles = min(math.ceil(k / cfg.tile_k), SGEMM_PROFILE_TILES)
 
-    def group_roles(events: list[Event], _ctx: PostProcessContext) -> list[Event]:
-        for event in events:
-            event.pid = event.unit_id
-            event.tid = producer_warp if event.tag_id <= SgemmProfileTag.PRODUCER_ISSUE else 0
-            assert event.event_idx is not None
-            event.extra_args = {"k_tile": event.event_idx // len(SGEMM_PROFILE_TAGS)}
-            if event.tag_id == SgemmProfileTag.PRODUCER_ISSUE:
-                event.extra_args["meaning"] = "TMA enqueue, not copy completion"
-            if event.tag_id == SgemmProfileTag.CONSUMER_COMPUTE:
-                event.extra_args["meaning"] = "Stage release occurs before the final register FMAs"
-        return events
+    producer_tags = {
+        SGEMM_PROFILE_TAGS[tag]
+        for tag in (SgemmProfileTag.PRODUCER_ACQUIRE, SgemmProfileTag.PRODUCER_ISSUE)
+    }
+    meanings = {
+        SGEMM_PROFILE_TAGS[SgemmProfileTag.PRODUCER_ISSUE]: "TMA enqueue, not copy completion",
+        SGEMM_PROFILE_TAGS[SgemmProfileTag.CONSUMER_COMPUTE]: (
+            "Stage release occurs before the final register FMAs"
+        ),
+    }
+
+    def role_warp(item: Range) -> str:
+        if item.name in producer_tags:
+            return f"Producer warp {producer_warp}"
+        return "Consumer warp 0"
+
+    def tile_args(item: Range) -> dict:
+        args = {"k_tile": item.slot // len(SGEMM_PROFILE_TAGS)}
+        if item.name in meanings:
+            args["meaning"] = meanings[item.name]
+        return args
 
     print(f"GPU: {torch.cuda.get_device_name()}; seed=0; float32 uniform[-1,1]")
     print(f"M,N,K={m},{n},{k}; A={a_layout.value}; B={b_layout.value}; config={cfg.name}")
@@ -164,16 +169,8 @@ def main(
         max_events_per_unit=SGEMM_PROFILE_EVENTS,
         num_units=(1, "CTA"),
         tag_names=list(SGEMM_PROFILE_TAGS),
-        trace_path=str(trace_path),
         compact=True,
         expected_events_per_unit=len(SGEMM_PROFILE_TAGS) * sampled_tiles,
-        post_process_events=group_roles,
-        post_process_trace=compose(
-            rename_processes({0: "SGEMM CTA (0, 0)"}),
-            rename_threads(
-                {producer_warp: f"Producer warp {producer_warp}", 0: "Consumer warp 0"}
-            ),
-        ),
     ) as session:
         graphs = {}
         for enabled in (False, True):
@@ -209,6 +206,13 @@ def main(
         session.prof.reset()
         sgemm(a, b, output, cfg, profile_buffer=session.prof.tensor)
 
+    trace_path = write_ranges(
+        trace_path,
+        session.ranges,
+        process=lambda _: "SGEMM CTA (0, 0)",
+        thread=role_warp,
+        args=tile_args,
+    )
     check_output(output, reference, error_bound)
     print("FP64 checks passed for both specializations, poisoned graph replay, and trace launch")
     print(
@@ -225,8 +229,8 @@ def main(
         )
     ratio = medians[True] / medians[False]
     print(f"  profiled/unprofiled latency: {ratio:.3f}x ({100 * (ratio - 1):+.1f}% overhead)")
-    print(f"Sampled CTA (0, 0): {sampled_tiles} K tiles, {len(session.events)} compact events")
-    for name, summary in summarize_by_tag(session.events).items():
+    print(f"Sampled CTA (0, 0): {sampled_tiles} K tiles, {len(session.ranges)} compact events")
+    for name, summary in summarize_by_tag(session.ranges).items():
         print(f"  {name}: count={summary.count}, median={summary.p50_ns:.0f} ns")
     print("producer_issue = enqueue, NOT copy completion; compute end is NOT stage release.")
     print(
