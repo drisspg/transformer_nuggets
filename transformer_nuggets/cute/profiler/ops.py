@@ -15,6 +15,8 @@ This module imports only CuTeDSL: a kernel's compile key hashes the modules it i
 the host decoder and analysis stay out of it.
 """
 
+from contextlib import contextmanager
+
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64
@@ -193,22 +195,12 @@ def compact_event_stop(
 ) -> None:
     """Record one event in compact format to global memory; 1x ``STG.E.EF.64`` per event.
 
-    Pick this when total kernel slowdown matters most and you do not want to
-    plumb a smem ``MemRange`` through your ``SharedStorage``. Per-event STGs
-    overlap with surrounding compute, but each event pays full L2/HBM cost.
-    For the same workload, :func:`compact_event_stop_smem` records ~30-50 ns
-    less observer overhead per event (at the cost of an end-of-kernel flush).
-
-
-    Pair with :func:`read_globaltimer_lo32` for the start timestamp. The
-    packed record layout is::
-
-        bits  63..56  55..32     31..0
-              tag(8)  dur_ns(24) ts_lo32(32)
-
-    ``dur_ns`` wraps modulo 2^24 ns (~16.7 ms): a longer region decodes as its
-    duration modulo 2^24 — use full records (:func:`event_stop`)
-    for coarse outer regions if needed. ``tag`` is masked to 8 bits.
+    Pair with :func:`read_globaltimer_lo32` for the start timestamp. The packed record is
+    ``tag(8) | dur_ns(24) | ts_lo32(32)`` (bits 63..56, 55..32, 31..0). ``dur_ns`` wraps
+    modulo 2^24 ns (~16.7 ms), so record coarse outer regions with :func:`event_stop`;
+    ``tag`` is masked to 8 bits. Each event pays a global store; for the same workload,
+    :func:`compact_event_stop_smem` records ~30-50 ns less observer overhead per event at the
+    cost of an end-of-kernel flush.
 
     Only lane 0 of the calling warp performs the store, and only for
     ``0 <= event_idx < max_events_per_unit``: an out-of-range slot is dropped
@@ -226,23 +218,6 @@ def compact_event_stop(
 
 
 @cute.jit
-def compact_anchor_init_smem(smem_buf: cute.Tensor) -> None:
-    """Write a 64-bit globaltimer anchor to slot 0 of a per-CTA smem profile buffer.
-
-    Companion to :func:`compact_event_stop_smem`. ``smem_buf`` is expected to
-    be the int64 tensor view of the caller's per-CTA smem ``MemRange``; the
-    slot 0 anchor lets the host decoder reconstruct full 64-bit timestamps
-    after :func:`compact_flush_smem_to_gmem` copies the slice out to global.
-    Call once at the top of ``@cute.kernel`` before any nested control flow.
-    Only lane 0 of warp 0 performs the write.
-    """
-    warp_idx = cute.arch.warp_idx()
-    lane_idx = cute.arch.lane_idx()
-    if warp_idx == 0 and lane_idx == 0:
-        smem_buf[0] = read_globaltimer()
-
-
-@cute.jit
 def compact_event_stop_smem(
     smem_buf: cute.Tensor,
     event_idx: Int32,
@@ -252,26 +227,15 @@ def compact_event_stop_smem(
 ) -> None:
     """Record one event into per-CTA smem; 1x ``STS.64`` per event, lowest observer cost.
 
-    Pick this when the recorded timestamps will drive optimization decisions:
-    the per-event hot-path cost is the smallest of any format (one shared-mem
-    store, no global address math), so recorded ``dur_ns`` for inner regions
-    is ~30-50 ns smaller than :func:`compact_event_stop` for the same logical
-    work. The cost is paid once at kernel exit via
-    :func:`compact_flush_smem_to_gmem`, which doesn't pollute the timestamps.
-
-
-    Same packed layout as :func:`compact_event_stop` (``tag | dur24 | ts32``)
-    but writes to shared memory instead of global. Pair with
-    :func:`read_globaltimer_lo32` for the start timestamp and call
-    :func:`compact_flush_smem_to_gmem` once at kernel exit to copy the slice
-    out to global memory.
+    Same packed record as :func:`compact_event_stop`, stored to shared memory: no global
+    address math, so recorded ``dur_ns`` for inner regions is ~30-50 ns smaller for the same
+    work. Pair with :func:`read_globaltimer_lo32` for the start timestamp and call
+    :func:`compact_flush_smem_to_gmem` once at kernel exit, a cost the timestamps do not see.
 
     Only lane 0 of the calling warp performs the store, and only for
     ``0 <= event_idx < max_events_per_unit`` (the slice holds ``1 + max_events_per_unit``
     words): an out-of-range slot is dropped rather than written over the kernel's
-    neighboring shared memory. The caller is responsible for any outer warp
-    guard. The hot path is a single ``STS`` plus the timer read and bit-pack —
-    no global address arithmetic.
+    neighboring shared memory. The caller is responsible for any outer warp guard.
     """
     lane_idx = cute.arch.lane_idx()
     end_ts32 = read_globaltimer_lo32()
@@ -298,7 +262,10 @@ def compact_prepare_smem(
             smem_buf[i] = Int64(0)
             i = i + bdim
         cute.arch.barrier()
-        compact_anchor_init_smem(smem_buf)
+        warp_idx = cute.arch.warp_idx()
+        lane_idx = cute.arch.lane_idx()
+        if warp_idx == 0 and lane_idx == 0:
+            smem_buf[0] = read_globaltimer()
         cute.arch.barrier()
 
 
@@ -312,14 +279,11 @@ def compact_flush_smem_to_gmem(
 ) -> None:
     """Cooperative copy: smem profile slice -> per-unit slice in the gmem buffer.
 
-    Must be called once at kernel end, AFTER all events for this CTA have
-    been recorded via :func:`compact_event_stop_smem`. Issues a CTA-wide
-    ``__syncthreads`` first so pending event STS writes are visible to all
-    threads before the cooperative copy, then every thread copies a strided
-    subset of the ``1 + max_events_per_unit`` slots out to its position in
-    the global buffer (same layout as gmem-only compact mode). ``record``: the CTA-uniform
-    predicate passed to :func:`compact_prepare_smem`; a CTA that does not record flushes
-    nothing.
+    Call once at kernel end, after this CTA's last :func:`compact_event_stop_smem`. A CTA-wide
+    barrier makes the recorded slots visible, then every thread copies a strided subset of the
+    ``1 + max_events_per_unit`` slots to the unit's slice (the gmem compact layout).
+    ``record``: the CTA-uniform predicate passed to :func:`compact_prepare_smem`; a CTA that
+    does not record flushes nothing.
     """
     if record:
         cute.arch.barrier()
@@ -335,16 +299,6 @@ def compact_flush_smem_to_gmem(
             i = i + bdim
 
 
-class _NoOpProfileRegion:
-    """No-op context used when profiling is disabled."""
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        return False
-
-
 @cute.jit
 def compact_warp_start(target_warp: Int32, record=True) -> Int32:
     """Read a compact start timestamp from lane 0 of one warp."""
@@ -356,23 +310,7 @@ def compact_warp_start(target_warp: Int32, record=True) -> Int32:
 
 
 @cute.jit
-def compact_warp_stop_smem(
-    buf: cute.Tensor,
-    event_idx: Int32,
-    start_ts32: Int32,
-    tag: Int32,
-    max_events_per_unit: Int32,
-    target_warp: Int32,
-    record=True,
-) -> None:
-    """Close a compact shared-memory region from lane 0 of one warp."""
-    if record:
-        if cute.arch.warp_idx() == target_warp and cute.arch.lane_idx() == 0:
-            compact_event_stop_smem(buf, event_idx, start_ts32, tag, max_events_per_unit)
-
-
-@cute.jit
-def compact_warp_stop_gmem(
+def compact_warp_stop(
     buf: cute.Tensor,
     unit_id: Int32,
     event_idx: Int32,
@@ -381,72 +319,18 @@ def compact_warp_stop_gmem(
     max_events_per_unit: Int32,
     target_warp: Int32,
     record=True,
+    smem=False,
 ) -> None:
-    """Close a compact global-memory region from lane 0 of one warp."""
+    """Close a compact region from lane 0 of one warp, in shared (``smem``) or global memory."""
     if record:
         if cute.arch.warp_idx() == target_warp and cute.arch.lane_idx() == 0:
-            compact_event_stop(
-                buf,
-                unit_id,
-                event_idx,
-                start_ts32,
-                tag,
-                max_events_per_unit,
-            )
+            if cutlass.const_expr(smem):
+                compact_event_stop_smem(buf, event_idx, start_ts32, tag, max_events_per_unit)
+            else:
+                compact_event_stop(buf, unit_id, event_idx, start_ts32, tag, max_events_per_unit)
 
 
-class _CompactProfileRegionContext:
-    """DSL context manager for statically indexed compact profile records."""
-
-    def __init__(
-        self,
-        buf,
-        max_events_per_unit,
-        tag,
-        unit_id,
-        target_warp,
-        event_idx,
-        record,
-        smem,
-    ):
-        self._buf = buf
-        self._max_events_per_unit = max_events_per_unit
-        self._tag = tag
-        self._unit_id = unit_id
-        self._target_warp = target_warp
-        self._event_idx = event_idx
-        self._record = record
-        self._smem = smem
-
-    def __enter__(self):
-        self._start_ts32 = compact_warp_start(self._target_warp, self._record)
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        if cutlass.const_expr(self._smem):
-            compact_warp_stop_smem(
-                self._buf,
-                self._event_idx,
-                self._start_ts32,
-                self._tag,
-                self._max_events_per_unit,
-                self._target_warp,
-                self._record,
-            )
-        else:
-            compact_warp_stop_gmem(
-                self._buf,
-                self._unit_id,
-                self._event_idx,
-                self._start_ts32,
-                self._tag,
-                self._max_events_per_unit,
-                self._target_warp,
-                self._record,
-            )
-        return False
-
-
+@contextmanager
 def compact_profile_region(
     buf,
     max_events_per_unit,
@@ -469,16 +353,20 @@ def compact_profile_region(
         record: Runtime predicate selecting whether this unit records the region.
     """
     if not cutlass.const_expr(enabled):
-        return _NoOpProfileRegion()
+        yield
+        return
     if target_warp is None:
         target_warp = Int32(0)
-    return _CompactProfileRegionContext(
+    start_ts32 = compact_warp_start(target_warp, record)
+    yield
+    compact_warp_stop(
         buf,
-        max_events_per_unit,
-        tag,
         unit_id,
-        target_warp,
         event_idx,
+        start_ts32,
+        tag,
+        max_events_per_unit,
+        target_warp,
         record,
         smem,
     )
