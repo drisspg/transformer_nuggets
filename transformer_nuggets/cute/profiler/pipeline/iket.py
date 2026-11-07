@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import statistics
@@ -34,24 +34,6 @@ class MeasuredCapture:
     origin_ns: int
     duration_ns: int
     regions: tuple[MeasuredRegion, ...]
-
-    def to_dict(self) -> dict[str, object]:
-        """Return a browser-friendly normalized capture."""
-        return {
-            "source": self.source,
-            "kernel_name": self.kernel_name,
-            "cta": list(self.cta),
-            "origin_ns": self.origin_ns,
-            "duration_ns": self.duration_ns,
-            "regions": [
-                {
-                    **asdict(region),
-                    "start_ns": region.start_ns - self.origin_ns,
-                    "end_ns": region.end_ns - self.origin_ns,
-                }
-                for region in self.regions
-            ],
-        }
 
 
 def load_iket_capture(

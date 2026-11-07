@@ -9,10 +9,7 @@ from transformer_nuggets.cute.profiler.pipeline.plan import (
     Resource,
     Role,
 )
-from transformer_nuggets.cute.warpdrive.channels import Tma, Umma
 from transformer_nuggets.cute.warpdrive.describe import is_pair, rank_label
-
-ROLE_COLORS = ("#4f9cf9", "#5bc8a5", "#ef6a8a", "#c88bf2", "#f0b35b", "#63c7da", "#a0a0a0")
 
 
 def plan_from_warpdrive(kernel, *, cta: int = 0, name: str | None = None) -> PipelinePlan:
@@ -44,28 +41,16 @@ def plan_from_warpdrive(kernel, *, cta: int = 0, name: str | None = None) -> Pip
         iteration_name="work item" if kernel._ws_streams else "launch",
     )
     where = f" ({rank_label(cta, is_pair(cluster))})" if cluster.size > 1 else ""
-    for i, r in enumerate(roles):
-        plan.add_role(
-            Role(
-                r.name,
-                f"{r.name}{where}",
-                r.first_warp,
-                r.first_warp + r.num_warps,
-                ROLE_COLORS[i % len(ROLE_COLORS)],
-            )
-        )
-        plan.add_region(
-            Region(r.name, r.name, r.name, 0, 1, f"warps {r.first_warp}-{r.warps.stop - 1}")
-        )
+    for r in roles:
+        plan.add_role(Role(r.name, f"{r.name}{where}", r.first_warp, r.first_warp + r.num_warps))
+        plan.add_region(Region(r.name, r.name, r.name, 0, 1))
     channels = {}
     for cname, ch in kernel._ws_chans.items():
         producers = [p.name for p, _ in ch.producers if p.name in in_cta]
         consumers = [c.name for c, _ in ch.consumers if c.name in in_cta]
         if any(p != c for p in producers for c in consumers):
             channels[cname] = (ch, producers, consumers)
-            plan.add_resource(
-                Resource(cname, cname, ch.n, _storage(ch), f"{type(ch).__name__}({ch.n}) {cname}")
-            )
+            plan.add_resource(Resource(cname, cname, ch.n))
     downstream: dict[str, set[str]] = {r: set() for r in in_cta}
     for cname, (_, producers, consumers) in channels.items():
         for prod in producers:
@@ -103,15 +88,6 @@ def plan_from_warpdrive(kernel, *, cta: int = 0, name: str | None = None) -> Pip
 def _kernel_name(kernel) -> str:
     get_name = getattr(kernel, "get_name", None)
     return get_name() if callable(get_name) else type(kernel).__name__
-
-
-def _storage(ch) -> str:
-    # Payloads and TMA-filled or MMA-read operand stages use SMEM.
-    if ch.payload is not None or isinstance(ch.producer, Tma) or ch.consumer is Umma:
-        return "SMEM"
-    if ch.producer is Umma:
-        return "TMEM"
-    return "barrier"
 
 
 def _reaches(edges: dict, src: str, dst: str) -> bool:

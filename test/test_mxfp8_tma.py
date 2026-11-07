@@ -20,7 +20,6 @@ try:
     )
     from transformer_nuggets.cute.mxfp8_tma import Mxfp8TmaGemv, app
     from transformer_nuggets.cute.profiler import profile_session
-    from transformer_nuggets.cute.profiler.host import decode_events
 except ImportError:
     pytest.skip("CuTe DSL not available", allow_module_level=True)
 
@@ -325,20 +324,20 @@ def test_mxfp8_tma_gemv_profiles_labeled_regions(grid_scheduler, num_persistent_
         tag_names=list(MXFP8_TMA_PROFILE_TAGS),
         device=q_input.device,
         compact=True,
-    ) as (prof, tags):
+    ) as session:
         actual = op.interface(
             q_input,
             weight,
             input_scale,
             weight_scale,
-            profile_buffer=prof.tensor,
+            profile_buffer=session.prof.tensor,
         )
 
     expected = (
         dequantize_mxfp8(q_input, input_scale) @ dequantize_mxfp8(weight, weight_scale).T
     ).bfloat16()
     torch.testing.assert_close(actual, expected, atol=1.0, rtol=0.05)
-    events = decode_events(prof, tags)
+    events = session.events
     assert len(events) == op.num_profile_units * op.profile_events_per_cta
     assert {event.tag_name for event in events} == set(MXFP8_TMA_PROFILE_TAGS) - {
         "input_scale_acquire",

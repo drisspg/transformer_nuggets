@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 import statistics
 from collections.abc import Mapping
 
@@ -145,17 +145,6 @@ class PipelineAnalysis:
         for candidate in self.depth_counterfactuals:
             summary[f"depth_plus_one.{candidate.resource}.saved_ns"] = candidate.saved
         return summary
-
-    def to_dict(self) -> dict[str, object]:
-        """Return a JSON-serializable report."""
-        return {
-            "logical_critical_path": critical_path_dict(self.logical_critical_path),
-            "measured_critical_path": critical_path_dict(self.measured_critical_path),
-            "blockers": [asdict(item) for item in self.blockers],
-            "rings": [asdict(item) for item in self.rings],
-            "depth_counterfactuals": [asdict(item) for item in self.depth_counterfactuals],
-            "logical_critical_cycle": asdict(self.logical_critical_cycle),
-        }
 
 
 def analyze_pipeline(
@@ -588,19 +577,6 @@ def critical_cycle(
 def unique_edges(edges: list[ConcreteEdge]) -> list[ConcreteEdge]:
     """Deduplicate exact concrete edges while preserving order."""
     return list(dict.fromkeys(edges))
-
-
-def critical_path_dict(result: CriticalPath) -> dict[str, object]:
-    """Serialize a critical-path result with string node keys."""
-    return {
-        "makespan": result.makespan,
-        "path": [format_node(node) for node in result.path],
-        "earliest_start": {
-            format_node(node): value for node, value in result.earliest_start.items()
-        },
-        "latest_start": {format_node(node): value for node, value in result.latest_start.items()},
-        "slack": {format_node(node): value for node, value in result.slack.items()},
-    }
 
 
 def format_node(node: NodeKey | None) -> str:

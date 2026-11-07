@@ -62,10 +62,6 @@ from transformer_nuggets.cute.profiler.ops import (
 
 from transformer_nuggets.cute.profiler.postprocessors import (
     group_by_unit,
-    group_by_tag,
-    strip_tid_suffix,
-    prefix_tag_with_unit,
-    filter_by_tag,
     compose,
     rename_processes,
     rename_threads,
@@ -104,10 +100,6 @@ __all__ = [
     "compact_profile_region",
     # Post-processors
     "group_by_unit",
-    "group_by_tag",
-    "strip_tid_suffix",
-    "prefix_tag_with_unit",
-    "filter_by_tag",
     "compose",
     "rename_processes",
     "rename_threads",

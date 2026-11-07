@@ -2,13 +2,12 @@
 
 Quick start:
     from transformer_nuggets.cute.profiler.postprocessors import group_by_unit
-    with profile_session(..., post_process_events=group_by_unit) as (prof, tags):
+    with profile_session(..., post_process_events=group_by_unit) as session:
         ...
 """
 
 from __future__ import annotations
 
-import re
 from collections.abc import Iterable
 
 from transformer_nuggets.cute.profiler.host import Event, PostProcessContext
@@ -16,10 +15,6 @@ from transformer_nuggets.cute.profiler.host import Event, PostProcessContext
 
 __all__ = [
     "group_by_unit",
-    "group_by_tag",
-    "strip_tid_suffix",
-    "prefix_tag_with_unit",
-    "filter_by_tag",
     "compose",
     "rename_processes",
     "rename_threads",
@@ -61,116 +56,6 @@ def group_by_unit(events: list[Event], ctx: PostProcessContext) -> list[Event]:
     return events
 
 
-def strip_tid_suffix(events: list[Event], ctx: PostProcessContext) -> list[Event]:
-    """Strip trailing tid numbers from tag names to avoid Perfetto duplication.
-
-    Perfetto displays threads as "{thread_name} {tid}". If your tag names already
-    contain the tid (e.g., "warp_0", "consumer_1"), this results in redundant
-    display like "warp_0 0".
-
-    This post-processor strips trailing "_N" or "N" suffixes that match the tid:
-    - "consumer_warp1" with tid=1 → "consumer_warp"
-    - "warp_0" with tid=0 → "warp"
-    - "compute" with tid=2 → "compute" (unchanged)
-
-    Use after group_by_unit:
-        post_process_events=compose(group_by_unit, strip_tid_suffix)
-
-    Args:
-        events: List of decoded events.
-        ctx: Post-processing context.
-
-    Returns:
-        Events with cleaned tag_names.
-    """
-    for e in events:
-        tid_str = str(e.tid)
-        for pattern in (rf"_0*{tid_str}$", rf"(?<=[a-zA-Z])0*{tid_str}$"):
-            new_name = re.sub(pattern, "", e.tag_name)
-            if new_name != e.tag_name:
-                e.tag_name = new_name
-                break
-    return events
-
-
-def group_by_tag(events: list[Event], ctx: PostProcessContext) -> list[Event]:
-    """Group events by tag: each tag becomes a Perfetto process with unit-based threads.
-
-    Inverse of group_by_unit. Useful when you want to compare the same operation
-    across different units (e.g., see all "compute" events together).
-
-    Perfetto will render:
-        compute (process)
-          ├─ Block 0 (thread)
-          ├─ Block 1 (thread)
-        store (process)
-          ├─ Block 0 (thread)
-          ├─ Block 1 (thread)
-
-    Args:
-        events: List of decoded events.
-        ctx: Post-processing context.
-
-    Returns:
-        Modified events with pid/tid swapped for tag-based grouping.
-    """
-    for e in events:
-        e.pid = e.tag_id
-        e.tid = e.unit_id
-    return events
-
-
-def prefix_tag_with_unit(events: list[Event], ctx: PostProcessContext) -> list[Event]:
-    """Prefix each event's tag_name with its unit_id.
-
-    Transforms: "compute" → "Block 0: compute"
-
-    Useful when viewing all events in a single flat list but wanting
-    to distinguish which unit each event came from.
-
-    Args:
-        events: List of decoded events.
-        ctx: Post-processing context with unit_name.
-
-    Returns:
-        Events with modified tag_names.
-    """
-    for e in events:
-        e.tag_name = f"{ctx.unit_name} {e.unit_id}: {e.tag_name}"
-    return events
-
-
-def filter_by_tag(
-    tag_names: list[str] | None = None,
-    tag_ids: list[int] | None = None,
-):
-    """Create a post-processor that filters events to only specified tags.
-
-    Use this factory to create a filtering post-processor:
-
-        with profile_session(
-            ...,
-            post_process_events=filter_by_tag(tag_names=["compute"]),
-        ) as (prof, tags):
-            ...
-
-    Args:
-        tag_names: List of tag names to keep. If None, uses tag_ids.
-        tag_ids: List of tag IDs to keep. If None, uses tag_names.
-
-    Returns:
-        A post-processor function that filters events.
-    """
-
-    def _filter(events: list[Event], ctx: PostProcessContext) -> list[Event]:
-        keep_ids = set(tag_ids or ())
-        if tag_names is not None:
-            keep_ids.update(ctx.tag_table.id(name) for name in tag_names)
-        return [e for e in events if e.tag_id in keep_ids]
-
-    return _filter
-
-
 def compose(*processors):
     """Compose multiple post-processors into one.
 
@@ -180,11 +65,8 @@ def compose(*processors):
     Example:
         with profile_session(
             ...,
-            post_process_events=compose(
-                filter_by_tag(tag_names=["compute", "store"]),
-                group_by_unit,
-            ),
-        ) as (prof, tags):
+            post_process_events=compose(group_by_unit, add_warp_args),
+        ) as session:
             ...
 
     Args:
@@ -212,7 +94,7 @@ def rename_processes(name_map: dict[int, str]):
             ...,
             post_process_events=group_by_unit,
             post_process_trace=rename_processes({0: "Producer CTA", 1: "Consumer CTA"}),
-        ) as (prof, tags):
+        ) as session:
             ...
 
     Args:
@@ -403,14 +285,14 @@ def rename_threads(name_map: dict[tuple[int, int] | int, str]):
         with profile_session(
             ...,
             post_process_trace=rename_threads({(0, 0): "Main Warp", (0, 1): "Helper Warp"}),
-        ) as (prof, tags):
+        ) as session:
             ...
 
         # Or just by tid (applies to all pids)
         with profile_session(
             ...,
             post_process_trace=rename_threads({0: "Warp 0", 1: "Warp 1"}),
-        ) as (prof, tags):
+        ) as session:
             ...
 
     Args:

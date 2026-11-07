@@ -36,25 +36,24 @@ from transformer_nuggets.utils.merge_traces import merge_traces
 ANNOTATED_SOURCE = """
 PIPELINE = PipelineAnnotations("demo", iteration_name="chunk")
 PIPELINE.resource(
-    "x", label="X ring", depth=1, storage="SMEM", description="staged value"
+    "x", label="X ring", depth=1
 )
 PIPELINE.resource(
-    "state", label="State", depth=1, storage="registers",
-    description="recurrent state", kind="state"
+    "state", label="State", depth=1, kind="state"
 )
 
 class Kernel:
-    @PIPELINE.role("load", label="Load", warp_start=0, warp_end=1, color="#00f")
+    @PIPELINE.role("load", label="Load", warp_start=0, warp_end=1)
     def run_load(self):
         PIPELINE.region(
-            "load.x", label="Load X", weight=1, description="load", produces=("x",)
+            "load.x", label="Load X", weight=1, produces=("x",)
         )
         PIPELINE.iteration_end()
 
-    @PIPELINE.role("compute", label="Compute", warp_start=1, warp_end=2, color="#0f0")
+    @PIPELINE.role("compute", label="Compute", warp_start=1, warp_end=2)
     def run_compute(self):
         PIPELINE.region(
-            "compute.x", label="Consume X", weight=3, description="compute",
+            "compute.x", label="Consume X", weight=3,
             consumes=("x", "state"), produces=("state@1",), releases=("x",)
         )
         PIPELINE.iteration_end()
@@ -64,11 +63,11 @@ class Kernel:
 def toy_plan() -> PipelinePlan:
     """Build a two-role depth-one recurrent pipeline with a known cycle ratio."""
     plan = PipelinePlan("toy", iteration_name="chunk")
-    plan.add_role(Role("load", "Load", 0, 1, "#00f"))
-    plan.add_role(Role("compute", "Compute", 1, 2, "#0f0"))
-    plan.add_resource(Resource("x", "X ring", 1, "SMEM", "staged value"))
-    plan.add_region(Region("load.x", "load", "Load X", 0, 1, "load"))
-    plan.add_region(Region("compute.x", "compute", "Consume X", 0, 3, "compute"))
+    plan.add_role(Role("load", "Load", 0, 1))
+    plan.add_role(Role("compute", "Compute", 1, 2))
+    plan.add_resource(Resource("x", "X ring", 1))
+    plan.add_region(Region("load.x", "load", "Load X", 0, 1))
+    plan.add_region(Region("compute.x", "compute", "Consume X", 0, 3))
     plan.add_dependency(Dependency("load.x", "compute.x", "x"))
     plan.add_dependency(Dependency("compute.x", "load.x", "x", distance=1, kind="reuse"))
     return plan
@@ -116,24 +115,22 @@ def test_annotations_extract_data_state_and_reuse(tmp_path: Path) -> None:
 def test_runtime_annotations_are_noops_until_iket_is_enabled() -> None:
     annotations = PipelineAnnotations("test", iteration_name="tile")
 
-    @annotations.role("load", label="Load", warp_start=0, warp_end=1, color="#fff")
+    @annotations.role("load", label="Load", warp_start=0, warp_end=1)
     def body(value: int) -> int:
-        annotations.region("work", label="Work", weight=1, description="work")
+        annotations.region("work", label="Work", weight=1)
         return value + 1
 
     assert body(2) == 3
-    assert (
-        annotations.resource("x", label="X", depth=1, storage="SMEM", description="value") is None
-    )
+    assert annotations.resource("x", label="X", depth=1) is None
 
 
 def test_scheduler_rejects_same_iteration_cycle() -> None:
     plan = PipelinePlan("cycle", iteration_name="tile")
-    plan.add_role(Role("a", "A", 0, 1, "#fff"))
-    plan.add_role(Role("b", "B", 1, 2, "#fff"))
-    plan.add_resource(Resource("x", "X", 1, "register", "value"))
-    plan.add_region(Region("a.work", "a", "A", 0, 1, "work"))
-    plan.add_region(Region("b.work", "b", "B", 0, 1, "work"))
+    plan.add_role(Role("a", "A", 0, 1))
+    plan.add_role(Role("b", "B", 1, 2))
+    plan.add_resource(Resource("x", "X", 1))
+    plan.add_region(Region("a.work", "a", "A", 0, 1))
+    plan.add_region(Region("b.work", "b", "B", 0, 1))
     plan.add_dependency(Dependency("a.work", "b.work", "x"))
     plan.add_dependency(Dependency("b.work", "a.work", "x"))
 
@@ -143,11 +140,11 @@ def test_scheduler_rejects_same_iteration_cycle() -> None:
 
 def test_semantic_edges_survive_role_edge_deduplication() -> None:
     plan = PipelinePlan("same-role", iteration_name="tile")
-    plan.add_role(Role("role", "Role", 0, 1, "#fff"))
-    plan.add_resource(Resource("x", "X", 1, "SMEM", "x"))
-    plan.add_resource(Resource("y", "Y", 1, "SMEM", "y"))
-    plan.add_region(Region("a", "role", "A", 0, 1, "a"))
-    plan.add_region(Region("b", "role", "B", 1, 1, "b"))
+    plan.add_role(Role("role", "Role", 0, 1))
+    plan.add_resource(Resource("x", "X", 1))
+    plan.add_resource(Resource("y", "Y", 1))
+    plan.add_region(Region("a", "role", "A", 0, 1))
+    plan.add_region(Region("b", "role", "B", 1, 1))
     plan.add_dependency(Dependency("a", "b", "x"))
     plan.add_dependency(Dependency("a", "b", "y"))
 
@@ -222,8 +219,8 @@ def write_iket(path: Path, ranges: list[tuple[str, int, int, int]]) -> Path:
 def two_warp_plan() -> PipelinePlan:
     """One region on a two-warp role."""
     plan = PipelinePlan("two-warp", iteration_name="tile")
-    plan.add_role(Role("role", "Role", 0, 2, "#fff"))
-    plan.add_region(Region("work", "role", "Work", 0, 1, "work"))
+    plan.add_role(Role("role", "Role", 0, 2))
+    plan.add_region(Region("work", "role", "Work", 0, 1))
     return plan
 
 
@@ -331,9 +328,9 @@ def fanout_plan(first: str) -> PipelinePlan:
     """``load`` fills one slot of ``x`` that ``fast`` and ``slow`` both read and release."""
     plan = PipelinePlan("fanout", iteration_name="tile")
     for warp, name in enumerate(("load", "fast", "slow")):
-        plan.add_role(Role(name, name, warp, warp + 1, "#fff"))
-        plan.add_region(Region(name, name, name, 0, 1, name))
-    plan.add_resource(Resource("x", "X", 1, "SMEM", "x"))
+        plan.add_role(Role(name, name, warp, warp + 1))
+        plan.add_region(Region(name, name, name, 0, 1))
+    plan.add_resource(Resource("x", "X", 1))
     consumers = ("fast", "slow") if first == "fast" else ("slow", "fast")
     for consumer in consumers:
         plan.add_dependency(Dependency("load", consumer, "x"))
@@ -374,9 +371,9 @@ def test_perfetto_splits_crossing_role_envelopes_and_normalizes_suffix(
     tmp_path: Path,
 ) -> None:
     plan = PipelinePlan("crossing", iteration_name="tile")
-    plan.add_role(Role("role", "Role", 0, 1, "#fff"))
-    plan.add_region(Region("a", "role", "A", 0, 1, "a"))
-    plan.add_region(Region("b", "role", "B", 1, 1, "b"))
+    plan.add_role(Role("role", "Role", 0, 1))
+    plan.add_region(Region("a", "role", "A", 0, 1))
+    plan.add_region(Region("b", "role", "B", 1, 1))
     timeline = plan.schedule(iterations=1)
     measured = MeasuredCapture(
         "measured",
@@ -414,9 +411,9 @@ def test_perfetto_splits_crossing_role_envelopes_and_normalizes_suffix(
 def test_perfetto_zero_duration_slice_begins_before_it_ends(tmp_path: Path) -> None:
     """An empty region at the time the next one starts on its lane opens and closes before it."""
     plan = PipelinePlan("empty", iteration_name="tile")
-    plan.add_role(Role("role", "Role", 0, 1, "#fff"))
-    plan.add_region(Region("a", "role", "A", 0, 1, "a"))
-    plan.add_region(Region("b", "role", "B", 1, 1, "b"))
+    plan.add_role(Role("role", "Role", 0, 1))
+    plan.add_region(Region("a", "role", "A", 0, 1))
+    plan.add_region(Region("b", "role", "B", 1, 1))
     timeline = plan.schedule(iterations=1)
     regions = (
         MeasuredRegion("a", "role", 0, 5, 5, 0.0, 1),
@@ -442,28 +439,28 @@ def test_perfetto_zero_duration_slice_begins_before_it_ends(tmp_path: Path) -> N
 
 INDEXED_SOURCE = """
 PIPELINE = PipelineAnnotations("indexed", iteration_name="chunk")
-PIPELINE.resource("x_0", label="X hi", depth=1, storage="SMEM", description="hi half")
-PIPELINE.resource("x_1", label="X lo", depth=1, storage="SMEM", description="lo half")
-PIPELINE.resource("acc", label="Acc", depth=1, storage="TMEM", description="accumulator")
+PIPELINE.resource("x_0", label="X hi", depth=1)
+PIPELINE.resource("x_1", label="X lo", depth=1)
+PIPELINE.resource("acc", label="Acc", depth=1)
 
 class Kernel:
-    @PIPELINE.role("state", label="State", warp_start=0, warp_end=4, color="#f80")
+    @PIPELINE.role("state", label="State", warp_start=0, warp_end=4)
     def run_state(self):
         PIPELINE.region(
-            "state.split", label="Split", weight=2, description="store halves",
+            "state.split", label="Split", weight=2,
             produces=("x_0", "x_1"),
         )
         PIPELINE.region(
-            "state.wait", label="Wait", weight=1, description="wait acc",
+            "state.wait", label="Wait", weight=1,
             consumes=("acc",), releases=("acc",),
         )
         PIPELINE.iteration_end()
 
-    @PIPELINE.role("mma", label="MMA", warp_start=4, warp_end=5, color="#08f")
+    @PIPELINE.role("mma", label="MMA", warp_start=4, warp_end=5)
     def run_mma(self):
         for split in cutlass.range_constexpr(2):
             PIPELINE.region(
-                "mma.pass", label="Pass", weight=2, description="one half",
+                "mma.pass", label="Pass", weight=2,
                 consumes=("x_{index}",), releases=("x_{index}",), produces=("acc",),
                 count=2, index=split,
             )
@@ -508,9 +505,9 @@ def test_runtime_indexed_region_names_and_rejects_dynamic_index(
     fake_iket = SimpleNamespace(range_push=pushed.append, range_pop=lambda: None)
     monkeypatch.setattr(pipeline_annotations, "iket", fake_iket)
 
-    @annotations.role("mma", label="MMA", warp_start=0, warp_end=1, color="#fff")
+    @annotations.role("mma", label="MMA", warp_start=0, warp_end=1)
     def body(index) -> None:
-        annotations.region("pass", label="Pass", weight=1, description="p", count=2, index=index)
+        annotations.region("pass", label="Pass", weight=1, count=2, index=index)
         annotations.iteration_end()
 
     body(1)

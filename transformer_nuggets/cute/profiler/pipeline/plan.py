@@ -9,7 +9,7 @@ logical weights; measured timestamps can replace them later.
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Literal
 
 DependencyKind = Literal["data", "state", "reuse"]
@@ -32,7 +32,6 @@ class Role:
     label: str
     warp_start: int
     warp_end: int
-    color: str
     source: SourceLocation | None = None
 
 
@@ -43,8 +42,6 @@ class Resource:
     name: str
     label: str
     depth: int
-    storage: str
-    description: str
     kind: str = "buffer"
 
 
@@ -57,7 +54,6 @@ class Region:
     label: str
     order: int
     weight: int
-    description: str
     source: SourceLocation | None = None
 
 
@@ -114,34 +110,6 @@ class Timeline:
     dependencies: tuple[ScheduledDependency, ...]
     plan_dependencies: tuple[Dependency, ...]
     logical_duration: int
-
-    def to_dict(self) -> dict[str, object]:
-        """Return a JSON-serializable timeline description."""
-        return {
-            "plan_name": self.plan_name,
-            "iteration_name": self.iteration_name,
-            "iterations": self.iterations,
-            "logical_duration": self.logical_duration,
-            "roles": [asdict(role) for role in self.roles],
-            "resources": [asdict(resource) for resource in self.resources],
-            "regions": [
-                {
-                    **asdict(item.region),
-                    "iteration": item.iteration,
-                    "start": item.start,
-                    "end": item.end,
-                }
-                for item in self.regions
-            ],
-            "dependencies": [
-                {
-                    **asdict(item.dependency),
-                    "source_iteration": item.source_iteration,
-                    "target_iteration": item.target_iteration,
-                }
-                for item in self.dependencies
-            ],
-        }
 
 
 class PipelinePlan:

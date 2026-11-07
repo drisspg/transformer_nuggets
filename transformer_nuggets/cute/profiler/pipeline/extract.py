@@ -158,8 +158,6 @@ class _AnnotatedPlanExtractor:
                     name=positional_literal(call, 0, str),
                     label=keyword_literal(call, "label", str),
                     depth=keyword_literal(call, "depth", int),
-                    storage=keyword_literal(call, "storage", str),
-                    description=keyword_literal(call, "description", str),
                     kind=keyword_literal(call, "kind", str, default="buffer"),
                 )
             )
@@ -197,7 +195,6 @@ class _AnnotatedPlanExtractor:
                         label=keyword_literal(call, "label", str),
                         warp_start=keyword_literal(call, "warp_start", int),
                         warp_end=keyword_literal(call, "warp_end", int),
-                        color=keyword_literal(call, "color", str),
                         source=SourceLocation(
                             str(self.path), function.lineno, function.end_lineno
                         ),
@@ -253,12 +250,11 @@ class _AnnotatedPlanExtractor:
             )
         label = keyword_literal(call, "label", str)
         weight = keyword_literal(call, "weight", int)
-        description = keyword_literal(call, "description", str)
         consumes = keyword_string_tuple(call, "consumes")
         produces = keyword_string_tuple(call, "produces")
         releases = keyword_string_tuple(call, "releases")
         if count == 1:
-            region = Region(name, role.name, label, first_order, weight, description, source)
+            region = Region(name, role.name, label, first_order, weight, source)
             return [ParsedRegion(region, consumes, produces, releases)]
 
         def copy_tokens(tokens: tuple[str, ...], index: int, plain_at: int) -> tuple[str, ...]:
@@ -276,7 +272,6 @@ class _AnnotatedPlanExtractor:
                     f"{label} [{index}]",
                     first_order + index,
                     weight,
-                    description,
                     source,
                 ),
                 consumes=copy_tokens(consumes, index, 0),

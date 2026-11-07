@@ -35,7 +35,6 @@ class PipelineAnnotations:
         label: str,
         warp_start: int,
         warp_end: int,
-        color: str,
     ) -> Callable[[Callable], Callable]:
         """Delimit optional IKET region switching for one annotated role."""
 
@@ -69,8 +68,6 @@ class PipelineAnnotations:
         *,
         label: str,
         depth: int,
-        storage: str,
-        description: str,
         kind: str = "buffer",
     ) -> None:
         """Declare a logical resource; statically consumed and runtime-inert."""
@@ -81,7 +78,6 @@ class PipelineAnnotations:
         *,
         label: str,
         weight: int,
-        description: str,
         consumes: Iterable[str] = (),
         produces: Iterable[str] = (),
         releases: Iterable[str] = (),

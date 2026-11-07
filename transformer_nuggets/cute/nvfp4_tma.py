@@ -1104,7 +1104,7 @@ def profile_nvfp4_tma(
             if trace_cta_zero_only
             else None
         ),
-    ) as (prof, _):
+    ) as session:
         result = torch.empty((1, n), dtype=torch.bfloat16, device=torch_device)
         for _ in range(warmups):
             op.interface(
@@ -1113,17 +1113,17 @@ def profile_nvfp4_tma(
                 input_scale,
                 weight_scale,
                 output=result,
-                profile_buffer=prof.tensor,
+                profile_buffer=session.prof.tensor,
             )
         torch.cuda.synchronize(torch_device)
-        prof.tensor.zero_()
+        session.prof.reset()
         op.interface(
             q_input,
             weight,
             input_scale,
             weight_scale,
             output=result,
-            profile_buffer=prof.tensor,
+            profile_buffer=session.prof.tensor,
         )
 
     typer.echo(f"Wrote {output.resolve()}")

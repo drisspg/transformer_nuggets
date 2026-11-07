@@ -92,13 +92,8 @@ def _build_pipeline_perfetto(
     process_uuid = stable_id("pipeline", timeline.plan_name, measured.cta)
     descriptor = builder.add_packet().track_descriptor
     descriptor.uuid = process_uuid
-    mode = (
-        "logical plan (synthetic ticks)"
-        if measured.source.startswith("logical")
-        else "measured pipeline"
-    )
     descriptor.process.pid = stable_id("pipeline-pid", timeline.plan_name, measured.cta) % (2**31)
-    descriptor.process.process_name = f"{timeline.plan_name} · CTA {measured.cta} · {mode}"
+    descriptor.process.process_name = f"{timeline.plan_name} · CTA {measured.cta}"
     descriptor.child_ordering = TrackDescriptor.EXPLICIT
 
     role_by_name = {role.name: role for role in timeline.roles}
@@ -201,7 +196,7 @@ def _build_pipeline_perfetto(
         plan_region = planned[key]
         role = role_by_name[region.role]
         event.type = TrackEvent.TYPE_SLICE_BEGIN
-        event.name = f"{plan_region.region.label} · chunk {region.iteration}"
+        event.name = f"{plan_region.region.label} · {timeline.iteration_name} {region.iteration}"
         event.flow_ids.extend(outgoing.get(key, ()))
         event.terminating_flow_ids.extend(incoming.get(key, ()))
         add_annotation(event, "region_id", region.name)

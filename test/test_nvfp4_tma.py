@@ -24,7 +24,6 @@ try:
     )
     from transformer_nuggets.cute.nvfp4_tma import Nvfp4TmaGemv, app
     from transformer_nuggets.cute.profiler import profile_session
-    from transformer_nuggets.cute.profiler.host import decode_events
 except ImportError:
     pytest.skip("CuTe DSL not available", allow_module_level=True)
 
@@ -424,16 +423,16 @@ def test_nvfp4_tma_profiles_common_pipeline_regions(use_runtime_k_loop):
         tag_names=list(NVFP4_TMA_PROFILE_TAGS),
         device="cuda",
         compact=True,
-    ) as (prof, tags):
+    ) as session:
         actual = op.interface(
             q_input,
             weight,
             input_scale,
             weight_scale,
-            profile_buffer=prof.tensor,
+            profile_buffer=session.prof.tensor,
         )
     torch.testing.assert_close(actual, expected, atol=2.0, rtol=0.05)
-    events = decode_events(prof, tags)
+    events = session.events
     assert len(events) == op.num_profile_units * op.profile_events_per_cta
     assert {event.tag_name for event in events} == set(NVFP4_TMA_PROFILE_TAGS) - {
         "input_scale_acquire",
@@ -459,16 +458,16 @@ def test_nvfp4_tma_profiles_sampled_ctas():
         tag_names=list(NVFP4_TMA_PROFILE_TAGS),
         device="cuda",
         compact=True,
-    ) as (prof, tags):
+    ) as session:
         actual = op.interface(
             q_input,
             weight,
             input_scale,
             weight_scale,
-            profile_buffer=prof.tensor,
+            profile_buffer=session.prof.tensor,
         )
     torch.testing.assert_close(actual, expected, atol=2.0, rtol=0.05)
-    events = decode_events(prof, tags)
+    events = session.events
     assert len(events) == op.num_profile_units * op.profile_events_per_cta
     assert {event.unit_id for event in events} == set(range(op.num_profile_units))
 
@@ -494,16 +493,16 @@ def test_nvfp4_tma_profiles_dedicated_persistent_tiles():
         tag_names=list(NVFP4_TMA_PROFILE_TAGS),
         device="cuda",
         compact=True,
-    ) as (prof, tags):
+    ) as session:
         actual = op.interface(
             q_input,
             weight,
             input_scale,
             weight_scale,
-            profile_buffer=prof.tensor,
+            profile_buffer=session.prof.tensor,
         )
     torch.testing.assert_close(actual, expected, atol=2.0, rtol=0.05)
-    events = decode_events(prof, tags)
+    events = session.events
     assert len(events) == op.num_profile_units * op.profile_events_per_cta
     assert {event.unit_id for event in events} == set(range(op.num_profile_units))
 
