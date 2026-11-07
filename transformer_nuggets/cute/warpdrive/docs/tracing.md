@@ -8,7 +8,7 @@ Use the view that answers your question:
 |---|---|---|
 | Who runs, signals and owns storage? | [`describe()`](#inspect-the-kernel), or [as a graph](#draw-the-pipeline) | Declarations and available compile diagnostics |
 | Where does a handle open and close? | [Protocol trace](#trace-the-protocol) | Traced code sites, not runtime iterations |
-| When does a role work or wait? | [IKET](#iket) | Instrumented runtime ranges |
+| When does a role work or wait? | [Tracing backends](#tracing-backends) | Instrumented runtime ranges |
 | How do those ranges relate to channels? | [Pipeline plan](#join-a-capture-to-the-pipeline-plan) | A per-CTA, work-item model |
 
 None of these proves balanced runtime epochs, race freedom, liveness or a performance bound.
@@ -299,17 +299,20 @@ A separate context check inspects **direct fields** for MMA CTA span and unsuppo
 group-TWO/multicast G2S atoms. It neither walks nested objects nor turns off for a per-use
 `unchecked("tma")`.
 
-## IKET
+## Tracing backends
 
 ```python
 from transformer_nuggets.cute.warpdrive import StaticPersistent
 
-op = PersistentGemm(schedule=StaticPersistent()).enable_iket(waits=False)
+op = PersistentGemm(schedule=StaticPersistent()).enable_trace("iket", waits=False)
 fn = compile_persistent_gemm(op)
 ```
 
-Enable IKET before compiling. Start with `waits=False`: short-wait instrumentation can
-change the timing you want to understand.
+`enable_trace(backend)` before compiling makes the layer emit ranges named after the
+declarations, recorded by one of the two backends of the
+[profiler](../../profiler/README.md): `"iket"` (`enable_iket()` is the shorthand) or
+`"globaltimer"`. Start with `waits=False`: short-wait instrumentation can change the timing you
+want to understand.
 
 - Roles taking `WorkCursor`: one range per work item, ending at `advance()`.
 - Other roles: one range over the body. Instance names remain distinct, e.g. `softmax[0]`.
@@ -317,6 +320,16 @@ change the timing you want to understand.
   `mufu.turn` and `compute_sync.sync` for a `NamedBarrier`.
 - Try-token probes have no range. The subsequent wait keeps its range, empty if the probe
   already succeeded.
+- Your regions, inside a role: `with self.trace_region("exp", payload=row):`. The optional
+  payload is a runtime `Int32`, such as the work item the region belongs to.
+
+| | `"iket"` | `"globaltimer"` |
+|---|---|---|
+| Records | every warp, with NVIDIA's `run-iket` | lane 0 of each role instance's first warp, into a profile buffer |
+| Kernel | unchanged | passes an int64 buffer: `self.run_roles(ctx, trace_buffer=trace)` |
+| Capture | `run-iket` around a script that launches once | `trace_session(op, num_ctas)` around a launch |
+| Result | IKET JSON/Perfetto; `load_iket_capture` joins the [pipeline plan](#join-a-capture-to-the-pipeline-plan) | `session.events` for the profiler's analysis helpers; a Perfetto trace with one process per CTA and one thread per role |
+| Payloads | `trace_region`'s, as the range's `payloadVal` | `trace_region`'s and each work item's index, as `Event.payload` |
 
 Conceptual timeline (not a measured capture):
 
@@ -331,15 +344,13 @@ waited for storage reuse. Neither alone identifies the bottleneck. Match the CTA
 epoch to the other side before attributing the delay; overlapping waits are not additive
 kernel time.
 
-Add a region in a role:
+Disabled tracing emits no instructions. The backend, and `waits` and `events_per_role` where
+they change the code, are part of the kernel's cache key; `trace_key()` names them in the
+examples' kernel names (`_iket`, `_iketroles`, `_gtimer`, `_gtimerroles`). Ranges must nest:
+closing a range while another opened inside it is still open (a work cursor advanced inside a
+`trace_region`) raises `ProtocolError` at trace time.
 
-```python
-with self.trace_region("exp"):
-    ...  # exp2 work
-```
-
-Disabled tracing emits no IKET operations. `iket` and `iket_waits` are part of the kernel's
-cache key; `iket_key()` names them in the examples' kernel names.
+### IKET
 
 The following needs NVIDIA's `run-iket` tooling and a script that launches the compiled kernel
 once. `profile_kernel.py` is your script, not a file supplied by warpdrive:
@@ -347,6 +358,48 @@ once. `profile_kernel.py` is your script, not a file supplied by warpdrive:
 ```bash
 run-iket -o traces/gemm --clobber profile --postprocess all -- python profile_kernel.py
 ```
+
+IKET ranges may also sit outside the roles. Work-item ranges carry no payload, so the
+instrumentation is what it was before payloads existed.
+
+### globaltimer
+
+The globaltimer backend records the profiler's legacy region records (two `%globaltimer` reads
+and four 8-byte stores per range) in static slots: one profiling unit per CTA, an equal share
+of `events_per_role` slots (default 1024) per role instance, the role's first warp as `tid`.
+An open range's start sits in SMEM (8 bytes per nesting level and role), so a range holds no
+register over the code it spans. Ranges past a role's share are dropped and `trace_session`
+warns; a buffer with fewer units than the grid has CTAs records the first CTAs only.
+
+The kernel takes the buffer as an argument in every build (compiled from a fake `Int64` tensor
+of shape `(cute.sym_int(),)`; a disabled build ignores it) and hands it to the layer. Of the
+examples only the Qwen megakernel does; the others support IKET only, and enabling globaltimer
+on them raises `ProtocolError` at compile time.
+
+```python
+@cute.kernel
+def kernel(self, ..., trace: cute.Tensor, bound):
+    self.begin_roles(work=bound)
+    ...
+    self.run_roles(ctx, trace_buffer=trace)
+```
+
+```python
+from transformer_nuggets.cute.profiler import dependency_gaps, summarize_by_tag
+from transformer_nuggets.cute.warpdrive.trace_session import trace_session
+
+op = MyKernel().enable_trace("globaltimer", waits=False)
+fn = compile_my_kernel(op)  # compile first: the range names come from the trace
+with trace_session(op, num_ctas, trace_path="kernel.pftrace") as session:
+    fn(..., session.prof.tensor, ...)
+print(summarize_by_tag(session.events)["mma"])
+```
+
+`trace_session` wraps `profile_session`: pass its other arguments through
+(`post_process_events`, `post_process_trace`, `trace_format`). The decoded `Event`s have the
+range name as `tag_name`, the CTA as `unit_id`, the role's first warp as `tid`, and the payload.
+The [Qwen megakernel](examples.md#qwen3-06b-decode-megakernel) traces every SM's instruction
+rows this way and links rows across CTAs with `link_payload_flow`.
 
 ## Join a capture to the pipeline plan
 

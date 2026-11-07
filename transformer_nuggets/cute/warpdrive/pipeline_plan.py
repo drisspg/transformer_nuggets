@@ -18,7 +18,7 @@ ROLE_COLORS = ("#4f9cf9", "#5bc8a5", "#ef6a8a", "#c88bf2", "#f0b35b", "#63c7da",
 def plan_from_warpdrive(kernel, *, cta: int = 0, name: str | None = None) -> PipelinePlan:
     """The kernel's roles, channels, and handoffs as a ``PipelinePlan`` for CTA rank ``cta``.
 
-    Names match the IKET ranges the layer emits: one ``Role`` and one ``Region`` per role
+    Names match the ranges the layer emits (either trace backend): one ``Role`` and one ``Region`` per role
     instance running in this CTA, one ``Resource`` per channel between two of them. Per channel:
 
     * a ``data`` dependency producer -> consumer at distance 0 for every pair of roles. Handoffs

@@ -81,7 +81,7 @@ class NamedBarrier:
         return self._id
 
     def sync(self, *, aligned: bool = False):
-        """Arrive, then wait until ``threads`` threads have arrived in this generation. With IKET
+        """Arrive, then wait until ``threads`` threads have arrived in this generation. With trace
         waits enabled, the wait is a ``<name>.sync`` range."""
         with wait_range(current_trace(), f"{self.name}.sync"):
             if aligned:

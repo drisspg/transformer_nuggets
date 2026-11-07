@@ -404,7 +404,7 @@ when `threads` arrivals have come through `sync()` or `arrive()`.
   `cute.arch.barrier(barrier_id=nb.id, number_of_threads=nb.threads)`. These may mix with
   managed methods on the same barrier. Native calls are invisible, but reading `.id` while
   tracing records `native id by ...` in `describe()`.
-- `describe()` lists IDs, counts and traced callers. IKET waits wrap `sync()` in
+- `describe()` lists IDs, counts and traced callers. Trace wait ranges wrap `sync()` in
   `<name>.sync`; [pipeline plans](tracing.md) model channels, not standalone named barriers.
 
 Checks and limits:

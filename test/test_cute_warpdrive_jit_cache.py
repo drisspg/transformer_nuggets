@@ -76,11 +76,16 @@ def test_key_names_each_compile_time_choice():
         Gemm(acc_stages=2),
         Gemm().enable_iket(),
         Gemm().enable_iket(waits=False),
+        Gemm().enable_trace("globaltimer"),
+        Gemm().enable_trace("globaltimer", events_per_role=64),
         strict,
         ReorderedGemm(),
     ]
     keys = {key_of(op) for op in changed}
     assert base not in keys and len(keys) == len(changed)
+    # Trace options that cannot change the code do not split the key.
+    assert key_of(Gemm().enable_trace(None, waits=False, events_per_role=8)) == base
+    assert key_of(Gemm().enable_trace("iket", events_per_role=8)) == key_of(Gemm().enable_iket())
     pgemms = [
         PersistentGemm(),
         PersistentGemm(schedule=ClusterLaunchControl()),
@@ -117,7 +122,7 @@ def test_pickled_kernel_keeps_its_key():
     op.enable_iket(waits=False).alias_check = "off"
     copy = pickle.loads(pickle.dumps(op))
     assert type(copy) is PersistentGemm and copy is not op
-    assert (copy.iket, copy.iket_waits, copy.alias_check) == (True, False, "off")
+    assert (copy.trace_backend, copy.trace_waits, copy.alias_check) == ("iket", False, "off")
     assert key_of(copy, compile_pgemm) == key_of(op, compile_pgemm)
     moved = PersistentGemm()
     moved.cluster = CtaPair()

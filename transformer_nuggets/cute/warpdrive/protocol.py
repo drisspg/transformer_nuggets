@@ -289,13 +289,11 @@ class ProtocolLog:
 class RoleTrace:
     """Open-handle bookkeeping for one traced role instance."""
 
-    def __init__(
-        self, role_name: str, log: ProtocolLog | None, iket: bool = False, iket_waits: bool = True
-    ):
+    def __init__(self, role_name: str, log: ProtocolLog | None, ranges=None, waits: bool = True):
         self.role_name = role_name
         self.log = log
-        self.iket = iket  # emit IKET work-item/role ranges (tracing.py)
-        self.iket_waits = iket and iket_waits  # and ranges around blocking waits
+        self.ranges = ranges  # the trace backend's ranges of this role (tracing.py), or None
+        self.trace_waits = ranges is not None and waits  # and ranges around blocking waits
         # (channel, op, enclosing blocks innermost first, epochs, order) per recorded op:
         # epochs is a skip's count (None if dynamic), else 1; order is a close's handle order
         # (HandleRecord).

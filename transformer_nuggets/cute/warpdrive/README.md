@@ -164,7 +164,7 @@ CUTracer work follows the [fuzz harness guide](../../../test/warpdrive_fuzz/READ
 
 The suite covers numerical correctness and determinism, shape reuse, schedules, CTA pairs and
 larger clusters, protocol errors, raw/managed synchronization, TMA and alias diagnostics, and
-the IKET-to-profiler path.
+both trace backends' paths into the profiler.
 
 To test another supported CuTeDSL version, install it into a separate environment along with
 this checkout, and give it its own caches. The compile cache key already includes the CuTeDSL

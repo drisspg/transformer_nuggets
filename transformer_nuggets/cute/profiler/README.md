@@ -416,6 +416,15 @@ CUTLASS 4.7 Task Scheduling objects can be adapted with
 `plan_from_task_manager`; this adapter is duck-typed and does not import
 CuTeDSL at package import time.
 
+## warpdrive kernels
+
+warpdrive kernels need no hand-placed regions: `kernel.enable_trace("globaltimer")` or
+`enable_trace("iket")` makes the layer emit ranges named after its roles, channel waits and
+`trace_region`s through this profiler's two backends. The globaltimer backend uses static-slot
+legacy records with one unit per CTA, records work items' indices as payloads, and decodes
+through `profile_session`; the IKET backend feeds the pipeline plan above. See
+[Tracing backends](../warpdrive/docs/tracing.md#tracing-backends).
+
 ## Buffer Layout
 
 Each unit owns `1 + 4 * max_events_per_unit` int64s:

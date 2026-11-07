@@ -242,7 +242,7 @@ class FlashAttentionForward(WarpSpecialized):
             ts += f"_n{self.tile_n}_d{self.head_dim}"
         return (
             f"warpdrive_fa4_fwd_{self.cluster.get_key()}_kv{self.kv_stages}{ts}_"
-            f"{self.work.get_key()}{self.iket_key()}{self.trace_key()}"
+            f"{self.work.get_key()}{self.trace_key()}"
         )
 
     # ------------------------------------------------------------------ roles

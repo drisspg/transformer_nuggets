@@ -96,7 +96,7 @@ from transformer_nuggets.cute.warpdrive.protocol import (
     current_block,
     user_site,
 )
-from transformer_nuggets.cute.warpdrive.tracing import pop, push_if
+from transformer_nuggets.cute.warpdrive.tracing import push_if
 
 AXES = ("m", "n", "l")
 INT32_MAX = 2**31 - 1
@@ -1148,12 +1148,22 @@ class WorkCursor:
     """
 
     def __init__(
-        self, stream, problem, end, index, words, rec, count=None, slot=None, iket=None, state=None
+        self,
+        stream,
+        problem,
+        end,
+        index,
+        words,
+        rec,
+        count=None,
+        slot=None,
+        ranged=False,
+        state=None,
     ):
         self._stream, self._problem, self._end, self._rec = stream, problem, end, rec
         self.index, self._words = index, words
         self._count, self._slot = count, slot  # recording: items seen, (role ordinal, warp)
-        self._iket = iket  # IKET range name of one work item (the role name), or None
+        self._ranged = ranged  # one trace range per work item (named after the role)
         self._state = state  # WorkMap.decode state of a decoding cursor (None: stateless)
         self._copy = rec.lineage.add()
 
@@ -1166,9 +1176,10 @@ class WorkCursor:
         rec = _CursorRecord(trace.role_name, stream.name or "work", trace=trace)
         trace.checks.append(rec.check)
         count = Int32(0) if stream.record else None
-        iket = trace.role_name if trace.iket else None
         first = Int32(stream.schedule.first_index(problem))
-        cur = WorkCursor(stream, problem, end, first, (), rec, count, slot, iket)
+        cur = WorkCursor(
+            stream, problem, end, first, (), rec, count, slot, trace.ranges is not None
+        )
         if end is None:
             cur.index, cur._words, cur._state = _local_start(stream, first, problem)
         elif not _publishes_first(stream):
@@ -1188,7 +1199,7 @@ class WorkCursor:
         return cur
 
     def _enter_item(self):
-        """Bookkeeping at the start of each item: the record log and the item's IKET range."""
+        """Bookkeeping at the start of each item: the record log and the item's trace range."""
         if self._count is not None:
             _record(
                 self._problem.workspace,
@@ -1199,8 +1210,9 @@ class WorkCursor:
                 self._stream.record,
             )
             self._count = self._count + 1
-        if self._iket is not None:
-            push_if(self.index < self._problem.total, self._iket)
+        if self._ranged:
+            trace = self._rec.trace
+            push_if(trace.ranges, self.index < self._problem.total, trace.role_name)
 
     def __extract_mlir_values__(self):
         values = [self.index.ir_value()] + [w.ir_value() for w in self._words]
@@ -1232,7 +1244,7 @@ class WorkCursor:
             self._rec,
             count,
             self._slot,
-            self._iket,
+            self._ranged,
             state,
         )
 
@@ -1272,8 +1284,9 @@ class WorkCursor:
         self._rec.lineage.advanced(self._copy)
         self._rec.advances.append((user_site(), current_block()))
         self._rec.trace.item_block = current_block()
-        if self._iket is not None:
-            pop()  # this item's range
+        if self._ranged:
+            trace = self._rec.trace
+            trace.ranges.pop(trace.role_name, self.index)  # this item's range; payload: index
         stream, problem = self._stream, self._problem
         if self._end is None:
             self.index = Int32(stream.schedule.next_index(self.index, problem))

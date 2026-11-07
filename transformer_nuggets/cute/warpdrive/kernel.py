@@ -16,7 +16,7 @@ import cutlass
 from cutlass import Int32, cute, pipeline
 
 from transformer_nuggets.cute.jit_cache import canonical_key, module_source_digest
-from transformer_nuggets.cute.warpdrive import alias
+from transformer_nuggets.cute.warpdrive import alias, tracing
 from transformer_nuggets.cute.warpdrive._compat import SmemAllocator, TmemAllocator
 from transformer_nuggets.cute.warpdrive.channels import (
     Barriers,
@@ -55,6 +55,7 @@ from transformer_nuggets.cute.warpdrive.protocol import (
     ProtocolError,
     ProtocolLog,
     RoleTrace,
+    current_trace,
     take_opt_outs,
     tracing_role,
 )
@@ -72,7 +73,7 @@ from transformer_nuggets.cute.warpdrive.storage import (
 from transformer_nuggets.cute.warpdrive.tma import TmaReport, clear_multicast_masks
 from transformer_nuggets.cute.warpdrive.tma import check_role as check_tma
 from transformer_nuggets.cute.warpdrive.tmem import TmemPlan, TmemView
-from transformer_nuggets.cute.warpdrive.tracing import pop, pop_if, push
+from transformer_nuggets.cute.warpdrive.tracing import IketRanges, IketTrace, pop_if
 
 WARP_SIZE = 32
 WARPGROUP = 4
@@ -370,7 +371,13 @@ def role(
 # Keyed settings that may change after construction. The first collection derives the channel
 # scopes from the cluster and the scheduler roles from the work streams, and opens the protocol
 # log for trace_protocol; these cannot change after it. The rest are read when tracing.
-_HOST_SETTINGS = ("alias_check", "trace_protocol", "iket", "iket_waits")
+_HOST_SETTINGS = (
+    "alias_check",
+    "trace_protocol",
+    "trace_backend",
+    "trace_waits",
+    "trace_events_per_role",
+)
 _COLLECTED_SETTINGS = ("cluster", "trace_protocol")
 
 
@@ -441,8 +448,10 @@ class WarpSpecialized(metaclass=_KernelType):
     # (raise on a potential hazard), or "off". Host-only; it never changes the generated code.
     alias_check: str = "warn"
     trace_protocol: bool = False
-    iket: bool = False  # emit IKET ranges named after roles and channels (tracing.py)
-    iket_waits: bool = True  # with iket: also a range around every blocking channel wait
+    # Ranges named after roles and channels (tracing.py), set with enable_trace().
+    trace_backend: str | None = None  # "iket", "globaltimer", or None: no ranges
+    trace_waits: bool = True  # also a range around every blocking channel wait
+    trace_events_per_role: int = 1024  # globaltimer: records per role instance and CTA
     cluster: Cluster = SingleCta()  # or CtaPair(): one line switches to 2-CTA MMAs
 
     def __reduce__(self):
@@ -952,9 +961,9 @@ class WarpSpecialized(metaclass=_KernelType):
         ``jit_cache`` adds the class's module and name. The key is the constructor call (its
         bound arguments, defaults filled in, copied before ``__init__`` runs, so changing a
         list argument in place later does not change it) plus what may change after it: the
-        cluster, each work stream, and the host settings (IKET, ``trace_protocol``,
-        ``alias_check``: a "warn" build must not satisfy a "strict" one). The resolved role
-        placement and budgets and the source of every module defining the kernel's, cluster's,
+        cluster, each work stream, and the host settings (the trace backend and its options,
+        ``trace_protocol``, ``alias_check``: a "warn" build must not satisfy a "strict" one).
+        The resolved role placement and budgets and the source of every module defining the kernel's, cluster's,
         and streams' classes complete it, so editing a kernel the compile function does not
         import (a test's subclass) recompiles it. Other public attributes assigned after
         construction raise a ``TypeError`` here: set them in ``__init__``. In-place changes to
@@ -965,7 +974,7 @@ class WarpSpecialized(metaclass=_KernelType):
                 f"{type(self).__name__}: {sorted(late)} assigned after construction, but a "
                 "cached compile keys the constructor call. Pass the value to the constructor or "
                 "set it in __init__ (a subclass works); only cluster, work streams, alias_check, "
-                "trace_protocol and the IKET settings may change after construction"
+                "trace_protocol and the trace settings may change after construction"
             )
         if isinstance(self._ws_init_key, TypeError):
             raise self._ws_init_key
@@ -977,7 +986,7 @@ class WarpSpecialized(metaclass=_KernelType):
             self._ws_init_key,
             self.cluster,
             tuple((s.schedule, s.mapping, s.ready, s.record, s.scheduler_warp) for s in streams),
-            tuple(getattr(self, k) for k in _HOST_SETTINGS),
+            (self.alias_check, self.trace_protocol, self._trace_settings()),
             self.role_config_key(),
             tuple((m, module_source_digest(m)) for m in modules),
         )
@@ -1000,6 +1009,7 @@ class WarpSpecialized(metaclass=_KernelType):
             "uses": self._ws_uses,
             "named_users": self._ws_named_users,
             "ownership": self._ws_ownership,
+            "trace_tags": self._ws_trace_tags,
         }
 
     def __cute_restore_trace__(self, record: dict) -> None:
@@ -1020,39 +1030,78 @@ class WarpSpecialized(metaclass=_KernelType):
         self._ws_uses = record["uses"]
         self._ws_named_users = record["named_users"]
         self._ws_ownership = record["ownership"]
+        self._ws_trace_tags = record["trace_tags"]
         self._ws_traced = True
         self._report_trace()
 
-    def enable_iket(self, enabled: bool = True, *, waits: bool = True):
-        """Emit IKET ranges in the next compile (``tracing.py`` lists the names). Off: no IR.
-        ``waits=False`` keeps only the role/work-item ranges (fine-grained wait ranges cost
-        ~35% on FA4 under ``run-iket``; role ranges alone cost about nothing).
-        ``__cute_cache_key__`` keys both settings; ``iket_key()`` names them (the examples'
+    def enable_trace(
+        self, backend: str | None, *, waits: bool = True, events_per_role: int = 1024
+    ):
+        """Emit ranges named after roles and channels in the next compile, recorded by one of
+        the profiler's backends (``tracing.py`` lists the names): ``"iket"`` (IKET ranges, for
+        ``run-iket``) or ``"globaltimer"`` (profiler records in the buffer passed to
+        ``run_roles(..., trace_buffer=...)``, decoded by ``trace_session.trace_session``).
+        ``None``: no ranges and no IR. ``waits=False`` keeps only the role/work-item ranges
+        and ``trace_region``s (fine-grained wait ranges cost ~35% on FA4 under ``run-iket``;
+        role ranges alone cost about nothing). ``events_per_role``: globaltimer records per
+        role instance and CTA; later ranges are dropped. ``__cute_cache_key__`` keys the
+        settings that change the code; ``trace_key()`` names the backend (the examples'
         ``get_name`` uses it)."""
-        self.iket, self.iket_waits = enabled, waits
+        if backend is not None and backend not in tracing.BACKENDS:
+            raise ValueError(
+                f"trace backend must be one of {tracing.BACKENDS} or None, got {backend!r}"
+            )
+        if type(events_per_role) is not int or events_per_role < 1:
+            raise ValueError(f"events_per_role must be a positive int, got {events_per_role!r}")
+        self.trace_backend, self.trace_waits = backend, waits
+        self.trace_events_per_role = events_per_role
         return self
 
-    def trace_key(self) -> str:
-        """Kernel-name suffix of ``trace_protocol``. A cached kernel was never traced, so the
-        examples compile a traced instance uncached (``jit_cache(uncached=...)``) to fill its
-        protocol log."""
-        return "_trace" if self.trace_protocol else ""
+    def _trace_settings(self) -> tuple:
+        """The trace settings that change the generated code (the compile key's part)."""
+        if self.trace_backend is None:
+            return (None,)
+        if self.trace_backend == "iket":
+            return ("iket", self.trace_waits)
+        return (self.trace_backend, self.trace_waits, self.trace_events_per_role)
 
-    def iket_key(self) -> str:
-        """Compile-key suffix of the IKET configuration ('' when off)."""
-        if not self.iket:
-            return ""
-        return "_iket" if self.iket_waits else "_iketroles"
+    def enable_iket(self, enabled: bool = True, *, waits: bool = True):
+        """``enable_trace("iket", waits=waits)``, or ``enable_trace(None)`` when not enabled."""
+        return self.enable_trace("iket" if enabled else None, waits=waits)
+
+    def trace_key(self) -> str:
+        """Kernel-name suffix of the trace settings: the backend (``_iket``, ``_iketroles``,
+        ``_gtimer``, ``_gtimerroles``; '' when off), then ``_trace`` for ``trace_protocol``. A
+        cached kernel was never traced, so the examples compile a ``trace_protocol`` instance
+        uncached (``jit_cache(uncached=...)``) to fill its protocol log."""
+        backend = ""
+        if self.trace_backend is not None:
+            backend = {"iket": "_iket", "globaltimer": "_gtimer"}[self.trace_backend]
+            backend += "" if self.trace_waits else "roles"
+        return backend + ("_trace" if self.trace_protocol else "")
 
     @contextmanager
-    def trace_region(self, name: str):
-        """``with self.trace_region("exp"):`` inside a role: a named IKET range when IKET is
-        enabled, nothing otherwise."""
-        if self.iket:
-            push(name)
+    def trace_region(self, name: str, payload=None):
+        """``with self.trace_region("exp", payload=row):`` inside a role: a named range when a
+        trace backend is enabled, nothing otherwise. ``payload``: an optional runtime ``Int32``
+        recorded with the range (globaltimer: ``Event.payload``; IKET: the range's payload,
+        ``payloadVal`` in the capture), e.g. the work item it belongs to. The globaltimer
+        backend records per role; IKET ranges may also sit outside the roles."""
+        if self.trace_backend is None:
+            yield
+            return
+        trace = current_trace()
+        if trace is not None:
+            ranges = trace.ranges
+        elif self.trace_backend == "iket":
+            ranges = IketRanges()
+        else:
+            raise ProtocolError(
+                f"trace_region({name!r}) outside a role: globaltimer ranges are recorded per role"
+            )
+        ranges.push(name, payload)
         yield
-        if self.iket:
-            pop()
+        ranges.pop(name, payload)
 
     @property
     def num_warps(self) -> int:
@@ -1171,6 +1220,12 @@ class WarpSpecialized(metaclass=_KernelType):
             [c for _, _, counts in plan for c in counts[rank]] for rank in range(self.cluster.size)
         ]
         self._init_barriers(bars)
+        self._ws_trace_starts = None
+        if self.trace_backend == "globaltimer":  # open ranges' starts per role (tracing.py)
+            depth = tracing.MAX_DEPTH
+            starts = smem.allocate_array(cutlass.Int64, len(self._ws_roles) * depth)
+            layout = cute.make_layout((len(self._ws_roles), depth), stride=(depth, 1))
+            self._ws_trace_starts = cute.make_tensor(starts, layout)
         self._ws_buffers = {}  # channel name -> {buffer name: StageBuffer}
         for name, ch in self._ws_chans.items():
             if ch.payload is not None:
@@ -1295,9 +1350,12 @@ class WarpSpecialized(metaclass=_KernelType):
                     cute.arch.mbarrier_init(bars + offset + lane, rank_value(arrivals, rank))
 
     @cute.jit
-    def run_roles(self, params):
-        """Dispatch roles with the kernel-specific input params, then perform teardown."""
+    def run_roles(self, params, trace_buffer=None):
+        """Dispatch roles with the kernel-specific input params, then perform teardown.
+        ``trace_buffer``: the int64 profile buffer of a ``"globaltimer"`` trace (any shape;
+        ``trace_session.trace_session`` allocates it); ignored otherwise."""
         params = self._role_context(params)
+        self._ws_trace = self._start_trace(trace_buffer)
         clustered = self.cluster.size > 1
         if cutlass.const_expr(not clustered):
             # Fences mbarrier.init and syncs the CTA; the same bar.sync publishes the TMEM base
@@ -1335,6 +1393,26 @@ class WarpSpecialized(metaclass=_KernelType):
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
         self._finish_trace()
+
+    def _start_trace(self, buffer):
+        """The trace backend's kernel-wide state, which makes each role's ranges:
+        ``tracing.GlobaltimerTrace`` (device code computing this CTA's unit), ``IketTrace``, or
+        None when tracing is off."""
+        self._ws_trace_tags = []
+        if self.trace_backend is None:
+            return None
+        if self.trace_backend == "iket":
+            return IketTrace()
+        if buffer is None:
+            raise ProtocolError(
+                "enable_trace('globaltimer') records into a profile buffer: pass "
+                "run_roles(params, trace_buffer=...) (see trace_session.py)"
+            )
+        trace = tracing.GlobaltimerTrace(
+            buffer, self._ws_trace_starts, len(self._ws_roles), self.trace_events_per_role
+        )
+        self._ws_trace_tags = trace.tags
+        return trace
 
     def _role_context(self, ctx):
         """The context the roles receive: a frozen dataclass as is, any other object (such as a
@@ -1660,15 +1738,16 @@ class WarpSpecialized(metaclass=_KernelType):
 
     def _dispatch(self, r: RoleInstance, ctx, tmem_threads: dict[int, int]):
         # Plain Python (no dynamic control flow): runs at trace time inside the role's `if`.
-        trace = RoleTrace(
-            r.name, None if r.raw else self._ws_log, iket=self.iket, iket_waits=self.iket_waits
-        )
+        ranges = None
+        if self._ws_trace is not None:
+            ranges = self._ws_trace.role(self._ws_roles.index(r), r.first_warp)
+        trace = RoleTrace(r.name, None if r.raw else self._ws_log, ranges, self.trace_waits)
         args = self._role_args(r, ctx, trace)
-        # A role looping over a WorkStream gets one IKET range per work item (WorkCursor);
-        # any other role gets one over its whole body.
-        whole_range = self.iket and not any(isinstance(arg, WorkCursor) for arg in args)
+        # A role looping over a WorkStream gets one range per work item (WorkCursor); any
+        # other role gets one over its whole body.
+        whole_range = ranges is not None and not any(isinstance(arg, WorkCursor) for arg in args)
         if whole_range:
-            push(r.name)
+            ranges.push(r.name)
         positional, keywords = [], {}
         for (name, _), arg in zip(r.params, args):
             if name in r.keyword_only:
@@ -1684,16 +1763,18 @@ class WarpSpecialized(metaclass=_KernelType):
                 if isinstance(arg, _ROLE_STATE_TYPES)
             ]
             final = _returned_state(r, result, state_args)
-            if self.iket:
+            if ranges is not None:
                 for _, arg in state_args:
                     if isinstance(arg, WorkCursor):
                         cur = final[_state_identity(arg)]
-                        pop_if(cur.index < cur._problem.total)
+                        pop_if(ranges, cur.index < cur._problem.total, r.name, cur.index)
             for _, arg in state_args:
                 if isinstance(arg, ProducerEnd) and arg.scope.tail:
                     final[_state_identity(arg)].tail()
         if whole_range:
-            pop()
+            ranges.pop(r.name)
+        if ranges is not None and ranges.names:
+            raise ProtocolError(f"{r.name}: trace ranges {ranges.names} left open at role exit")
         if not r.raw:
             check_tma(trace, self.cluster, self._ws_tma)
             trace.finish()

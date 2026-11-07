@@ -1,24 +1,44 @@
-"""IKET ranges emitted by the warp-role layer and the PipelinePlan exported for them: stable names,
-no IKET ops when disabled, and an end-to-end join through the profiler on a synthetic capture
-(compile only; no GPU or run-iket needed)."""
+"""Ranges emitted by the warp-role layer and the PipelinePlan exported for them: stable IKET
+names, no IKET ops when disabled, and an end-to-end join through the profiler on a synthetic
+capture (compile only; no GPU or run-iket needed); globaltimer ranges decoded through the
+profiler on a small persistent kernel (GPU)."""
 
 import json
+from collections import Counter
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 pytest.importorskip("cutlass.cute")
 
+import cutlass
+from cuda.bindings import driver as cuda
+from cutlass import Int32, cute
+
+from transformer_nuggets.cute.jit_cache import jit_cache
 from transformer_nuggets.cute.profiler.pipeline import (
     analyze_pipeline,
     load_iket_capture,
     write_pipeline_perfetto,
 )
+from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
 from transformer_nuggets.cute.warpdrive import (
     ClusterLaunchControl,
+    Consumer,
     CtaPair,
+    Producer,
+    ProtocolError,
+    Ring,
     StaticPersistent,
+    Threads,
+    WarpSpecialized,
+    WorkCursor,
+    WorkStream,
+    role,
     tracing,
 )
+from transformer_nuggets.cute.warpdrive.trace_session import trace_session
 from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import (
     PersistentGemm,
     compile_persistent_gemm,
@@ -31,11 +51,12 @@ class _Recorder:
     ops (so the compile is the real instrumented one)."""
 
     def __init__(self, real):
-        self.real, self.pushed, self.pops = real, [], 0
+        self.real, self.pushed, self.payloads, self.pops = real, [], [], 0
 
-    def range_push(self, name):
+    def range_push(self, name, *payload):
         self.pushed.append(name)
-        return self.real.range_push(name) if self.real else None
+        self.payloads.append(bool(payload))
+        return self.real.range_push(name, *payload) if self.real else None
 
     def range_pop(self):
         self.pops += 1
@@ -63,7 +84,7 @@ def test_disabled_emits_no_iket_ops(monkeypatch, traced_compiles):
     monkeypatch.setattr(tracing, "load_iket", forbidden)
     compile_persistent_gemm.cache_clear()
     op = _compile_gemm(PersistentGemm(schedule=ClusterLaunchControl(), cluster=CtaPair()))
-    assert op.iket_key() == "" and "iket" not in op.get_name()
+    assert op.trace_key() == "" and "iket" not in op.get_name()
 
 
 def test_gemm_range_names_match_plan(iket_recorder):
@@ -144,14 +165,14 @@ def _synthetic_capture(path, plan, iterations, warps_per_role):
     strings, ranges, locations = [], [], []
     t = 1_000
     for it in range(iterations):
-        for role in plan.roles.values():
-            for warp in range(role.warp_start, role.warp_end)[:warps_per_role]:
+        for plan_role in plan.roles.values():
+            for warp in range(plan_role.warp_start, plan_role.warp_end)[:warps_per_role]:
                 locations.append({"ctaId": [0, 0, 0], "warpId": warp})
-                if role.name not in strings:
-                    strings.append(role.name)
+                if plan_role.name not in strings:
+                    strings.append(plan_role.name)
                 ranges.append(
                     {
-                        "rangeNameIdx": strings.index(role.name),
+                        "rangeNameIdx": strings.index(plan_role.name),
                         "warpLocIdxs": [len(locations) - 1],
                         "startTs": t,
                         "endTs": t + 900,
@@ -180,3 +201,206 @@ def test_plan_joins_capture_end_to_end(tmp_path, iket_recorder):
     write_pipeline_perfetto(tmp_path / "pipeline.pftrace", timeline, measured, analysis=analysis)
     assert {r.role for r in measured.regions} == set(plan.roles)
     assert (tmp_path / "pipeline.pftrace").stat().st_size > 0
+
+
+# ---------------------------------------------------------------------------------------------
+# globaltimer backend
+# ---------------------------------------------------------------------------------------------
+
+ITEMS, CTAS = 7, 3  # StaticPersistent: CTA c runs items c, c + 3, ...
+
+
+class TracedRing(WarpSpecialized):
+    """A producer and a two-warp consumer over a persistent work stream, plus a raw role without
+    a cursor (one range over its body); the consumer marks a region with a payload."""
+
+    def __init__(self):
+        self.ring = Ring(2, Threads, Threads, payload=(Int32, (32,)))
+        self.work = WorkStream(schedule=StaticPersistent())
+
+    @role(warps=2)
+    @cute.jit
+    def prod(self, ctx, *, ring: Producer, work: WorkCursor):
+        while work.valid:
+            i, _, _ = work.item
+            with ring.produce() as h:
+                h.data[cute.arch.lane_idx()] = i
+            work.advance()
+        return ring, work
+
+    @role(warps=range(2))
+    @cute.jit
+    def cons(self, ctx, *, ring: Consumer, work: WorkCursor):
+        while work.valid:
+            i, _, _ = work.item
+            with ring.consume() as h, self.trace_region("store", payload=i * 10):
+                if cute.arch.thread_idx()[0] == 0:
+                    ctx.out[i] = h.data[0] + 1
+            work.advance()
+        return ring, work
+
+    @role(warps=3, raw=True)  # raw: a persistent stream does not require it to loop
+    @cute.jit
+    def idle(self, ctx):
+        pass
+
+    @cute.kernel
+    def kernel(self, out: cute.Tensor, trace: cute.Tensor, bound):
+        self.begin_roles(work=bound)
+        self.run_roles(SimpleNamespace(out=out), trace_buffer=trace)
+
+    @cute.jit
+    def __call__(
+        self, out: cute.Tensor, trace: cute.Tensor, workspace: cute.Tensor, stream: cuda.CUstream
+    ):
+        bound = self.work.bind((out.shape[0], 1, 1), workspace, CTAS)
+        self.kernel.set_name_prefix("warpdrive_traced_ring")
+        self.kernel(out, trace, bound).launch(**self.launch_config(bound), stream=stream)
+
+
+@jit_cache
+def compile_traced_ring(op):
+    return compile_tvm_ffi(
+        op,
+        make_fake_compact_tensor(Int32, (cute.sym_int(),), assumed_align=4),
+        make_fake_compact_tensor(cutlass.Int64, (cute.sym_int(),)),
+        make_fake_compact_tensor(Int32, (cute.sym_int(),)),
+        name="warpdrive_traced_ring",
+    )
+
+
+def _run_traced(op, num_ctas, **kwargs):
+    fn = compile_traced_ring(op)
+    workspace, _ = op.work.launch_args("cuda")
+    out = torch.zeros(ITEMS, device="cuda", dtype=torch.int32)
+    with trace_session(op, num_ctas, **kwargs) as session:
+        fn(out, session.prof.tensor, workspace)
+    torch.testing.assert_close(out.cpu(), torch.arange(1, ITEMS + 1, dtype=torch.int32))
+    return session
+
+
+def test_globaltimer_ranges_decode_per_cta_and_role(requires_blackwell, tmp_path):
+    op = TracedRing().enable_trace("globaltimer")
+    session = _run_traced(
+        op, CTAS, trace_path=str(tmp_path / "ring.json"), trace_format="chrome_json"
+    )
+    events = session.events
+    warps = {"cons": 0, "prod": 2, "idle": 3}  # each role's first warp records, as its tid
+    for cta in range(CTAS):
+        items = list(range(cta, ITEMS, CTAS))
+        mine = [e for e in events if e.unit_id == cta]
+        by_name = {}
+        for e in mine:
+            by_name.setdefault(e.tag_name, []).append(e)
+        # Work-item ranges carry the item index; the region carries its own payload.
+        assert sorted(e.payload for e in by_name["prod"]) == items
+        assert sorted(e.payload for e in by_name["cons"]) == items
+        assert sorted(e.payload for e in by_name["store"]) == [10 * i for i in items]
+        assert [e.payload for e in by_name["idle"]] == [None]
+        waits = {"ring.acquire": "prod", "ring.wait": "cons"}
+        for name, owner in waits.items():
+            assert len(by_name[name]) == len(items)
+            assert {e.tid for e in by_name[name]} == {warps[owner]}
+        for name, owner in warps.items():
+            assert {e.tid for e in by_name[name]} == {owner}
+        # Nested ranges sit inside their item's range.
+        for item in by_name["cons"]:
+            inner = [e for e in by_name["store"] if e.payload == 10 * item.payload]
+            assert len(inner) == 1
+            assert item.start_ns <= inner[0].start_ns
+            assert inner[0].start_ns + inner[0].dur_ns <= item.start_ns + item.dur_ns
+    threads = {
+        (ev["pid"], ev["args"]["name"])
+        for ev in session.trace["traceEvents"]
+        if ev.get("name") == "thread_name"
+    }
+    assert threads == {(cta, name) for cta in range(CTAS) for name in warps}
+
+
+def test_globaltimer_short_buffer_and_capacity(requires_blackwell):
+    """A buffer with fewer units than CTAs records the first CTAs only; a role past its
+    records drops later ranges and the session warns."""
+    session = _run_traced(TracedRing().enable_trace("globaltimer", waits=False), CTAS - 1)
+    assert {e.unit_id for e in session.events} == set(range(CTAS - 1))
+    assert not {e.tag_name for e in session.events} & {"ring.acquire", "ring.wait"}
+    op = TracedRing().enable_trace("globaltimer", events_per_role=2)
+    with pytest.warns(UserWarning, match="filled their 2 records"):
+        session = _run_traced(op, CTAS)
+    assert max(Counter((e.unit_id, e.tid) for e in session.events).values()) == 2
+
+
+def test_globaltimer_tags_restored_from_cache(requires_blackwell):
+    """A kernel served by the compile cache was never traced; it decodes with the range names
+    its cached trace recorded."""
+    compile_traced_ring.cache_clear()
+    first = TracedRing().enable_trace("globaltimer")
+    compile_traced_ring(first)
+    cached = TracedRing().enable_trace("globaltimer")
+    hits = compile_traced_ring.cache_info().hits
+    session = _run_traced(cached, CTAS)
+    assert compile_traced_ring.cache_info().hits == hits + 1
+    names = {e.tag_name for e in session.events}
+    assert names == {"prod", "cons", "idle", "store", "ring.acquire", "ring.wait"}
+
+
+class AdvanceInRegion(TracedRing):
+    @role(warps=range(2))
+    @cute.jit
+    def cons(self, ctx, *, ring: Consumer, work: WorkCursor):
+        while work.valid:
+            with ring.consume(), self.trace_region("store"):
+                work.advance()
+        return ring, work
+
+
+class RegionOutsideRoles(TracedRing):
+    @cute.kernel
+    def kernel(self, out: cute.Tensor, trace: cute.Tensor, bound):
+        self.begin_roles(work=bound)
+        with self.trace_region("setup"):
+            pass
+        self.run_roles(SimpleNamespace(out=out), trace_buffer=trace)
+
+
+@pytest.mark.parametrize("backend", ["iket", "globaltimer"])
+def test_ranges_must_nest(traced_compiles, backend):
+    """Closing a work item's range while a region inside it is open is rejected at trace time
+    (both backends pair a pop with the latest push)."""
+    with pytest.raises(ProtocolError, match="ranges must nest"):
+        compile_traced_ring.__wrapped__(AdvanceInRegion().enable_trace(backend))
+
+
+def test_globaltimer_needs_a_buffer_and_a_role():
+    class NoBuffer(TracedRing):
+        @cute.kernel
+        def kernel(self, out: cute.Tensor, trace: cute.Tensor, bound):
+            self.begin_roles(work=bound)
+            self.run_roles(SimpleNamespace(out=out))
+
+    with pytest.raises(ProtocolError, match="trace_buffer"):
+        compile_traced_ring.__wrapped__(NoBuffer().enable_trace("globaltimer"))
+    with pytest.raises(ProtocolError, match="outside a role"):
+        compile_traced_ring.__wrapped__(RegionOutsideRoles().enable_trace("globaltimer"))
+    compile_traced_ring.__wrapped__(RegionOutsideRoles().enable_iket())  # IKET may: no error
+    op = TracedRing().enable_trace("globaltimer")
+    with pytest.raises(ProtocolError, match="compiled kernel"):
+        trace_session(op, CTAS)
+    with pytest.raises(ValueError, match="trace backend"):
+        op.enable_trace("nvtx")
+    assert op.trace_key() == "_gtimer"
+    assert op.enable_trace("globaltimer", waits=False).trace_key() == "_gtimerroles"
+
+
+def test_iket_region_payload(iket_recorder):
+    """With IKET, a trace_region payload becomes the range's payload; layer ranges carry none."""
+    compile_traced_ring.cache_clear()
+    compile_traced_ring.__wrapped__(TracedRing().enable_iket())
+    pushed = dict(zip(iket_recorder.pushed, iket_recorder.payloads))
+    assert pushed == {
+        "prod": False,
+        "cons": False,
+        "idle": False,
+        "ring.acquire": False,
+        "ring.wait": False,
+        "store": True,
+    }

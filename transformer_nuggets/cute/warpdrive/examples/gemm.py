@@ -96,10 +96,7 @@ class Gemm(WarpSpecialized):
 
     def get_name(self) -> str:
         n = "" if self.tile[1] == 256 else f"_n{self.tile[1]}"
-        return (
-            f"warpdrive_gemm_ab{self.ab.n}_acc{self.acc_stages}{n}"
-            f"{self.iket_key()}{self.trace_key()}"
-        )
+        return f"warpdrive_gemm_ab{self.ab.n}_acc{self.acc_stages}{n}{self.trace_key()}"
 
     # ------------------------------------------------------------------ roles
 

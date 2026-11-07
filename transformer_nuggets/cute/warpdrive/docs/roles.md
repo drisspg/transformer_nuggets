@@ -271,7 +271,8 @@ def compile_kernel(op: MyKernel):
 
 - The constructor call, with defaults filled in and its arguments copied/frozen for the key.
 - Cluster and each work stream's schedule, mapping, readiness, recording and scheduler warp.
-- `iket`, `iket_waits`, `trace_protocol`, `alias_check`, and resolved roles.
+- The trace settings that change the code (`enable_trace`'s backend, and its `waits` and
+  `events_per_role` where they apply), `trace_protocol`, `alias_check`, and resolved roles.
 - Source of the modules defining the kernel, cluster and stream-component classes, including
   their base classes.
 
@@ -287,7 +288,7 @@ narrow:
 | `op.tile_n = 128` after construction | Key raises `TypeError`; pass it to the constructor |
 | Reassign cluster, work stream or `trace_protocol` before collection | Allowed and keyed |
 | Reassign those after collection | Raises `ProtocolError`; channels already depend on them |
-| Change `iket`, `iket_waits` or `alias_check` | Allowed and keyed |
+| Change the trace settings (`enable_trace`) or `alias_check` | Allowed and keyed |
 | Mutate a constructed object, e.g. `op.ab.n = 4` | Not tracked; do not do it |
 
 A cache hit performs no new trace. `jit_cache` restores saved TMA, SMEM and alias reports,

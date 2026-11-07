@@ -323,9 +323,7 @@ class FlashAttentionBackward(WarpSpecialized):
         suffix = ("_pair" if pair else "") + ("_causal" if self.causal else "")
         if not pair and self.dq_stages != 2:
             suffix += f"_dq{self.dq_stages}"
-        return (
-            f"warpdrive_fa4_bwd{suffix}_{self.work.get_key()}{self.iket_key()}{self.trace_key()}"
-        )
+        return f"warpdrive_fa4_bwd{suffix}_{self.work.get_key()}{self.trace_key()}"
 
     @cute.jit
     def m_block_range(self, params: BwdParams, n_block):

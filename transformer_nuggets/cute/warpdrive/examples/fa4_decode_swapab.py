@@ -394,7 +394,7 @@ class SwapABDecode(WarpSpecialized):
             shape += "_shared"
         return (
             f"warpdrive_fa4_decode_swapab_hq{self.tile_hq}_k{n_k}v{n_v}{shape}_"
-            f"{self.work.get_key()}{self.iket_key()}{self.trace_key()}"
+            f"{self.work.get_key()}{self.trace_key()}"
         )
 
     def split_range(self, params: DecodeParams, item) -> SplitRange:

@@ -426,7 +426,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
         timeline = "_timeline" if self.timeline else ""
         return (
             f"warpdrive_qwen_decode_s{self.stages}_kv{self.splits}{timeline}_"
-            f"{self.work.get_key()}{self.iket_key()}"
+            f"{self.work.get_key()}{self.trace_key()}"
         )
 
     # ------------------------------------------------------------------ roles

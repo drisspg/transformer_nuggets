@@ -82,11 +82,13 @@ Dropping down, per edge:
 * Raw ``cute.copy(..., tma_bar_ptr=p)`` with a pointer the layer did not hand out stays legal;
   ``describe()`` marks that channel's TMA check unverified.
 
-Tracing: ``kernel.enable_iket()`` before compiling makes the layer emit IKET ranges named after
-the declarations: ``<role>`` per work item (or per role body), ``<channel>.acquire``/``.wait``/
-``.peek``/``.tail`` around blocking waits, ``<turnstile>.turn``, and ``with self.trace_region(name)`` user
-regions (``enable_iket(waits=False)``: role ranges only). Disabled, it emits nothing.
-``plan_from_warpdrive(kernel, cta=0)`` exports the matching ``PipelinePlan``, so a ``run-iket``
+Tracing: ``kernel.enable_trace(backend)`` before compiling makes the layer emit ranges named
+after the declarations: ``<role>`` per work item (or per role body), ``<channel>.acquire``/
+``.wait``/``.peek``/``.tail`` around blocking waits, ``<turnstile>.turn``, and
+``with self.trace_region(name, payload=...)`` user regions (``waits=False``: role ranges and
+regions only), recorded by the profiler's ``"iket"`` backend (``enable_iket()``) or its
+``"globaltimer"`` backend (decoded by ``trace_session.trace_session``). Disabled, it emits
+nothing. ``plan_from_warpdrive(kernel, cta=0)`` exports the matching ``PipelinePlan``, so a ``run-iket``
 capture feeds ``load_iket_capture``, ``analyze_pipeline``, and ``write_pipeline_perfetto`` from
 ``transformer_nuggets.cute.profiler.pipeline`` with no hand annotations (``tracing.py``).
 
