@@ -154,18 +154,100 @@ def _bound(bound) -> str:
     return ", ".join(r.name + ("" if s is None else f"@{s}") for r, s in bound)
 
 
+def channel_kind(ch) -> str:
+    return f"Slots({ch.n})" if ch.fixed else f"Ring({ch.n})"
+
+
+def channel_signal(ch) -> str:
+    return f"{_mech(ch.producer)} -> {_mech(ch.consumer)}"
+
+
+def channel_barriers(ch, cluster) -> list[tuple[str, str]]:
+    """A named channel's ``("named", ids and count)``; an mbarrier channel's ``("full", ...)``
+    (arrival counts, TMA bytes and who arms them) and ``("empty", ...)``."""
+    if ch.named:
+        # One hardware barrier per slot and side; producers and consumers both arrive.
+        full_ids, empty_ids = (
+            [nb._allocated_id() for nb in bars] for bars in (ch.full_barriers, ch.empty_barriers)
+        )
+        count = fmt_counts(ch.named_counts())
+        named = f"full ids {full_ids}, empty ids {empty_ids}, {count} threads"
+        if ch.turnstile is not None:
+            named += f", taken in turn ({ch.turnstile})"
+        return [("named", named)]
+    cs = cluster.size
+    pair = is_pair(cluster)
+    sc = ch.scope
+    full_ranks = sc.full_ctas if sc.pair else range(cs)
+    empty_ranks = sc.empty_ctas if sc.pair else range(cs)
+    full = fmt_per_cta(sc.full_counts, full_ranks, by_rank=sc.pair, pair=pair)
+    if sc.tx is not None and isinstance(ch.producer, Tma) and ch.producer.fills:
+        # The filling CTA arms the barriers of the CTAs it fills.
+        copies = f" ({sc.tx_ctas} CTAs' copies)" if sc.tx_ctas > 1 else ""
+        arms = ", ".join(
+            f"rank {r} arms {'+'.join(map(str, targets))}"
+            for r, targets in sc.full_targets.items()
+            if targets
+        )
+        full += f", tx {sc.tx} B{copies}, {arms}"
+    elif sc.tx is not None:
+        # Leaders arm for both CTAs of their pair, or rank 0's scheduler for every CTA.
+        armers = [r for r, targets in sc.full_targets.items() if targets]
+        armed = sc.pair and (sc.tx_ctas > 1 or armers == [0])
+        full += f", tx {sc.tx} B" + (" (leader-armed)" if armed else "")
+    empty = fmt_per_cta(sc.empty_counts, empty_ranks, by_rank=sc.pair, pair=pair)
+    return [("full", full), ("empty", empty)]
+
+
+def channel_scope(ch, cluster) -> list[str]:
+    """Where the channel's barriers and signals reach: empty in a single CTA, else
+    ``CTA-local`` or ``pair-scoped``/``cross-CTA`` and its fills, multicast and masks."""
+    if cluster.size == 1:
+        return []
+    sc = ch.scope
+    if not sc.pair:
+        return ["CTA-local"]
+    scope = ["pair-scoped" if is_pair(cluster) else "cross-CTA"]
+    if isinstance(ch.producer, Tma) and ch.producer.fills:
+        scope.append(f"fills {ch.producer.fills}")
+    if isinstance(ch.producer, Tma) and ch.producer.multicast:
+        scope.append(f"multicast {'+'.join(ch.producer.multicast)}")
+    if ch.producer is Umma:
+        scope.append(f"commit_mask {fmt_mask(sc.full_mask, cluster)}")
+    if ch.consumer is Umma:
+        scope.append(f"release_mask {fmt_mask(sc.empty_mask, cluster)}")
+    if {Threads, Warps} & {ch.producer, ch.consumer}:
+        scope.append(f"remote_scope {ch.remote_scope}")
+    if sc.tail:
+        scope.append("tail")
+    return scope
+
+
+def channel_storage(ch) -> list[str]:
+    """The channel's payload or plan buffers, then its fences."""
+    extra = []
+    if ch.payload is not None:
+        dtype, shape = ch.payload
+        extra.append(f"payload {getattr(dtype, '__name__', dtype)}{tuple(shape)}")
+    if ch.buffers:
+        names = [k if k == b.name else f"{k}={b.name}" for k, b in ch.buffers.items()]
+        extra.append(f"buffer {', '.join(names)}")
+    if ch.commit_fence:
+        extra.append(f"commit_fence {'+'.join(ch.commit_fence)}")
+    if ch.release_fence:
+        extra.append(f"release_fence {'+'.join(ch.release_fence)}")
+    return extra
+
+
 def _channels(kernel) -> str:
     chans = kernel._ws_chans
     if not chans:
         return ""
-    cs = kernel.cluster.size
-    pair = is_pair(kernel.cluster)
     width = max(len(n) for n in chans)
     pad = " " * (2 + width + 2)
     lines = ["Channels"]
     for name, ch in chans.items():
-        kind = f"Slots({ch.n})" if ch.fixed else f"Ring({ch.n})"
-        head = f"  {name:<{width}}  {kind:<9}"
+        head = f"  {name:<{width}}  {channel_kind(ch):<9}"
         sides = [
             "raw code" if side == ch.external else _bound(bound)
             for side, bound in (("producer", ch.producers), ("consumer", ch.consumers))
@@ -178,41 +260,7 @@ def _channels(kernel) -> str:
             subsequent_indent=" " * (len(head) + 4),
             break_on_hyphens=False,
         )
-        details = []
-        sc = ch.scope
-        full_ranks = sc.full_ctas if sc.pair else range(cs)
-        empty_ranks = sc.empty_ctas if sc.pair else range(cs)
-        full = fmt_per_cta(sc.full_counts, full_ranks, by_rank=sc.pair, pair=pair)
-        if sc.tx is not None and isinstance(ch.producer, Tma) and ch.producer.fills:
-            # The filling CTA arms the barriers of the CTAs it fills.
-            copies = f" ({sc.tx_ctas} CTAs' copies)" if sc.tx_ctas > 1 else ""
-            arms = ", ".join(
-                f"rank {r} arms {'+'.join(map(str, targets))}"
-                for r, targets in sc.full_targets.items()
-                if targets
-            )
-            full += f", tx {sc.tx} B{copies}, {arms}"
-        elif sc.tx is not None:
-            # Leaders arm for both CTAs of their pair, or rank 0's scheduler for every CTA.
-            armers = [r for r, targets in sc.full_targets.items() if targets]
-            armed = sc.pair and (sc.tx_ctas > 1 or armers == [0])
-            full += f", tx {sc.tx} B" + (" (leader-armed)" if armed else "")
-        details.append(("signal", f"{_mech(ch.producer)} -> {_mech(ch.consumer)}"))
-        if ch.named:
-            # One hardware barrier per slot and side; producers and consumers both arrive.
-            full_ids, empty_ids = (
-                [nb._allocated_id() for nb in bars]
-                for bars in (ch.full_barriers, ch.empty_barriers)
-            )
-            count = fmt_counts(ch.named_counts())
-            named = f"full ids {full_ids}, empty ids {empty_ids}, {count} threads"
-            if ch.turnstile is not None:
-                named += f", taken in turn ({ch.turnstile})"
-            details.append(("named", named))
-        else:
-            details.append(("full", full))
-            empty = fmt_per_cta(sc.empty_counts, empty_ranks, by_rank=sc.pair, pair=pair)
-            details.append(("empty", empty))
+        details = [("signal", channel_signal(ch)), *channel_barriers(ch, kernel.cluster)]
         if ch.exclusive:
             owners = ", ".join(r.name for r, _ in ch.consumers)
             counts = (
@@ -247,34 +295,10 @@ def _channels(kernel) -> str:
                     "(unverified)",
                 )
             )
-        if cs > 1:
-            scope = ["CTA-local"]
-            if sc.pair:
-                scope = ["pair-scoped" if pair else "cross-CTA"]
-                if isinstance(ch.producer, Tma) and ch.producer.fills:
-                    scope.append(f"fills {ch.producer.fills}")
-                if isinstance(ch.producer, Tma) and ch.producer.multicast:
-                    scope.append(f"multicast {'+'.join(ch.producer.multicast)}")
-                if ch.producer is Umma:
-                    scope.append(f"commit_mask {fmt_mask(sc.full_mask, kernel.cluster)}")
-                if ch.consumer is Umma:
-                    scope.append(f"release_mask {fmt_mask(sc.empty_mask, kernel.cluster)}")
-                if {Threads, Warps} & {ch.producer, ch.consumer}:
-                    scope.append(f"remote_scope {ch.remote_scope}")
-                if sc.tail:
-                    scope.append("tail")
+        scope = channel_scope(ch, kernel.cluster)
+        if scope:
             details.append(("scope", ", ".join(scope)))
-        extra = []
-        if ch.payload is not None:
-            dtype, shape = ch.payload
-            extra.append(f"payload {getattr(dtype, '__name__', dtype)}{tuple(shape)}")
-        if ch.buffers:
-            names = [k if k == b.name else f"{k}={b.name}" for k, b in ch.buffers.items()]
-            extra.append(f"buffer {', '.join(names)}")
-        if ch.commit_fence:
-            extra.append(f"commit_fence {'+'.join(ch.commit_fence)}")
-        if ch.release_fence:
-            extra.append(f"release_fence {'+'.join(ch.release_fence)}")
+        extra = channel_storage(ch)
         if extra:
             storage = ch.payload is not None or ch.buffers
             details.append(("storage" if storage else "fences", ", ".join(extra)))
