@@ -46,6 +46,10 @@ def _imported_names(source: Path, package: str) -> Iterator[str]:
     ``TYPE_CHECKING`` ones included) and string literals shaped like module names, which covers
     ``importlib.import_module("pkg.module")``. ``from pkg import name`` yields ``pkg``, where
     ``name`` may be defined, and ``pkg.name``, in case it is a submodule.
+
+    Relative names in strings (``importlib.import_module(".mod", __package__)``) are not
+    followed: that is how host-only code that tracing never runs stays out of the key (see the
+    README).
     """
     for node in ast.walk(ast.parse(source.read_bytes(), filename=str(source))):
         match node:

@@ -69,6 +69,10 @@ Imports are found statically, so keep the code a kernel traces reachable by impo
   only, so if its module is not imported by the compile module, list that module in
   `extra_sources` (warpdrive kernels key their class modules' sources themselves).
 - Do not add `extra_sources` for modules the compile module already imports; they are hashed.
+- Keep host-only code (renderers, reports, trace decoding) out of the layer's imports. When a
+  layer module must call it, import it at call time by relative name,
+  `importlib.import_module(".mod", __package__)`, which the scan does not follow (as
+  `describe(format="html")` does); never for code tracing runs.
 - Pass a warpdrive kernel's static choices to its constructor: the key is the constructor call,
   and a public attribute assigned afterwards (other than `cluster`, work streams, and the IKET,
   tracing and alias settings) raises.

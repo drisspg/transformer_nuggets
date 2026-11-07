@@ -53,6 +53,12 @@ versioned dependencies above). A class passed as an argument is keyed by its mod
 if the compile module does not import its module, list it in `extra_sources` or give the class
 a `__cute_cache_key__` that includes `module_source_digest(cls.__module__)`.
 
+Host-only code that tracing never runs (report renderers, say) can stay out of the key even
+when a module the kernel imports calls it: import it at call time by relative name,
+`importlib.import_module(".mod", __package__)`, which the scan does not follow (a test pins
+this). warpdrive's `describe(format="html")` loads its renderers this way, and its tests check
+they stay outside the examples' `module_closure`. Never import code that tracing runs like this.
+
 ## Trace results
 
 A kernel loaded from disk was never traced, so anything the trace left on the Python

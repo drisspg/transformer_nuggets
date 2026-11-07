@@ -716,6 +716,12 @@ from transformer_nuggets.cute.jit_cache import jit_cache
 @jit_cache
 def compile_kernel():
     from pkg import local
+
+
+def report():
+    import importlib
+
+    return importlib.import_module(".hostonly", __package__)
 """,
     "absolute.py": "from pkg import cycle\n",
     "cycle.py": "from pkg import absolute\n",
@@ -746,6 +752,8 @@ def __getattr__(name):
     "lazy_target.py": "thing = 1\n",
     # Excluded: nothing imports it.
     "unrelated.py": "VALUE = 1\n",
+    # Excluded: imported by relative name at call time, the opt-out for host-only code.
+    "hostonly.py": "VALUE = 1\n",
 }
 
 
@@ -775,7 +783,7 @@ def test_cache_namespace_changes_only_with_imported_sources(synthetic_package, m
     cute_key.source_fingerprint.cache_clear()
 
     changed = compile_kernel.cache_namespace() != baseline
-    assert changed == (module not in {"sub/__init__.py", "unrelated.py"})
+    assert changed == (module not in {"sub/__init__.py", "unrelated.py", "hostonly.py"})
 
 
 def test_callers_outside_the_package_key_on_their_package_imports(

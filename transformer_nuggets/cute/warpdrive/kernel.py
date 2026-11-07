@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import functools
+import importlib
 import inspect
 import pickle
 import warnings
@@ -49,8 +50,6 @@ from transformer_nuggets.cute.warpdrive.cluster import (
     rank_value,
 )
 from transformer_nuggets.cute.warpdrive.describe import describe_kernel
-from transformer_nuggets.cute.warpdrive.describe_graph import describe_graph
-from transformer_nuggets.cute.warpdrive.describe_html import describe_html
 from transformer_nuggets.cute.warpdrive.named import NamedBarrier
 from transformer_nuggets.cute.warpdrive.protocol import (
     ProtocolError,
@@ -1126,9 +1125,10 @@ class WarpSpecialized(metaclass=_KernelType):
         self._collect()
         if format == "text":
             return describe_kernel(self)
-        if format == "html":
-            return describe_html(self)
-        return describe_graph(self, format)
+        # The renderers run on the host only. A relative import at call time keeps them out of
+        # every kernel's compile key, which hashes the modules a kernel imports (jit_cache
+        # README, "host-only code").
+        return importlib.import_module(".describe_graph", __package__).describe_graph(self, format)
 
     def _barrier_plan(self):
         """(owner, offset, {cta rank: arrival counts}) for every mbarrier, in allocation order.

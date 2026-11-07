@@ -6,6 +6,7 @@ import pickle
 import sys
 import textwrap
 import threading
+from pathlib import Path
 
 import pytest
 import torch
@@ -260,6 +261,29 @@ def test_editing_the_kernel_module_recompiles(
     finally:
         sys.path.remove(str(directory))
         sys.modules.pop("warpdrive_fill_kernel", None)
+
+
+# Host-only modules: rendering and trace decoding never run while tracing.
+HOST_ONLY = (
+    "describe_graph.py",
+    "describe_html.py",
+    "html_page.py",
+    "schedule_html.py",
+    "trace_session.py",
+    "examples/schedule_views.py",
+    "examples/qwen_megakernel_viz.py",
+    "examples/qwen_megakernel_trace.py",
+)
+
+
+@pytest.mark.parametrize("example", ["gemm", "persistent_gemm", "fa4_bwd", "qwen_megakernel"])
+def test_host_only_modules_stay_out_of_compile_keys(example):
+    """Editing describe()'s renderers, the schedule views or trace decoding recompiles no
+    kernel: they are outside the import closure that compile keys hash."""
+    warpdrive = Path(importlib.import_module("transformer_nuggets.cute.warpdrive").__file__).parent
+    closure = cute_key.module_closure(warpdrive / "examples" / f"{example}.py")
+    assert warpdrive / "kernel.py" in closure
+    assert not {warpdrive / name for name in HOST_ONLY} & set(closure)
 
 
 # M: 1, a multiple of 16, odd, a tile edge, several waves; N and K: multiples of 8 on both sides

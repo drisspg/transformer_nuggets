@@ -83,6 +83,12 @@ class Graph:
 
 
 def describe_graph(kernel, fmt: str) -> str:
+    """``kernel.describe(format=fmt)`` for the graph formats: ``FORMATS`` or ``"html"``."""
+    if fmt == "html":
+        # describe_html builds on this module's graph model.
+        from transformer_nuggets.cute.warpdrive.describe_html import describe_html
+
+        return describe_html(kernel)
     if fmt not in FORMATS:
         raise ValueError(
             f"describe format must be 'text', 'html' or one of {FORMATS}, got {fmt!r}"
