@@ -117,15 +117,16 @@ adds what a compile recorded: TMA check status, epoch ownership and named-barrie
 print(op.describe(format="mermaid"))
 ```
 
-- **Roles** (blue) are role instances with their warps, register budget, CTA placement in a
+- **Roles** are role instances with their warps, register budget, CTA placement in a
   cluster, and `raw`.
 - **Channels** run from producer to consumer, labelled like the text: stages, signal
-  mechanisms, FULL/EMPTY arrival counts, scope, sharing and storage. **Thick** edges cross
-  CTAs (pair-scoped); thin ones stay in a CTA. A channel with several roles on a side, or
-  slot-bound ends, is a grey junction: producers join it with a line and it points to each
-  consumer. Parallel channels that differ only in name and storage share one edge
-  (`k, kt, v, do ... each`).
-- **Synchronization that is not a handoff** is an orange hub joined by dotted lines: a
+  mechanisms, FULL/EMPTY arrival counts, scope, sharing and storage. An edge takes the colour
+  of its producers' signal mechanism: TMA green, UMMA blue, threads or warps purple, named
+  barriers ochre. **Thick** edges cross CTAs (pair-scoped); thin ones stay in a CTA. A channel
+  with several roles on a side, or slot-bound ends, is a junction: producers join it with a
+  line and it points to each consumer, in the consumers' colour. Parallel channels that
+  differ only in name and storage share one edge (`k, kt, v, do ... each`).
+- **Synchronization that is not a handoff** is an ochre hub joined by dotted lines: a
   named barrier (`sync`, `arrive`, `native id`; listed in one box before a compile names
   its users), a turnstile (`turn i`) and `Barriers` (to roles taking them as a parameter;
   `barrier_ptr` users are not tracked).
@@ -139,7 +140,7 @@ The diagrams below are the uncompiled output for the single-CTA GEMM, FA4 forwar
 **GEMM** (`examples/gemm.py`): TMA → MMA → epilogue.
 
 ```mermaid
-%%{init: {"flowchart": {"wrappingWidth": 400}}}%%
+%%{init: {"theme": "base", "flowchart": {"wrappingWidth": 400, "curve": "basis"}, "themeVariables": {"fontSize": "13px", "lineColor": "#6a7a6e", "edgeLabelBackground": "#fbf9f4", "primaryColor": "#fbf9f4", "primaryBorderColor": "#1a2e22", "primaryTextColor": "#1a2e22"}}}%%
 %% Gemm: 8 warps, single CTA, tcgen05 CtaGroup.ONE
 flowchart LR
   role_epilogue["epilogue<br>warps 0-3 · 160 regs"]
@@ -148,10 +149,12 @@ flowchart LR
   stream_work[["stream work<br>OneShot(), Raster(along=m)<br>decoded locally in every role"]]
   role_load -->|"ab · Ring(3)<br>Tma(49152 B) -#gt; Umma<br>full 1 x3, tx 49152 B<br>empty 1 x3<br>buffer A, B"| role_mma
   role_mma -->|"acc · Ring(1)<br>Umma -#gt; Threads<br>full 1<br>empty 128"| role_epilogue
-  classDef role fill:#e8f0fe,stroke:#3b6db3,color:#111
+  classDef role fill:#fbf9f4,stroke:#1a2e22,color:#1a2e22
   class role_epilogue,role_load,role_mma role
-  classDef stream fill:#e6f4ea,stroke:#3a7d44,color:#111
+  classDef stream fill:#eef2ec,stroke:#5f7f67,color:#1a2e22
   class stream_work stream
+  linkStyle 0 stroke:#3f7d5c,stroke-width:1.6px
+  linkStyle 1 stroke:#3b689c,stroke-width:1.6px
 ```
 
 **FA4 forward** (`examples/fa4_fwd.py`): each softmax instance owns one slot of `s`,
@@ -159,7 +162,7 @@ flowchart LR
 around exp2.
 
 ```mermaid
-%%{init: {"flowchart": {"wrappingWidth": 400}}}%%
+%%{init: {"theme": "base", "flowchart": {"wrappingWidth": 400, "curve": "basis"}, "themeVariables": {"fontSize": "13px", "lineColor": "#6a7a6e", "edgeLabelBackground": "#fbf9f4", "primaryColor": "#fbf9f4", "primaryBorderColor": "#1a2e22", "primaryTextColor": "#1a2e22"}}}%%
 %% FlashAttentionForward: 16 warps, single CTA, tcgen05 CtaGroup.ONE
 flowchart LR
   role_softmax_0["softmax[0]<br>warps 0-3 · 192 regs"]
@@ -189,16 +192,20 @@ flowchart LR
   role_correction -->|"epi · Slots(2)<br>Threads -#gt; Threads<br>full 128 x2<br>empty 32 x2<br>buffer O, commit_fence smem_async"| role_epilogue
   role_softmax_0 -.-|"turn 0"| turnstile_mufu
   role_softmax_1 -.-|"turn 1"| turnstile_mufu
-  classDef role fill:#e8f0fe,stroke:#3b6db3,color:#111
+  classDef role fill:#fbf9f4,stroke:#1a2e22,color:#1a2e22
   class role_softmax_0,role_softmax_1,role_correction,role_mma,role_epilogue,role_load role
-  classDef stream fill:#e6f4ea,stroke:#3a7d44,color:#111
+  classDef stream fill:#eef2ec,stroke:#5f7f67,color:#1a2e22
   class stream_work stream
-  classDef channel fill:#f4f4f4,stroke:#777,color:#111
+  classDef channel fill:#eae6de,stroke:#6a7a6e,color:#1a2e22
   class channel_s,channel_p_last,channel_stats channel
-  classDef sync fill:#fdf2e0,stroke:#b26a00,color:#111
+  classDef sync fill:#f6efe3,stroke:#a26f22,color:#1a2e22
   class turnstile_mufu sync
-  classDef storage fill:#fafafa,stroke:#aaa,stroke-dasharray:2 2,color:#111
+  classDef storage fill:#fbf9f4,stroke:#b9b4aa,stroke-dasharray:2 2,color:#6a7a6e
   class storage_aliases storage
+  linkStyle 0,6 stroke:#3b689c,stroke-width:1.6px
+  linkStyle 1,2,3,4,5,7,8,9,12 stroke:#8a5a9e,stroke-width:1.6px
+  linkStyle 10,11 stroke:#3f7d5c,stroke-width:1.6px
+  linkStyle 13,14 stroke:#6a7a6e,stroke-width:1.6px
 ```
 
 **2-CTA FA4 backward** (`FlashAttentionBackward2Cta` in `examples/fa4_bwd.py`): every
@@ -208,7 +215,7 @@ completes on the peer's raw `xchg` barrier, and its `relay` warp forwards that a
 the leader on `ds`. Hence `ds` joins compute and relay.
 
 ```mermaid
-%%{init: {"flowchart": {"wrappingWidth": 400}}}%%
+%%{init: {"theme": "base", "flowchart": {"wrappingWidth": 400, "curve": "basis"}, "themeVariables": {"fontSize": "13px", "lineColor": "#6a7a6e", "edgeLabelBackground": "#fbf9f4", "primaryColor": "#fbf9f4", "primaryBorderColor": "#1a2e22", "primaryTextColor": "#1a2e22"}}}%%
 %% FlashAttentionBackward2Cta: 16 warps, CTA pair (2, 1, 1), tcgen05 CtaGroup.TWO, leader = rank 0
 flowchart LR
   role_reduce["reduce<br>warps 0-3 · 136 regs · cta all"]
@@ -231,17 +238,72 @@ flowchart LR
   role_mma ==>|"s, dp · Ring(1) each<br>Umma -#gt; Warps<br>full leader 1, peer 1<br>empty leader 16<br>pair-scoped, commit_mask 0b11, remote_scope cta<br>release_fence tmem_store"| role_compute
   role_mma ==>|"dq · Ring(1)<br>Umma -#gt; Warps<br>full leader 1, peer 1<br>empty leader 8<br>pair-scoped, commit_mask 0b11, remote_scope cta"| role_reduce
   role_mma ==>|"dkv · Slots(2)<br>Umma -#gt; Warps<br>full leader 1 x2, peer 1 x2<br>empty leader 16 x2<br>pair-scoped, commit_mask 0b11, remote_scope cta"| role_compute
-  classDef role fill:#e8f0fe,stroke:#3b6db3,color:#111
+  classDef role fill:#fbf9f4,stroke:#1a2e22,color:#1a2e22
   class role_reduce,role_compute,role_mma,role_load,role_relay role
-  classDef stream fill:#e6f4ea,stroke:#3a7d44,color:#111
+  classDef stream fill:#eef2ec,stroke:#5f7f67,color:#1a2e22
   class stream_work stream
-  classDef channel fill:#f4f4f4,stroke:#777,color:#111
+  classDef channel fill:#eae6de,stroke:#6a7a6e,color:#1a2e22
   class channel_ds channel
-  classDef sync fill:#fdf2e0,stroke:#b26a00,color:#111
+  classDef sync fill:#f6efe3,stroke:#a26f22,color:#1a2e22
   class named_list_barriers,barriers_xchg sync
-  classDef storage fill:#fafafa,stroke:#aaa,stroke-dasharray:2 2,color:#111
+  classDef storage fill:#fbf9f4,stroke:#b9b4aa,stroke-dasharray:2 2,color:#6a7a6e
   class storage_aliases storage
+  linkStyle 0,1 stroke:#8a5a9e,stroke-width:3.5px
+  linkStyle 2,7,8,9 stroke:#3b689c,stroke-width:3.5px
+  linkStyle 3,4 stroke:#3f7d5c,stroke-width:3.5px
+  linkStyle 5,6 stroke:#3f7d5c,stroke-width:1.6px
 ```
+
+### Draw it as a page
+
+`describe(format="html")` returns the same graph as one self-contained HTML file (styles,
+script and layout inline; it opens from disk with no network access):
+
+```python
+Path("fa4_bwd_2cta.html").write_text(op.describe(format="html"))
+```
+
+![FA4 2-CTA backward drawn by describe(format="html")](images/fa4_bwd_2cta_pipeline.png)
+
+Each role is a card with its warps and registers, a strip marking which of the CTA's warps
+it occupies, and its placement (`cta leader`; a role on every CTA of a cluster is a stacked
+card). Each channel is a chip between its producers and consumers: one tick per stage, a bar
+in its producer and consumer mechanism colours, and badges for pair scope, multicast,
+fences, overrides (red when they differ from what the layer derived), round-robin turns,
+exclusive consumers and compile results (`tma ✓`, `epochs`). The wire into a chip takes the
+producers' colour and the wire out the consumers'; cross-CTA wires are double. Hubs sit
+between their users. Hover or click any of them for the full text label; work streams,
+named barriers without known users and storage aliases are listed under the figure.
+
+### See which CTA runs what
+
+For a static schedule (`OneShot`, `StaticPersistent`) the host can list exactly which work
+items each CTA runs, in order: `WorkStream.assignment(space, max_ctas)` runs the schedule's
+own index sequence for every work unit and returns `[cta][slot] -> (index, item)`. A pure
+mapping such as `Raster` decodes the items itself; a mapping that reads tables or device
+data takes its host counterpart as `decode=`, which also tells it which items are dropped.
+
+```python
+rows = PersistentGemm().work.assignment((32, 16, 1), max_ctas=148)
+rows[0]  # [(0, (0, 0, 0)), (148, (18, 4, 0)), ...]: CTA 0's tiles, in order
+```
+
+`schedule_html` draws such an assignment: a CTA x slot grid (wave quantization is a ragged
+last column), a timeline when the items carry predicted spans, with dependency arrows on
+hover, the critical path and an optional measured overlay, and a work-space map when they
+carry 2-D coordinates. Two example views use it:
+
+```bash
+# persistent GEMM tiles per CTA and a grouped GEMM's groups
+python -m transformer_nuggets.cute.warpdrive.examples.schedule_views OUTDIR --ctas 148
+# the Qwen megakernel's instruction table under its latency model; --timeline overlays a
+# capture (JSON format in the module docstring)
+python -m transformer_nuggets.cute.warpdrive.examples.qwen_megakernel_viz OUT.html --ctas 152
+```
+
+![The Qwen megakernel's predicted timeline with its critical path](images/qwen_megakernel_schedule.png)
+
+![A 4096 x 4096 persistent GEMM on 152 CTAs: tiles per CTA and where each wave lands](images/persistent_gemm_schedule.png)
 
 ## Trace the protocol
 

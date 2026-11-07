@@ -50,6 +50,10 @@ unit 1:  1 -> 4 -> 7 -> terminal
 unit 2:  2 -> 5      -> terminal
 ```
 
+The local schedules fix these sequences before the launch, so the host can list them:
+`work.assignment(space, max_ctas)` returns each CTA's `(index, item)` list in run order
+([drawn per CTA](tracing.md#see-which-cta-runs-what)).
+
 Atomic claims are unique but have no fixed inter-unit order. CLC recovers the canceled
 work index from its CTA x coordinate divided by cluster size. It waits for every cancellation
 response and never queries again after failure.
