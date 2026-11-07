@@ -1236,23 +1236,10 @@ class WorkCursor:
     warp), and, in broadcast mode, the role's consumer end of the work ring.
     """
 
-    def __init__(
-        self,
-        stream,
-        problem,
-        end,
-        index,
-        words,
-        rec,
-        count=None,
-        slot=None,
-        ranged=False,
-        state=None,
-    ):
+    def __init__(self, stream, problem, end, index, words, rec, count=None, slot=None, state=None):
         self._stream, self._problem, self._end, self._rec = stream, problem, end, rec
         self.index, self._words = index, words
         self._count, self._slot = count, slot  # recording: items seen, (role ordinal, warp)
-        self._ranged = ranged  # one trace range per work item (named after the role)
         self._state = state  # WorkMap.decode state of a decoding cursor (None: stateless)
         self._copy = rec.lineage.add()
 
@@ -1266,9 +1253,7 @@ class WorkCursor:
         trace.checks.append(rec.check)
         count = Int32(0) if stream.record else None
         first = Int32(stream.schedule.first_index(problem))
-        cur = WorkCursor(
-            stream, problem, end, first, (), rec, count, slot, trace.ranges is not None
-        )
+        cur = WorkCursor(stream, problem, end, first, (), rec, count, slot)
         if end is None:
             cur.index, cur._words, cur._state = _local_start(stream, first, problem)
         elif not _publishes_first(stream):
@@ -1299,8 +1284,8 @@ class WorkCursor:
                 self._stream.record,
             )
             self._count = self._count + 1
-        if self._ranged:
-            trace = self._rec.trace
+        trace = self._rec.trace
+        if trace.ranges is not None:  # one range per work item, named after the role
             push_if(trace.ranges, self.index < self._problem.total, trace.role_name)
 
     def __extract_mlir_values__(self):
@@ -1333,7 +1318,6 @@ class WorkCursor:
             self._rec,
             count,
             self._slot,
-            self._ranged,
             state,
         )
 
@@ -1372,9 +1356,9 @@ class WorkCursor:
         self._check_current()
         self._rec.lineage.advanced(self._copy)
         self._rec.advances.append((user_site(), current_block()))
-        self._rec.trace.item_block = current_block()
-        if self._ranged:
-            trace = self._rec.trace
+        trace = self._rec.trace
+        trace.item_block = current_block()
+        if trace.ranges is not None:
             trace.ranges.pop(trace.role_name, self.index)  # this item's range; payload: index
         stream, problem = self._stream, self._problem
         if self._end is None:
