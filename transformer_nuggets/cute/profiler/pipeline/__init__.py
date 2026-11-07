@@ -4,39 +4,35 @@ from __future__ import annotations
 
 from importlib import import_module
 
+# The annotation markers run while kernels trace, so they load eagerly (and are hashed into
+# the compile keys of kernels that import them through this package); the plan model,
+# extractor, join, analysis and writers load on first use and stay out of those keys.
 from transformer_nuggets.cute.profiler.pipeline.annotations import PipelineAnnotations
-from transformer_nuggets.cute.profiler.pipeline.extract import extract_plan
-from transformer_nuggets.cute.profiler.pipeline.plan import (
-    Dependency,
-    PipelinePlan,
-    Region,
-    Resource,
-    Role,
-    SourceLocation,
-    Timeline,
-)
 
 _LAZY_EXPORTS = {
-    "MeasuredCapture": ("measure", "MeasuredCapture"),
-    "MeasuredRegion": ("measure", "MeasuredRegion"),
-    "PipelineAnalysis": ("analysis", "PipelineAnalysis"),
-    "analyze_pipeline": ("analysis", "analyze_pipeline"),
-    "join": ("measure", "join"),
-    "report": ("summary", "report"),
-    "write_pipeline_perfetto": ("perfetto", "write_pipeline_perfetto"),
+    "Dependency": "plan",
+    "PipelinePlan": "plan",
+    "Region": "plan",
+    "Resource": "plan",
+    "Role": "plan",
+    "SourceLocation": "plan",
+    "Timeline": "plan",
+    "extract_plan": "extract",
+    "MeasuredCapture": "measure",
+    "MeasuredRegion": "measure",
+    "join": "measure",
+    "PipelineAnalysis": "analysis",
+    "analyze_pipeline": "analysis",
+    "report": "summary",
+    "write_pipeline_perfetto": "perfetto",
 }
 
 
 def __getattr__(name: str):
-    """Load measurement, analysis, and visualization helpers on first use."""
-    target = _LAZY_EXPORTS.get(name)
-    if target is None:
-        raise AttributeError(name)
-    module_name, attribute = target
-    value = getattr(
-        import_module(f"transformer_nuggets.cute.profiler.pipeline.{module_name}"),
-        attribute,
-    )
+    """Load the plan model, measurement, analysis, and visualization helpers on first use."""
+    if name not in _LAZY_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(f".{_LAZY_EXPORTS[name]}", __name__), name)
     globals()[name] = value
     return value
 

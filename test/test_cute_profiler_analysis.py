@@ -257,3 +257,27 @@ def test_recording_kernels_key_only_the_profilers_device_code(kernel_module, rec
     assert {
         path.relative_to(PROFILER).as_posix() for path in closure if path.is_relative_to(PROFILER)
     } == {recorder}
+
+
+@pytest.mark.parametrize(
+    "statement, keyed",
+    [
+        (
+            "from transformer_nuggets.cute.profiler import compact_profile_region",
+            {"__init__.py", "ops.py"},
+        ),
+        (
+            "from transformer_nuggets.cute.profiler.pipeline import PipelineAnnotations",
+            {"pipeline/__init__.py", "pipeline/annotations.py"},
+        ),
+    ],
+)
+def test_package_imports_of_device_code_key_no_host_code(tmp_path, statement, keyed):
+    """Importing a recorder through its package keys the package's ``__init__`` and the device
+    module, not the host modules the package exports lazily."""
+    kernel = tmp_path / "kernel.py"
+    kernel.write_text(statement + "\n")
+    closure = module_closure(kernel)
+    assert {
+        path.relative_to(PROFILER).as_posix() for path in closure if path.is_relative_to(PROFILER)
+    } == keyed

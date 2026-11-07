@@ -26,15 +26,10 @@ Quick Start:
     session.ranges  # decoded after the block
 """
 
-from transformer_nuggets.cute.profiler.host import (
-    ProfileBuf,
-    ProfileSession,
-    TagTable,
-    allocate_profile_buffer,
-    decode_ranges,
-    profile_session,
-)
-from transformer_nuggets.cute.profiler.iket import parse_iket
+from importlib import import_module
+
+# Device code loads eagerly; host code on first use, so a kernel that imports a recorder from
+# this package keys only this file and ops.py (compile keys hash every module imported).
 from transformer_nuggets.cute.profiler.ops import (
     compact_anchor_init,
     compact_event_stop,
@@ -46,14 +41,31 @@ from transformer_nuggets.cute.profiler.ops import (
     read_globaltimer,
     read_globaltimer_lo32,
 )
-from transformer_nuggets.cute.profiler.perfetto import write_ranges
-from transformer_nuggets.cute.profiler.ranges import (
-    OverlapSummary,
-    Range,
-    RangeSummary,
-    overlap_between,
-    summarize_by_tag,
-)
+
+_HOST_EXPORTS = {
+    "ProfileBuf": "host",
+    "ProfileSession": "host",
+    "TagTable": "host",
+    "allocate_profile_buffer": "host",
+    "decode_ranges": "host",
+    "profile_session": "host",
+    "parse_iket": "iket",
+    "write_ranges": "perfetto",
+    "OverlapSummary": "ranges",
+    "Range": "ranges",
+    "RangeSummary": "ranges",
+    "overlap_between": "ranges",
+    "summarize_by_tag": "ranges",
+}
+
+
+def __getattr__(name: str):
+    if name not in _HOST_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(f".{_HOST_EXPORTS[name]}", __name__), name)
+    globals()[name] = value
+    return value
+
 
 __all__ = [
     # Device
@@ -72,13 +84,13 @@ __all__ = [
     "TagTable",
     "allocate_profile_buffer",
     "decode_ranges",
+    "parse_iket",
     "profile_session",
     # Ranges, statistics and traces
     "OverlapSummary",
     "Range",
     "RangeSummary",
     "overlap_between",
-    "parse_iket",
     "summarize_by_tag",
     "write_ranges",
 ]
