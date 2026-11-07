@@ -25,6 +25,7 @@ from transformer_nuggets.cute.profiler import (
     compact_event_stop,
     compact_event_stop_smem,
     compact_flush_smem_to_gmem,
+    compact_prepare_smem,
     profile_region,
     profile_session,
     raw_event_stop,
@@ -336,6 +337,98 @@ def test_compact_smem_roundtrip():
         assert {e.event_idx for e in events if e.unit_id == unit_id} == set(range(NUM_ITERS))
     for e in events:
         assert e.start_ns > (1 << 40)
+
+
+# ---------------------------------------------------------------------------
+# Out-of-range slots are dropped, not written over neighboring records
+# ---------------------------------------------------------------------------
+
+
+@cute.kernel
+def _kernel_legacy_slots(prof_buf: cute.Tensor, max_events: cutlass.Int32):
+    bidx, _, _ = cute.arch.block_idx()
+    # Block 1's slot -1 would overlap block 0's only record.
+    with profile_region(prof_buf, max_events, Int32(0), bidx, event_idx=Int32(bidx) * -1):
+        pass
+
+
+@cute.jit()
+def _launch_legacy_slots(prof_buf, max_events):
+    _kernel_legacy_slots(prof_buf, max_events).launch(grid=(2, 1, 1), block=(THREADS, 1, 1))
+
+
+def test_legacy_negative_slot_is_dropped():
+    with profile_session(max_events_per_unit=1, num_units=2, tag_names=["t"]) as session:
+        _launch_legacy_slots(from_dlpack(session.prof.tensor), Int32(1))
+    assert [(e.unit_id, e.event_idx) for e in session.events] == [(0, 0)]
+    assert session.events[0].dur_ns < 1_000_000
+
+
+@cute.kernel
+def _kernel_compact_slots(prof_buf: cute.Tensor, max_events: cutlass.Int32):
+    bidx, _, _ = cute.arch.block_idx()
+    compact_anchor_init(prof_buf, bidx, max_events)
+    cute.arch.barrier()
+    if cute.arch.warp_idx() == 0:
+        # Block 0's slots -1 and max_events would overwrite its anchor and block 1's.
+        for slot in (Int32(0) - bidx, max_events * bidx):
+            start = read_globaltimer_lo32()
+            compact_event_stop(prof_buf, Int32(1) - bidx, slot, start, Int32(0), max_events)
+
+
+@cute.jit()
+def _launch_compact_slots(prof_buf, max_events):
+    _kernel_compact_slots(prof_buf, max_events).launch(grid=(2, 1, 1), block=(THREADS, 1, 1))
+
+
+def test_compact_out_of_range_slots_are_dropped():
+    with profile_session(
+        max_events_per_unit=2, num_units=2, tag_names=["t"], compact=True
+    ) as session:
+        _launch_compact_slots(from_dlpack(session.prof.tensor), Int32(2))
+    # Block 0 records slot 0 of unit 1 twice; block 1's slots -1 and 2 of unit 0 are dropped.
+    assert [(e.unit_id, e.event_idx) for e in session.events] == [(1, 0)]
+    anchors = session.prof.tensor.view(2, 3)[:, 0]
+    assert (anchors > 1 << 50).all(), "an out-of-range record overwrote an anchor"
+
+
+SENTINEL = 0x5E17
+
+
+@cute.kernel
+def _kernel_compact_smem_slot(prof_gmem: cute.Tensor, out: cute.Tensor):
+    @cute.struct
+    class S:
+        prof_smem: cute.struct.MemRange[cutlass.Int64, 2]
+        neighbor: cute.struct.MemRange[cutlass.Int64, 1]
+
+    storage = cutlass.utils.SmemAllocator().allocate(S)
+    smem_tensor = storage.prof_smem.get_tensor(cute.make_layout((2,)))
+    neighbor = storage.neighbor.get_tensor(cute.make_layout((1,)))
+    if cute.arch.thread_idx()[0] == 0:
+        neighbor[0] = cutlass.Int64(SENTINEL)
+    compact_prepare_smem(smem_tensor, Int32(1))
+    if cute.arch.warp_idx() == 0:
+        start = read_globaltimer_lo32()
+        compact_event_stop_smem(smem_tensor, Int32(1), start, Int32(0))  # one past the end
+    compact_flush_smem_to_gmem(smem_tensor, prof_gmem, Int32(0), Int32(1))
+    if cute.arch.thread_idx()[0] == 0:
+        out[0] = neighbor[0]
+
+
+@cute.jit()
+def _launch_compact_smem_slot(prof_gmem, out):
+    _kernel_compact_smem_slot(prof_gmem, out).launch(grid=(1, 1, 1), block=(THREADS, 1, 1))
+
+
+def test_compact_smem_slot_past_the_slice_is_dropped():
+    out = torch.zeros(1, dtype=torch.int64, device="cuda")
+    with profile_session(
+        max_events_per_unit=1, num_units=1, tag_names=["t"], compact=True
+    ) as session:
+        _launch_compact_smem_slot(from_dlpack(session.prof.tensor), from_dlpack(out))
+    assert session.events == []
+    assert out.item() == SENTINEL
 
 
 # ---------------------------------------------------------------------------

@@ -165,13 +165,15 @@ def compact_event_stop(
     duration modulo 2^24 — use the legacy 4xi64 path (:func:`raw_event_stop`)
     for coarse outer regions if needed. ``tag`` is masked to 8 bits.
 
-    Only lane 0 of the calling warp performs the store; the caller is
-    responsible for any outer warp guard. The inner ``if lane_idx == 0:``
-    yields no value, so this primitive is safe in deeply nested control flow.
+    Only lane 0 of the calling warp performs the store, and only for
+    ``0 <= event_idx < max_events_per_unit``: an out-of-range slot is dropped
+    rather than written over a neighboring unit. The caller is responsible for
+    any outer warp guard. The inner ``if`` yields no value, so this primitive
+    is safe in deeply nested control flow.
     """
     lane_idx = cute.arch.lane_idx()
     end_ts32 = read_globaltimer_lo32()
-    if lane_idx == 0:
+    if (lane_idx == 0) & (event_idx >= 0) & (event_idx < max_events_per_unit):
         dur32 = end_ts32 - start_ts32
         ts_u = Int64(start_ts32) & Int64(0xFFFFFFFF)
         dur_u = Int64(dur32) & Int64(0xFFFFFF)
@@ -223,13 +225,16 @@ def compact_event_stop_smem(
     :func:`compact_flush_smem_to_gmem` once at kernel exit to copy the slice
     out to global memory.
 
-    Only lane 0 of the calling warp performs the store; the caller is
-    responsible for any outer warp guard. The hot path is a single ``STS``
-    plus the timer read and bit-pack — no global address arithmetic.
+    Only lane 0 of the calling warp performs the store, and only for a slot
+    inside ``smem_buf`` (``0 <= event_idx < size(smem_buf) - 1``): an
+    out-of-range slot is dropped rather than written over the kernel's
+    neighboring shared memory. The caller is responsible for any outer warp
+    guard. The hot path is a single ``STS`` plus the timer read and bit-pack —
+    no global address arithmetic.
     """
     lane_idx = cute.arch.lane_idx()
     end_ts32 = read_globaltimer_lo32()
-    if lane_idx == 0:
+    if (lane_idx == 0) & (event_idx >= 0) & (event_idx < cute.size(smem_buf) - 1):
         dur32 = end_ts32 - start_ts32
         ts_u = Int64(start_ts32) & Int64(0xFFFFFFFF)
         dur_u = Int64(dur32) & Int64(0xFFFFFF)
@@ -426,7 +431,7 @@ def static_start(
         event_idx: Event index within this unit (0, 1, 2, ... tracked in registers).
         max_events_per_unit: Maximum events per unit (determines slice size).
         bounds_check: Compile-time flag. When ``True`` (default), gate the timer
-            read on ``event_idx < max_events_per_unit``. Setting ``False`` drops
+            read on ``0 <= event_idx < max_events_per_unit``. Setting ``False`` drops
             the inner ``scf.if`` and is required when calling from deeply nested
             control flow (e.g. inside ``if warp_idx == 0: for ...:`` in a
             warp-specialized kernel) where the extra conditional has been seen
@@ -438,7 +443,7 @@ def static_start(
     """
     if cutlass.const_expr(bounds_check):
         start_ns = Int64(0)
-        if event_idx < max_events_per_unit:
+        if (event_idx >= 0) & (event_idx < max_events_per_unit):
             start_ns = read_globaltimer()
         return start_ns
     return read_globaltimer()
@@ -474,7 +479,7 @@ def static_stop(
     """
     should_record = True
     if cutlass.const_expr(bounds_check):
-        should_record = event_idx < max_events_per_unit
+        should_record = (event_idx >= 0) & (event_idx < max_events_per_unit)
     if should_record:
         end_ns = read_globaltimer()
         base_ptr = buf.iterator.toint()

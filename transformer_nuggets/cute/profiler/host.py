@@ -315,6 +315,16 @@ def _tag_name_or_unknown(tag_table: TagTable, tag_id: int) -> str:
 def _decode_events_legacy(buf: ProfileBuf, tag_table: TagTable, tid_base: int) -> list[Event]:
     cpu_buf = buf.tensor.cpu().numpy()
     slice_size = buf.slice_size
+    # Slot 0 counts atomically allocated events (static slots leave it zero).
+    counts = cpu_buf[::slice_size][: buf.num_units]
+    overflowed = (counts > buf.max_events_per_unit).nonzero()[0]
+    if len(overflowed):
+        raise RuntimeError(
+            f"Profiling units {overflowed.tolist()} allocated "
+            f"{', '.join(str(int(counts[u])) for u in overflowed)} events for "
+            f"max_events_per_unit={buf.max_events_per_unit}; the excess was dropped. "
+            "Raise max_events_per_unit."
+        )
     events = []
 
     for unit_id in range(buf.num_units):
