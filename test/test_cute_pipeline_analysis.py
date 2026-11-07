@@ -111,6 +111,17 @@ def test_annotations_extract_data_state_and_reuse(tmp_path: Path) -> None:
     assert plan.schedule(iterations=3).logical_duration > 0
 
 
+def test_extractor_rejects_keywords_the_markers_reject(tmp_path: Path) -> None:
+    source = tmp_path / "annotated.py"
+    source.write_text(
+        ANNOTATED_SOURCE.replace(
+            'label="Load", warp_start', 'label="Load", color="#00f", warp_start'
+        )
+    )
+    with pytest.raises(ValueError, match="Unknown role\\(\\) keyword 'color'"):
+        extract_plan(source)
+
+
 def test_runtime_annotations_are_noops_until_iket_is_enabled() -> None:
     annotations = PipelineAnnotations("test", iteration_name="tile")
 
@@ -362,6 +373,35 @@ def test_ring_slot_is_free_after_its_last_release(first: str) -> None:
         "x": ((0, 0), (100, 1), (600, 0), (700, 1), (1200, 0))
     }
     assert [d.resource for d in analysis.depth_counterfactuals] == ["x"]
+
+
+def test_ring_slot_with_two_producers_fills_once_both_finish() -> None:
+    """Two producer roles fill one slot of ``x`` together: it holds one item, not two."""
+    plan = PipelinePlan("fanin", iteration_name="tile")
+    for warp, name in enumerate(("a", "b", "use")):
+        plan.add_role(Role(name, name, warp, warp + 1))
+        plan.add_region(Region(name, name, name, 0, 1))
+    plan.add_resource(Resource("x", "X", 1))
+    for producer in ("a", "b"):
+        plan.add_dependency(Dependency(producer, "use", "x"))
+        plan.add_dependency(Dependency("use", producer, "x", distance=1, kind="reuse"))
+    timeline = plan.schedule(iterations=2)
+    regions = [
+        (name, i, 300 * i + start, 300 * i + end)
+        for i in range(2)
+        for name, start, end in (("a", 0, 100), ("b", 0, 150), ("use", 150, 300))
+    ]
+    measured = MeasuredCapture(
+        (0, 0, 0),
+        0,
+        600,
+        tuple(MeasuredRegion(n, n, i, s, e, float(e - s), 1) for n, i, s, e in regions),
+    )
+    assert ring_occupancy_samples(timeline, measured) == {
+        "x": ((0, 0), (150, 1), (300, 0), (450, 1), (600, 0))
+    }
+    (ring,) = analyze_pipeline(timeline, measured).rings
+    assert (ring.peak_occupancy, ring.final_occupancy) == (1, 0)
 
 
 def test_perfetto_splits_crossing_role_envelopes_and_normalizes_suffix(

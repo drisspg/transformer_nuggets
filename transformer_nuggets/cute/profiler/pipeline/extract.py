@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import ast
+import inspect
 from dataclasses import dataclass
 from pathlib import Path
 
-from transformer_nuggets.cute.profiler.pipeline.annotations import indexed_region_name
+from transformer_nuggets.cute.profiler.pipeline.annotations import (
+    PipelineAnnotations,
+    indexed_region_name,
+)
 from transformer_nuggets.cute.profiler.pipeline.plan import (
     Dependency,
     PipelinePlan,
@@ -153,6 +157,7 @@ class _AnnotatedPlanExtractor:
             call = node.value
             if not is_annotation_call(call, self.annotation_name, "resource"):
                 continue
+            check_keywords(call, "resource")
             resources.append(
                 Resource(
                     name=positional_literal(call, 0, str),
@@ -187,6 +192,7 @@ class _AnnotatedPlanExtractor:
             if len(decorators) != 1:
                 raise ValueError(f"Function {function.name!r} has multiple role annotations")
             call = decorators[0]
+            check_keywords(call, "role")
             roles.append(
                 (
                     function,
@@ -239,6 +245,7 @@ class _AnnotatedPlanExtractor:
         first_order: int,
     ) -> list[ParsedRegion]:
         """Lower one region call into ``count`` regions with per-copy tokens."""
+        check_keywords(call, "region")
         name = positional_literal(call, 0, str)
         count = keyword_literal(call, "count", int, default=1)
         if count < 1:
@@ -339,6 +346,14 @@ def positional_literal(call: ast.Call, index: int, expected_type: type):
             f"Expected {expected_type.__name__} at line {call.lineno}, got {type(value).__name__}"
         )
     return value
+
+
+def check_keywords(call: ast.Call, method: str) -> None:
+    """Reject keywords that ``PipelineAnnotations.<method>`` would reject when the kernel runs."""
+    parameters = inspect.signature(getattr(PipelineAnnotations, method)).parameters
+    unknown = [item.arg for item in call.keywords if item.arg not in parameters]
+    if unknown:
+        raise ValueError(f"Unknown {method}() keyword {unknown[0]!r} at line {call.lineno}")
 
 
 def keyword_literal(call: ast.Call, name: str, expected_type: type, *, default=None):

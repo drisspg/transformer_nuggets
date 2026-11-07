@@ -394,27 +394,28 @@ def ring_lifetimes(
     measured: MeasuredCapture,
     dependencies: tuple[Dependency, ...],
 ) -> tuple[list[int], list[int]]:
-    """Origin-relative fill and release times of one ring's slots.
+    """Origin-relative fill and release times of one ring's slots, one of each per iteration.
 
-    A slot fills when its producer finishes and is free again once the last of its readers
-    releases it.
+    A slot is full once the last of its producers finishes and free again once the last of its
+    readers releases it.
     """
     measured_by_key = {(item.name, item.iteration): item for item in measured.regions}
     producers = tuple(dict.fromkeys(dependency.target for dependency in dependencies))
     readers = tuple(dict.fromkeys(dependency.source for dependency in dependencies))
+
+    def last_end(regions: tuple[str, ...], iteration: int) -> list[int]:
+        ends = [
+            measured_by_key[(name, iteration)].end_ns
+            for name in regions
+            if (name, iteration) in measured_by_key
+        ]
+        return [max(ends) - measured.origin_ns] if ends else []
+
     fills: list[int] = []
     releases: list[int] = []
     for iteration in range(timeline.iterations):
-        for producer in producers:
-            if (producer, iteration) in measured_by_key:
-                fills.append(measured_by_key[(producer, iteration)].end_ns - measured.origin_ns)
-        released = [
-            measured_by_key[(reader, iteration)].end_ns
-            for reader in readers
-            if (reader, iteration) in measured_by_key
-        ]
-        if released:
-            releases.append(max(released) - measured.origin_ns)
+        fills += last_end(producers, iteration)
+        releases += last_end(readers, iteration)
     return fills, releases
 
 
