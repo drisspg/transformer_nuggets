@@ -53,6 +53,14 @@ versioned dependencies above). A class passed as an argument is keyed by its mod
 if the compile module does not import its module, list it in `extra_sources` or give the class
 a `__cute_cache_key__` that includes `module_source_digest(cls.__module__)`.
 
+The `jit_cache` modules stay in this closure: they define the caching and compilation
+contract. Their imports should stay minimal. The scan conservatively treats any string
+literal naming a `transformer_nuggets` module or package as an import edge, too: the
+`"transformer_nuggets"` cache-directory component reaches the root `__init__.py`.
+The root loads its public `utils` and `numerics` subpackages only on demand, so they do not
+enter kernel keys through this edge. Traced code using those subpackages must import their
+modules explicitly, like any other kernel helper.
+
 Host-only code that tracing never runs (report renderers, say) can stay out of the key even
 when a module the kernel imports calls it: import it at call time by relative name,
 `importlib.import_module(".mod", __package__)`, which the scan does not follow (a test pins

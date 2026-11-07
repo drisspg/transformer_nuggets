@@ -1,9 +1,22 @@
-from pathlib import Path
-
-from transformer_nuggets import utils as utils, numerics as numerics
 import logging
+from importlib import import_module as _import_module
+from pathlib import Path
+from types import ModuleType as _ModuleType
+
+# Preserve the existing wildcard exports while loading utility subpackages on demand.
+__all__ = ["DATA_DIR", "Path", "init_logging", "logging", "numerics", "utils", "vscode_breakpoint"]
 
 DATA_DIR = Path(__file__).parent.parent / "data"
+
+
+def __getattr__(name: str) -> _ModuleType:
+    if name in {"utils", "numerics"}:
+        return _import_module(f".{name}", __name__)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
 
 
 def init_logging(level=logging.INFO):
