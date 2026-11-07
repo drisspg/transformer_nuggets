@@ -150,8 +150,8 @@ One GB300 run on 2026-11-07 (branch `profiler-fix`, CuTeDSL 4.8.0, the command a
 CTA, the producer load's overlap with consumer work rose from 0% to 74%, median producer
 acquire fell from 192 to 32 ns, median consumer wait from 192 to 64 ns, and the producer's wait
 for a released stage (inferred from the consumer's release, as compact records trace no wait
-ranges) from 42 us to 0. Treat
-these as a worked interpretation, not expected constants; rerun on the target kernel and GPU.
+ranges) from 42 us to 0. Treat these as a worked interpretation, not expected constants; rerun
+on the target kernel and GPU.
 
 ## Pipeline analysis
 

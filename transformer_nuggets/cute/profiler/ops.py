@@ -197,7 +197,7 @@ def compact_event_stop(
 
     Pair with :func:`read_globaltimer_lo32` for the start timestamp. The packed record is
     ``tag(8) | dur_ns(24) | ts_lo32(32)`` (bits 63..56, 55..32, 31..0). ``dur_ns`` wraps
-    modulo 2^24 ns (~16.7 ms), so record coarse outer regions with :func:`event_stop`;
+    modulo 2^24 ns (~16.7 ms); use :func:`event_stop` for regions needing longer durations;
     ``tag`` is masked to 8 bits. Each event pays a global store; for the same workload,
     :func:`compact_event_stop_smem` records ~30-50 ns less observer overhead per event at the
     cost of an end-of-kernel flush.
@@ -230,7 +230,7 @@ def compact_event_stop_smem(
     Same packed record as :func:`compact_event_stop`, stored to shared memory: no global
     address math, so recorded ``dur_ns`` for inner regions is ~30-50 ns smaller for the same
     work. Pair with :func:`read_globaltimer_lo32` for the start timestamp and call
-    :func:`compact_flush_smem_to_gmem` once at kernel exit, a cost the timestamps do not see.
+    :func:`compact_flush_smem_to_gmem` once at kernel exit, outside the recorded regions.
 
     Only lane 0 of the calling warp performs the store, and only for
     ``0 <= event_idx < max_events_per_unit`` (the slice holds ``1 + max_events_per_unit``
@@ -321,7 +321,7 @@ def compact_warp_stop(
     record=True,
     smem=False,
 ) -> None:
-    """Close a compact region from lane 0 of one warp, in shared (``smem``) or global memory."""
+    """Close a compact region from lane 0 of ``target_warp``, in shared or global memory."""
     if record:
         if cute.arch.warp_idx() == target_warp and cute.arch.lane_idx() == 0:
             if cutlass.const_expr(smem):

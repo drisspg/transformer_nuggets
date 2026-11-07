@@ -451,7 +451,7 @@ def test_perfetto_zero_duration_slice_begins_before_it_ends(tmp_path: Path) -> N
 
     output = write_pipeline_perfetto(tmp_path / "empty.pftrace", timeline, measured)
 
-    # read_slices raises on an end before its begin.
+    # read_slices rejects an end with no open slice on its track.
     assert [(s.name, s.start_ns, s.end_ns) for s in read_slices(output)] == [
         ("B · tile 0", 0, 4),
         ("A · tile 0", 0, 0),

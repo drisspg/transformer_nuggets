@@ -1,18 +1,7 @@
 """Host side of the profiler: allocate profile buffers and decode their records into ranges.
 
-Usage:
-    with profile_session(
-        64,
-        num_units=(num_ctas, "CTA"),
-        tag_names=["produce", "consume"],
-        trace_path="trace.pftrace",
-        compact=True,
-    ) as session:
-        produce_tag = session.tags.id("produce")
-        kernel(x, session.prof.tensor, session.prof.max_events_per_unit, produce_tag)
-    session.ranges  # decoded after the block
-
-The buffer layouts are described in ``ops.py``.
+``profile_session`` wraps both for a block of launches. The buffer layouts are described in
+``ops.py``.
 """
 
 from __future__ import annotations

@@ -8,8 +8,7 @@ The command must launch the annotated kernel exactly once with IKET enabled. The
 run executes under ``run-iket`` with ``CUTE_DSL_NO_CACHE=1``; the raw IKET JSON
 and pftrace, the enriched pipeline pftrace, and the text report are copied to
 ``<out>/<tag>.*`` (``<tag>`` kept whole, dots included) so successive experiments stay side
-by side. Pass
-``--from-trace <trace.json>`` to re-analyze an existing capture without a GPU.
+by side. Pass ``--from-trace <trace.json>`` to re-analyze an existing capture without a GPU.
 """
 
 from __future__ import annotations
