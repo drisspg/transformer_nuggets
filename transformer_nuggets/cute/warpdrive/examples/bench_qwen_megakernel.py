@@ -19,6 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from transformer_nuggets.cute.warpdrive.examples.bench_support import provenance, settle
+from transformer_nuggets.cute.warpdrive.examples import qwen_megakernel_trace
 from transformer_nuggets.cute.warpdrive.examples.qwen_megakernel import QwenMegakernel
 from transformer_nuggets.cute.warpdrive.examples.qwen_megakernel_ref import (
     QwenWeights,
@@ -223,6 +224,22 @@ def measure_hbm_rooflines(buffer_gb: float = 2.0, iters: int = 100) -> dict[str,
 
 
 @torch.no_grad()
+def trace_megakernel(weights, max_len: int, token, pos: int, caches, path: Path) -> dict:
+    """One warmed megakernel step traced with the globaltimer backend (``qwen_megakernel_trace``):
+    per-layer phase spans and median input waits in us, and the Perfetto trace at ``path``."""
+    runner = QwenMegakernel(weights, max_len, trace="globaltimer")
+    runner(weights, token, pos, *caches)  # compile, warm, and set the step's token and position
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with qwen_megakernel_trace.trace_session(runner, trace_path=str(path)) as session:
+        runner.launch(*caches)
+    return {
+        "trace": str(path),
+        "phase_span_us": qwen_megakernel_trace.phase_spans(session.events, runner.table),
+        "input_wait_us": qwen_megakernel_trace.input_waits(session.events, runner.table),
+    }
+
+
+@torch.no_grad()
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
@@ -242,6 +259,12 @@ def main() -> None:
         "--skip-megakernel", action="store_true", help="skip the warpdrive decode megakernel"
     )
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--trace-dir",
+        type=Path,
+        help="also trace one megakernel step per context with the globaltimer backend: write "
+        "qwen_megakernel_ctx<N>.pftrace here and report per-phase spans and input waits",
+    )
     args = parser.parse_args()
     weights = load_qwen3_weights(args.model)
     packed = prepare_fast_weights(weights, max(args.contexts) + 1, args.gemm_rows)
@@ -324,6 +347,19 @@ def main() -> None:
                 return runner.logits
 
             variants.append(("megakernel_graph", megakernel_step, True))
+            if args.trace_dir:
+                report.setdefault("traces", {})[str(ctx_len)] = trace_megakernel(
+                    weights,
+                    max_len,
+                    token,
+                    pos,
+                    caches,
+                    args.trace_dir / f"qwen_megakernel_ctx{ctx_len}.pftrace",
+                )
+                print(
+                    f"ctx={ctx_len} megakernel_trace={json.dumps(report['traces'][str(ctx_len)])}",
+                    flush=True,
+                )
         for name, fn, graph in variants:
             stats = time_step(fn, cuda_graph=graph, iters=args.iters, warmup=args.warmup)
             moved = bytes_per_step(weights, ctx_len)

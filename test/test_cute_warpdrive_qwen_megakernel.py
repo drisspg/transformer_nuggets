@@ -8,6 +8,7 @@ pytest.importorskip("cutlass.cute")
 
 from transformer_nuggets.cute.warpdrive import ProtocolError, RoleConfig
 from transformer_nuggets.cute.warpdrive.examples import qwen_megakernel as mk
+from transformer_nuggets.cute.warpdrive.examples import qwen_megakernel_trace as mk_trace
 from transformer_nuggets.cute.warpdrive.examples.qwen_megakernel_ref import (
     compare_logits,
     decode_step_ref,
@@ -206,6 +207,62 @@ def test_moved_roles_match_defaults(weights):
     assert torch.equal(logits, expected)
     for mine, other in zip(ours, theirs):  # rows past pos are uninitialized
         assert torch.equal(mine[:, :, : pos + 1], other[:, :, : pos + 1])
+
+
+def test_globaltimer_trace(weights, tmp_path):
+    """A traced step computes the same logits; every table row has one compute and one load
+    range carrying its row, each phase has a span, and the trace links rows across CTAs."""
+    caches, token, pos = make_decode_state(weights, 100, MAX_LEN, seed=0)
+    ours, theirs = [c.clone() for c in caches], [c.clone() for c in caches]
+    runner = mk.QwenMegakernel(weights, MAX_LEN, trace="globaltimer")
+    with mk_trace.trace_session(runner, trace_path=str(tmp_path / "step.pftrace")) as session:
+        logits = runner(weights, token, pos, *ours)
+    expected = mk.QwenMegakernel(weights, MAX_LEN)(weights, token, pos, *theirs)
+    assert torch.equal(logits, expected)
+    rows = [r for r, words in enumerate(runner.table.tolist()) if words[0] >= 0]
+    for role in ("compute", "load"):
+        ranges = [e for e in session.events if e.tag_name == role]
+        assert sorted(e.payload for e in ranges) == rows
+    computed = mk_trace.item_ranges(session.events)
+    cta = {row: e.unit_id for row, e in computed.items()}
+    ctas = runner.max_ctas
+    assert all(cta[row] == row % ctas for row in rows)  # the static [slot][cta] layout
+    spans = mk_trace.phase_spans(session.events, runner.table)
+    assert set(spans) == set(mk.OP_NAMES) and all(v > 0 for v in spans.values())
+    assert set(mk_trace.input_waits(session.events, runner.table)) == set(mk.OP_NAMES)
+    flows = [e for e in session.trace["traceEvents"] if e.get("ph") == "s"]
+    assert len(flows) >= len(rows) - mk.QKV_ROWS // mk.ROWS  # layer 0's QKV rows wait on nothing
+    assert (tmp_path / "step.pftrace").stat().st_size > 0
+
+
+def test_trace_analysis_on_synthetic_rows():
+    """Phase spans run from the producer phase's last row (QKV: the previous layer's down; the
+    LM head: the last layer's) to the phase's last row; input waits from a row's start to its
+    first poll's end; arrows leave each input group's last-finishing producer row."""
+    from transformer_nuggets.cute.profiler import Event
+
+    rows = [
+        [mk.DOWN, 0, 0, 0],
+        [mk.QKV, 1, 0, 0],  # q head 0: kv group 0
+        [mk.QKV, 1, 1, 0],  # also q head 0
+        [mk.ATTN, 1, 0, 0],
+        [mk.DOWN, mk.LAYERS - 1, 0, 0],
+        [mk.LMHEAD, 0, 0, 8],
+    ]
+    table = torch.tensor([words + [i] for i, words in enumerate(rows)])
+    done = [100, 150, 140, 200, 250, 300]
+    events = [Event(d - 10, 10, 0, "compute", 0, payload=row) for row, d in enumerate(done)]
+    events.append(Event(140, 4, 1, "poll", 0, payload=1))  # QKV row 1: ready at 144
+    events.append(Event(144, 4, 1, "poll", 0, payload=1))  # a later poll does not count
+    spans = mk_trace.phase_spans(events, table)
+    assert spans == {"QKV": 0.05, "ATTN": 0.05, "LMHEAD": 0.05}
+    assert mk_trace.input_waits(events, table) == {"QKV": 0.004}
+    edges = mk_trace.input_edges(table.tolist(), dict(enumerate(done)))
+    assert edges == {
+        ("DOWN", "QKV"): [(0, 1), (0, 2)],
+        ("QKV", "ATTN"): [(1, 3)],  # row 1 finished after row 2
+        ("DOWN", "LMHEAD"): [(4, 5)],
+    }
 
 
 @pytest.mark.parametrize("warps", [range(4), [range(8), range(9, 17)]], ids=["4", "2x8"])

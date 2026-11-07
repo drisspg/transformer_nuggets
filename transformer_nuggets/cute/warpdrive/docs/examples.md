@@ -1351,16 +1351,43 @@ gpu-run --timeout 600 auto -- timeout --signal=TERM --kill-after=5s 2400s \
   --output agent_space/qwen_megakernel.json
 ```
 
-`QwenMegakernel(..., timeline=True)` fills `runner.timeline` with globaltimer stamps per table
-row (columns `TIMELINE`: CTA, item start, inputs ready, done, load start/end, prologue and
-mainloop end; a row that reuses the previous row's GEMV input records no inputs-ready stamp). `iket="roles"` compiles IKET ranges for work items plus `trace_region`s
-(`prologue`, `poll`, `stream`, `publish`, `attn.norm`, `attn.blocks`, `attn.merge`);
-`iket="waits"` adds the layer's wait ranges. Disabled, both emit no instructions; with IKET, roles
-mode measured 480 us against 470–480 us unprofiled and waits mode 508 us at the time. Capture one launch with `run-iket` as in
-[Tracing](tracing.md#iket). Traces at ctx 1024:
+`QwenMegakernel(..., trace="globaltimer")` compiles the layer's
+[globaltimer ranges](tracing.md#globaltimer): every CTA records its compute and load work items
+(payload: the table row) and the compute role's `trace_region`s, also with the row as payload:
+`poll` (waiting for the row's inputs; it ends when they are ready), `stream` (a GEMV tile's
+weight stages), `attn.blocks` (an attention row's KV blocks) and `reduce.poll` (the last down
+split fetching the other partials). Earlier regions (`prologue`, `publish`, `attn.norm`,
+`attn.merge`) were dropped to keep the recording cost low: the gaps between the remaining
+ranges show them. `qwen_megakernel_trace` decodes one launch:
+
+```python
+from transformer_nuggets.cute.warpdrive.examples import qwen_megakernel_trace as mkt
+
+runner = QwenMegakernel(weights, max_len=1088, trace="globaltimer")
+runner(weights, token, pos, *caches)  # compile and warm up
+with mkt.trace_session(runner, trace_path="step.pftrace") as session:
+    runner.launch(*caches)
+mkt.phase_spans(session.events, runner.table)  # {"QKV": 1.9, "ATTN": 3.8, ...} us per layer
+mkt.input_waits(session.events, runner.table)  # median row start -> inputs ready, us
+```
+
+The trace has one process per SM and one thread per role; work items are named after their
+instruction (`QKV`, `load QKV`, ...) with `layer`, `a` and `b` in their args, and an arrow runs
+from each input group's last-finishing producer row to the row waiting for it, across SMs
+(`link_payload_flow`). `bench_qwen_megakernel --trace-dir DIR` writes one trace per context and
+reports both views. `trace="iket"` emits the same ranges for `run-iket` (as in
+[Tracing](tracing.md#iket); the payload is each range's `payloadVal`), and `waits=True` adds the
+layer's wait ranges with either backend. Disabled, both emit no instructions.
+
+The globaltimer ranges replaced hand-written per-row stamps (one store per stamp). In one
+reservation at ctx 1024 (GB300, 15 interleaved launches each), the per-layer phase spans agreed
+to within 0.1 us except GATEUP (old stamps 3.84, globaltimer 3.98 us) and the LM head (46.3,
+47.4 us); a launch took 472.2 us untraced, 483.1 us with the stamps and 485.7 us with
+globaltimer ranges. With IKET, roles mode measured 480 us against 470–480 us unprofiled and
+waits mode 508 us at the time. Traces at ctx 1024:
 [IKET roles](https://fburl.com/perfetto/3h1t248o),
 [IKET waits](https://fburl.com/perfetto/ak5nt8jt),
-[per-row timeline, one track per SM](https://fburl.com/perfetto/gxuo6bjz).
+[globaltimer, one process per SM](https://fburl.com/perfetto/pqda0s42).
 
 At ctx 1024 the step went 1050 us (atomic claiming, counters) -> 668 (host static schedule)
 -> 640 (row-independent loads before waiting) -> 546 (tagged activations) -> 526 (FFMA2 GEMV)
@@ -1434,10 +1461,12 @@ Writing this kernel exposed these warpdrive gaps, most useful fix first:
    stores, which needed inline PTX to try evict_last on tagged words). Each strong load is one
    L2 request per lane, so vector loads matter for polling.
    `from cutlass._mlir_helpers.arith import bitcast`
-8. **IKET ranges are named after the role, not the instruction**, so heterogeneous items must
-   be matched back to the host table; every compute warp emits its own copy of a region (8x the
-   ranges), and `trace_region` is only a context manager.
-   `with self.trace_region("poll"): fetch(segments, vals, epoch)`
+8. **Trace ranges are named after the role, not the instruction** (partly fixed). A range's
+   payload now carries the table row (`trace_region(..., payload=row)`; globaltimer work items
+   carry their index), and the globaltimer backend records once per role rather than once per
+   warp; matching rows to instructions is still host work, and `trace_region` is only a
+   context manager.
+   `with self.trace_region("poll", payload=row): fetch(segments, vals, epoch)`
 9. **`plan_from_warpdrive` models only the CTA-local ring**: analyzed against the IKET
    capture, it reports compute as critical and the load warp as blocked on reuse, but the
    real critical path crosses CTAs and is invisible to the plan. `plan_from_warpdrive(op)  # one ring (w), two roles; no cross-CTA edges`
