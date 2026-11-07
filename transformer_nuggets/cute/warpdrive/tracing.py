@@ -1,20 +1,8 @@
-"""Ranges named after roles and channels, recorded by one of the profiler's two backends, and the
-matching ``PipelinePlan``.
+"""Device-side role and channel ranges for IKET and globaltimer.
 
-``kernel.enable_trace(backend)`` (before compiling) makes the layer emit ranges; with it off the
-layer emits nothing, so the generated code is unchanged. The backends of
-``transformer_nuggets.cute.profiler``:
-
-* ``"iket"``: IKET push/pop ranges (``cutlass.cute.experimental.iket``), captured by ``run-iket``
-  for every warp; ``kernel.enable_iket()`` is the shorthand.
-* ``"globaltimer"``: the profiler's full records (``%globaltimer``, 32 bytes each, in static
-  slots) in a profile buffer the kernel passes to ``run_roles(..., trace_buffer=...)``.
-  One profiling unit per CTA; lane 0 of each role instance's first warp records its ranges into
-  its share of the unit's slots, with that warp as the record's warp.
-  ``trace_session.trace_session(kernel, num_ctas)`` allocates the buffer and decodes it into
-  the profiler's ``Range``s (one Perfetto process per CTA, one track per role). This module
-  imports only the profiler's device ops: every kernel's compile key hashes the modules it
-  imports.
+See ``docs/tracing.md`` ("Tracing backends") for backend setup, capture and decoding.
+This module imports only the profiler's device ops because kernel compile keys hash
+imported modules.
 
 Range names are stable (the profiler's pipeline join relies on the role and wait names):
 
@@ -22,8 +10,8 @@ Range names are stable (the profiler's pipeline join relies on the role and wait
   cursor's start to its ``advance()``), else one range over the whole role. Role instances keep
   their suffix (``softmax[0]``). The CTA of a pair kernel is not in the name: both backends record
   the CTA of every range, and ``plan_from_warpdrive(kernel, cta=...)`` builds the plan of one CTA.
-  With globaltimer, a work item's range carries its linear index as the payload; IKET item
-  ranges carry none, which keeps the IKET instrumentation exactly what it was before payloads.
+  Globaltimer work-item ranges carry their linear index as the payload; IKET work-item
+  ranges carry no payload.
 * ``<channel>.acquire`` / ``<channel>.wait`` / ``<channel>.peek`` / ``<channel>.tail``: the
   blocking mbarrier wait of a producer acquire, a consumer wait or preview, and a producer
   tail, nested inside the role range, so waiting is separated from working. ``<turnstile>.turn``

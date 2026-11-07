@@ -1070,10 +1070,10 @@ class WarpSpecialized(metaclass=_KernelType):
         return self.enable_trace("iket" if enabled else None, waits=waits)
 
     def trace_key(self) -> str:
-        """Kernel-name suffix of the trace settings: the backend (``_iket``, ``_iketroles``,
-        ``_gtimer``, ``_gtimerroles``; '' when off), then ``_trace`` for ``trace_protocol``. A
-        cached kernel was never traced, so the examples compile a ``trace_protocol`` instance
-        uncached (``jit_cache(uncached=...)``) to fill its protocol log."""
+        """Kernel-name suffix: ``_iket``, ``_iketroles``, ``_gtimer`` or ``_gtimerroles``
+        (empty when disabled), followed by ``_trace`` when ``trace_protocol`` is enabled.
+        Cache hits do not retrace the body; examples use ``jit_cache(uncached=...)`` for
+        protocol logs. See ``docs/tracing.md`` ("Trace the protocol")."""
         backend = ""
         if self.trace_backend is not None:
             backend = {"iket": "_iket", "globaltimer": "_gtimer"}[self.trace_backend]
