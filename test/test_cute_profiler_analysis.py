@@ -2,6 +2,8 @@ import pytest
 
 pytest.importorskip("cutlass")  # transformer_nuggets.cute imports CuTeDSL
 
+from pathlib import Path
+
 import torch
 
 from transformer_nuggets.cute.profiler import (
@@ -17,6 +19,7 @@ from transformer_nuggets.cute.profiler import (
     validate_event_counts,
 )
 from transformer_nuggets.cute.profiler.ops import PAYLOAD_FLAG
+from transformer_nuggets.cute.jit_cache._key import module_closure
 
 
 def make_event(
@@ -264,3 +267,24 @@ def test_link_payload_flow_links_slices_across_units():
     duplicate = {"traceEvents": [producer, dict(producer, args=dict(producer["args"]))]}
     with pytest.raises(ValueError, match="payload 10"):
         link_payload_flow([(10, 10)], "row")(duplicate, None)
+
+
+PROFILER = Path(__file__).resolve().parents[1] / "transformer_nuggets" / "cute" / "profiler"
+
+
+@pytest.mark.parametrize(
+    "kernel_module, recorder",
+    [
+        ("sgemm.py", "ops.py"),
+        ("blockscaled_tma.py", "ops.py"),
+        ("warpdrive/tracing.py", "ops.py"),
+        ("profiler/pipeline/annotations.py", "pipeline/annotations.py"),
+    ],
+)
+def test_recording_kernels_key_only_the_profilers_device_code(kernel_module, recorder):
+    """A kernel's compile key hashes the modules it imports: a kernel that records ranges must
+    reach only the profiler's device code, not its decoding, analysis, or plan model."""
+    closure = module_closure(PROFILER.parent / kernel_module)
+    assert {
+        path.relative_to(PROFILER).as_posix() for path in closure if path.is_relative_to(PROFILER)
+    } == {recorder}

@@ -44,9 +44,9 @@ from contextlib import contextmanager
 
 import cutlass
 from cutlass import Int32, Int64, cute
+from cutlass.cute.experimental import iket
 
 from transformer_nuggets.cute.profiler.ops import read_globaltimer, static_stop
-from transformer_nuggets.cute.profiler.pipeline.annotations import load_iket
 from transformer_nuggets.cute.warpdrive.protocol import ProtocolError
 
 BACKENDS = ("iket", "globaltimer")
@@ -96,14 +96,14 @@ class IketRanges(Ranges):
     def push(self, name: str, payload=None) -> None:
         self.open_range(name)
         if payload is None:
-            load_iket().range_push(name)
+            iket.range_push(name)
         else:
-            load_iket().range_push(name, payload)
+            iket.range_push(name, payload)
 
     def pop(self, name: str, payload=None) -> None:
         """IKET records a range's payload at its push (work items push none)."""
         self.close_range(name)
-        load_iket().range_pop()
+        iket.range_pop()
 
 
 class IketTrace:

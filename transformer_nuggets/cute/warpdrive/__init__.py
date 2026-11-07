@@ -99,6 +99,8 @@ outside a layer payload must declare ``remote_scope="cluster"``. The layer canno
 case. The cluster scope costs about 30% on FA4's hot S channel.
 """
 
+import importlib
+
 from transformer_nuggets.cute.warpdrive.adapters import CutlassRaster, Fa4Mapping
 from transformer_nuggets.cute.warpdrive.alias import (
     bulk_commit_group,
@@ -135,7 +137,6 @@ from transformer_nuggets.cute.warpdrive.kernel import (
     role,
 )
 from transformer_nuggets.cute.warpdrive.named import NamedBarrier
-from transformer_nuggets.cute.warpdrive.pipeline_plan import plan_from_warpdrive
 from transformer_nuggets.cute.warpdrive.protocol import ProtocolError, ProtocolLog, unchecked
 from transformer_nuggets.cute.warpdrive.scheduling import (
     AtomicPersistent,
@@ -211,3 +212,11 @@ __all__ = [
     "role",
     "unchecked",
 ]
+
+
+def __getattr__(name: str):
+    # Host-only: every kernel's compile key hashes the modules this package imports, and
+    # ``plan_from_warpdrive`` (with the profiler's plan model) never runs while tracing.
+    if name == "plan_from_warpdrive":
+        return importlib.import_module(".pipeline_plan", __package__).plan_from_warpdrive
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

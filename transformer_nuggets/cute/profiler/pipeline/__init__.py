@@ -4,10 +4,8 @@ from __future__ import annotations
 
 from importlib import import_module
 
-from transformer_nuggets.cute.profiler.pipeline.annotations import (
-    PipelineAnnotations,
-    extract_plan,
-)
+from transformer_nuggets.cute.profiler.pipeline.annotations import PipelineAnnotations
+from transformer_nuggets.cute.profiler.pipeline.extract import extract_plan
 from transformer_nuggets.cute.profiler.pipeline.plan import (
     Dependency,
     PipelinePlan,

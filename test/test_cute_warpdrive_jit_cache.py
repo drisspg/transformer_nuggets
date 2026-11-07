@@ -268,6 +268,7 @@ HOST_ONLY = (
     "describe_graph.py",
     "describe_html.py",
     "html_page.py",
+    "pipeline_plan.py",
     "schedule_html.py",
     "trace_session.py",
     "examples/schedule_views.py",
@@ -278,8 +279,10 @@ HOST_ONLY = (
 
 @pytest.mark.parametrize("example", ["gemm", "persistent_gemm", "fa4_bwd", "qwen_megakernel"])
 def test_host_only_modules_stay_out_of_compile_keys(example):
-    """Renderers, trace decoding and the root package's utilities do not invalidate kernels."""
+    """Renderers, trace decoding, the pipeline plan export and the root package's utilities do
+    not invalidate kernels; of the profiler, only its device ops are inside the closure."""
     warpdrive = Path(importlib.import_module("transformer_nuggets.cute.warpdrive").__file__).parent
+    profiler = warpdrive.parent / "profiler"
     closure = cute_key.module_closure(warpdrive / "examples" / f"{example}.py")
     assert warpdrive / "kernel.py" in closure
     assert not {warpdrive / name for name in HOST_ONLY} & set(closure)
@@ -288,6 +291,7 @@ def test_host_only_modules_stay_out_of_compile_keys(example):
     # exports (utils, numerics) must not bring non-CuTe dependencies into the key.
     unrelated = {source for source in closure if not source.is_relative_to(package / "cute")}
     assert unrelated <= {package / "__init__.py"}
+    assert {path for path in closure if path.is_relative_to(profiler)} == {profiler / "ops.py"}
 
 
 # M: 1, a multiple of 16, odd, a tile edge, several waves; N and K: multiples of 8 on both sides

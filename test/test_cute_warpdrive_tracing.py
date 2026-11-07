@@ -65,9 +65,8 @@ class _Recorder:
 
 @pytest.fixture
 def iket_recorder(monkeypatch, traced_compiles):
-    real = tracing.load_iket()
-    rec = _Recorder(real)
-    monkeypatch.setattr(tracing, "load_iket", lambda: rec)
+    rec = _Recorder(tracing.iket)
+    monkeypatch.setattr(tracing, "iket", rec)
     compile_persistent_gemm.cache_clear()  # trace even if another test compiled the same key
     return rec
 
@@ -78,10 +77,11 @@ def _compile_gemm(op):
 
 
 def test_disabled_emits_no_iket_ops(monkeypatch, traced_compiles):
-    def forbidden():
-        raise AssertionError("IKET op emitted with IKET disabled")
+    class Forbidden:
+        def __getattr__(self, name):
+            raise AssertionError("IKET op emitted with IKET disabled")
 
-    monkeypatch.setattr(tracing, "load_iket", forbidden)
+    monkeypatch.setattr(tracing, "iket", Forbidden())
     compile_persistent_gemm.cache_clear()
     op = _compile_gemm(PersistentGemm(schedule=ClusterLaunchControl(), cluster=CtaPair()))
     assert op.trace_key() == "" and "iket" not in op.get_name()

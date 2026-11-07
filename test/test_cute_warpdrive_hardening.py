@@ -729,14 +729,14 @@ def test_raw_role_runs_under_its_budget_branch(monkeypatch, traced_compiles):
         monkeypatch.setattr(
             cute.arch, fn, lambda regs, *a, _real=real, **kw: (events.append(regs), _real(regs))
         )
-    iket = tracing.load_iket()
+    iket = tracing.iket
 
     def push(name):
         events.append(name)
         return iket.range_push(name)
 
     monkeypatch.setattr(
-        tracing, "load_iket", lambda: SimpleNamespace(range_push=push, range_pop=iket.range_pop)
+        tracing, "iket", SimpleNamespace(range_push=push, range_pop=iket.range_pop)
     )
     op = MixedGemm().enable_iket(waits=False)
     compile_gemm.cache_clear()  # trace even if another test compiled the same key

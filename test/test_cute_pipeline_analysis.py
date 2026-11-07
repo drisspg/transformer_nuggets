@@ -129,23 +129,6 @@ def test_runtime_annotations_are_noops_until_iket_is_enabled() -> None:
     )
 
 
-def test_iket_unavailable_error_is_actionable(monkeypatch: pytest.MonkeyPatch) -> None:
-    annotations = PipelineAnnotations("test", iteration_name="tile")
-    annotations.enable_iket()
-
-    def unavailable():
-        raise RuntimeError("IKET pipeline ranges require a supported CuTeDSL release")
-
-    monkeypatch.setattr(pipeline_annotations, "load_iket", unavailable)
-
-    @annotations.role("load", label="Load", warp_start=0, warp_end=1, color="#fff")
-    def body() -> None:
-        annotations.region("work", label="Work", weight=1, description="work")
-
-    with pytest.raises(RuntimeError, match="IKET pipeline ranges require"):
-        body()
-
-
 def test_scheduler_rejects_same_iteration_cycle() -> None:
     plan = PipelinePlan("cycle", iteration_name="tile")
     plan.add_role(Role("a", "A", 0, 1, "#fff"))
@@ -577,7 +560,7 @@ def test_runtime_indexed_region_names_and_rejects_dynamic_index(
     annotations.enable_iket()
     pushed: list[str] = []
     fake_iket = SimpleNamespace(range_push=pushed.append, range_pop=lambda: None)
-    monkeypatch.setattr(pipeline_annotations, "load_iket", lambda: fake_iket)
+    monkeypatch.setattr(pipeline_annotations, "iket", fake_iket)
 
     @annotations.role("mma", label="MMA", warp_start=0, warp_end=1, color="#fff")
     def body(index) -> None:

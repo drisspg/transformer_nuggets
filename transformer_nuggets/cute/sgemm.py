@@ -70,12 +70,12 @@ from cutlass.cute.nvgpu.warpgroup import SmemLayoutAtomKind
 
 from transformer_nuggets.cute.base import CuteOp
 from transformer_nuggets.cute.cache import compile_tvm_ffi_and_cache
-from transformer_nuggets.cute.profiler import (
+from transformer_nuggets.cute.profiler.ops import (
+    ENABLE_PROFILING_CONST,
     compact_flush_smem_to_gmem,
     compact_prepare_smem,
     compact_profile_region,
 )
-from transformer_nuggets.cute.profiler.ops import ENABLE_PROFILING_CONST
 from transformer_nuggets.cute.utils import get_device_properties, make_fake_compact_tensor
 
 
