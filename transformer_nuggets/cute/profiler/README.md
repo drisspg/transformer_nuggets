@@ -131,6 +131,17 @@ region_end(prof_buf, TAG_OUTER, outer, max_events)
 
 This is the closest analogue to NVIDIA IKET's `iket.range_start` / `iket.range_end` SSA-token pairing in `cutlass.cute.experimental.iket`. The shape is similar but the mechanism is different: IKET emits MLIR ops and lowers via the proprietary `iket` dialect, while this profiler emits inline PTX (`%globaltimer`, `st.global.cs.u64`) directly.
 
+## Payloads
+
+Legacy records can carry one runtime `Int32` payload, for example the work item a region belongs to. Pass `payload=` to `profile_region`, `region_end`, `warp_stop`, `static_stop` or `raw_event_stop`; it decodes as `Event.payload` (`None` for records without one) and appears in the Perfetto slice args:
+
+```python
+with profile_region(prof_buf, max_events, TAG_ROW, bidx, event_idx=slot, payload=row):
+    run_row(row)
+```
+
+The payload shares the record's tag word (tag in the low 31 bits, a flag in bit 31, the payload in the high 32 bits), so the record stays 32 bytes and records without a payload decode as before. Compact records have no room for one. `link_payload_flow` draws arrows between slices identified by payload across units (below).
+
 ## Record formats: legacy 4xi64 vs compact 1xi64 (gmem / smem)
 
 Three on-wire record formats are available, in addition to the three pairing modes above:
@@ -165,7 +176,7 @@ The smem path requires a CTA-local `Int64` tensor with `1 + max_events_per_unit`
 |----------|-------------|
 | `profile_session(...)` | Context manager returning `ProfileSession`; allocate, validate, decode, post-process, and optionally write trace |
 | `allocate_profile_buffer(max_events_per_unit, num_units, device)` | Allocate buffer |
-| `decode_events(buf, tag_table)` | Decode to `Event` list, preserving each unit-local `event_idx` slot |
+| `decode_events(buf, tag_table)` | Decode to `Event` list, preserving each unit-local `event_idx` slot and any `payload` |
 | `events_to_perfetto(events, path)` | Write native Perfetto TrackEvent `.pftrace` by default, or Chrome JSON/JSON.GZ with `trace_format="chrome_json"` |
 | `validate_event_counts(events, num_units, expected_events_per_unit)` | Validate exact per-unit decoded counts |
 | `TagTable(names)` | Map tag names ↔ integer IDs |
@@ -313,6 +324,8 @@ with profile_session(
 
 The source slice receives an `unblocks` argument and the destination receives `depends_on`, so the relationship remains readable in Perfetto's slice details as well as through the arrow.
 
+`link_payload_flow(edges, tag)` links slices by payload instead, across units: each `(source, target)` pair draws an arrow from the `tag` slice recorded with payload `source` to the one recorded with `target`, whichever CTAs recorded them. The [Qwen megakernel](../warpdrive/docs/examples.md#qwen3-06b-decode-megakernel) uses it for dependencies between instruction rows that run on different SMs.
+
 ## Declarative pipeline analysis
 
 `transformer_nuggets.cute.profiler.pipeline` turns explicit warp roles and
@@ -412,7 +425,7 @@ For each unit u (0 <= u < num_units):
   buf[u * slice_size + 0]           = event_count (atomic mode) or unused
   buf[u * slice_size + 1 + 4*i + 0] = start_ns
   buf[u * slice_size + 1 + 4*i + 1] = dur_ns
-  buf[u * slice_size + 1 + 4*i + 2] = tag_id
+  buf[u * slice_size + 1 + 4*i + 2] = tag_id | PAYLOAD_FLAG | payload << 32  (payload optional)
   buf[u * slice_size + 1 + 4*i + 3] = tid
 
 slice_size = 1 + 4 * max_events_per_unit

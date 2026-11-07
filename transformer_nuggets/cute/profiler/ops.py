@@ -9,7 +9,7 @@ Static Allocation Buffer Layout (all int64 for alignment):
         buf[u * slice_size + 0] = event_count for unit u
         buf[u * slice_size + 1 + 4*i + 0] = start_ns
         buf[u * slice_size + 1 + 4*i + 1] = dur_ns
-        buf[u * slice_size + 1 + 4*i + 2] = tag_id
+        buf[u * slice_size + 1 + 4*i + 2] = tag_id, plus an optional payload (``tag_word``)
         buf[u * slice_size + 1 + 4*i + 3] = tid
 
     slice_size = 1 + 4 * max_events_per_unit
@@ -59,7 +59,21 @@ __all__ = [
     "compact_profile_region",
     "ENABLE_PROFILING",
     "ENABLE_PROFILING_CONST",
+    "PAYLOAD_FLAG",
 ]
+
+# A legacy record's tag word holds the tag in its low 31 bits. A region recorded with a payload
+# sets bit 31 and keeps the payload (an int32, e.g. the work item a region belongs to) in the
+# high 32 bits, so records without one decode exactly as before. (This module imports only
+# CuTeDSL so that kernels importing it do not depend on the host decoder's source.)
+PAYLOAD_FLAG = 1 << 31
+
+
+def tag_word(tag, payload=None) -> Int64:
+    """The record's tag word: ``tag``, or ``tag | PAYLOAD_FLAG | payload << 32``."""
+    if payload is None:
+        return Int64(tag)
+    return Int64(tag) | Int64(PAYLOAD_FLAG) | (Int64(Int32(payload)) << 32)
 
 
 @cute.jit
@@ -71,6 +85,7 @@ def raw_event_stop(
     tag: Int32,
     tid: Int32,
     max_events_per_unit: Int32,
+    payload: Int32 | None = None,
 ) -> None:
     """Read the end timer and store an event record without a warp guard.
 
@@ -79,6 +94,7 @@ def raw_event_stop(
     outer warp election. The inner ``if lane_idx == 0:`` yields no value, so
     this primitive can be used in deeply nested control flow where
     :func:`profile_region` would trigger ``cf.br`` lowering failures.
+    ``payload``: an optional runtime int32 decoded as ``Event.payload``.
     """
     lane_idx = cute.arch.lane_idx()
     end_ns = read_globaltimer()
@@ -90,7 +106,7 @@ def raw_event_stop(
         dur_ns = end_ns - start_ns
         _store_i64(base_ptr + byte_offset, start_ns)
         _store_i64(base_ptr + byte_offset + Int64(8), dur_ns)
-        _store_i64(base_ptr + byte_offset + Int64(16), Int64(tag))
+        _store_i64(base_ptr + byte_offset + Int64(16), tag_word(tag, payload))
         _store_i64(base_ptr + byte_offset + Int64(24), Int64(tid))
 
 
@@ -437,6 +453,7 @@ def static_stop(
     tid: Int32,
     max_events_per_unit: Int32,
     bounds_check: cutlass.Constexpr = True,
+    payload: Int32 | None = None,
 ) -> None:
     """Stop profiling an event, recording duration, tag, and tid.
 
@@ -452,6 +469,7 @@ def static_stop(
         tid: Thread/block identifier for Perfetto visualization.
         max_events_per_unit: Maximum events per unit (determines slice size).
         bounds_check: Forwarded to :func:`static_start`.
+        payload: Optional runtime int32 stored with the tag (``Event.payload``).
     """
     should_record = True
     if cutlass.const_expr(bounds_check):
@@ -465,7 +483,7 @@ def static_stop(
         dur_ns = end_ns - start_ns
         _store_i64(base_ptr + byte_offset, start_ns)
         _store_i64(base_ptr + byte_offset + Int64(8), dur_ns)
-        _store_i64(base_ptr + byte_offset + Int64(16), Int64(tag))
+        _store_i64(base_ptr + byte_offset + Int64(16), tag_word(tag, payload))
         _store_i64(base_ptr + byte_offset + Int64(24), Int64(tid))
 
 
@@ -557,6 +575,7 @@ def warp_stop(
     target_warp: Int32,
     bounds_check: cutlass.Constexpr = True,
     record=True,
+    payload: Int32 | None = None,
 ) -> None:
     """Stop profiling, but only for lane 0 of the specified warp.
 
@@ -571,6 +590,7 @@ def warp_stop(
         target_warp: Which warp should profile.
         bounds_check: Forwarded to :func:`static_stop`.
         record: Runtime predicate controlling whether the warp records.
+        payload: Optional runtime int32 stored with the tag (``Event.payload``).
     """
     warp_idx = cute.arch.warp_idx()
     lane_idx = cute.arch.lane_idx()
@@ -586,6 +606,7 @@ def warp_stop(
                 tid,
                 max_events_per_unit,
                 bounds_check=bounds_check,
+                payload=payload,
             )
 
 
@@ -610,6 +631,7 @@ class _ProfileRegionContext:
         event_idx,
         bounds_check,
         record,
+        payload,
     ):
         self._buf = buf
         self._max_events_per_unit = max_events_per_unit
@@ -621,6 +643,7 @@ class _ProfileRegionContext:
         self._use_atomic = event_idx is None
         self._bounds_check = bounds_check
         self._record = record
+        self._payload = payload
 
     def __enter__(self):
         if cutlass.const_expr(self._use_atomic):
@@ -655,6 +678,7 @@ class _ProfileRegionContext:
             self._target_warp,
             bounds_check=self._bounds_check,
             record=self._record,
+            payload=self._payload,
         )
         return False
 
@@ -808,6 +832,7 @@ def profile_region(
     bounds_check=True,
     enabled=True,
     record=True,
+    payload=None,
 ):
     """Context manager that profiles a code region in a CUTE DSL kernel.
 
@@ -841,6 +866,8 @@ def profile_region(
         bounds_check: Forwarded to :func:`static_start`/:func:`static_stop`.
         enabled: Compile-time switch. When false, the region emits no profiling code.
         record: Runtime predicate selecting whether this unit records the region.
+        payload: Optional runtime int32 recorded with the region (``Event.payload``),
+            e.g. the work item it belongs to.
 
     Returns:
         Context manager for use with ``with``.
@@ -863,6 +890,7 @@ def profile_region(
         event_idx,
         bounds_check,
         record,
+        payload,
     )
 
 
@@ -906,6 +934,7 @@ def region_end(
     token: RegionToken,
     max_events_per_unit: Int32,
     tid: Int32 | None = None,
+    payload: Int32 | None = None,
 ) -> None:
     """Close a region opened by :func:`region_start`.
 
@@ -918,6 +947,7 @@ def region_end(
         token: Token returned by :func:`region_start`.
         max_events_per_unit: Slots reserved per unit.
         tid: Per-event ``tid``. Defaults to the token's ``unit_id``.
+        payload: Optional runtime int32 recorded with the region (``Event.payload``).
     """
     if tid is None:
         tid = token.unit_id
@@ -930,4 +960,5 @@ def region_end(
         tid,
         max_events_per_unit,
         token.target_warp,
+        payload=payload,
     )

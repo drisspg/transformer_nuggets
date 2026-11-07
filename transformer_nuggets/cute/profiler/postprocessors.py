@@ -9,6 +9,7 @@ Quick start:
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 
 from transformer_nuggets.cute.profiler.host import Event, PostProcessContext
 
@@ -23,6 +24,7 @@ __all__ = [
     "rename_processes",
     "rename_threads",
     "link_dependency_flow",
+    "link_payload_flow",
 ]
 
 
@@ -253,6 +255,22 @@ def next_flow_id(trace: dict) -> int:
     return max(flow_ids, default=0) + 1
 
 
+def append_flow(trace: dict, flow_id: int, name: str, source: dict, target: dict) -> None:
+    """Append one Perfetto flow arrow from the middle of ``source`` to that of ``target``."""
+    trace["traceEvents"].extend(
+        {
+            "name": name,
+            "cat": "pipeline",
+            "ph": phase,
+            "ts": event["ts"] + event["dur"] / 2,
+            "pid": event["pid"],
+            "tid": event["tid"],
+            "id": flow_id,
+        }
+        for phase, event in (("s", source), ("f", target))
+    )
+
+
 def link_dependency_flow(
     predecessor_tag: str,
     successor_tag: str,
@@ -307,29 +325,69 @@ def link_dependency_flow(
                 successor_label = f"{successor_tag}[{successor_idx}]"
                 append_slice_relation(predecessor, "unblocks", successor_label)
                 append_slice_relation(successor, "depends_on", predecessor_label)
-                trace["traceEvents"].extend(
-                    (
-                        {
-                            "name": relation_name,
-                            "cat": "pipeline",
-                            "ph": "s",
-                            "ts": predecessor["ts"] + predecessor["dur"] / 2,
-                            "pid": predecessor["pid"],
-                            "tid": predecessor["tid"],
-                            "id": flow_id,
-                        },
-                        {
-                            "name": relation_name,
-                            "cat": "pipeline",
-                            "ph": "f",
-                            "ts": successor["ts"] + successor["dur"] / 2,
-                            "pid": successor["pid"],
-                            "tid": successor["tid"],
-                            "id": flow_id,
-                        },
-                    )
-                )
+                append_flow(trace, flow_id, relation_name, predecessor, successor)
                 flow_id += 1
+        return trace
+
+    return _link
+
+
+def link_payload_flow(
+    edges: Iterable[tuple[int, int]],
+    predecessor_tag: str,
+    successor_tag: str | None = None,
+    *,
+    flow_name: str | None = None,
+):
+    """Draw arrows between slices identified by their payload, across profiling units.
+
+    For each ``(source, target)`` pair, links the ``predecessor_tag`` slice recorded with
+    payload ``source`` to the ``successor_tag`` slice (default: ``predecessor_tag``) recorded
+    with payload ``target``, whichever units recorded them: for example an instruction-table
+    row and a row that consumes its output on another CTA. Pairs with a missing slice are
+    skipped.
+
+    Args:
+        edges: ``(source payload, target payload)`` pairs.
+        predecessor_tag: Name of the source duration slices.
+        successor_tag: Name of the destination duration slices.
+        flow_name: Optional name for the emitted Perfetto flow.
+
+    Returns:
+        Trace post-processor that adds the arrows and readable ``unblocks``/``depends_on``
+        slice arguments.
+
+    Raises:
+        ValueError: When two slices of one tag carry the same payload.
+    """
+    successor_tag = successor_tag or predecessor_tag
+    relation_name = flow_name or f"{predecessor_tag}_to_{successor_tag}"
+    edges = list(edges)
+
+    def _link(trace: dict, ctx: PostProcessContext) -> dict:
+        del ctx
+        slices: dict[tuple[str, int], dict] = {}
+        for event in trace["traceEvents"]:
+            payload = event.get("args", {}).get("payload")
+            if event.get("ph") != "X" or payload is None:
+                continue
+            if event["name"] not in (predecessor_tag, successor_tag):
+                continue
+            key = (event["name"], payload)
+            if key in slices:
+                raise ValueError(f"two {event['name']!r} slices carry payload {payload}")
+            slices[key] = event
+
+        flow_id = next_flow_id(trace)
+        for source, target in edges:
+            predecessor = slices.get((predecessor_tag, source))
+            successor = slices.get((successor_tag, target))
+            if predecessor is None or successor is None:
+                continue
+            append_slice_relation(predecessor, "unblocks", f"{successor_tag}[{target}]")
+            append_slice_relation(successor, "depends_on", f"{predecessor_tag}[{source}]")
+            append_flow(trace, flow_id, relation_name, predecessor, successor)
+            flow_id += 1
         return trace
 
     return _link

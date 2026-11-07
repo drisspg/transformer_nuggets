@@ -8,7 +8,7 @@ Static Allocation Buffer Layout (all int64):
         buf[u * slice_size + 0] = event_count for unit u
         buf[u * slice_size + 1 + 4*i + 0] = start_ns
         buf[u * slice_size + 1 + 4*i + 1] = dur_ns
-        buf[u * slice_size + 1 + 4*i + 2] = tag_id
+        buf[u * slice_size + 1 + 4*i + 2] = tag_id, plus an optional payload (PAYLOAD_FLAG)
         buf[u * slice_size + 1 + 4*i + 3] = tid
 
     slice_size = 1 + 4 * max_events_per_unit
@@ -44,6 +44,7 @@ from typing import Literal
 
 import torch
 
+from transformer_nuggets.cute.profiler.ops import PAYLOAD_FLAG
 from transformer_nuggets.utils.perfetto import write_perfetto_trace
 
 try:
@@ -81,6 +82,7 @@ class Event:
         event_idx: Static or allocated slot index within the profiling unit.
         pid: Process ID for grouping in Perfetto (e.g., CTA/block grouping).
         extra_args: Optional dict of extra args to include in Perfetto trace.
+        payload: Runtime int32 the region was recorded with (legacy records only), else None.
     """
 
     start_ns: int
@@ -92,6 +94,7 @@ class Event:
     pid: int | None = None
     extra_args: dict | None = None
     event_idx: int | None = None
+    payload: int | None = None
 
 
 @dataclass
@@ -321,11 +324,14 @@ def _decode_events_legacy(buf: ProfileBuf, tag_table: TagTable, tid_base: int) -
             base = unit_offset + 1 + 4 * i
             start_ns = int(cpu_buf[base + 0])
             dur_ns = int(cpu_buf[base + 1])
-            tag_id = int(cpu_buf[base + 2])
+            tag_word = int(cpu_buf[base + 2])
             tid = int(cpu_buf[base + 3])
 
             if start_ns == 0 and dur_ns == 0:
                 continue
+            tag_id, payload = tag_word, None
+            if tag_word & PAYLOAD_FLAG:
+                tag_id, payload = tag_word & (PAYLOAD_FLAG - 1), tag_word >> 32
 
             events.append(
                 Event(
@@ -336,6 +342,7 @@ def _decode_events_legacy(buf: ProfileBuf, tag_table: TagTable, tid_base: int) -
                     tid=tid + tid_base,
                     unit_id=unit_id,
                     event_idx=i,
+                    payload=payload,
                 )
             )
 
@@ -508,6 +515,8 @@ def events_to_perfetto(
         }
         if event.event_idx is not None:
             args["event_idx"] = event.event_idx
+        if event.payload is not None:
+            args["payload"] = event.payload
         if event.extra_args:
             args.update(event.extra_args)
 

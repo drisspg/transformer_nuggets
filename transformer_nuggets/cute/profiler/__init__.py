@@ -81,6 +81,7 @@ from transformer_nuggets.cute.profiler.postprocessors import (
     rename_processes,
     rename_threads,
     link_dependency_flow,
+    link_payload_flow,
 )
 
 __all__ = [
@@ -132,4 +133,5 @@ __all__ = [
     "rename_processes",
     "rename_threads",
     "link_dependency_flow",
+    "link_payload_flow",
 ]

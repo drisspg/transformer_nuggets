@@ -2,14 +2,21 @@ import pytest
 
 pytest.importorskip("cutlass")  # transformer_nuggets.cute imports CuTeDSL
 
+import torch
+
 from transformer_nuggets.cute.profiler import (
     Event,
+    TagTable,
+    allocate_profile_buffer,
+    decode_events,
     dependency_gaps,
     link_dependency_flow,
+    link_payload_flow,
     overlap_between,
     summarize_by_tag,
     validate_event_counts,
 )
+from transformer_nuggets.cute.profiler.ops import PAYLOAD_FLAG
 
 
 def make_event(
@@ -162,3 +169,45 @@ def test_link_dependency_flow_pairs_static_slots_with_pipeline_offset():
 def test_link_dependency_flow_rejects_negative_offset():
     with pytest.raises(ValueError, match="successor_offset must be non-negative"):
         link_dependency_flow("produce", "consume", successor_offset=-1)
+
+
+def test_decode_legacy_payload_records():
+    """A tag word with PAYLOAD_FLAG carries a signed payload in its high half; one without
+    decodes as before (payload None)."""
+    prof = allocate_profile_buffer(2, 2, device="cpu")
+    buf = prof.tensor.view(2, prof.slice_size)
+    buf[0, 1:5] = torch.tensor([100, 5, 1, 3])  # plain record: tag 1, tid 3
+    word = 2 | PAYLOAD_FLAG | (-7 << 32)
+    buf[1, 5:9] = torch.tensor([200, 6, word, 4])  # slot 1 of unit 1: tag 2, payload -7
+    events = decode_events(prof, TagTable(["a", "plain", "item"]))
+    assert [(e.unit_id, e.event_idx, e.tag_name, e.tid, e.payload) for e in events] == [
+        (0, 0, "plain", 3, None),
+        (1, 1, "item", 4, -7),
+    ]
+
+
+def test_link_payload_flow_links_slices_across_units():
+    def trace_slice(name: str, payload: int | None, ts: float, pid: int) -> dict:
+        args = {"unit_id": pid} if payload is None else {"unit_id": pid, "payload": payload}
+        return {"name": name, "ph": "X", "ts": ts, "dur": 2.0, "pid": pid, "tid": 0, "args": args}
+
+    producer = trace_slice("row", 10, 0.0, 0)
+    consumer = trace_slice("row", 11, 5.0, 1)
+    other = trace_slice("poll", 11, 4.0, 1)  # another tag with the same payload
+    plain = trace_slice("row", None, 1.0, 2)
+    trace = {"traceEvents": [producer, consumer, other, plain]}
+
+    processed = link_payload_flow([(10, 11), (10, 99)], "row", flow_name="dep")(trace, None)
+
+    flows = [event for event in processed["traceEvents"] if event.get("cat") == "pipeline"]
+    assert [(e["ph"], e["id"], e["pid"], e["ts"]) for e in flows] == [
+        ("s", 1, 0, 1.0),
+        ("f", 1, 1, 6.0),
+    ]  # (10, 99) has no target slice
+    assert producer["args"]["unblocks"] == "row[11]"
+    assert consumer["args"]["depends_on"] == "row[10]"
+    assert "depends_on" not in other["args"]
+
+    duplicate = {"traceEvents": [producer, dict(producer, args=dict(producer["args"]))]}
+    with pytest.raises(ValueError, match="payload 10"):
+        link_payload_flow([(10, 10)], "row")(duplicate, None)

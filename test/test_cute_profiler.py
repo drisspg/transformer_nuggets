@@ -119,6 +119,59 @@ def test_legacy_raw_event_stop_roundtrip():
 
 
 # ---------------------------------------------------------------------------
+# Payloads (legacy records)
+# ---------------------------------------------------------------------------
+
+
+@cute.kernel
+def _kernel_payload(prof_buf: cute.Tensor, max_events: cutlass.Int32):
+    bidx, _, _ = cute.arch.block_idx()
+    for i in cutlass.range(NUM_ITERS):
+        # Static slots, alternating plain records with payloads, some negative.
+        if i % 2 == 0:
+            with profile_region(prof_buf, max_events, Int32(1), bidx, event_idx=Int32(i)):
+                pass
+        else:
+            payload = (Int32(i) - 4) * Int32(1000) + bidx
+            with profile_region(
+                prof_buf, max_events, Int32(2), bidx, event_idx=Int32(i), payload=payload
+            ):
+                pass
+
+
+@cute.jit()
+def _launch_payload(prof_buf, max_events):
+    _kernel_payload(prof_buf, max_events).launch(grid=(NUM_BLOCKS, 1, 1), block=(THREADS, 1, 1))
+
+
+def test_legacy_payload_roundtrip(tmp_path):
+    """A region's runtime payload decodes as Event.payload (and Perfetto args); plain records
+    in the same buffer keep payload None and their tag."""
+    with profile_session(
+        max_events_per_unit=NUM_ITERS,
+        num_units=(NUM_BLOCKS, "Block"),
+        tag_names=["unused", "plain", "item"],
+        trace_path=str(tmp_path / "payload.json"),
+        trace_format="chrome_json",
+    ) as session:
+        _launch_payload(from_dlpack(session.prof.tensor), Int32(session.prof.max_events_per_unit))
+
+    events = session.events
+    assert len(events) == NUM_BLOCKS * NUM_ITERS
+    for e in events:
+        if e.event_idx % 2 == 0:
+            assert (e.tag_name, e.payload) == ("plain", None)
+        else:
+            assert (e.tag_name, e.payload) == ("item", (e.event_idx - 4) * 1000 + e.unit_id)
+    payloads = [
+        ev["args"].get("payload") for ev in session.trace["traceEvents"] if ev.get("ph") == "X"
+    ]
+    assert sorted(p for p in payloads if p is not None) == sorted(
+        e.payload for e in events if e.payload is not None
+    )
+
+
+# ---------------------------------------------------------------------------
 # Token-paired mode
 # ---------------------------------------------------------------------------
 
