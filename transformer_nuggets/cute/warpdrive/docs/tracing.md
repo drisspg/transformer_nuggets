@@ -390,8 +390,8 @@ want to understand.
 | Records | every warp, with NVIDIA's `run-iket` | lane 0 of each role instance's first warp, into a profile buffer |
 | Kernel | unchanged | passes an int64 buffer: `self.run_roles(ctx, trace_buffer=trace)` |
 | Capture | `run-iket` around a script that launches once | `trace_session(op, num_ctas)` around a launch |
-| Result | IKET JSON/Perfetto; `load_iket_capture` joins the [pipeline plan](#join-a-capture-to-the-pipeline-plan) | `session.events` for the profiler's analysis helpers; a Perfetto trace with one process per CTA and one thread per role |
-| Payloads | `trace_region`'s, as the range's `payloadVal` | `trace_region`'s and each work item's index, as `Event.payload` |
+| Result | IKET JSON/Perfetto; `parse_iket(path)` decodes it into the profiler's `Range`s | `session.ranges`; a Perfetto trace with one process per CTA and one track per role |
+| Payloads | `trace_region`'s, as the range's `payloadVal` (`Range.payload`) | `trace_region`'s and each work item's index, as `Range.payload` |
 
 Conceptual timeline (not a measured capture):
 
@@ -426,9 +426,10 @@ instrumentation is what it was before payloads existed.
 
 ### globaltimer
 
-The globaltimer backend records the profiler's legacy region records (two `%globaltimer` reads
-and four 8-byte stores per range) in static slots: one profiling unit per CTA, an equal share
-of `events_per_role` slots (default 1024) per role instance, the role's first warp as `tid`.
+The globaltimer backend records the profiler's full records (two `%globaltimer` reads and four
+8-byte stores per range) in static slots: one profiling unit per CTA, an equal share of
+`events_per_role` slots (default 1024) per role instance, the role's first warp as the record's
+warp.
 An open range's start sits in SMEM (8 bytes per nesting level and role), so a range holds no
 register over the code it spans. Ranges past a role's share are dropped and `trace_session`
 warns; a buffer with fewer units than the grid has CTAs records the first CTAs only.
@@ -447,45 +448,55 @@ def kernel(self, ..., trace: cute.Tensor, bound):
 ```
 
 ```python
-from transformer_nuggets.cute.profiler import dependency_gaps, summarize_by_tag
+from transformer_nuggets.cute.profiler import summarize_by_tag
 from transformer_nuggets.cute.warpdrive.trace_session import trace_session
 
 op = MyKernel().enable_trace("globaltimer", waits=False)
 fn = compile_my_kernel(op)  # compile first: the range names come from the trace
 with trace_session(op, num_ctas, trace_path="kernel.pftrace") as session:
     fn(..., session.prof.tensor, ...)
-print(summarize_by_tag(session.events)["mma"])
+print(summarize_by_tag(session.ranges)["mma"])
 ```
 
-`trace_session` wraps `profile_session`: pass its other arguments through
-(`post_process_events`, `post_process_trace`, `trace_format`). The decoded `Event`s have the
-range name as `tag_name`, the CTA as `unit_id`, the role's first warp as `tid`, and the payload.
+`trace_session` wraps `profile_session`. The decoded `Range`s have the range name as `name`, the
+CTA as `cta=(c,)`, the role's first warp as `warp`, and the payload. For another trace layout,
+`trace_session.write_trace(path, op, session.ranges, name=..., args=..., flows=...)` keeps one
+process per CTA and one track per role and forwards the rest to the profiler's `write_ranges`.
 The [Qwen megakernel](examples.md#qwen3-06b-decode-megakernel) traces every SM's instruction
-rows this way and links rows across CTAs with `link_payload_flow`.
+rows this way and links rows across CTAs.
 
 ## Join a capture to the pipeline plan
 
 ```python
 from transformer_nuggets.cute.warpdrive import plan_from_warpdrive
+from transformer_nuggets.cute.profiler import parse_iket
 from transformer_nuggets.cute.profiler.pipeline import (
     analyze_pipeline,
-    load_iket_capture,
+    join,
     write_pipeline_perfetto,
 )
 
 plan = plan_from_warpdrive(op, cta=0)  # after a fresh compile, for traced reuse counts
-timeline = plan.schedule(iterations=8)
-measured = load_iket_capture("capture.trace.json", timeline, cta=(0, 0, 0))
+timeline = plan.schedule(iterations=8)  # the work items the joined CTA ran
+measured = join(parse_iket("capture.trace.json"), timeline, cta=(0, 0, 0))
 analysis = analyze_pipeline(timeline, measured)
 write_pipeline_perfetto("gemm.pftrace", timeline, measured, analysis=analysis)
 ```
 
-Use the JSON capture path produced by your IKET run in place of `capture.trace.json`.
-Open the resulting trace in [Perfetto](https://ui.perfetto.dev/).
+Use the JSON capture path produced by your IKET run in place of `capture.trace.json`; for a
+globaltimer capture, join `session.ranges` with `cta=(c,)`. Open the resulting trace in
+[Perfetto](https://ui.perfetto.dev/).
+
+The join is strict: every recording warp must record each of its role's ranges once per
+iteration, so `iterations` must be the number of work items the joined CTA ran (the error names
+it). A role without a work cursor records one range per launch and joins only a one-iteration
+timeline. With `waits=True`, the wait ranges nested in a role's range become its region's
+measured wait, which the blocker analysis uses instead of inferring one.
 
 The two `cta` arguments use different coordinates: `plan_from_warpdrive(cta=0)` selects a
-**cluster rank**; `load_iket_capture(cta=(0, 0, 0))` selects a **captured logical CTA**. Match
-them. In a pair, a rank-1 plan excludes leader-only roles; every rank excludes absent roles.
+**cluster rank**; `join(cta=(0, 0, 0))` selects a **captured logical CTA** (IKET's CTA id, or a
+globaltimer profiling unit `(c,)`). Match them. In a pair, a rank-1 plan excludes leader-only
+roles; every rank excludes absent roles.
 
 The plan joins names and dependencies, not individual inner-loop stages:
 

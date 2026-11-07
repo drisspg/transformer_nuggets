@@ -1367,14 +1367,14 @@ runner = QwenMegakernel(weights, max_len=1088, trace="globaltimer")
 runner(weights, token, pos, *caches)  # compile and warm up
 with mkt.trace_session(runner, trace_path="step.pftrace") as session:
     runner.launch(*caches)
-mkt.phase_spans(session.events, runner.table)  # {"QKV": 1.9, "ATTN": 3.8, ...} us per layer
-mkt.input_waits(session.events, runner.table)  # median row start -> inputs ready, us
+mkt.phase_spans(session.ranges, runner.table)  # {"QKV": 1.9, "ATTN": 3.8, ...} us per layer
+mkt.input_waits(session.ranges, runner.table)  # median row start -> inputs ready, us
 ```
 
-The trace has one process per SM and one thread per role; work items are named after their
+The trace has one process per SM and one track per role; work items are named after their
 instruction (`QKV`, `load QKV`, ...) with `layer`, `a` and `b` in their args, and an arrow runs
 from each input group's last-finishing producer row to the row waiting for it, across SMs
-(`link_payload_flow`). `bench_qwen_megakernel --trace-dir DIR` writes one trace per context and
+(`write_step_trace`, the rows matched by their payloads). `bench_qwen_megakernel --trace-dir DIR` writes one trace per context and
 reports both views. `trace="iket"` emits the same ranges for `run-iket` (as in
 [Tracing](tracing.md#iket); the payload is each range's `payloadVal`), and `waits=True` adds the
 layer's wait ranges with either backend. Disabled, both emit no instructions.

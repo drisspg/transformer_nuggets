@@ -213,9 +213,9 @@ def test_plan_joins_capture_end_to_end(tmp_path, iket_recorder):
 ITEMS, CTAS = 7, 3  # StaticPersistent: CTA c runs items c, c + 3, ...
 
 
-class TracedRing(WarpSpecialized):
-    """A producer and a two-warp consumer over a persistent work stream, plus a raw role without
-    a cursor (one range over its body); the consumer marks a region with a payload."""
+class RingRoles(WarpSpecialized):
+    """A producer and a two-warp consumer over a persistent work stream; the consumer marks a
+    region with a payload."""
 
     def __init__(self):
         self.ring = Ring(2, Threads, Threads, payload=(Int32, (32,)))
@@ -242,11 +242,6 @@ class TracedRing(WarpSpecialized):
             work.advance()
         return ring, work
 
-    @role(warps=3, raw=True)  # raw: a persistent stream does not require it to loop
-    @cute.jit
-    def idle(self, ctx):
-        pass
-
     @cute.kernel
     def kernel(self, out: cute.Tensor, trace: cute.Tensor, bound):
         self.begin_roles(work=bound)
@@ -259,6 +254,15 @@ class TracedRing(WarpSpecialized):
         bound = self.work.bind((out.shape[0], 1, 1), workspace, CTAS)
         self.kernel.set_name_prefix("warpdrive_traced_ring")
         self.kernel(out, trace, bound).launch(**self.launch_config(bound), stream=stream)
+
+
+class TracedRing(RingRoles):
+    """``RingRoles`` plus a raw role without a cursor (one range over its body)."""
+
+    @role(warps=3, raw=True)  # raw: a persistent stream does not require it to loop
+    @cute.jit
+    def idle(self, ctx):
+        pass
 
 
 @jit_cache
@@ -312,6 +316,23 @@ def test_globaltimer_ranges_decode_per_cta_and_role(requires_blackwell, tmp_path
             assert inner[0].end_ns <= item.end_ns
     tracks = {(item.process, item.track) for item in read_slices(tmp_path / "ring.pftrace")}
     assert tracks == {(f"CTA {cta}", name) for cta in range(CTAS) for name in warps}
+
+
+def test_globaltimer_ranges_join_the_plan_with_measured_waits(requires_blackwell, tmp_path):
+    """A globaltimer capture joins ``plan_from_warpdrive``'s plan (one recording warp per role)
+    and the ring's acquire/wait ranges become the regions' measured waits."""
+    op = RingRoles().enable_trace("globaltimer")
+    session = _run_traced(op, CTAS)
+    timeline = plan_from_warpdrive(op).schedule(iterations=len(range(0, ITEMS, CTAS)))
+    measured = join(session.ranges, timeline, cta=(0,))
+    assert {r.name for r in measured.regions} == {"prod", "cons"}
+    assert all(r.wait_ns is not None and r.sample_count == 1 for r in measured.regions)
+    analysis = analyze_pipeline(timeline, measured)
+    assert {b.wait_source for b in analysis.blockers} == {"measured"}
+    path = write_pipeline_perfetto(
+        tmp_path / "ring.pftrace", timeline, measured, analysis=analysis
+    )
+    assert {s.track.split(" ·")[0] for s in read_slices(path)} == {"prod", "cons"}
 
 
 def test_globaltimer_short_buffer_and_capacity(requires_blackwell):

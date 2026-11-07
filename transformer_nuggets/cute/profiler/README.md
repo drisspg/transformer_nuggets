@@ -1,19 +1,27 @@
 # Intra-Kernel Profiling for CUTE DSL
 
-Profile code regions **inside** GPU kernels and export to [Perfetto](https://ui.perfetto.dev/).
+Record code regions **inside** GPU kernels, decode them into ranges, analyze them against a
+pipeline plan, and export native [Perfetto](https://ui.perfetto.dev/) traces.
 
 > Inspired by [gau-nernst's intra-kernel profiling for AMD MI300X](https://gau-nernst.github.io/amd-a2a/#intra-kernel-profiling)
 
 ## Quick Start
 
 ```python
-from transformer_nuggets.cute.profiler import profile_session, profile_region, summarize_by_tag
+from cutlass import Int32
+from transformer_nuggets.cute.profiler import (
+    compact_anchor_init,
+    compact_profile_region,
+    profile_session,
+    summarize_by_tag,
+)
 
 @cute.kernel
 def my_kernel(output, prof_buf, max_events):
     bidx, _, _ = cute.arch.block_idx()
+    compact_anchor_init(prof_buf, bidx, max_events)
     for i in cutlass.range(4):
-        with profile_region(prof_buf, max_events, TAG_COMPUTE, bidx):
+        with compact_profile_region(prof_buf, max_events, Int32(TAG_COMPUTE), bidx, Int32(i)):
             compute_something()
 
 with profile_session(
@@ -21,384 +29,215 @@ with profile_session(
     num_units=(num_blocks, "Block"),
     tag_names=["compute"],
     trace_path="trace.pftrace",
+    compact=True,
     expected_events_per_unit=4,
 ) as session:
     my_kernel(output, session.prof.tensor, session.prof.max_events_per_unit)
 
-print(summarize_by_tag(session.events)["compute"])
+print(summarize_by_tag(session.ranges)["compute"])
 ```
 
-`session.events` and `session.trace` are populated after the context exits. Existing code can still use `as (prof, tags)` because `ProfileSession` preserves tuple unpacking.
+`session.ranges` is set after the block exits.
 
-## Session Analysis and Validation
+## One model, two recorders
 
-The built-in host helpers cover the common first pass:
+Every measurement is a frozen `Range(name, start_ns, end_ns, cta, warp, slot, payload)`:
+
+| Recorder | Produces ranges with | Decoded by |
+|---|---|---|
+| Compact records (this package, `%globaltimer`) | `cta=(unit,)`, `slot`; no warp or payload | `decode_ranges` / `profile_session(compact=True)` |
+| Full records (warpdrive's `"globaltimer"` backend) | `cta=(unit,)`, `slot`, the recording `warp`, an optional `payload` | `decode_ranges` / `warpdrive.trace_session` |
+| IKET (`cutlass.cute.experimental.iket`, `run-iket`) | `cta=(x, y, z)`, `warp`, an optional `payload` | `parse_iket(path)` |
+
+The same ranges feed the statistics below, `write_ranges`, and the pipeline join. The
+backends do not have equal overheads, clocks or sampling: IKET records every warp of a role,
+the globaltimer backend one warp per role instance.
+
+## Recording compact ranges
+
+`compact_profile_region(buf, max_events, tag, unit_id, event_idx, target_warp=None,
+enabled=True, record=True, smem=False)` records one region in static slot `event_idx`: lane 0
+of `target_warp` (default warp 0) reads the start timer on entry and stores the record on
+exit. `enabled` is a compile-time switch (a disabled region emits no code); `record` is a
+runtime predicate selecting the units that record (sparse CTA sampling). For deeply nested
+call sites, pair `read_globaltimer_lo32()` with `compact_event_stop` / `compact_event_stop_smem`
+directly; they guard only on lane 0, so the caller elects the warp.
+
+Contracts:
+
+- **Anchor.** Each unit's slot 0 holds a 64-bit timer anchor written by warp 0
+  (`compact_anchor_init` for global memory, `compact_prepare_smem` for shared memory). The
+  decoder rebuilds each start as the anchor plus the signed difference of their low 32 bits, so
+  an event may start up to ~2.1 s before or after the anchor; other warps need not wait for it.
+  Records in a unit without an anchor raise (the anchor and the events used different `record`
+  predicates, say).
+- **Slots.** Out-of-range slots (`event_idx < 0` or `>= max_events_per_unit`) are dropped on the
+  device rather than written over a neighboring unit or shared memory. Use
+  `expected_events_per_unit` to catch them on the host.
+- **Limits.** Durations wrap modulo 2^24 ns (~16.7 ms); tags are 8 bits.
+
+### Global or shared memory
+
+| Records | Per-event device cost | Storage |
+|---|---|---|
+| Compact gmem (`compact_event_stop`, `smem=False`) | 2x `CS2R.32` + 1x `STG.E.EF.64` + address math | 8 B per event, global |
+| Compact smem (`compact_event_stop_smem`, `smem=True`) | 2x `CS2R.32` + 1x `STS.64` + bit-pack | 8 B per event in shared memory, flushed at exit |
+
+The smem path needs a CTA-local `Int64` tensor of `1 + max_events_per_unit` slots
+(`SmemAllocator.allocate_array` or a `cute.struct.MemRange`): `compact_prepare_smem(smem, max,
+record)` clears and anchors it, `compact_flush_smem_to_gmem(smem, gmem, unit, max, record)`
+copies it out at kernel exit. On one Blackwell GEMM, total kernel time was the same either way
+(the smem path pays its stores in the final flush), but inner-region durations were ~30-50 ns
+shorter with smem because each event costs less to record. Pick smem when recorded durations
+drive optimization decisions, gmem when plumbing shared memory is not worth it.
+
+### Full records
+
+`event_stop(buf, unit_id, event_idx, start_ns, tag, warp, max_events, payload=None)` (with
+`read_globaltimer()` for the start) stores a 32-byte record: 64-bit start and duration, the tag
+word, and the warp. It is unguarded: the caller elects the recording thread and keeps the slot
+in range. Warpdrive's globaltimer backend records these, since its ranges need a warp, a
+payload (a work item's index) and durations past 2^24 ns.
+
+## Statistics and traces
 
 ```python
-from transformer_nuggets.cute.profiler import (
-    dependency_gaps,
-    overlap_between,
-    summarize_by_tag,
-)
+from transformer_nuggets.cute.profiler import overlap_between, summarize_by_tag, write_ranges
 
-summaries = summarize_by_tag(session.events)
-wait_p50_ns = summaries["consumer_wait"].p50_ns
+summaries = summarize_by_tag(session.ranges)  # count, total, mean, min, p50, p95, max per name
+overlap = overlap_between(session.ranges, "producer_load", "consumer_compute_store")
+```
 
-load_compute_overlap = overlap_between(
-    session.events, "producer_load", "consumer_compute_store"
-)
+`overlap_between` merges intervals and, by default, measures overlap within each CTA so
+unrelated CTAs cannot inflate it.
 
-load_to_compute = dependency_gaps(
-    session.events, "producer_load", "consumer_compute_store"
+`profile_session(trace_path=...)` writes one process per unit and one track per warp (per range
+name for compact records). For another layout, call `write_ranges` on the ranges; each option
+is a function of a range:
+
+```python
+write_ranges(
+    "trace.pftrace",
+    session.ranges,
+    process=lambda r: f"CTA {r.cta[0]}",
+    thread=lambda r: "producer" if r.name.startswith("producer") else "consumer",
+    name=lambda r: f"{r.name} {r.slot}",
+    args=lambda r: {"k_tile": r.slot // 4},
+    flows=[(producer_range, consumer_range)],  # arrows between two ranges
 )
 ```
 
-- `summarize_by_tag` reports count, total, mean, min, p50, p95, and max duration.
-- `overlap_between` merges intervals and, by default, measures overlap independently within each profiling unit so unrelated CTAs cannot inflate it.
-- `dependency_gaps` pairs repeated tags positionally after `event_idx` ordering within each unit. Use `successor_offset=N` when producer iteration `i` enables successor iteration `i + N`; use complete static streams plus event-count validation, because dropped events would shift later pairs. Legacy atomic slots are only meaningful here when allocation order is deterministic.
-- `expected_events_per_unit=N` validates raw decoded counts before post-processing and raises if a unit emitted too few or too many events. With sparse sampling, allocate buffer units only for sampled units or omit validation when unsampled zero-event units remain allocated.
+Ranges that cross on one track move to a sibling "overlap" track that Perfetto merges under the
+track's name; nested ranges stay nested. `perfetto.TraceBuilder` is the builder underneath, also
+used by the pipeline trace; the `perfetto` package is imported only when a trace is written.
 
-## Worked Performance Example
-
-Run the complete serialized-versus-buffered producer/consumer example:
+## Worked example
 
 ```shell
 python examples/cute_profiler_buffering.py
 ```
 
-It compares two otherwise identical warp-specialized kernels:
+It compares two otherwise identical warp-specialized kernels: one shared-memory stage forces
+`load i -> wait i -> compute/store i -> release i -> load i+1`; two stages let the producer load
+tile `i + 1` while the consumer works on tile `i`. The example records compact shared-memory
+ranges for one sampled CTA, joins them to the kernel's pipeline plan (stage reuse is a
+`num_stages`-tile dependency), and writes one trace per variant with the plan's dependency
+arrows and the stage ring's occupancy. It checks correctness and times the unprofiled
+specializations separately.
 
-- one SMEM stage forces `load i -> wait i -> compute/store i -> release i -> load i+1`;
-- two stages allow the producer's load of tile `i + 1` to overlap the consumer's work on tile `i`.
+One GB300 run of this checkout measured 167.5 us with one stage and 126.6 us with two (1.32x,
+five interleaved rounds). In the sampled CTA, the producer load's overlap with consumer work
+rose from 0% to 74%, median producer acquire fell from 192 to 32 ns, median consumer wait from
+192 to 64 ns, and the producer's measured wait for a released stage from 42 us to 0. Treat
+these as a worked interpretation, not expected constants; rerun on the target kernel and GPU.
 
-The example uses a compile-time profiling specialization, deterministic event slots, compact shared-memory records, sparse CTA sampling, stable producer/consumer Perfetto lanes, decoded median durations, and a numeric producer-load/consumer-work overlap calculation. Its Perfetto traces draw direct arrows for acquire → load → wait → compute and compute/release → stage reacquire; the final edge advances by the configured pipeline depth. Decoded events and Perfetto details preserve `event_idx`, so a consumer event can be paired with the exact producer/tile slot that enabled it. The example separately checks correctness and times the unprofiled specializations.
+## Pipeline analysis
 
-A representative B200 run on August 30, 2026 measured 177.449 us with one stage and 133.475 us with two stages over five interleaved timing rounds (1.329x speedup). The sampled CTA's producer-load overlap rose from 0.0% to 74.2%, while median producer acquire and consumer wait both fell from 224 ns to 64 ns. The median wait-to-compute dependency gap was 0 ns in both variants, showing that the consumer starts immediately once data is ready. Treat these numbers as a worked interpretation, not expected constants; rerun on the target kernel and GPU.
-
-The script writes `data/buffering_1_stage.pftrace` and `data/buffering_2_stage.pftrace` for side-by-side inspection in Perfetto.
-
-## Three Modes
-
-### Atomic mode (default)
-
-Omit `event_idx` and indices are allocated via atomics at runtime:
-
-```python
-with profile_region(prof_buf, max_events, TAG, unit_id):
-    do_work()
-```
-
-Works in loops without manual bookkeeping. The tradeoff: **nested regions cause timing skew**. The inner region's atomic runs while the outer region's timer is still running, inflating the outer duration.
-
-### Static mode (accurate for nesting)
-
-Pass an explicit `event_idx` to avoid atomics entirely:
+`transformer_nuggets.cute.profiler.pipeline` models a warp-specialized kernel as a
+`PipelinePlan`: roles (warp ranges), resources, ordered regions per role, and data, state and
+reuse dependencies with iteration distances. `plan.schedule(iterations)` unrolls it into a
+`Timeline`; `join(ranges, timeline, cta=None)` assigns one CTA's measured ranges to its
+`(region, iteration)`s; `analyze_pipeline` and `write_pipeline_perfetto` analyze and draw the
+result.
 
 ```python
-with profile_region(..., event_idx=Int32(0)):
-    with profile_region(..., event_idx=Int32(1)):
-        do_work()
-```
-
-For loops, compute indices from the loop variable:
-
-```python
-for i in cutlass.range(4):
-    with profile_region(..., event_idx=Int32(0) + i * Int32(2)):
-        ...
-    with profile_region(..., event_idx=Int32(1) + i * Int32(2)):
-        ...
-```
-
-You set `max_events_per_unit` to something larger than you need; the decoder scans all slots and skips empty ones.
-
-### Token mode (explicit pairing across scopes)
-
-`with profile_region(...)` already pairs start and end structurally, but it can't bridge two Python scopes or open in iteration `i` and close in `i+1`. For those cases, use `region_start` / `region_end` and pass the returned `RegionToken` explicitly:
-
-```python
-from transformer_nuggets.cute.profiler import region_start, region_end, RegionToken
-
-outer = region_start(prof_buf, unit_id, max_events)
-for i in cutlass.range(N):
-    inner = region_start(prof_buf, unit_id, max_events)
-    do_work(i)
-    region_end(prof_buf, TAG_INNER, inner, max_events)
-region_end(prof_buf, TAG_OUTER, outer, max_events)
-```
-
-`RegionToken` captures `(unit_id, event_idx, start_ns, target_warp)`, so `region_end` only needs the token plus the tag, and the start/end pair can't drift on those fields. It's a `NamedTuple`, so the DSL can thread it through `cutlass.range` as a loop-carried value if you need to keep a region open across iterations.
-
-This is the closest analogue to NVIDIA IKET's `iket.range_start` / `iket.range_end` SSA-token pairing in `cutlass.cute.experimental.iket`. The shape is similar but the mechanism is different: IKET emits MLIR ops and lowers via the proprietary `iket` dialect, while this profiler emits inline PTX (`%globaltimer`, `st.global.cs.u64`) directly.
-
-## Payloads
-
-Legacy records can carry one runtime `Int32` payload, for example the work item a region belongs to. Pass `payload=` to `profile_region`, `region_end`, `warp_stop`, `static_stop` or `raw_event_stop`; it decodes as `Event.payload` (`None` for records without one) and appears in the Perfetto slice args:
-
-```python
-with profile_region(prof_buf, max_events, TAG_ROW, bidx, event_idx=slot, payload=row):
-    run_row(row)
-```
-
-The payload shares the record's tag word (tag in the low 31 bits, a flag in bit 31, the payload in the high 32 bits), so the record stays 32 bytes and records without a payload decode as before. Compact records have no room for one. `link_payload_flow` draws arrows between slices identified by payload across units (below).
-
-## Record formats: legacy 4xi64 vs compact 1xi64 (gmem / smem)
-
-Three on-wire record formats are available, in addition to the three pairing modes above:
-
-| Format | Per-event device cost | Bytes/event | Where stored | When to use |
-|---|---|---|---|---|
-| **Legacy 4xi64** (`profile_region` / `region_start` / `region_end`) | 2x `CS2R` (64-bit timer) + 4x `STG.E.EF.64` + address math | 32 B global | Per-event STG to global | Default; matches the original API |
-| **Compact 1xi64 gmem** (`compact_event_stop` + `compact_anchor_init`) | 2x `CS2R.32` (32-bit timer) + 1x `STG.E.EF.64` (packed) + address math | 8 B global | Per-event STG to global | Smaller buffer, smaller decode work, lower L2 pressure |
-| **Compact 1xi64 smem** (`compact_event_stop_smem` + `compact_anchor_init_smem` + `compact_flush_smem_to_gmem`) | 2x `CS2R.32` + 1x `STS.64` + bit-pack | 8 B in smem; cooperative flush to gmem at kernel exit | Per-event STS, one cooperative flush at end | Lowest per-event observer cost; recommended when timestamps will drive optimization decisions |
-
-Format is the per-event SHAPE; pairing (atomic vs static vs token) is independent. The legacy path uses `with profile_region(...)`; compact static slots can use `with compact_profile_region(...)`, selecting shared-memory records with `smem=True`. Direct `read_globaltimer_lo32()` + `compact_event_stop*()` calls remain available for deeply nested call sites.
-
-### When to pick smem
-
-We benchmarked compact-gmem vs compact-smem on a Blackwell GEMM (`agent_space/bench_*.py`). Headline finding:
-
-- **Total kernel time is a wash.** The smem path saves per-event STGs but pays the same number of STGs in a single end-of-kernel cooperative flush; for the GEMM we tested, that flush couldn't overlap with anything.
-- **Per-event observer cost is ~30-50 ns lower in smem mode.** The recorded `dur_ns` for inner regions (e.g. `k_tile`, `mma_wait`) is consistently ~64 ns shorter than in compact-gmem for the same logical work — i.e. the timestamps better reflect real kernel behavior because measurement is less invasive.
-
-Decision rule:
-- **Pick smem** when the timestamps you record will be used to make optimization decisions (per-region duration is your signal). The flush cost is paid once at kernel exit and doesn't pollute the timestamps.
-- **Pick compact-gmem** when total kernel slowdown matters most (e.g. you're profiling something that already runs under other tooling), or when you don't want to plumb a smem `MemRange` through your `SharedStorage`.
-- **Pick legacy** when you need atomic slot allocation, per-event thread IDs, or backwards compatibility.
-
-The smem path requires a CTA-local `Int64` tensor with `1 + max_events_per_unit` slots, allocated through either `SmemAllocator.allocate_array` or a `cute.struct.MemRange`. See `examples/cute_profiler_buffering.py` for a complete compact-smem performance-debugging example.
-
-## API
-
-### Host (`host.py`)
-
-| Function | Description |
-|----------|-------------|
-| `profile_session(...)` | Context manager returning `ProfileSession`; allocate, validate, decode, post-process, and optionally write trace |
-| `allocate_profile_buffer(max_events_per_unit, num_units, device)` | Allocate buffer |
-| `decode_events(buf, tag_table)` | Decode to `Event` list, preserving each unit-local `event_idx` slot and any `payload` |
-| `events_to_perfetto(events, path)` | Write native Perfetto TrackEvent `.pftrace` by default, or Chrome JSON/JSON.GZ with `trace_format="chrome_json"` |
-| `validate_event_counts(events, num_units, expected_events_per_unit)` | Validate exact per-unit decoded counts |
-| `TagTable(names)` | Map tag names ↔ integer IDs |
-| `ProfileSession` | `.prof`/`.tags` during capture; `.events`/`.trace` after exit; preserves tuple unpacking |
-| `PostProcessContext` | Context passed to post-processing callbacks |
-
-### Analysis (`analysis.py`)
-
-| Function | Description |
-|----------|-------------|
-| `summarize_by_tag(events)` | Count and duration statistics per tag |
-| `overlap_between(events, left_tag, right_tag)` | Per-unit interval overlap and left/right overlap fractions |
-| `dependency_gaps(events, predecessor_tag, successor_tag, successor_offset=0)` | Matched predecessor-end to successor-start gaps |
-
-### Device (`ops.py`)
-
-Legacy 4xi64 format (default; `profile_session(compact=False, ...)`):
-
-| Function | Description |
-|----------|-------------|
-| `profile_region(buf, max_events, tag, unit_id, target_warp=None, event_idx=None, tid=None)` | Context-manager API |
-| `region_start(buf, unit_id, max_events, ...) -> RegionToken` / `region_end(buf, tag, token, ...)` | Token-based start/end pairing |
-| `raw_event_stop(buf, unit_id, event_idx, start_ns, tag, tid, max_events)` | No-warp-guard stop for deeply nested call sites |
-| `warp_start/warp_stop(...)` | Low-level start/stop (lane 0 of target_warp) |
-| `warp_atomic_alloc(...)` | Allocate event index atomically |
-
-Compact 1xi64 format (`profile_session(compact=True, ...)`):
-
-| Function | Description |
-|----------|-------------|
-| `read_globaltimer_lo32()` | 32-bit timer read (1x `CS2R.32`); pair with `compact_event_stop*` |
-| `compact_anchor_init(buf, unit_id, max_events)` | Write 64-bit anchor to gmem slot 0 |
-| `compact_event_stop(buf, unit_id, event_idx, start_ts32, tag, max_events)` | 1x `STG.E.EF.64` packed-record store |
-| `compact_anchor_init_smem(smem_buf)` | Write 64-bit anchor to smem slot 0 |
-| `compact_event_stop_smem(smem_buf, event_idx, start_ts32, tag)` | 1x `STS.64` packed-record store |
-| `compact_prepare_smem(smem_buf, max_events, record)` | Cooperatively clear and anchor a reusable smem slice |
-| `compact_flush_smem_to_gmem(smem_buf, gmem_buf, unit_id, max_events)` | Cooperative copy at kernel exit |
-| `compact_profile_region(..., event_idx, smem=False)` | Context-manager wrapper for compact static slots |
-
-## Trace Formats
-
-Two output formats are supported:
-
-- `track_event` (default): native Perfetto protobuf (`.pftrace` / `.perfetto-trace`). This is the preferred format for programmatically generated traces. Crossing overlaps on one logical track are encoded as multiple backing TrackEvent tracks with the same merge key, so Perfetto can display them as one logical row.
-- `chrome_json`: legacy Chrome JSON/JSON.GZ. Use this only for compatibility with tools that require Chrome JSON. Perfetto handles this format on a best-effort basis and requires duration events on a track to nest cleanly.
-
-Pass `trace_format="chrome_json"` to `profile_session` or `events_to_perfetto` to opt into legacy JSON output. Pass `split_overlaps=False` to keep raw tracks.
-
-## Post-Processing
-
-You can pass callbacks to `profile_session` to mutate events or the Perfetto trace before writing:
-
-- `post_process_events(events, ctx) -> events`: Rename, filter, or regroup events.
-- `post_process_trace(trace_dict, ctx) -> trace_dict`: Add flow events, counters, etc.
-
-The `PostProcessContext` provides:
-- `tag_table`: TagTable for looking up tag names/IDs.
-- `prof_buf`: The ProfileBuf with raw event data.
-- `unit_name`: Name for units in trace (e.g., "Block", "Warp").
-
-### Example: Dynamic Naming
-
-```python
-def add_unit_prefix(events, ctx):
-    for e in events:
-        e.tag_name = f"{ctx.unit_name} {e.unit_id}: {e.tag_name}"
-    return events
-
-with profile_session(
-    ...,
-    post_process_events=add_unit_prefix,
-) as (prof, tags):
-    ...
-```
-
-### Example: Group by Block/Warp (Nsight-style view)
-
-To get separate Perfetto rows for each warp within each block (like Nsight's CTA view), set `pid` per block and `tid` per warp:
-
-```python
-def group_by_block_warp(events, ctx):
-    warps_per_block = 4
-    for e in events:
-        block_id = e.unit_id
-        warp_id = e.tid % warps_per_block
-        e.pid = block_id              # Each block becomes a Perfetto "process"
-        e.tid = warp_id               # Each warp becomes a lane under that process
-        e.tag_name = f"warp {warp_id}: {e.tag_name}"
-    return events
-
-with profile_session(
-    ...,
-    post_process_events=group_by_block_warp,
-) as (prof, tags):
-    ...
-```
-
-In Perfetto, this renders as:
-- `CTA 0` (process)
-  - `warp 0` (thread lane)
-  - `warp 1`
-  - ...
-- `CTA 1` (process)
-  - `warp 0`
-  - ...
-
-### Example: Add Extra Metadata
-
-```python
-def add_tile_coords(events, ctx):
-    tile_map = {0: (0, 0), 1: (0, 1), 2: (1, 0), 3: (1, 1)}
-    for e in events:
-        tile_m, tile_n = tile_map.get(e.unit_id, (-1, -1))
-        e.extra_args = {"tile_m": tile_m, "tile_n": tile_n}
-    return events
-```
-
-The `extra_args` dict is merged into each event's `args` in the Perfetto trace.
-
-### Example: Draw Pipeline Dependencies
-
-`link_dependency_flow` pairs repeated tags by `event_idx` within each profiling unit and draws direct arrows between the matched Perfetto slices. Use `successor_offset` when a released stage is reused by a later pipeline iteration:
-
-```python
-from transformer_nuggets.cute.profiler.postprocessors import (
-    compose,
-    link_dependency_flow,
-)
-
-with profile_session(
-    ...,
-    post_process_trace=compose(
-        link_dependency_flow("producer_load", "consumer_wait"),
-        link_dependency_flow("consumer_wait", "consumer_compute"),
-        link_dependency_flow(
-            "consumer_compute",
-            "producer_acquire",
-            successor_offset=num_stages,
-            flow_name="stage_release_to_reacquire",
-        ),
-    ),
-) as session:
-    ...
-```
-
-The source slice receives an `unblocks` argument and the destination receives `depends_on`, so the relationship remains readable in Perfetto's slice details as well as through the arrow.
-
-`link_payload_flow(edges, tag)` links slices by payload instead, across units: each `(source, target)` pair draws an arrow from the `tag` slice recorded with payload `source` to the one recorded with `target`, whichever CTAs recorded them. The [Qwen megakernel](../warpdrive/docs/examples.md#qwen3-06b-decode-megakernel) uses it for dependencies between instruction rows that run on different SMs.
-
-## Declarative pipeline analysis
-
-`transformer_nuggets.cute.profiler.pipeline` turns explicit warp roles and
-resource handoffs into a logical schedule, joins that plan to IKET measurements,
-and writes a native Perfetto trace with direct dependency flows, blocker
-metadata, and ring-occupancy counters. It lives under the CuTe package and
-therefore requires the `transformer-nuggets[cute]` extra, although the analysis
-and Task Scheduling adapter do not import CuTeDSL directly.
-
-```python
+from transformer_nuggets.cute.profiler import parse_iket
 from transformer_nuggets.cute.profiler.pipeline import (
-    PipelineAnnotations,
     analyze_pipeline,
     extract_plan,
-    load_iket_capture,
+    join,
+    report,
     write_pipeline_perfetto,
 )
 
-PIPELINE = PipelineAnnotations("my_kernel", iteration_name="tile")
-PIPELINE.resource(
-    "operand",
-    label="Operand ring",
-    depth=2,
-    storage="SMEM",
-    description="TMA producer to MMA consumer.",
-)
-
-# In the CuTeDSL implementation:
-# @PIPELINE.role(...)
-# PIPELINE.region(..., produces=("operand",))
-# PIPELINE.region(..., consumes=("operand",), releases=("operand",))
-# PIPELINE.iteration_end()
-
-plan = extract_plan("annotated_kernel.py")
+plan = extract_plan("annotated_kernel.py")  # or plan_from_warpdrive(op), or PipelinePlan(...)
 timeline = plan.schedule(iterations=4)
-measured = load_iket_capture("iket.trace.json", timeline, cta=(0, 0, 0))
+measured = join(parse_iket("iket.trace.json"), timeline, cta=(0, 0, 0))
 analysis = analyze_pipeline(timeline, measured)
 write_pipeline_perfetto("pipeline.pftrace", timeline, measured, analysis=analysis)
+print(report(timeline, measured, analysis))
 ```
 
-The analysis reports finite critical paths and slack, latest-arriving blockers,
-wait/busy decomposition, ring occupancy and run-ahead, depth+1 counterfactuals,
-and the steady-state maximum cycle ratio (RecMII versus per-role ResMII).
-Logical weights remain metadata; only measured timestamps use Perfetto's time
-axis.
+The join is strict: a warp's n-th range of a region is iteration n, so every recording warp
+must record each region of its role exactly `iterations` times. A persistent CTA that ran more
+items than the timeline raises with the count to schedule; a warp missing a range raises rather
+than shifting its later ranges onto the wrong iterations. Ranges without a warp (compact
+records) count as one recorder per role. `cta` defaults to the lowest CTA that recorded a plan
+region.
 
-Current regions are assumed to begin before acquire/wait, so wait is inferred
-from predecessor overlap. Add a second marker after the wait when an exact
-wait/work split is required.
+**Waits.** A range named `<x>.<op>` with `op` one of `acquire`, `wait`, `peek`, `tail`, `turn`,
+`sync` (warpdrive's wait ranges, `enable_trace(waits=True)`), nested in a region's range on the
+same warp, is a measured wait: the region's `wait_ns` is the largest per-warp sum of them, and
+the blocker analysis uses it (`wait_source="measured"`). Without wait ranges, a region's wait
+is inferred from the latest predecessor's end (`wait_source="inferred"`).
 
-Region names are source literals. For a region inside a
-`cutlass.range_constexpr` loop, pass the compile-time loop variable and the trip
-count so each copy gets its own range:
+The analysis reports finite critical paths and slack, latest-arriving blockers, wait/busy
+decomposition, ring occupancy and run-ahead (a ring slot is free once its last reader releases
+it), depth+1 counterfactuals, and the steady-state maximum cycle ratio (RecMII versus per-role
+ResMII, in the plan's logical weight units). Recurrences and rings come from the plan's symbolic
+dependencies, so they do not depend on the scheduled window. The depth+1 counterfactual replaces
+a ring's reuse distance with `depth + 1`, which matches one use per iteration only.
+
+`report(timeline, measured, analysis, range_overhead_ns=None)` renders per-role region medians
+over the interior iterations, one iteration's timeline in ns, and the scheduler findings; pass
+`summary.IKET_RANGE_OVERHEAD_NS` (~50 ns per IKET push/pop on GB200) to flag regions dominated
+by instrumentation.
+
+### Annotated kernels
+
+`PipelineAnnotations` markers in a CuTeDSL kernel emit IKET ranges when `enable_iket()` was
+called and nothing otherwise; `extract_plan(path)` reads the same literal declarations into a
+plan. A kernel imports only `pipeline/annotations.py`, so the extractor and the plan model stay
+out of its compile key.
+
+```python
+PIPELINE = PipelineAnnotations("my_kernel", iteration_name="tile")
+PIPELINE.resource("operand", label="Operand ring", depth=2)
+
+# In the CuTeDSL implementation:
+# @PIPELINE.role("load", label="Load", warp_start=0, warp_end=1)
+# PIPELINE.region("load.operand", label="Load", weight=1, produces=("operand",))
+# PIPELINE.region(..., consumes=("operand",), releases=("operand",))
+# PIPELINE.iteration_end()
+```
+
+For a region inside a `cutlass.range_constexpr` loop, pass the compile-time loop variable and
+the trip count so each copy gets its own range:
 
 ```python
 for split in cutlass.range_constexpr(2):
     PIPELINE.region(
-        "mma.pass", label="kg@X pass", weight=2, description="one hi/lo half",
+        "mma.pass", label="kg@X pass", weight=2,
         consumes=("x_{index}",), releases=("x_{index}",), produces=("acc",),
         count=2, index=split,
     )
 ```
 
-This expands to `mma.pass[0]` and `mma.pass[1]`. Tokens containing `{index}`
-are substituted per copy; plain `consumes` attach to the first copy and plain
-`produces`/`releases` to the last, so the group acts as one region externally.
+This expands to `mma.pass[0]` and `mma.pass[1]`. Tokens containing `{index}` are substituted
+per copy; plain `consumes` attach to the first copy and plain `produces`/`releases` to the
+last, so the group acts as one region externally.
 
-`report(timeline, measured, analysis)` renders the text you read after every
-capture: per-role region medians over the steady-state iterations, one
-iteration's timeline in ns, and the RecMII/ResMII/critical-cycle findings.
-Regions shorter than about twice the ~50 ns range push/pop overhead are
-flagged. The capture CLI wraps the whole loop and keeps successive experiments
-side by side:
+### Capture CLI
 
 ```
 python -m transformer_nuggets.cute.profiler.pipeline.capture \
@@ -406,44 +245,39 @@ python -m transformer_nuggets.cute.profiler.pipeline.capture \
     --unprofiled-iteration-ns 950 -- python profile_kernel.py --iket
 ```
 
-It runs the command under `run-iket` with `CUTE_DSL_NO_CACHE=1` (the command
-must launch the annotated kernel exactly once), then writes
-`traces/<tag>.raw_iket.{trace.json,pftrace}`, `traces/<tag>.enriched.pftrace`,
-and `traces/<tag>.report.txt`. `--from-trace <trace.json>` re-analyzes an
-existing capture without a GPU.
-
-CUTLASS 4.7 Task Scheduling objects can be adapted with
-`plan_from_task_manager`; this adapter is duck-typed and does not import
-CuTeDSL at package import time.
+It runs the command under `run-iket` with `CUTE_DSL_NO_CACHE=1` (the command must launch the
+annotated kernel exactly once), then writes `traces/<tag>.raw_iket.{trace.json,pftrace}`,
+`traces/<tag>.enriched.pftrace` and `traces/<tag>.report.txt`, keeping the tag whole.
+`--from-trace <trace.json>` re-analyzes an existing capture without a GPU.
 
 ## warpdrive kernels
 
 warpdrive kernels need no hand-placed regions: `kernel.enable_trace("globaltimer")` or
 `enable_trace("iket")` makes the layer emit ranges named after its roles, channel waits and
-`trace_region`s through this profiler's two backends. The globaltimer backend uses static-slot
-legacy records with one unit per CTA, records work items' indices as payloads, and decodes
-through `profile_session`; the IKET backend feeds the pipeline plan above. See
+`trace_region`s, and `plan_from_warpdrive(op)` exports the matching plan, so either backend's
+ranges join it with their waits measured. See
 [Tracing backends](../warpdrive/docs/tracing.md#tracing-backends).
 
-## Buffer Layout
+## Buffer layouts
 
-Each unit owns `1 + 4 * max_events_per_unit` int64s:
-
-```
-For each unit u (0 <= u < num_units):
-  buf[u * slice_size + 0]           = event_count (atomic mode) or unused
-  buf[u * slice_size + 1 + 4*i + 0] = start_ns
-  buf[u * slice_size + 1 + 4*i + 1] = dur_ns
-  buf[u * slice_size + 1 + 4*i + 2] = tag_id | PAYLOAD_FLAG | payload << 32  (payload optional)
-  buf[u * slice_size + 1 + 4*i + 3] = tid
-
-slice_size = 1 + 4 * max_events_per_unit
-```
-
-## Example
+Each unit owns a slice of `1 + R * max_events_per_unit` int64 words:
 
 ```
-python -m transformer_nuggets.cute.profiler.example
+compact (R = 1):  slice[0]     = 64-bit globaltimer anchor
+                  slice[1 + i] = tag(8) | dur_ns(24) | ts_lo32(32)
+full    (R = 4):  slice[0]     = unused
+                  slice[1 + 4*i + 0] = start_ns
+                  slice[1 + 4*i + 1] = dur_ns
+                  slice[1 + 4*i + 2] = tag | PAYLOAD_FLAG | payload << 32  (payload optional)
+                  slice[1 + 4*i + 3] = warp
 ```
 
-Open the trace in https://ui.perfetto.dev/
+Importing any of this package runs `transformer_nuggets/cute/__init__.py`, which imports
+CuTeDSL, so host-only analysis still needs `cutlass` installed.
+
+## Examples
+
+- `examples/cute_profiler_buffering.py`: compact smem ranges joined to a pipeline plan.
+- `examples/cute_sgemm_profile.py`: sampled-CTA SGEMM ranges with a custom trace layout.
+- `examples/warp_specialized_static.py`: one region per warp role, gmem records.
+- `examples/measure_profiler_overhead.py`: the same kernel with `enabled=False` and `True`.
