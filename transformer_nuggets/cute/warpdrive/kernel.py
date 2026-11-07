@@ -49,6 +49,7 @@ from transformer_nuggets.cute.warpdrive.cluster import (
     rank_value,
 )
 from transformer_nuggets.cute.warpdrive.describe import describe_kernel
+from transformer_nuggets.cute.warpdrive.describe_graph import describe_graph
 from transformer_nuggets.cute.warpdrive.named import NamedBarrier
 from transformer_nuggets.cute.warpdrive.protocol import (
     ProtocolError,
@@ -1063,12 +1064,18 @@ class WarpSpecialized(metaclass=_KernelType):
     def num_threads(self) -> int:
         return self.num_warps * WARP_SIZE
 
-    def describe(self) -> str:
+    def describe(self, format: str = "text") -> str:
         """Plain-text summary of what the layer derived: roles and register budgets, channels
         (arrival counts per CTA, TMA bytes, masks, overrides, TMA check status), streams, TMEM,
-        and, after a compile, check opt-outs and the traced protocol (``describe.py``)."""
+        and, after a compile, check opt-outs and the traced protocol (``describe.py``).
+
+        ``format="mermaid"`` or ``"dot"`` draws the same declarations as a graph: roles as
+        nodes, channels as producer -> consumer edges, barriers and storage aliases
+        (``describe_graph.py``)."""
         self._collect()
-        return describe_kernel(self)
+        if format == "text":
+            return describe_kernel(self)
+        return describe_graph(self, format)
 
     def _barrier_plan(self):
         """(owner, offset, {cta rank: arrival counts}) for every mbarrier, in allocation order.
