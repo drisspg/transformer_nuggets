@@ -1286,9 +1286,9 @@ LMHEAD  594         8 x 32 rows of the tied embedding x final RMSNorm    -> logi
 | GPU | SM100 family; one CTA per SM, cooperative launch |
 | Not supported | Batch > 1, prefill, paging, other model shapes |
 
-- **Schedule.** `InstructionTable` is a `WorkMap` over the int32 table. `assign_static`
-  list-schedules rows onto CTAs with a row-latency model and lays the table out `[slot][cta]`
-  for `StaticPersistent`; `schedule="atomic"` claims rows in dependency order with
+- **Schedule.** `InstructionTable` is a `WorkMap` over the int32 table. `list_schedule`
+  assigns rows to CTAs with a row-latency model and `assign_static` lays the table out
+  `[slot][cta]` for `StaticPersistent`; `schedule="atomic"` claims rows in dependency order with
   `AtomicPersistent` instead. Each CTA's rows stay in dependency order, so with every CTA
   resident (the reason for `cooperative=True`) the earliest unfinished row can always run.
 - **Roles.** Eight compute warps and one TMA load warp. The load warp streams 16 KB weight
