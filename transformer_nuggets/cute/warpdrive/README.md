@@ -11,7 +11,8 @@ self.acc = Ring(1, Umma, Threads)
 You still choose the tiles, layouts, warps and register budgets. warpdrive handles the barrier
 counts and phases, role dispatch and TMEM allocation/free. The math is ordinary CuTeDSL.
 
-Experimental. Requires `nvidia-cutlass-dsl` 4.8 and a Blackwell SM100/SM103 GPU.
+Experimental. Requires `nvidia-cutlass-dsl` 4.6.2 or newer (tested on 4.6, 4.7 and 4.8) and a
+Blackwell SM100/SM103 GPU.
 
 **Start with [Write a kernel](docs/writing-kernels.md):** run the complete GEMM, define a work
 item, connect the roles, and validate the handoffs. The [safety contract](GUARANTEES.md) explains
@@ -162,3 +163,19 @@ CUTracer work follows the [fuzz harness guide](../../../test/warpdrive_fuzz/READ
 The suite covers numerical correctness and determinism, shape reuse, schedules, CTA pairs and
 larger clusters, protocol errors, raw/managed synchronization, TMA and alias diagnostics, and
 the IKET-to-profiler path.
+
+To test another supported CuTeDSL version, install it into a separate environment along with
+this checkout, and give it its own caches. The compile cache key already includes the CuTeDSL
+version, but separate directories keep runs of different versions independent:
+
+```bash
+uv venv /tmp/dsl-4.7 && source /tmp/dsl-4.7/bin/activate
+uv pip install -e ".[cute,dev]" pytest-xdist "nvidia-cutlass-dsl[cu13]==4.7.1"
+export CUTE_DSL_CACHE_DIR=/tmp/dsl-4.7/cute-dsl-cache
+export TRANSFORMER_NUGGETS_CUTE_CACHE_DIR=/tmp/dsl-4.7/tn-cache
+pytest -n 12 test/test_cute_warpdrive*.py
+```
+
+The FA4 examples also need `flash_attn.cute` and a `quack-kernels` release that supports that
+CuTeDSL version (quack 0.6.5 needs 4.7; 0.6.3 works with 4.6). Renamed or version-dependent
+CuTeDSL APIs live in [`_compat.py`](_compat.py); import them from there.

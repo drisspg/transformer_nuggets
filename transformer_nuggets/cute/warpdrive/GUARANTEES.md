@@ -6,8 +6,8 @@ warpdrive derives synchronization from your roles and channels. You supply the a
 layouts and matching work on both sides of each handoff. **A kernel that compiles can still
 race or deadlock.**
 
-This contract covers CuTeDSL 4.8 on Blackwell SM100/SM103, with a single CTA, a CTA pair or a
-cluster of at most eight CTAs. Example wrappers have their own tensor and numerical contracts.
+This contract covers CuTeDSL 4.6.2 through 4.8 on Blackwell SM100/SM103, with a single CTA, a
+CTA pair or a cluster of at most eight CTAs. Example wrappers have their own tensor and numerical contracts.
 
 ## What the layer handles
 

@@ -51,8 +51,8 @@ def test_fa4_hardware_rowmax_matches_software(requires_sm103, mode):
 def test_fa4_hardware_rowmax_rejects_sm100(monkeypatch):
     pytest.importorskip("flash_attn.cute")
     from cutlass.base_dsl import BaseDSL
-    from cutlass.base_dsl.enums import Arch
 
+    from transformer_nuggets.cute.warpdrive._compat import Arch
     from transformer_nuggets.cute.warpdrive.examples.fa4_fwd import FlashAttentionForward
 
     monkeypatch.setattr(BaseDSL._get_dsl(), "get_arch_enum", lambda: Arch.sm_100a)

@@ -22,8 +22,8 @@ You do not need the numbered fuzz rejection catalog to author a kernel. You do n
 
 [gemm.py](../examples/gemm.py) is the smallest complete GEMM: three roles, SMEM partitions,
 TMEM views, launch setup, cached compilation and a PyTorch wrapper. It computes BF16
-`D = A @ B.T` with FP32 accumulation on Blackwell SM100/SM103. Use CuTeDSL 4.8 and the
-repository's [environment setup](../README.md#tests).
+`D = A @ B.T` with FP32 accumulation on Blackwell SM100/SM103. Use CuTeDSL 4.6.2 or newer and
+the repository's [environment setup](../README.md#tests).
 
 From the checkout root, in that environment:
 

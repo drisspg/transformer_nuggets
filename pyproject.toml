@@ -49,8 +49,10 @@ cupti-monitor = [
 ]
 
 cute = [
-    "nvidia-cutlass-dsl[cu13]>=4.5.0",
+    # warpdrive needs 4.6.2: 4.6.0/4.6.1 hang on a bulk copy issued in elect_one().
+    "nvidia-cutlass-dsl[cu13]>=4.6.2",
     "apache-tvm-ffi>=0.1.12",
+    "packaging",
 ]
 
 huggingface = [

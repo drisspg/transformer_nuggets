@@ -377,13 +377,13 @@ def test_tmem_allocator_avoids_the_barrier_warp(
     """The traced kernel allocates from the expected warp, inside the role that frees, and
     every CTA frees its columns (the CTAs sharing an SM would otherwise wait forever)."""
     allocator_warps = []
-    real = kernel_module.memory.TmemAllocator
+    real = kernel_module.TmemAllocator
 
     def spy(*args, **kwargs):
         allocator_warps.append(kwargs["allocator_warp_id"])
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(kernel_module.memory, "TmemAllocator", spy)
+    monkeypatch.setattr(kernel_module, "TmemAllocator", spy)
     op = toy()
     compile_toy.cache_clear()
     fn = compile_toy(op)

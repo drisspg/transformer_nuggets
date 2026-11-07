@@ -55,9 +55,7 @@ import torch
 from cuda.bindings import driver as cuda
 from cutlass import Float32, cute
 from cutlass.base_dsl import BaseDSL
-from cutlass.base_dsl.enums import Arch
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.tensor_utils import LayoutEnum
 from flash_attn.cute.softmax import SoftmaxSm100
 from quack import copy_utils, layout_utils
 
@@ -92,6 +90,7 @@ from transformer_nuggets.cute.warpdrive import (
     bulk_wait_group,
     role,
 )
+from transformer_nuggets.cute.warpdrive._compat import Arch, LayoutEnum
 from transformer_nuggets.cute.warpdrive.examples.tma_tiles import tma_partition_tiles
 
 M_BLOCK = 128  # Q rows per CTA MMA tile: one softmax thread per row

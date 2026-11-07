@@ -810,7 +810,8 @@ as FA4's loader does, was not tried.
 <summary>Fast-divmod change, setup timeline and rejected alternatives</summary>
 
 
-`SplitKV.bind()` builds shape-dependent `FastDivmodDivisorV2` values once on the host.
+`SplitKV.bind()` builds shape-dependent `FastDivmodDivisor` values (`FastDivmodDivisorV2` from
+CuTeDSL 4.7, via `_compat`) once on the host.
 Roles use them instead of repeating general integer division, as in FA4's scheduler. Batch,
 heads and splits remain dynamic; per-sequence counts are still read after `PdlWait()`.
 Partials remained bitwise equal to FA4.

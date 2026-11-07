@@ -79,7 +79,6 @@ import torch
 from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.tensor_utils import LayoutEnum
 from flash_attn.cute import blackwell_helpers as fa_mma
 from flash_attn.cute import copy_utils as fa_copy_utils
 from flash_attn.cute import mask as fa_mask
@@ -115,6 +114,7 @@ from transformer_nuggets.cute.warpdrive import (
     fence_async_shared,
     role,
 )
+from transformer_nuggets.cute.warpdrive._compat import LayoutEnum
 from transformer_nuggets.cute.warpdrive.examples.tma_tiles import tma_partition_tiles
 
 TILE_M = 128  # Q rows per tile (the MMA N of S^T and dP^T)

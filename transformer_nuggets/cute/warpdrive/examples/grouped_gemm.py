@@ -29,7 +29,6 @@ import torch
 from cuda.bindings import driver as cuda
 from cutlass import Int32, Int64, cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.tensor_utils import LayoutEnum
 from cutlass.utils.gemm.sm100 import (
     epilogue_smem_copy_and_partition,
     epilogue_tmem_copy_and_partition,
@@ -61,6 +60,7 @@ from transformer_nuggets.cute.warpdrive import (
     WorkStream,
     role,
 )
+from transformer_nuggets.cute.warpdrive._compat import LayoutEnum
 from transformer_nuggets.cute.warpdrive.examples.gemm import _overlaps
 from transformer_nuggets.cute.warpdrive.examples.persistent_gemm import (
     CTA_TILE_M,

@@ -63,6 +63,11 @@ from transformer_nuggets.cute.warpdrive import (
     WorkStream,
     role,
 )
+from transformer_nuggets.cute.warpdrive._compat import (
+    FastDivmodDivisor,
+    SmemAllocator,
+    TmemAllocator,
+)
 
 TMA_ELEMS = 256  # one TMA box: 512 bytes of bf16
 TMA_BYTES = TMA_ELEMS * 2
@@ -313,7 +318,7 @@ class RawProbe:
     def kernel(self, stamps, n, tma, gsrc):
         ctx = ProbeCtx(stamps, n, tma, gsrc)
         stages, kind = self.stages, self.kind
-        smem = cutlass.memory.SmemAllocator()
+        smem = SmemAllocator()
         bars = smem.allocate_array(Int64, 4 * stages)
         buf = smem.allocate_tensor(BFloat16, cute.make_layout((TMA_ELEMS, stages)), 128)
         full_f, empty_f, full_b, empty_b = (bars + i * stages for i in range(4))
@@ -477,7 +482,7 @@ class GridItems(WorkMap):
 
     def bind(self, space):
         a, b, c = space
-        return (a, b, c, cute.FastDivmodDivisorV2(a), cute.FastDivmodDivisorV2(b))
+        return (a, b, c, FastDivmodDivisor(a), FastDivmodDivisor(b))
 
     def count64(self, space):
         a, b, c, *_ = space
@@ -635,7 +640,7 @@ class RawEmptyRoles:
 
     @cute.jit
     def __call__(self, stamps: cute.Tensor, out: cute.Tensor, ctas: Int32, stream: cuda.CUstream):
-        div_a, div_b = cute.FastDivmodDivisorV2(ctas), cute.FastDivmodDivisorV2(Int32(1))
+        div_a, div_b = FastDivmodDivisor(ctas), FastDivmodDivisor(Int32(1))
         self.kernel.set_name_prefix(self.get_name())
         self.kernel(stamps, out, div_a, div_b).launch(
             grid=(ctas, 1, 1), block=(32 * FIXED_WARPS, 1, 1), stream=stream
@@ -645,7 +650,7 @@ class RawEmptyRoles:
     def kernel(self, stamps, out, div_a, div_b):
         ctx = FixedCtx(stamps, out)
         stamp_warp(stamps, 0)
-        smem = cutlass.memory.SmemAllocator()
+        smem = SmemAllocator()
         bars = smem.allocate_array(Int64, 2 * sum(FIXED_RINGS))
         holder = smem.allocate_array(Int32, 1)
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -653,7 +658,7 @@ class RawEmptyRoles:
             with cute.arch.elect_one():
                 for i in cutlass.range_constexpr(2 * sum(FIXED_RINGS)):
                     cute.arch.mbarrier_init(bars + i, 32)
-        tmem = cutlass.memory.TmemAllocator(
+        tmem = TmemAllocator(
             holder,
             barrier_for_retrieve=pipeline.NamedBarrier(barrier_id=1, num_threads=512),
             allocator_warp_id=self.alloc_warp,

@@ -109,6 +109,7 @@ from transformer_nuggets.cute.warpdrive import (
     bulk_wait_group,
     role,
 )
+from transformer_nuggets.cute.warpdrive._compat import FastDivmodDivisor
 from transformer_nuggets.cute.warpdrive.examples.tma_tiles import tma_partition_tiles
 
 TILE_M = 128  # MMA M: KV tokens of one S subtile, head dims of one O tile (one lane per row)
@@ -143,7 +144,7 @@ class SplitKV(WorkMap):
         splits, heads, batch, _table = space
         # These divisors depend only on launch shapes, not the PDL-produced split table.
         major = heads * batch if self.per_sequence else splits
-        return (*space, cute.FastDivmodDivisorV2(major), cute.FastDivmodDivisorV2(heads))
+        return (*space, FastDivmodDivisor(major), FastDivmodDivisor(heads))
 
     def count64(self, space):
         splits, heads, batch, *_ = space

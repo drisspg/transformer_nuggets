@@ -13,10 +13,11 @@ from dataclasses import dataclass, fields, is_dataclass, replace
 from types import SimpleNamespace
 
 import cutlass
-from cutlass import Int32, cute, memory, pipeline
+from cutlass import Int32, cute, pipeline
 
 from transformer_nuggets.cute.jit_cache import canonical_key, module_source_digest
 from transformer_nuggets.cute.warpdrive import alias
+from transformer_nuggets.cute.warpdrive._compat import SmemAllocator, TmemAllocator
 from transformer_nuggets.cute.warpdrive.channels import (
     Barriers,
     Channel,
@@ -1154,7 +1155,7 @@ class WarpSpecialized(metaclass=_KernelType):
         for nb in self._ws_named_bars.values():  # this trace's native ID reads only
             nb._native_outside_roles = False
         clear_multicast_masks()
-        smem = memory.SmemAllocator()
+        smem = SmemAllocator()
         plan, total = self._barrier_plan()
         bars = smem.allocate_array(cutlass.Int64, max(total, 1))
         self._ws_bars = {name: bars + off for name, off, _ in plan}
@@ -1175,7 +1176,7 @@ class WarpSpecialized(metaclass=_KernelType):
             alloc_role, alloc_warp = self._tmem_allocator()
             holder = smem.allocate_array(cutlass.Int32, 1)
             dealloc_bar = smem.allocate_array(cutlass.Int64, 1) if two_cta else None
-            tmem = memory.TmemAllocator(
+            tmem = TmemAllocator(
                 holder,
                 barrier_for_retrieve=pipeline.NamedBarrier(
                     barrier_id=TMEM_PTR_BARRIER_ID, num_threads=self.num_threads
