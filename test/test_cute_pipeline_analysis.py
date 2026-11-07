@@ -329,8 +329,8 @@ def test_analysis_and_perfetto_direct_flows(tmp_path: Path) -> None:
         for packet in merged.packet
         if packet.HasField("track_descriptor") and packet.track_descriptor.HasField("process")
     }
-    assert any(name.startswith("first ·") for name in process_names)
-    assert any(name.startswith("second ·") for name in process_names)
+    # merge_traces folds each input into one process named after its label.
+    assert process_names == {"first", "second"}
 
 
 def test_steady_state_analysis_does_not_depend_on_the_window() -> None:
@@ -426,6 +426,35 @@ def test_perfetto_splits_crossing_role_envelopes_and_normalizes_suffix(
     assert len({event.track_uuid for event in begins}) == 2
     assert all(descriptors[event.track_uuid].sibling_merge_behavior for event in begins)
     assert any(descriptor.HasField("process") for descriptor in descriptors.values())
+
+
+def test_perfetto_zero_duration_slice_begins_before_it_ends(tmp_path: Path) -> None:
+    """An empty region at the time the next one starts on its lane opens and closes before it."""
+    plan = PipelinePlan("empty", iteration_name="tile")
+    plan.add_role(Role("role", "Role", 0, 1, "#fff"))
+    plan.add_region(Region("a", "role", "A", 0, 1, "a"))
+    plan.add_region(Region("b", "role", "B", 1, 1, "b"))
+    timeline = plan.schedule(iterations=1)
+    regions = (
+        MeasuredRegion("a", "role", 0, 5, 5, 0.0, 1),
+        MeasuredRegion("b", "role", 0, 5, 9, 4.0, 1),
+    )
+    measured = MeasuredCapture("measured", "empty", (0, 0, 0), 5, 4, regions)
+
+    trace = Trace()
+    trace.ParseFromString(
+        write_pipeline_perfetto(tmp_path / "empty.pftrace", timeline, measured).read_bytes()
+    )
+
+    open_slices: dict[int, int] = {}
+    for packet in trace.packet:
+        event = packet.track_event
+        if event.type == TrackEvent.TYPE_SLICE_BEGIN:
+            open_slices[event.track_uuid] = open_slices.get(event.track_uuid, 0) + 1
+        elif event.type == TrackEvent.TYPE_SLICE_END:
+            assert open_slices.get(event.track_uuid, 0) > 0, "slice end without a begin"
+            open_slices[event.track_uuid] -= 1
+    assert not any(open_slices.values())
 
 
 def test_task_scheduling_adapter_maps_staged_resources() -> None:

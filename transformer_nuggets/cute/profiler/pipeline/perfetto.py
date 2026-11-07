@@ -176,13 +176,17 @@ def _build_pipeline_perfetto(
         edge_metadata[source].append(f"unblocks {edge_description}")
         edge_metadata[target].append(f"depends_on {edge_description}")
 
-    markers: list[tuple[int, bool, MeasuredRegion]] = []
+    # At one timestamp, slices that end close before others begin, and an empty slice ends
+    # right after its own begin.
+    markers: list[tuple[tuple, bool, MeasuredRegion]] = []
     for region in measured.regions:
-        markers.append((region.start_ns - measured.origin_ns, True, region))
-        markers.append((region.end_ns - measured.origin_ns, False, region))
-    markers.sort(key=lambda marker: (marker[0], marker[1], marker[2].role, marker[2].name))
+        start_ns, end_ns = region.start_ns - measured.origin_ns, region.end_ns - measured.origin_ns
+        key = (region.role, region.name, region.iteration)
+        markers.append(((start_ns, 1, *key, 0), True, region))
+        markers.append(((end_ns, int(end_ns == start_ns), *key, 1), False, region))
+    markers.sort(key=lambda marker: marker[0])
 
-    for timestamp_ns, is_begin, region in markers:
+    for (timestamp_ns, *_), is_begin, region in markers:
         packet = builder.add_packet()
         packet.timestamp = timestamp_ns
         packet.trusted_packet_sequence_id = 2001
