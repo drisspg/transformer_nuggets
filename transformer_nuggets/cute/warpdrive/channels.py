@@ -62,7 +62,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 import cutlass
-from cutlass import Int32, cute
+from cutlass import Int32, cute, pipeline
 from cutlass._mlir.dialects import nvvm as _nvvm
 from cutlass.cutlass_dsl import if_generate
 
@@ -1277,7 +1277,7 @@ class _End:
             self._state = self._state ^ (1 << slot)
             self._rec.slots.add(slot)
         else:
-            self._state.advance(self._stride)
+            advance_state(self._state, self._stride)
         self._advanced(slot)
         return index, phase, label
 
@@ -1509,8 +1509,8 @@ class ConsumerEnd(_End):
 
     def skip(self, n: int | Int32 = 1):
         """Exclusive ring: advance past ``n`` epochs that other consumers own, without waiting
-        or arriving (``state.advance(n)``). Outstanding try tokens of this end go stale; an
-        unadopted preview raises. ``n`` is a positive Python int, or a dynamic ``Int32`` (at
+        or arriving (``advance_state(state, n)``). Outstanding try tokens of this end go stale;
+        an unadopted preview raises. ``n`` is a positive Python int, or a dynamic ``Int32`` (at
         least 0), which leaves the ring's ownership check unverified."""
         chan, who, site = self._chan, self._trace.role_name, user_site()
         if not chan.exclusive:
@@ -1534,7 +1534,7 @@ class ConsumerEnd(_End):
             )
         self._check_current()
         self._trace.record(chan.name, "skip", None, count=None if dynamic else n)
-        self._state.advance(n)
+        advance_state(self._state, n)
         self._advanced(None)
 
     def peek(self, slot=None) -> Preview:
@@ -1604,6 +1604,26 @@ def _stale_back_edge(rec: _EndRecord, key, body) -> str | None:
         if block == body and k == key and why is not None:
             return f"the value one iteration passes to the next (probed at {site}) is stale: {why}"
     return None
+
+
+def advance_state(state: pipeline.PipelineState, count: int | Int32) -> pipeline.PipelineState:
+    """Advance ``state`` in place by ``count`` epochs (a positive Python int, or a dynamic
+    ``Int32`` of at least 0) and return it. CuTeDSL 4.8's ``state.advance(count)``, which 4.6
+    and 4.7 lack (they advance one epoch), with the same index, phase and count arithmetic.
+
+    A dynamic loop carries a state only if its body reassigns it or calls a method on it, so
+    reassign the result there: ``st = advance_state(st, 2)``."""
+    if not isinstance(count, Int32) and count < 1:
+        raise ValueError(f"advance_state: a Python int count must be at least 1, got {count!r}")
+    if not isinstance(count, Int32) and count == 1:
+        state.advance()
+        return state
+    state._count += count
+    state._index += count
+    phase_flips = state._index // state.stages
+    state._index = state._index % state.stages
+    state._phase ^= phase_flips % 2
+    return state
 
 
 def _wait(bar, phase, ready):

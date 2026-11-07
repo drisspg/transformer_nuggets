@@ -32,6 +32,7 @@ from transformer_nuggets.cute.warpdrive.channels import (
     Umma,
     Warps,
     _named_sync,
+    advance_state,
     arrivals,
 )
 from transformer_nuggets.cute.warpdrive.cluster import (
@@ -1789,7 +1790,7 @@ class WarpSpecialized(metaclass=_KernelType):
                 chan.n,
             )
             if turn:
-                state.advance(turn)
+                advance_state(state, turn)
         cls = ProducerEnd if is_prod else ConsumerEnd
         end = cls(
             chan,

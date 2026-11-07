@@ -178,4 +178,6 @@ pytest -n 12 test/test_cute_warpdrive*.py
 
 The FA4 examples also need `flash_attn.cute` and a `quack-kernels` release that supports that
 CuTeDSL version (quack 0.6.5 needs 4.7; 0.6.3 works with 4.6). Renamed or version-dependent
-CuTeDSL APIs live in [`_compat.py`](_compat.py); import them from there.
+CuTeDSL APIs live in [`_compat.py`](_compat.py); import them from there. Advance a raw
+`PipelineState` by several epochs with `advance_state(state, n)`: `state.advance(n)` is new in
+4.8.

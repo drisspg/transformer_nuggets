@@ -61,6 +61,7 @@ from transformer_nuggets.cute.warpdrive import (
     WorkCursor,
     WorkMap,
     WorkStream,
+    advance_state,
     role,
 )
 from transformer_nuggets.cute.warpdrive._compat import (
@@ -417,10 +418,10 @@ class RawProbe:
             for _ in cutlass.range(turn, ctx.n, 2, unroll=1):
                 raw_wait(style, full_f + f.index, f.phase)
                 cute.arch.mbarrier_arrive(empty_f + f.index)
-                f.advance(2)
+                f = advance_state(f, 2)
                 raw_wait(style, empty_b + b.index, b.phase)
                 cute.arch.mbarrier_arrive(full_b + b.index)
-                b.advance(2)
+                b = advance_state(b, 2)
 
     @cute.jit
     def named_roles(self, ctx, warp):

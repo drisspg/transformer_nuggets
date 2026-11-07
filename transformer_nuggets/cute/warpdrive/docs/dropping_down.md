@@ -102,7 +102,8 @@ state that raw code may advance.
 
 Sharing changes the state contract:
 
-- **Exclusive consumers:** `skip(n)` is `end.state.advance(n)` plus trace bookkeeping. Use a
+- **Exclusive consumers:** `skip(n)` is `advance_state(end.state, n)` plus trace bookkeeping
+  (`advance_state` is CuTeDSL 4.8's `state.advance(n)`, on every supported version). Use a
   positive Python int or dynamic `Int32` with `n >= 0`. Raw state or dynamic skips make
   ownership unverified. `override={"empty_counts": ...}` lifts equal consumer contributions;
   each owner must supply the replacement count.

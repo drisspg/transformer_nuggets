@@ -39,6 +39,7 @@ from transformer_nuggets.cute.warpdrive import (
     WarpSpecialized,
     WorkCursor,
     WorkStream,
+    advance_state,
     role,
 )
 
@@ -296,7 +297,7 @@ class Static(Toy):
                 kv.skip(1)
             elif cutlass.const_expr(self.mode == "raw_state" and g == 0):
                 state = kv.state  # a raw skip of a's two epochs
-                state.advance(2)
+                state = advance_state(state, 2)
                 kv.state = state
             else:
                 kv.skip(2)

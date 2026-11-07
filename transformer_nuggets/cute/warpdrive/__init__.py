@@ -118,6 +118,7 @@ from transformer_nuggets.cute.warpdrive.channels import (
     Turnstile,
     Umma,
     Warps,
+    advance_state,
 )
 from transformer_nuggets.cute.warpdrive.cluster import Cluster, CtaPair, SingleCta, TmaMulticast
 from transformer_nuggets.cute.warpdrive.kernel import (
@@ -199,6 +200,7 @@ __all__ = [
     "WorkCursor",
     "WorkMap",
     "WorkStream",
+    "advance_state",
     "bulk_commit_group",
     "bulk_wait_group",
     "fence_async_shared",
