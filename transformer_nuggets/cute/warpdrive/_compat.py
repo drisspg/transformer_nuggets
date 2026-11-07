@@ -43,6 +43,9 @@ def _remote(ptr: cute.Pointer, rank: ir.Value, loc, ip) -> ir.Value:
     return nvvm.mapa(dsmem, ptr.to_llvm_ptr(loc=loc, ip=ip), rank, loc=loc, ip=ip)
 
 
+# CuTeDSL 4.8's PipelineState.advance(count) takes a count; older versions advance one epoch.
+NATIVE_MULTI_ADVANCE = cutedsl_version_matches(">=4.8")
+
 if cutedsl_version_matches(">=4.8"):
     from cutlass.memory import SmemAllocator, TmemAllocator
     from cutlass.tensor_utils import LayoutEnum

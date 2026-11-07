@@ -66,7 +66,7 @@ from cutlass import Int32, cute, pipeline
 from cutlass._mlir.dialects import nvvm as _nvvm
 from cutlass.cutlass_dsl import if_generate
 
-from transformer_nuggets.cute.warpdrive._compat import mbarrier_arrive
+from transformer_nuggets.cute.warpdrive._compat import NATIVE_MULTI_ADVANCE, mbarrier_arrive
 from transformer_nuggets.cute.warpdrive.cluster import (
     ALL,
     FILLS,
@@ -1609,8 +1609,9 @@ def _stale_back_edge(rec: _EndRecord, key, body) -> str | None:
 
 def advance_state(state: pipeline.PipelineState, count: int | Int32) -> pipeline.PipelineState:
     """Advance ``state`` in place by ``count`` epochs (a positive Python int, or a dynamic
-    ``Int32`` of at least 0) and return it. CuTeDSL 4.8's ``state.advance(count)``, which 4.6
-    and 4.7 lack (they advance one epoch), with the same index, phase and count arithmetic.
+    ``Int32`` of at least 0) and return it. On CuTeDSL 4.8 this is ``state.advance(count)``;
+    4.6 and 4.7 advance one epoch per call, so there it applies 4.8's index, phase and count
+    arithmetic.
 
     A dynamic loop carries a state only if its body reassigns it or calls a method on it, so
     reassign the result there: ``st = advance_state(st, 2)``."""
@@ -1618,6 +1619,9 @@ def advance_state(state: pipeline.PipelineState, count: int | Int32) -> pipeline
         raise ValueError(f"advance_state: a Python int count must be at least 1, got {count!r}")
     if not isinstance(count, Int32) and count == 1:
         state.advance()
+        return state
+    if NATIVE_MULTI_ADVANCE:
+        state.advance(count)
         return state
     state._count += count
     state._index += count
