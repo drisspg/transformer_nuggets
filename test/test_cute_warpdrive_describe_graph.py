@@ -170,6 +170,29 @@ def test_pair_channels_point_from_producer_to_consumers():
     assert link == "-->" and "CTA-local" in label
 
 
+def test_wires_take_their_signal_mechanism_colour():
+    """A handoff edge is coloured by its producers' mechanism (by its consumers' from a
+    junction), thick across CTAs; stream and hub edges stay grey."""
+    text = PairPipeline().describe(format="mermaid")
+    g = Mermaid(text)
+    styles = {
+        int(i): style
+        for ids, style in re.findall(r"^  linkStyle ([\d,]+) (.*)$", text, re.M)
+        for i in ids.split(",")
+    }
+
+    def style(src: str, dst: str) -> str:
+        (i,) = (i for i, (s, _, _, d) in enumerate(g.edges) if (s, d) == (src, dst))
+        return styles[i]
+
+    load, mma, log, sink = (g.node(n) for n in ("load", "mma", "log", "sink[0]"))
+    acc = g.node("acc · Ring(1)")
+    assert style(load, mma) == "stroke:#3f7d5c,stroke-width:3.5px"  # TMA, pair
+    assert style(mma, acc) == "stroke:#3b689c,stroke-width:3.5px"  # UMMA producer joins
+    assert style(acc, sink) == "stroke:#8a5a9e,stroke-width:3.5px"  # to thread consumers
+    assert style(load, log) == "stroke:#8a5a9e,stroke-width:1.6px"  # CTA-local threads
+
+
 def test_hubs_join_their_users_and_raw_code_is_a_node():
     """Raw code on an external side is its own node at that end; a turnstile and ``Barriers``
     are hubs joined to their users; before a compile the named barriers are only listed."""
@@ -284,9 +307,17 @@ def test_every_example_draws_a_well_formed_graph(make):
     text = op.describe(format="mermaid")
     assert make().describe(format="mermaid") == text
     g = Mermaid(text)
-    body = [line for line in text.splitlines()[3:] if not line.lstrip().startswith("class")]
+    body = [
+        line
+        for line in text.splitlines()[3:]
+        if not line.lstrip().startswith(("class", "linkStyle"))
+    ]
     assert len(body) == len(g.nodes) + len(g.edges), "a line is neither a node nor an edge"
     assert all(s in g.nodes and d in g.nodes for s, _, _, d in g.edges)
+    styled = [
+        int(i) for i in re.findall(r"^  linkStyle ([\d,]+) ", text, re.M) for i in i.split(",")
+    ]
+    assert sorted(styled) == list(range(len(g.edges))), "each link styled once (or Mermaid fails)"
     assert {r.name for r in op._ws_roles} <= {lines[0] for lines in g.nodes.values()}
     heads = [lab[0] for lab in [*g.nodes.values(), *(e[2] for e in g.edges)] if lab]
     names = {n.strip() for head in heads for n in head.split(" · ")[0].split(",")}

@@ -88,7 +88,7 @@ def describe_graph(kernel, fmt: str) -> str:
             f"describe format must be 'text', 'html' or one of {FORMATS}, got {fmt!r}"
         )
     graph = build_graph(kernel)
-    return to_mermaid(graph) if fmt == "mermaid" else to_dot(graph)
+    return to_mermaid(graph, kernel._ws_chans) if fmt == "mermaid" else to_dot(graph)
 
 
 def mechanism(mech, named: bool = False) -> str:
@@ -99,6 +99,16 @@ def mechanism(mech, named: bool = False) -> str:
     if isinstance(mech, Tma):
         return "tma"
     return "umma" if mech is Umma else "threads"
+
+
+def wire_mechanism(graph: Graph, edge: Edge, chans: dict) -> str:
+    """The mechanism a handoff edge carries: its consumers' from a junction to a consumer,
+    else its producers' (``""`` for stream and hub edges)."""
+    if not edge.channels:
+        return ""
+    ch = chans[edge.channels[0]]
+    from_junction = any(n.id == edge.src and n.kind == "channel" for n in graph.nodes)
+    return mechanism(ch.consumer if from_junction else ch.producer, ch.named)
 
 
 # --------------------------------------------------------------------------- #
@@ -337,13 +347,28 @@ _MERMAID_SHAPES = {
     "storage": ('["', '"]'),
 }
 _MERMAID_CLASSES = {
-    "role": "fill:#e8f0fe,stroke:#3b6db3,color:#111",
-    "channel": "fill:#f4f4f4,stroke:#777,color:#111",
-    "stream": "fill:#e6f4ea,stroke:#3a7d44,color:#111",
-    "external": "fill:#fff,stroke:#888,stroke-dasharray:4 3,color:#111",
-    "sync": "fill:#fdf2e0,stroke:#b26a00,color:#111",
-    "storage": "fill:#fafafa,stroke:#aaa,stroke-dasharray:2 2,color:#111",
+    "role": "fill:#fbf9f4,stroke:#1a2e22,color:#1a2e22",
+    "channel": "fill:#eae6de,stroke:#6a7a6e,color:#1a2e22",
+    "stream": "fill:#eef2ec,stroke:#5f7f67,color:#1a2e22",
+    "external": "fill:#fbf9f4,stroke:#6a7a6e,stroke-dasharray:4 3,color:#1a2e22",
+    "sync": "fill:#f6efe3,stroke:#a26f22,color:#1a2e22",
+    "storage": "fill:#fbf9f4,stroke:#b9b4aa,stroke-dasharray:2 2,color:#6a7a6e",
 }
+# Wire colours by signal mechanism (describe_html's palette); thick wires cross CTAs.
+_MERMAID_WIRES = {
+    "tma": "#3f7d5c",
+    "umma": "#3b689c",
+    "threads": "#8a5a9e",
+    "named": "#a26f22",
+    "": "#6a7a6e",
+}
+_MERMAID_INIT = (
+    '%%{init: {"theme": "base", "flowchart": {"wrappingWidth": 400, "curve": "basis"}, '
+    '"themeVariables": {"fontSize": "13px", "lineColor": "#6a7a6e", '
+    '"edgeLabelBackground": "#fbf9f4", '
+    '"primaryColor": "#fbf9f4", "primaryBorderColor": "#1a2e22", '
+    '"primaryTextColor": "#1a2e22"}}}%%'
+)
 # (edge kind, crosses CTAs) -> link: thick links cross CTAs.
 _MERMAID_LINKS = {
     ("into", False): "---",
@@ -364,10 +389,10 @@ def _mermaid_text(lines) -> str:
     return "<br>".join(escaped)
 
 
-def to_mermaid(graph: Graph) -> str:
+def to_mermaid(graph: Graph, chans: dict) -> str:
     # Labels are explicit lines: widen Mermaid's 200px wrapping so they keep them.
     out = [
-        '%%{init: {"flowchart": {"wrappingWidth": 400}}}%%',
+        _MERMAID_INIT,
         f"%% {graph.title}",
         "flowchart LR",
     ]
@@ -383,6 +408,14 @@ def to_mermaid(graph: Graph) -> str:
     for cls, ids in by_class.items():
         out.append(f"  classDef {cls} {_MERMAID_CLASSES[cls]}")
         out.append(f"  class {','.join(ids)} {cls}")
+    by_wire = {}  # (colour, thick) -> link indices
+    for i, e in enumerate(graph.edges):
+        by_wire.setdefault((wire_mechanism(graph, e, chans), e.cross_cta), []).append(str(i))
+    for (mech, thick), ids in by_wire.items():
+        width = "3.5px" if thick else "1.6px"
+        out.append(
+            f"  linkStyle {','.join(ids)} stroke:{_MERMAID_WIRES[mech]},stroke-width:{width}"
+        )
     return "\n".join(out)
 
 

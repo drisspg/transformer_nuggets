@@ -29,7 +29,12 @@ from dataclasses import dataclass, field
 
 from transformer_nuggets.cute.warpdrive.channels import SIDES, Tma
 from transformer_nuggets.cute.warpdrive.describe import _overrides, is_pair
-from transformer_nuggets.cute.warpdrive.describe_graph import Graph, build_graph, mechanism
+from transformer_nuggets.cute.warpdrive.describe_graph import (
+    Graph,
+    build_graph,
+    mechanism,
+    wire_mechanism,
+)
 from transformer_nuggets.cute.warpdrive.html_page import asset, page
 
 # Node kinds drawn in the side panel instead of the graph.
@@ -140,10 +145,7 @@ def _items(graph: Graph, kernel):
             0, _section("work streams", [" · ".join(s[:2]) + f" ({s[2]})" for s in streams])
         )
     wires = []
-    chip_of = {}  # junction id -> its channel's first name
-    for n in graph.nodes:
-        if n.kind == "channel":
-            chip_of[n.id] = n.ref
+    chip_of = {n.id for n in graph.nodes if n.kind == "channel"}  # junctions
     for i, e in enumerate(graph.edges):
         match e.kind:
             case "spoke":
@@ -152,20 +154,9 @@ def _items(graph: Graph, kernel):
                 wires.append(_Wire(e.src, e.dst, "stream", "stream"))
             case "into" | "flow" if e.src in chip_of or e.dst in chip_of:
                 junction = e.dst if e.kind == "into" else e.src
-                ch = chans[chip_of[junction]]
-                side = ch.producer if e.kind == "into" else ch.consumer
+                color = wire_mechanism(graph, e, chans)
                 label = " ".join(e.lines)
-                wires.append(
-                    _Wire(
-                        e.src,
-                        e.dst,
-                        e.kind,
-                        mechanism(side, ch.named),
-                        e.cross_cta,
-                        label,
-                        junction,
-                    )
-                )
+                wires.append(_Wire(e.src, e.dst, e.kind, color, e.cross_cta, label, junction))
             case _:  # a 1:1 channel edge: a chip between its ends
                 chip = f"chip_{i}"
                 boxes[chip] = _chip_box(chip, list(e.channels), e.lines, kernel, chans)
