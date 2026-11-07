@@ -773,27 +773,22 @@ class WorkStream:
             )
         space = mapping.bind(space)
         count = int(mapping.count64(space))
-        total = int(_narrow(count))
+        total = _narrow(count)
         cs = self.cluster_size
-        cap = None
-        if schedule.uses_max_ctas:
-            if max_ctas is None:
-                raise ValueError(f"{schedule.describe()} needs max_ctas")
-            cap = max(max_ctas // cs, 1)
-        units = int(schedule.launch_units(total, cap))
+        units = int(schedule.launch_units(total, _unit_cap(schedule, max_ctas, cs)))
         if schedule.index_limit(count, units, cs) > INT32_MAX:
             raise ValueError(f"the space's {count} items exceed what a launch indexes in Int32")
-        if decode is None and mapping.skips and not mapping.decodes_any_index:
-            raise ValueError(
-                f"{type(mapping).__name__} drops items by data the host cannot read; pass its "
-                "host counterpart as decode=(index -> (keep, item))"
-            )
         if decode is None and mapping.decodes_any_index:
 
             def decode(index):
                 keep, words, _ = mapping.decode(index, space, mapping.start(space))
                 return keep, tuple(int(w) for w in words)
 
+        elif decode is None and mapping.skips:
+            raise ValueError(
+                f"{type(mapping).__name__} drops items by data the host cannot read; pass its "
+                "host counterpart as decode=(index -> (keep, item))"
+            )
         elif decode is None:
 
             def decode(index):
@@ -934,12 +929,7 @@ class BoundWork:
         work unit. A space whose ``schedule.index_limit`` exceeds Int32 gets a zero-wide grid,
         which CUDA rejects at launch."""
         schedule = self.stream.schedule
-        cap = None
-        if schedule.uses_max_ctas:
-            if self.max_ctas is None:
-                raise ValueError(f"{schedule.describe()} needs max_ctas")
-            cap = self.max_ctas if self.cs == 1 else cutlass.max(self.max_ctas // self.cs, 1)
-        units = schedule.launch_units(self.total, cap)
+        units = schedule.launch_units(self.total, _unit_cap(schedule, self.max_ctas, self.cs))
         if _tile_grid(self.stream):
             x, y, z = tile_grid_dims(self.space, self.cs)
         else:
@@ -957,6 +947,16 @@ class BoundWork:
 # --------------------------------------------------------------------------- #
 # Device side: decoding, the per-role cursor, and the scheduler role
 # --------------------------------------------------------------------------- #
+
+
+def _unit_cap(schedule, max_ctas, cs: int):
+    """``launch_units``'s cap: ``max_ctas`` in whole work units of ``cs`` CTAs (at least one),
+    or None for a schedule without ``uses_max_ctas``."""
+    if not schedule.uses_max_ctas:
+        return None
+    if max_ctas is None:
+        raise ValueError(f"{schedule.describe()} needs max_ctas")
+    return max_ctas if cs == 1 else cutlass.max(max_ctas // cs, 1)
 
 
 def _narrow(count):
