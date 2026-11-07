@@ -12,6 +12,7 @@
 
 import argparse
 import math
+from itertools import accumulate
 from pathlib import Path
 
 import torch
@@ -83,7 +84,7 @@ def grouped_tiles_decode(offsets: list[int], total_m: int, n_tiles: int, tile_m:
 def grouped_gemm_view(sizes: list[int], n: int, ctas: int) -> str:
     op = GroupedGemm()
     tile_m, tile_n = op.mma_tile[:2]
-    offsets = [sum(sizes[: g + 1]) for g in range(len(sizes))]
+    offsets = list(accumulate(sizes))
     total_m, n_tiles = offsets[-1], math.ceil(n / tile_n)
     space = (torch.tensor(offsets, dtype=torch.int32), total_m, n_tiles)
     decode = grouped_tiles_decode(offsets, total_m, n_tiles, tile_m)

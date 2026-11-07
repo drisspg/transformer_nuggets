@@ -364,12 +364,9 @@ def load_into(out, src, offset, n: cutlass.Constexpr):
 
 @cute.jit
 def store_vec(dst, offset, frag, n: cutlass.Constexpr):
-    if cutlass.const_expr(dst.element_type is Float32):
-        cute.autovec_copy(frag, cute.local_tile(dst, (n,), (offset // n,)))
-    else:
-        cast = cute.make_rmem_tensor((n,), dst.element_type)
-        cast.store(frag.load().to(dst.element_type))
-        cute.autovec_copy(cast, cute.local_tile(dst, (n,), (offset // n,)))
+    cast = cute.make_rmem_tensor((n,), dst.element_type)
+    cast.store(frag.load().to(dst.element_type))
+    cute.autovec_copy(cast, cute.local_tile(dst, (n,), (offset // n,)))
 
 
 class QwenDecodeMegakernel(WarpSpecialized):
@@ -432,7 +429,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
 
     @role(warps=COMPUTE_WARPS)
     @cute.jit
-    def load(self, p: MegakernelParams, *, w: Producer, work: WorkCursor, me: Local):
+    def load(self, p: MegakernelParams, *, w: Producer, work: WorkCursor):
         w = w.views(W=p.sW, KV=p.sKV)
         tma_qkv, tma_o, tma_gu, tma_d, tma_lm, tma_k, tma_v = p.tma
         g_qkv, g_o, g_gu, g_d, g_lm, g_k, g_v = p.gmem
@@ -506,7 +503,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
                     xbuf = 1 - xbuf
                     self.prologue(p, op, layer, a, ks, token, epoch, xbuf, tid, warp, lane, row)
                     self.csync.sync()
-                w = self.gemv(p, w, op, layer, a, b, epoch, xbuf, tid, warp, lane, row)
+                w = self.gemv(p, w, op, layer, a, b, epoch, xbuf, warp, lane, row)
                 if (op == DOWN) & (b == DOWN_SPLITS - 1) & (tid < ROWS):
                     self.reduce_down(p, layer, a * ROWS + tid, epoch, row)
             work.advance()
@@ -688,9 +685,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
         xs[hh * HEAD_DIM + d + 1] = BFloat16(num1 / den)
 
     @cute.jit
-    def gemv(
-        self, p: MegakernelParams, w, op, layer, a, b, epoch, xbuf, tid, warp, lane, row_index
-    ):
+    def gemv(self, p: MegakernelParams, w, op, layer, a, b, epoch, xbuf, warp, lane, row_index):
         """32-row tiles: warp w owns rows 4w..4w+3 of a stage, lane l columns 8l..8l+7."""
         k_tiles = HIDDEN_K_TILES
         if op == OPROJ:
@@ -990,7 +985,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
         # Materialize the argument tensors here: their iterators/layouts are created lazily on
         # first use, and a first use inside one role's dispatch branch would not dominate the
         # other roles' uses.
-        tensors = dict(zip(TENSOR_ARGS, (materialize(t) for t in tensors)))
+        tensors = dict(zip(TENSOR_ARGS, (cute.make_tensor(t.iterator, t.layout) for t in tensors)))
         trace_buffer = tensors.pop("trace_buffer")
         parts = tma_partitions(tma, gtensors, self.buffer("W"), self.buffer("KV"))
         params = MegakernelParams(
@@ -1090,10 +1085,6 @@ def tma_partitions(tma, gtensors, sW, sKV):
             )
         )
     return parts
-
-
-def materialize(t):
-    return cute.make_tensor(t.iterator, t.layout)
 
 
 def tagged_views(scratch, layout: ScratchLayout):

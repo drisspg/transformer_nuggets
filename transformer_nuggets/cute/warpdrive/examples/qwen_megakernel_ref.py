@@ -232,7 +232,7 @@ def compare_logits(
     and cache inputs. This is a recommended integration gate, not a proof.
     """
     test, bf16, high = (x.double() for x in (test_logits, ref_bf16_logits, ref_fp32_logits))
-    delta = (test - bf16).abs()
+    delta = (test - bf16).abs().max().item()
     test_error, eager_error = test - high, bf16 - high
     test_max, eager_max = test_error.abs().max().item(), eager_error.abs().max().item()
     test_rms, eager_rms = (
@@ -243,8 +243,8 @@ def compare_logits(
     finite = bool(torch.isfinite(test).all())
     allowance = torch.finfo(torch.float32).eps * max(1.0, high.abs().max().item())
     return {
-        "max_abs_err": delta.max().item(),
-        "rel_err": delta.max().item() / max(bf16.abs().max().item(), 1e-30),
+        "max_abs_err": delta,
+        "rel_err": delta / max(bf16.abs().max().item(), 1e-30),
         "argmax_match": argmax_match,
         "test_fp32_max_err": test_max,
         "bf16_fp32_max_err": eager_max,
