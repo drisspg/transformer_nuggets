@@ -36,6 +36,7 @@ from test_cute_warpdrive_scheduling import (
     compile_toy,
     run_toy,
 )
+from warpdrive_test_helpers import INVALID_LAUNCH
 
 from transformer_nuggets.cute.jit_cache import jit_cache
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
@@ -697,8 +698,7 @@ def test_swapped_schedules_cover_empty_and_overflowing_spaces(requires_blackwell
     for space in EMPTY_SPACES:
         assert _count_items(fn, ws, space, 148) == [0, 0], space
     for space in OVERFLOWING_SPACES:
-        # The message differs for a freshly compiled and a cached (loaded) kernel.
-        with pytest.raises(Exception, match="CUDA launch failed|CUDA Error Code"):
+        with pytest.raises(Exception, match=INVALID_LAUNCH):
             _count_items(fn, ws, space, 148)
     want = 5 * 3 * 2 * cluster.size
     assert _count_items(fn, ws, (5, 3, 2), 4) == [want, want]
@@ -1307,11 +1307,11 @@ def fa4_example_cases():
 def test_fa4_example_swaps_mapping(requires_blackwell, case):
     """The FA4 example's (query block, head, batch) items take any mapping, including FA4's own
     scheduler order, with unchanged numerics."""
+    ts = fa4_tile_scheduler()
     from test_cute_warpdrive import fa4_inputs
 
     from transformer_nuggets.cute.warpdrive.examples.fa4_fwd import fa4_fwd
 
-    ts = fa4_tile_scheduler()
     schedule, make_mapping, cluster = fa4_example_cases()[case]
     q, k, v = fa4_inputs(2, 5, 1536, 384, True)
     qf, kf, vf = (x.float().transpose(1, 2) for x in (q, k, v))

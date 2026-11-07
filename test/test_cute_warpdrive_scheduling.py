@@ -12,6 +12,7 @@ pytest.importorskip("cutlass.cute")
 import cutlass
 from cuda.bindings import driver as cuda
 from cutlass import Int32, cute
+from warpdrive_test_helpers import INVALID_LAUNCH
 
 from transformer_nuggets.cute.jit_cache import jit_cache
 from transformer_nuggets.cute.utils import compile_tvm_ffi, make_fake_compact_tensor
@@ -749,8 +750,7 @@ def test_space_overflowing_int32_is_rejected(requires_blackwell, case, cluster):
         # cluster shape launches more than 10 units here).
         spaces.append((2**31 - 10, 1, 1))
     for space in spaces:
-        # The message differs for a freshly compiled and a cached (loaded) kernel.
-        with pytest.raises(Exception, match="CUDA launch failed|CUDA Error Code"):
+        with pytest.raises(Exception, match=INVALID_LAUNCH):
             _count_items(fn, ws, space, 148)
     _check_valid_launch(op, fn, ws)
 

@@ -7,6 +7,10 @@ import pytest
 
 from transformer_nuggets.cute.warpdrive import ProtocolError, WarpSpecialized
 
+# A launch CUDA rejects (here: a grid past its limits). CuTeDSL words the error differently
+# across versions and for fresh and cached kernels; every form names the CUDA error.
+INVALID_LAUNCH = "cudaErrorInvalidValue"
+
 
 def raises_protocol(match: str, fn: Callable[[], object]) -> None:
     with pytest.raises(Exception, match=match) as info:
