@@ -378,6 +378,14 @@ def _decode_events_compact(buf: ProfileBuf, tag_table: TagTable, tid_base: int) 
                 "unit's anchor. Bump max_events_per_unit or fix caller slot allocation."
             )
 
+    unanchored = (~valid_anchor & (records != 0).any(dim=1)).nonzero(as_tuple=True)[0]
+    if len(unanchored):
+        counts = (records[unanchored] != 0).sum(dim=1).tolist()
+        raise RuntimeError(
+            f"Compact-mode units {unanchored.tolist()} hold {', '.join(map(str, counts))} "
+            "record(s) but no anchor: warp 0 must run compact_anchor_init (or "
+            "compact_prepare_smem) with the same record predicate as the events"
+        )
     valid = (records != 0) & valid_anchor.unsqueeze(1)
     if not valid.any():
         return []
@@ -385,10 +393,12 @@ def _decode_events_compact(buf: ProfileBuf, tag_table: TagTable, tid_base: int) 
     ts_lo = records & mask32
     dur_ns = (records >> 32) & mask24
     tag_ids = (records >> 56) & 0xFF
-    anchor_lo = anchors & mask32
-    anchor_hi = (anchors >> 32) << 32
-    wrap = (ts_lo < anchor_lo.unsqueeze(1)).to(torch.int64) << 32
-    start_ns = anchor_hi.unsqueeze(1) + wrap + ts_lo
+    # A start within 2^31 ns of its unit's anchor, before it (another warp read its timer
+    # first) or after it (across a 2^32 ns boundary), is the anchor plus the signed
+    # 32-bit difference of their low halves.
+    delta = (ts_lo - (anchors & mask32).unsqueeze(1)) & mask32
+    delta = delta - ((delta >> 31) << 32)
+    start_ns = anchors.unsqueeze(1) + delta
 
     starts = start_ns[valid].tolist()
     durs = dur_ns[valid].tolist()

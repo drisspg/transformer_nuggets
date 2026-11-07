@@ -119,10 +119,11 @@ def compact_anchor_init(
     """Write a full 64-bit globaltimer anchor to slot 0 of this unit's buffer.
 
     Compact mode stores each event as a single packed int64 with only the low
-    32 bits of the timer. The decoder reconstructs full 64-bit timestamps by
-    combining each record's ts_lo32 with the upper 32 bits of this anchor (and
-    handling wraparound). Call once per CTA at the top of ``@cute.kernel``,
-    BEFORE any nested warp guards.
+    32 bits of the timer. The decoder reconstructs each full 64-bit start as
+    the anchor plus the signed difference of their low 32 bits, so an event
+    may start up to ~2.1 s before or after the anchor; other warps need not
+    wait for it. Call once per CTA at the top of ``@cute.kernel``, BEFORE any
+    nested warp guards.
 
     Only lane 0 of warp 0 performs the store.
     """
@@ -160,9 +161,9 @@ def compact_event_stop(
         bits  63..56  55..32     31..0
               tag(8)  dur_ns(24) ts_lo32(32)
 
-    ``dur_ns`` saturates at ~16.7 ms (2^24 ns); regions longer than that
-    overflow silently — use the legacy 4xi64 path (:func:`raw_event_stop`) for
-    coarse outer regions if needed. ``tag`` is masked to 8 bits.
+    ``dur_ns`` wraps modulo 2^24 ns (~16.7 ms): a longer region decodes as its
+    duration modulo 2^24 — use the legacy 4xi64 path (:func:`raw_event_stop`)
+    for coarse outer regions if needed. ``tag`` is masked to 8 bits.
 
     Only lane 0 of the calling warp performs the store; the caller is
     responsible for any outer warp guard. The inner ``if lane_idx == 0:``

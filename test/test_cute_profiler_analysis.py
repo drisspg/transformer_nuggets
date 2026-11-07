@@ -186,6 +186,49 @@ def test_decode_legacy_payload_records():
     ]
 
 
+def compact_record(ts_lo: int, dur_ns: int, tag: int) -> int:
+    """Pack one compact record: ``tag(8) | dur_ns(24) | ts_lo32(32)``, as a signed int64."""
+    word = ts_lo | dur_ns << 32 | tag << 56
+    return word - (1 << 64) if word >= 1 << 63 else word
+
+
+def compact_buffer(units: list[list[int]], max_events: int):
+    """A CPU compact profile buffer: each unit's anchor followed by its records."""
+    prof = allocate_profile_buffer(max_events, len(units), device="cpu", compact=True)
+    grid = prof.tensor.view(len(units), prof.slice_size)
+    for unit, words in enumerate(units):
+        grid[unit, : len(words)] = torch.tensor(words)
+    return prof
+
+
+def test_compact_decode_reconstructs_starts_around_the_anchor():
+    """Another warp can read its start before warp 0 writes the anchor: a start just before the
+    anchor decodes there, and one past a 2^32 ns boundary after it decodes after it."""
+    anchor = (8 << 32) + 1_000
+    wrapped_anchor = (8 << 32) - 50  # unit 1's events start past the 2^32 ns boundary
+    prof = compact_buffer(
+        [
+            [anchor, compact_record(900, 20, 0), compact_record(1_500, 5, 1)],
+            [wrapped_anchor, compact_record(30, 10, 1)],
+        ],
+        max_events=2,
+    )
+
+    events = decode_events(prof, TagTable(["early", "late"]))
+
+    assert [(e.unit_id, e.start_ns, e.dur_ns, e.tag_name) for e in events] == [
+        (0, anchor - 100, 20, "early"),
+        (0, anchor + 500, 5, "late"),
+        (1, wrapped_anchor + 80, 10, "late"),
+    ]
+
+
+def test_compact_decode_rejects_records_without_an_anchor():
+    prof = compact_buffer([[1 << 40, compact_record(1, 2, 0)], [0, compact_record(1, 2, 0)]], 1)
+    with pytest.raises(RuntimeError, match=r"units \[1\] hold 1 record\(s\) but no anchor"):
+        decode_events(prof, TagTable(["t"]))
+
+
 def test_link_payload_flow_links_slices_across_units():
     def trace_slice(name: str, payload: int | None, ts: float, pid: int) -> dict:
         args = {"unit_id": pid} if payload is None else {"unit_id": pid, "payload": payload}
