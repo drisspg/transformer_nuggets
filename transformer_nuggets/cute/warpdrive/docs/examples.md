@@ -1273,7 +1273,8 @@ for layer in 28 layers:
     ATTN    8 x 16      kv head x KV split: q/k norm, RoPE, flash decode  -> attention partials
     OPROJ   32 x 4      32 rows x 512-column slice of Wo (split K)        -> o partials
     GATEUP  192         16 gate + 16 up rows x RMSNorm(h + o)             -> SiLU(g) * u
-    DOWN    32 x 4      32 rows x 768-column slice of Wd (split K)        -> down partials
+    DOWN    32 x 4      32 rows x 768-column slice of Wd (split K)        -> down partials;
+                        the last split also sums them into the residual
 LMHEAD  594         8 x 32 rows of the tied embedding x final RMSNorm    -> logits
 ```
 
@@ -1297,28 +1298,42 @@ LMHEAD  594         8 x 32 rows of the tied embedding x final RMSNorm    -> logi
   `(fp32 value, launch epoch)` published with one relaxed store, and consumers spin on relaxed
   (mostly 16- and 32-byte vector) loads until each word carries the current epoch (NCCL's LL protocol). The
   last CTA to finish advances the epoch. Acquire/release counters with separate waiter and
-  signal warps were slower (686 vs 546 us at the time).
+  signal warps were slower (686 vs 546 us at the time). Split-K partials are summed by their
+  consumers, except down's: its last split, which finishes last because its GATEUP rows run in
+  a second wave, fetches the other splits' partials for its 32 columns and publishes the
+  finished residual, so QKV and the LM head fetch one word per element instead of five.
 - **Numerics** follow HF's bf16 rounding boundaries with fp32 accumulation; every per-step
   intermediate has its own buffer, so a launch has no write-after-read hazards.
 
-Median us per step (lower is better), one GB300 run of `bench_qwen_megakernel` on 2026-11-06
-(torch 2.15.0.dev20260922+cu132, CuTeDSL 4.8.0, CUDA-graph replay). The read roofline is the
-bench's logical bytes (weights once, KV read and new-row write, logits) at its measured 6.14
-TB/s read bandwidth:
+Median us per step (lower is better) on a GB300, 2026-11-06 (torch 2.15.0.dev20260922+cu132,
+CuTeDSL 4.8.0, CUDA-graph replay). The baselines and the read roofline come from one run of
+`bench_qwen_megakernel`; the roofline is the bench's logical bytes (weights once, KV read and
+new-row write, logits) at its measured 6.14 TB/s read bandwidth. The megakernel columns use
+the bench's `time_step` in interleaved rounds (`before` is the kernel as first landed):
 
-| ctx | eager + graph | torch.compile + graph | megakernel | read roofline | roofline / megakernel |
-|---:|---:|---:|---:|---:|---:|
-| 1024 | 4448 | 1365 | 476 | 213 | 45% |
-| 4096 | 5326 | 1417 | 552 | 271 | 49% |
-| 8192 | 6712 | 1488 | 648 | 347 | 54% |
+| ctx | eager + graph | torch.compile + graph | megakernel before | megakernel | `splits=19` | read roofline | roofline / megakernel |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 4448 | 1365 | 474 | 453 | 495 | 213 | 47% |
+| 4096 | 5326 | 1417 | 545 | 528 | 550 | 271 | 51% |
+| 8192 | 6712 | 1488 | 645 | 629 | 611 | 347 | 55% (57% with 19 splits) |
+
+`splits=19` gives 8 x 19 attention items, one per SM of the GB300. It measured faster at ctx
+6208-8192 (from 6208 it cuts the most KV blocks one split reads from 7 to 6) and slower at
+1024-6144. The
+split count is static and the position is read on the device, so a runner can't switch it
+per step; pick it for the contexts the runner decodes.
 
 **What limits it** is latency between dependent phases, not bandwidth. A step has about 140
 dependent phases, and a bare flag handoff between SMs measured 0.5 us one way with relaxed
-accesses (0.75–0.9 us with acquire/release). At ctx 1024 a layer takes about 14.4 us against
-about 5 us of bytes; IKET shows compute almost never waits for weights (0.05 us per stage),
-while input polling takes 0.3–1.9 us per row. GATEUP's 192 rows on 152 SMs add a second wave
-(about 1.4 us per layer); at ctx 8192 attention grows to 9.3 us per layer. The LM head runs
-at bandwidth.
+accesses (0.75–0.9 us with acquire/release). At ctx 1024 a layer takes about 14.1 us against
+about 5 us of bytes; IKET shows compute almost never waits for weights (0.05 us per stage).
+A row's fetch of words that are already published costs about 0.47 us plus 15 ns per KB
+(one-instruction-kind runs: 0.56 us for down's 6 KB, 1.51 us for o_proj's 68 KB), so
+the poll cost is the L2 round trip plus bytes, not cache misses. A 16 KB GEMV stage costs
+about 0.18 us of compute-warp time even with the data resident. Per layer at ctx 1024 the
+phase spans (last producer done to last row done) are QKV 1.9, attention 3.8, o_proj 2.2,
+GATEUP 3.8 and down 2.2 us; GATEUP's 192 rows on 152 SMs run a second wave, and at ctx 8192
+attention grows to 9.8 us per layer. The LM head runs at bandwidth.
 
 <details>
 <summary>Run, bench and trace; how it got here</summary>
@@ -1340,7 +1355,7 @@ row (columns `TIMELINE`: CTA, item start, inputs ready, done, load start/end, pr
 mainloop end; a row that reuses the previous row's GEMV input records no inputs-ready stamp). `iket="roles"` compiles IKET ranges for work items plus `trace_region`s
 (`prologue`, `poll`, `stream`, `publish`, `attn.norm`, `attn.blocks`, `attn.merge`);
 `iket="waits"` adds the layer's wait ranges. Disabled, both emit no instructions; with IKET, roles
-mode measured 480 us against 470–480 us unprofiled and waits mode 508 us. Capture one launch with `run-iket` as in
+mode measured 480 us against 470–480 us unprofiled and waits mode 508 us at the time. Capture one launch with `run-iket` as in
 [Tracing](tracing.md#iket). Traces at ctx 1024:
 [IKET roles](https://fburl.com/perfetto/3h1t248o),
 [IKET waits](https://fburl.com/perfetto/ak5nt8jt),
@@ -1348,9 +1363,42 @@ mode measured 480 us against 470–480 us unprofiled and waits mode 508 us. Capt
 
 At ctx 1024 the step went 1050 us (atomic claiming, counters) -> 668 (host static schedule)
 -> 640 (row-independent loads before waiting) -> 546 (tagged activations) -> 526 (FFMA2 GEMV)
--> 515 (three-warp q/k norm) -> 490 (L2 evict-first) -> 470–480 (12 stages, 32-byte polls).
-An L2 prefetch of the LM head, poll backoff, probe-then-fetch, and 19 or 32 KV splits were
-no faster and were dropped.
+-> 515 (three-warp q/k norm) -> 490 (L2 evict-first) -> 470–480 (12 stages, 32-byte polls)
+-> 460 (GEMV k-loop unrolled: the rolled loop kept a 32-byte stack frame) -> 453 (the last
+down split publishes the residual). An L2 prefetch of the LM head, poll backoff,
+probe-then-fetch, and 32 KV splits were no faster and were dropped.
+
+Ideas borrowed from Helion's megakernels (one layer per launch, many one-warp programs,
+acquire/release counters) and other latency ideas, each tried alone against the then-current
+kernel. Deltas are us per step at ctx 1024 / 4096 / 8192 from interleaved rounds with an
+identical-code control row (identical builds differed by up to 3.6 us at ctx 1024 and up to
+9 us in noisier runs):
+
+| idea | result | delta | why |
+|---|---|---:|---|
+| GEMV k-loop `unroll_full` | kept | -12 / -13 / -20 | no stack frame; a 4-stage GEMV 0.86 -> 0.73 us |
+| last down split publishes the residual (Helion's last-arrival reduce, counter-free) | kept | -11 / -5 / -6 | QKV span 2.6 -> 1.9 us; down span 1.9 -> 2.2 us |
+| `splits=19` | explicit option | +42 / +22 / -17; -10 at 6208 | fills the SMs; not a default |
+| RMSNorm scale after the projection, `(W(x g)) r` | rejected | +4 / 0 / 0 | residual chunks become ready within 0.04-0.2 us of each other, so there is nothing to overlap; logit error vs fp32 improved (geometric-mean rms 0.89x the HF-bf16 reference's, against 1.02x before) |
+| release by input chunk | already so | | o_proj waits on its head pair, down on its GATEUP group; GATEUP has no chunk stagger |
+| last-arrival reduce for o_proj: designated split / acq_rel counter | rejected | +37..47 / +35..46 | no o_proj split reliably finishes last; the counter round trip plus reading the others costs more than GATEUP saves |
+| GATEUP in one wave: 2-tile items / 16-row half tiles | rejected | +16 / +3 / -12; +18 / +17 / +16 | the second wave already shares the prologue; doubled items make every down split late; half-tile stages cost 0.31 us |
+| L2 hints: evict_last tagged words, 256 B prefetch size or L1::no_allocate on polls, load-warp prefetch.global.L2 of next inputs, KV evict_normal | rejected | within noise to +26 | fetch times don't move: polls pay the L2 round trip, not misses; KV is read once per step |
+| o_proj combine with 32-byte loads | rejected | +77 | spilled (24-byte stack) |
+| attention partials packed two per word (24-bit floats, 16-bit tag) | rejected | -3..-6 / -4 / mixed | o_proj fetch 1.51 -> 1.29 us; about 1%, within the control spread |
+| q/k norm replicated per warp; 19 balanced splits; fewer splits at short ctx | rejected | +5..+70 | spills, or fewer rows streaming |
+
+Attention splits beyond the context running first (Helion) has no counterpart: the splits
+here cover only `[0, pos)`, and the load warp already streams KV before q is ready.
+
+**Sharing a GPU.** The static schedule needs every CTA resident; the cooperative launch
+guarantees it, and a CUDA-graph capture keeps the attribute (the kernel node reports
+`cudaLaunchAttributeCooperative = 1`). Time-sliced with another process looping large
+matmuls, 4000 eager launches and 4000 graph replays ran 2.1-2.2x slower with bitwise-equal
+logits and no stall. Steps did run 4x slower, or stalled for minutes until a timeout, while
+another user's job shared the GPU; a capture of that state is still missing. `schedule="atomic"`
+does not need co-residency: rows are claimed in dependency order by running CTAs, so the
+earliest unfinished claimed row always has its producers done.
 
 </details>
 
@@ -1381,8 +1429,9 @@ Writing this kernel exposed these warpdrive gaps, most useful fix first:
    with `cudaErrorInvalidValue`; `describe()` cannot report bytes before compiling.
    `QwenDecodeMegakernel(stages=13)`
 7. **Bit-level helpers need private MLIR imports.** fp32/int32 bitcasts, i64 packing and vector
-   relaxed loads have no `cute.arch` wrapper (nor does nanosleep). Each strong load is one L2
-   request per lane, so vector loads matter for polling.
+   relaxed loads have no `cute.arch` wrapper (nor do nanosleep and `.L2::cache_hint` loads and
+   stores, which needed inline PTX to try evict_last on tagged words). Each strong load is one
+   L2 request per lane, so vector loads matter for polling.
    `from cutlass._mlir_helpers.arith import bitcast`
 8. **IKET ranges are named after the role, not the instruction**, so heterogeneous items must
    be matched back to the host table; every compute warp emits its own copy of a region (8x the
@@ -1391,7 +1440,13 @@ Writing this kernel exposed these warpdrive gaps, most useful fix first:
 9. **`plan_from_warpdrive` models only the CTA-local ring**: analyzed against the IKET
    capture, it reports compute as critical and the load warp as blocked on reuse, but the
    real critical path crosses CTAs and is invisible to the plan. `plan_from_warpdrive(op)  # one ring (w), two roles; no cross-CTA edges`
-10. **Two API traps.** A one-entry buffer dict makes `h.data` the bare tensor, and a rank-1
+10. **Register budgets don't help a 9-warp CTA.** Three warps share one SM sub-partition, so
+    ptxas caps every thread at 168 registers. `RoleConfig` budgets (compute 208 or 224, load
+    warpgroup 88 or 56) left the kernel at 168 with a 16-32 byte stack instead of none, and a
+    small change that pushes the compute role past 168 spills in the hot loops (+50 to +77 us
+    per step). Check `cuobjdump --dump-resource-usage` before timing.
+    `roles={"compute": RoleConfig(range(8), regs=224), "load": RoleConfig(8, regs=56)}`
+11. **Two API traps.** A one-entry buffer dict makes `h.data` the bare tensor, and a rank-1
     SMEM layout with an int shape crashes allocation.
     `h.view("W")  # not h.data["W"]`; `cute.make_layout((3072,))  # not make_layout(3072)`
 

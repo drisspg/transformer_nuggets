@@ -40,7 +40,7 @@ Every per-step intermediate has its own (per-layer) buffer, so there are no writ
 hazards inside a launch. The new K/V row at ``pos`` is written by the one attention row whose
 TMA-loaded block holds it (masked), after those loads completed.
 
-At ctx 1024 on a GB300 one step takes ~470-480 us (torch.compile + CUDA graph: ~1230-1365 us;
+At ctx 1024 on a GB300 one step takes ~453 us (torch.compile + CUDA graph: ~1230-1365 us;
 the 1.31 GB of weights and KV at the ~6.14 TB/s read roofline: 213 us; docs/examples.md). It is latency-bound: about 140
 dependent phases of ~1 us input propagation plus 1-3 us row latency. ``timeline=True`` records
 per-row stamps and ``QwenMegakernel(iket="roles")`` IKET ranges to see where the time goes.
