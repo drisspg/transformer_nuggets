@@ -234,13 +234,13 @@ class WarpSpecializedTransform(CuteOp):
 
         if cutlass.const_expr(enable_profiling):
             assert profile_records is not None and profile_gmem is not None
-            if record:
-                compact_flush_smem_to_gmem(
-                    profile_records,
-                    profile_gmem,
-                    Int32(PROFILE_UNIT),
-                    Int32(MAX_PROFILE_EVENTS),
-                )
+            compact_flush_smem_to_gmem(
+                profile_records,
+                profile_gmem,
+                Int32(PROFILE_UNIT),
+                Int32(MAX_PROFILE_EVENTS),
+                record,
+            )
 
     @cute.jit
     def __call__(

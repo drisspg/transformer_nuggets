@@ -189,16 +189,6 @@ def test_decode_legacy_payload_records():
     ]
 
 
-def test_decode_rejects_atomic_slot_overflow():
-    """Atomic allocation counts every region in slot 0, including those past the buffer."""
-    prof = allocate_profile_buffer(2, 2, device="cpu")
-    buf = prof.tensor.view(2, prof.slice_size)
-    buf[1, 0] = 5
-    buf[1, 1:5] = torch.tensor([100, 5, 0, 0])
-    with pytest.raises(RuntimeError, match=r"units \[1\] allocated 5 events"):
-        decode_events(prof, TagTable(["t"]))
-
-
 def compact_record(ts_lo: int, dur_ns: int, tag: int) -> int:
     """Pack one compact record: ``tag(8) | dur_ns(24) | ts_lo32(32)``, as a signed int64."""
     word = ts_lo | dur_ns << 32 | tag << 56

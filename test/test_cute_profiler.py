@@ -1,8 +1,8 @@
 """GPU tests for the CuTeDSL intra-kernel profiler.
 
-Covers the four recording shapes (legacy 4xi64, compact 1xi64 gmem,
-compact 1xi64 smem, token-paired) end-to-end: record events on the device,
-decode on the host, and assert the events are well-formed.
+Covers the three recording shapes (full 4xi64 records, compact 1xi64 gmem, compact 1xi64
+smem) end-to-end: record events on the device, decode on the host, and assert the events are
+well-formed.
 """
 
 import pytest
@@ -21,18 +21,14 @@ except ImportError:
 
 from transformer_nuggets.cute.profiler import (
     compact_anchor_init,
-    compact_anchor_init_smem,
     compact_event_stop,
     compact_event_stop_smem,
     compact_flush_smem_to_gmem,
     compact_prepare_smem,
-    profile_region,
+    event_stop,
     profile_session,
-    raw_event_stop,
     read_globaltimer,
     read_globaltimer_lo32,
-    region_end,
-    region_start,
 )
 from transformer_nuggets.cute.profiler.host import decode_events, events_to_perfetto
 
@@ -43,111 +39,34 @@ THREADS = 64
 
 
 # ---------------------------------------------------------------------------
-# Atomic legacy mode (profile_region)
+# Full records (event_stop), with and without payloads
 # ---------------------------------------------------------------------------
 
 
 @cute.kernel
-def _kernel_atomic(prof_buf: cute.Tensor, max_events: cutlass.Int32):
+def _kernel_full(prof_buf: cute.Tensor, max_events: cutlass.Int32):
     bidx, _, _ = cute.arch.block_idx()
-    for i in cutlass.range(NUM_ITERS):
-        with profile_region(prof_buf, max_events, Int32(i & 0xF), bidx):
-            pass
-
-
-@cute.jit()
-def _launch_atomic(prof_buf, max_events):
-    _kernel_atomic(prof_buf, max_events).launch(grid=(NUM_BLOCKS, 1, 1), block=(THREADS, 1, 1))
-
-
-def test_legacy_atomic_roundtrip():
-    """profile_region (legacy, atomic-mode) records events that decode cleanly."""
-    with profile_session(
-        max_events_per_unit=NUM_ITERS + 4,
-        num_units=(NUM_BLOCKS, "Block"),
-        tag_names=[f"t{i}" for i in range(NUM_ITERS)],
-    ) as (prof, tags):
-        _launch_atomic(from_dlpack(prof.tensor), Int32(prof.max_events_per_unit))
-
-    events = decode_events(prof, tags)
-    assert len(events) == NUM_BLOCKS * NUM_ITERS
-    units_seen = {e.unit_id for e in events}
-    assert units_seen == set(range(NUM_BLOCKS))
-    tags_seen = {e.tag_id for e in events}
-    assert tags_seen == set(range(NUM_ITERS))
-    for unit_id in range(NUM_BLOCKS):
-        assert {e.event_idx for e in events if e.unit_id == unit_id} == set(range(NUM_ITERS))
-    for e in events:
-        assert e.start_ns > 0
-        assert e.dur_ns >= 0
-
-
-# ---------------------------------------------------------------------------
-# Legacy raw_event_stop (no warp guard; deeply-nested call site)
-# ---------------------------------------------------------------------------
-
-
-@cute.kernel
-def _kernel_raw_legacy(prof_buf: cute.Tensor, max_events: cutlass.Int32):
-    bidx, _, _ = cute.arch.block_idx()
-    if cute.arch.warp_idx() == 0:
+    if cute.arch.warp_idx() == 1 and cute.arch.lane_idx() == 0:
         for i in cutlass.range(NUM_ITERS):
             start = read_globaltimer()
-            raw_event_stop(prof_buf, bidx, Int32(i), start, Int32(i & 0xF), bidx, max_events)
+            # Alternate plain records with payloads, some negative.
+            if i % 2 == 0:
+                event_stop(prof_buf, bidx, Int32(i), start, Int32(1), Int32(1), max_events)
+            else:
+                payload = (Int32(i) - 4) * Int32(1000) + bidx
+                event_stop(
+                    prof_buf, bidx, Int32(i), start, Int32(2), Int32(1), max_events, payload
+                )
 
 
 @cute.jit()
-def _launch_raw_legacy(prof_buf, max_events):
-    _kernel_raw_legacy(prof_buf, max_events).launch(grid=(NUM_BLOCKS, 1, 1), block=(THREADS, 1, 1))
+def _launch_full(prof_buf, max_events):
+    _kernel_full(prof_buf, max_events).launch(grid=(NUM_BLOCKS, 1, 1), block=(THREADS, 1, 1))
 
 
-def test_legacy_raw_event_stop_roundtrip():
-    """raw_event_stop records events even from inside a warp guard."""
-    with profile_session(
-        max_events_per_unit=NUM_ITERS,
-        num_units=(NUM_BLOCKS, "Block"),
-        tag_names=[f"t{i}" for i in range(NUM_ITERS)],
-    ) as session:
-        _launch_raw_legacy(
-            from_dlpack(session.prof.tensor), Int32(session.prof.max_events_per_unit)
-        )
-
-    events = session.events
-    assert session.trace is not None
-    assert len(events) == NUM_BLOCKS * NUM_ITERS
-    for e in events:
-        assert e.start_ns > 0
-
-
-# ---------------------------------------------------------------------------
-# Payloads (legacy records)
-# ---------------------------------------------------------------------------
-
-
-@cute.kernel
-def _kernel_payload(prof_buf: cute.Tensor, max_events: cutlass.Int32):
-    bidx, _, _ = cute.arch.block_idx()
-    for i in cutlass.range(NUM_ITERS):
-        # Static slots, alternating plain records with payloads, some negative.
-        if i % 2 == 0:
-            with profile_region(prof_buf, max_events, Int32(1), bidx, event_idx=Int32(i)):
-                pass
-        else:
-            payload = (Int32(i) - 4) * Int32(1000) + bidx
-            with profile_region(
-                prof_buf, max_events, Int32(2), bidx, event_idx=Int32(i), payload=payload
-            ):
-                pass
-
-
-@cute.jit()
-def _launch_payload(prof_buf, max_events):
-    _kernel_payload(prof_buf, max_events).launch(grid=(NUM_BLOCKS, 1, 1), block=(THREADS, 1, 1))
-
-
-def test_legacy_payload_roundtrip(tmp_path):
-    """A region's runtime payload decodes as Event.payload (and Perfetto args); plain records
-    in the same buffer keep payload None and their tag."""
+def test_full_record_roundtrip(tmp_path):
+    """Full records keep their slot, warp and tag; a payload decodes as Event.payload (and
+    Perfetto args), and plain records in the same buffer keep payload None."""
     with profile_session(
         max_events_per_unit=NUM_ITERS,
         num_units=(NUM_BLOCKS, "Block"),
@@ -155,11 +74,12 @@ def test_legacy_payload_roundtrip(tmp_path):
         trace_path=str(tmp_path / "payload.json"),
         trace_format="chrome_json",
     ) as session:
-        _launch_payload(from_dlpack(session.prof.tensor), Int32(session.prof.max_events_per_unit))
+        _launch_full(from_dlpack(session.prof.tensor), Int32(session.prof.max_events_per_unit))
 
     events = session.events
     assert len(events) == NUM_BLOCKS * NUM_ITERS
     for e in events:
+        assert e.start_ns > 0 and e.tid == 1
         if e.event_idx % 2 == 0:
             assert (e.tag_name, e.payload) == ("plain", None)
         else:
@@ -170,48 +90,6 @@ def test_legacy_payload_roundtrip(tmp_path):
     assert sorted(p for p in payloads if p is not None) == sorted(
         e.payload for e in events if e.payload is not None
     )
-
-
-# ---------------------------------------------------------------------------
-# Token-paired mode
-# ---------------------------------------------------------------------------
-
-
-@cute.kernel
-def _kernel_token(prof_buf: cute.Tensor, max_events: cutlass.Int32):
-    bidx, _, _ = cute.arch.block_idx()
-    outer = region_start(prof_buf, bidx, max_events)
-    for i in cutlass.range(NUM_ITERS):
-        inner = region_start(prof_buf, bidx, max_events)
-        region_end(prof_buf, Int32(i & 0xF), inner, max_events)
-    region_end(prof_buf, Int32(NUM_ITERS), outer, max_events)
-
-
-@cute.jit()
-def _launch_token(prof_buf, max_events):
-    _kernel_token(prof_buf, max_events).launch(grid=(NUM_BLOCKS, 1, 1), block=(THREADS, 1, 1))
-
-
-def test_token_pairing_roundtrip():
-    """region_start/region_end token pairing records nested events."""
-    with profile_session(
-        max_events_per_unit=NUM_ITERS + 4,
-        num_units=(NUM_BLOCKS, "Block"),
-        tag_names=[f"t{i}" for i in range(NUM_ITERS + 1)],
-    ) as (prof, tags):
-        _launch_token(from_dlpack(prof.tensor), Int32(prof.max_events_per_unit))
-
-    events = decode_events(prof, tags)
-    # NUM_ITERS inner + 1 outer per block.
-    assert len(events) == NUM_BLOCKS * (NUM_ITERS + 1)
-    outer_events = [e for e in events if e.tag_id == NUM_ITERS]
-    inner_events = [e for e in events if e.tag_id < NUM_ITERS]
-    assert len(outer_events) == NUM_BLOCKS
-    assert len(inner_events) == NUM_BLOCKS * NUM_ITERS
-    # Outer should be the slowest per block (it wraps everything inner).
-    for outer in outer_events:
-        same_block_inner = [e for e in inner_events if e.unit_id == outer.unit_id]
-        assert outer.dur_ns >= max(e.dur_ns for e in same_block_inner)
 
 
 # ---------------------------------------------------------------------------
@@ -300,12 +178,12 @@ def _kernel_compact_smem(prof_gmem: cute.Tensor, max_events: cutlass.Int32):
     smem_tensor = storage.prof_smem.get_tensor(cute.make_layout((PROF_SMEM_SLOTS,)))
 
     bidx, _, _ = cute.arch.block_idx()
-    compact_anchor_init_smem(smem_tensor)
+    compact_prepare_smem(smem_tensor, max_events)
 
     if cute.arch.warp_idx() == 0:
         for i in cutlass.range(NUM_ITERS):
             start = read_globaltimer_lo32()
-            compact_event_stop_smem(smem_tensor, Int32(i), start, Int32(i & 0xF))
+            compact_event_stop_smem(smem_tensor, Int32(i), start, Int32(i & 0xF), max_events)
 
     compact_flush_smem_to_gmem(smem_tensor, prof_gmem, bidx, max_events)
 
@@ -324,10 +202,12 @@ def test_compact_smem_roundtrip():
         num_units=(NUM_BLOCKS, "Block"),
         tag_names=[f"t{i}" for i in range(NUM_ITERS)],
         compact=True,
-    ) as (prof, tags):
-        _launch_compact_smem(from_dlpack(prof.tensor), Int32(prof.max_events_per_unit))
+    ) as session:
+        _launch_compact_smem(
+            from_dlpack(session.prof.tensor), Int32(session.prof.max_events_per_unit)
+        )
 
-    events = decode_events(prof, tags)
+    events = session.events
     assert len(events) == NUM_BLOCKS * NUM_ITERS
     units_seen = {e.unit_id for e in events}
     assert units_seen == set(range(NUM_BLOCKS))
@@ -342,26 +222,6 @@ def test_compact_smem_roundtrip():
 # ---------------------------------------------------------------------------
 # Out-of-range slots are dropped, not written over neighboring records
 # ---------------------------------------------------------------------------
-
-
-@cute.kernel
-def _kernel_legacy_slots(prof_buf: cute.Tensor, max_events: cutlass.Int32):
-    bidx, _, _ = cute.arch.block_idx()
-    # Block 1's slot -1 would overlap block 0's only record.
-    with profile_region(prof_buf, max_events, Int32(0), bidx, event_idx=Int32(bidx) * -1):
-        pass
-
-
-@cute.jit()
-def _launch_legacy_slots(prof_buf, max_events):
-    _kernel_legacy_slots(prof_buf, max_events).launch(grid=(2, 1, 1), block=(THREADS, 1, 1))
-
-
-def test_legacy_negative_slot_is_dropped():
-    with profile_session(max_events_per_unit=1, num_units=2, tag_names=["t"]) as session:
-        _launch_legacy_slots(from_dlpack(session.prof.tensor), Int32(1))
-    assert [(e.unit_id, e.event_idx) for e in session.events] == [(0, 0)]
-    assert session.events[0].dur_ns < 1_000_000
 
 
 @cute.kernel
@@ -410,7 +270,7 @@ def _kernel_compact_smem_slot(prof_gmem: cute.Tensor, out: cute.Tensor):
     compact_prepare_smem(smem_tensor, Int32(1))
     if cute.arch.warp_idx() == 0:
         start = read_globaltimer_lo32()
-        compact_event_stop_smem(smem_tensor, Int32(1), start, Int32(0))  # one past the end
+        compact_event_stop_smem(smem_tensor, Int32(1), start, Int32(0), Int32(1))  # past the end
     compact_flush_smem_to_gmem(smem_tensor, prof_gmem, Int32(0), Int32(1))
     if cute.arch.thread_idx()[0] == 0:
         out[0] = neighbor[0]

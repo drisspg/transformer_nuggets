@@ -12,7 +12,6 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 
 from transformer_nuggets.cute.base import CuteOp
 from transformer_nuggets.cute.profiler.ops import (
-    ENABLE_PROFILING_CONST,
     compact_anchor_init,
     compact_flush_smem_to_gmem,
     compact_prepare_smem,
@@ -898,11 +897,7 @@ class BlockscaledTmaGemv(CuteOp):
             )
         else:
             sSFW = None
-        if cutlass.const_expr(
-            enable_profiling
-            and ENABLE_PROFILING_CONST
-            and self.grid_scheduler is GridScheduler.STATIC
-        ):
+        if cutlass.const_expr(enable_profiling and self.grid_scheduler is GridScheduler.STATIC):
             assert prof_gmem is not None
             prof_buf = smem.allocate_array(
                 cutlass.Int64,
@@ -961,9 +956,7 @@ class BlockscaledTmaGemv(CuteOp):
             cute.group_modes(gX, 0, 2),
         )
         if cutlass.const_expr(
-            enable_profiling
-            and ENABLE_PROFILING_CONST
-            and self.grid_scheduler is GridScheduler.PERSISTENT
+            enable_profiling and self.grid_scheduler is GridScheduler.PERSISTENT
         ):
             assert prof_buf is not None
             for tile_round in cutlass.range(self.tiles_per_cta, unroll=1):
@@ -1319,19 +1312,15 @@ class BlockscaledTmaGemv(CuteOp):
             if warp == WarpRole.TMA_PRODUCER:
                 producer.tail()
 
-        if cutlass.const_expr(
-            enable_profiling
-            and ENABLE_PROFILING_CONST
-            and self.grid_scheduler is GridScheduler.STATIC
-        ):
+        if cutlass.const_expr(enable_profiling and self.grid_scheduler is GridScheduler.STATIC):
             assert prof_buf is not None and prof_gmem is not None
-            if scheduler_cta % self.profile_cta_stride == 0:
-                compact_flush_smem_to_gmem(
-                    prof_buf,
-                    prof_gmem,
-                    scheduler_cta // self.profile_cta_stride,
-                    cutlass.Int32(self.max_profile_events_per_cta),
-                )
+            compact_flush_smem_to_gmem(
+                prof_buf,
+                prof_gmem,
+                scheduler_cta // self.profile_cta_stride,
+                cutlass.Int32(self.max_profile_events_per_cta),
+                scheduler_cta % self.profile_cta_stride == 0,
+            )
 
     @cute.kernel
     def reduce_split_k(

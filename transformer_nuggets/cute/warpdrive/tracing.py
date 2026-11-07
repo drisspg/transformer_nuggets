@@ -7,8 +7,8 @@ layer emits nothing, so the generated code is unchanged. The backends of
 
 * ``"iket"``: IKET push/pop ranges (``cutlass.cute.experimental.iket``), captured by ``run-iket``
   for every warp; ``kernel.enable_iket()`` is the shorthand.
-* ``"globaltimer"``: the profiler's region records (``%globaltimer``, legacy 4xi64 records in
-  static slots) in a profile buffer the kernel passes to ``run_roles(..., trace_buffer=...)``.
+* ``"globaltimer"``: the profiler's full records (``%globaltimer``, 32 bytes each, in static
+  slots) in a profile buffer the kernel passes to ``run_roles(..., trace_buffer=...)``.
   One profiling unit per CTA; lane 0 of each role instance's first warp records its ranges into
   its share of the unit's slots, with that warp as the record's ``tid``.
   ``trace_session.trace_session(kernel, num_ctas)`` allocates the buffer and decodes it with
@@ -46,7 +46,7 @@ import cutlass
 from cutlass import Int32, Int64, cute
 from cutlass.cute.experimental import iket
 
-from transformer_nuggets.cute.profiler.ops import read_globaltimer, static_stop
+from transformer_nuggets.cute.profiler.ops import event_stop, read_globaltimer
 from transformer_nuggets.cute.warpdrive.protocol import ProtocolError
 
 BACKENDS = ("iket", "globaltimer")
@@ -216,7 +216,7 @@ def end_range(
     recorder,
 ):
     if recorder & (unit >= 0) & (slot < capacity):
-        static_stop(
+        event_stop(
             buffer,
             unit,
             slot + base,
@@ -224,8 +224,7 @@ def end_range(
             Int32(tag),
             Int32(tid),
             Int32(max_events),
-            bounds_check=False,
-            payload=payload,
+            payload,
         )
 
 

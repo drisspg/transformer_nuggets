@@ -71,7 +71,6 @@ from cutlass.cute.nvgpu.warpgroup import SmemLayoutAtomKind
 from transformer_nuggets.cute.base import CuteOp
 from transformer_nuggets.cute.cache import compile_tvm_ffi_and_cache
 from transformer_nuggets.cute.profiler.ops import (
-    ENABLE_PROFILING_CONST,
     compact_flush_smem_to_gmem,
     compact_prepare_smem,
     compact_profile_region,
@@ -198,8 +197,6 @@ class Sgemm(CuteOp[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]):
             if enable_profiling is None
             else enable_profiling
         )
-        if self.enable_profiling and not ENABLE_PROFILING_CONST:
-            raise ValueError("SGEMM_PROFILE requires TNUGGETS_ENABLE_PROFILING enabled at import")
         self.a_major = a_major
         self.b_major = b_major
         self.cta_tiler = (self.config.tile_m, self.config.tile_n, self.config.tile_k)
@@ -451,14 +448,14 @@ class Sgemm(CuteOp[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]):
             atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mC.element_type)
             cute.copy(atom, tCrC, tCgC, pred=predC)
 
-        if cutlass.const_expr(self.enable_profiling):  # noqa: SIM102
-            if record:
-                compact_flush_smem_to_gmem(
-                    profile_records,
-                    profile_buffer,
-                    cutlass.Int32(0),
-                    cutlass.Int32(SGEMM_PROFILE_EVENTS),
-                )
+        if cutlass.const_expr(self.enable_profiling):
+            compact_flush_smem_to_gmem(
+                profile_records,
+                profile_buffer,
+                cutlass.Int32(0),
+                cutlass.Int32(SGEMM_PROFILE_EVENTS),
+                record,
+            )
 
     def profile_scope(self, records, tag, tile, target_warp, record):
         return compact_profile_region(

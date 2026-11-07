@@ -1,4 +1,4 @@
-"""Warp-specialized profiling example using static indices and lane-0 tracing.
+"""Warp-specialized profiling example: compact records in static slots, one per warp role.
 
 Run with:
     python examples/warp_specialized_static.py
@@ -13,8 +13,14 @@ from cutlass.cute.runtime import from_dlpack
 
 import transformer_nuggets
 from transformer_nuggets.cute.base import CuteOp
-from transformer_nuggets.cute.profiler import profile_session, group_by_unit, rename_processes
-from transformer_nuggets.cute.profiler.ops import profile_region
+from transformer_nuggets.cute.profiler import (
+    compact_anchor_init,
+    compact_profile_region,
+    group_by_unit,
+    profile_session,
+    rename_processes,
+    summarize_by_tag,
+)
 
 
 TAG_PRODUCER = 0
@@ -42,15 +48,16 @@ class WarpSpecializedStaticProfile(CuteOp):
         lane_idx = cute.arch.lane_idx()
 
         block_base = bidx * bdim
+        compact_anchor_init(prof_buf, bidx, max_events_per_unit)
 
         if warp_idx == 0:
-            with profile_region(
+            with compact_profile_region(
                 prof_buf,
                 max_events_per_unit,
-                TAG_PRODUCER,
+                Int32(TAG_PRODUCER),
                 bidx,
+                Int32(0),
                 target_warp=Int32(0),
-                event_idx=Int32(0),
             ):
                 idx = block_base + lane_idx
                 if idx < cute.size(output):
@@ -63,13 +70,13 @@ class WarpSpecializedStaticProfile(CuteOp):
                         output[idx + i] = Float32(i)
 
         if warp_idx == 1:
-            with profile_region(
+            with compact_profile_region(
                 prof_buf,
                 max_events_per_unit,
-                TAG_CONSUMER,
+                Int32(TAG_CONSUMER),
                 bidx,
+                Int32(1),
                 target_warp=Int32(1),
-                event_idx=Int32(1),
             ):
                 idx = block_base + Int32(32) + lane_idx
                 if idx < cute.size(output):
@@ -111,21 +118,26 @@ def run():
     )
 
     trace_path = transformer_nuggets.DATA_DIR / "profiler_warp_static_trace.pftrace"
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
 
     process_names = {i: f"CTA {i}" for i in range(NUM_BLOCKS)}
 
     with profile_session(
         max_events_per_unit=MAX_EVENTS_PER_UNIT,
-        num_units=(NUM_BLOCKS, "Warp"),
+        num_units=(NUM_BLOCKS, "CTA"),
         tag_names=["producer", "consumer"],
         trace_path=str(trace_path),
         device=device,
+        compact=True,
+        expected_events_per_unit=2,
         post_process_events=group_by_unit,
         post_process_trace=rename_processes(process_names),
-    ) as (prof, tag_table):
-        print(f"Tags: {tag_table.names}")
+    ) as session:
         kernel = WarpSpecializedStaticProfile()
-        kernel.interface(output, prof.tensor, prof.max_events_per_unit)
+        kernel.interface(output, session.prof.tensor, session.prof.max_events_per_unit)
+
+    for name, summary in summarize_by_tag(session.events).items():
+        print(f"{name}: count={summary.count}, median={summary.p50_ns:.0f} ns")
 
     print(f"Trace: {trace_path}")
 

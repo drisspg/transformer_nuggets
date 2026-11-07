@@ -1,34 +1,19 @@
-"""NVIDIA Intra-Kernel Profiling Device Operations (CUTE DSL).
+"""Device side of the profiler: ``%globaltimer`` reads and profile-buffer records (CuTeDSL).
 
-This module provides device-side helpers for intra-kernel profiling on NVIDIA GPUs
-(Hopper/Blackwell). These are CUTE `dsl_user_ops` that wrap inline PTX instructions
-for reading the global timer and recording profiling events.
+Two record formats share one buffer layout, a slice of ``1 + records`` int64 words per
+profiling unit (one unit per CTA, usually):
 
-Static Allocation Buffer Layout (all int64 for alignment):
-    For each unit u (0 <= u < num_units):
-        buf[u * slice_size + 0] = event_count for unit u
-        buf[u * slice_size + 1 + 4*i + 0] = start_ns
-        buf[u * slice_size + 1 + 4*i + 1] = dur_ns
-        buf[u * slice_size + 1 + 4*i + 2] = tag_id, plus an optional payload (``tag_word``)
-        buf[u * slice_size + 1 + 4*i + 3] = tid
+* compact (``compact_*``): one int64 per record, ``tag(8) | dur_ns(24) | ts_lo32(32)``, with
+  word 0 of the slice a 64-bit timer anchor the decoder rebases ``ts_lo32`` on. Recorded to
+  global memory directly, or to a shared-memory slice flushed at kernel exit.
+* full (:func:`event_stop`): four int64 per record (``slice = 1 + 4 * records``, word 0 unused)
+  holding ``start_ns``, ``dur_ns``, the tag word (:func:`tag_word`) and the recording warp.
+  Warpdrive's ``"globaltimer"`` trace backend records these: they carry a warp, a payload and
+  durations past 2^24 ns.
 
-    slice_size = 1 + 4 * max_events_per_unit
-
-Usage in kernels (using guarded helpers - recommended):
-    unit_id = bidx
-    event_idx = Int32(0)
-
-    start_ns = warp_start(prof_buf, unit_id, event_idx, max_events_per_unit, Int32(0))
-    warp_stop(prof_buf, unit_id, event_idx, start_ns, TAG_X, tid, max_events_per_unit, Int32(0))
-
-Low-level usage (manual guards):
-    if warp_idx == 0 and lane_idx == 0:
-        start_ns = static_start(prof_buf, unit_id, event_idx, max_events_per_unit)
-        static_stop(prof_buf, unit_id, event_idx, start_ns, TAG_X, tid, max_events_per_unit)
+This module imports only CuTeDSL: a kernel's compile key hashes the modules it imports, so
+the host decoder and analysis stay out of it.
 """
-
-import os
-from typing import NamedTuple
 
 import cutlass
 import cutlass.cute as cute
@@ -38,34 +23,21 @@ from cutlass._mlir.dialects import llvm
 
 
 __all__ = [
+    "PAYLOAD_FLAG",
+    "compact_anchor_init",
+    "compact_event_stop",
+    "compact_event_stop_smem",
+    "compact_flush_smem_to_gmem",
+    "compact_prepare_smem",
+    "compact_profile_region",
+    "event_stop",
     "read_globaltimer",
     "read_globaltimer_lo32",
-    "static_start",
-    "static_stop",
-    "warp_atomic_alloc",
-    "warp_start",
-    "warp_stop",
-    "profile_region",
-    "RegionToken",
-    "region_start",
-    "region_end",
-    "raw_event_stop",
-    "compact_event_stop",
-    "compact_anchor_init",
-    "compact_event_stop_smem",
-    "compact_anchor_init_smem",
-    "compact_prepare_smem",
-    "compact_flush_smem_to_gmem",
-    "compact_profile_region",
-    "ENABLE_PROFILING",
-    "ENABLE_PROFILING_CONST",
-    "PAYLOAD_FLAG",
 ]
 
-# A legacy record's tag word holds the tag in its low 31 bits. A region recorded with a payload
+# A full record's tag word holds the tag in its low 31 bits. A region recorded with a payload
 # sets bit 31 and keeps the payload (an int32, e.g. the work item a region belongs to) in the
-# high 32 bits, so records without one decode exactly as before. (This module imports only
-# CuTeDSL so that kernels importing it do not depend on the host decoder's source.)
+# high 32 bits, so records without one decode exactly as before.
 PAYLOAD_FLAG = 1 << 31
 
 
@@ -77,249 +49,32 @@ def tag_word(tag, payload=None) -> Int64:
 
 
 @cute.jit
-def raw_event_stop(
+def event_stop(
     buf: cute.Tensor,
     unit_id: Int32,
     event_idx: Int32,
     start_ns: Int64,
     tag: Int32,
-    tid: Int32,
+    warp: Int32,
     max_events_per_unit: Int32,
     payload: Int32 | None = None,
 ) -> None:
-    """Read the end timer and store an event record without a warp guard.
+    """Read the end timer and store one full record in slot ``event_idx`` of ``unit_id``.
 
-    Pair with :func:`read_globaltimer` for the start timestamp. Only lane 0 of
-    the calling warp performs the stores; the caller is responsible for any
-    outer warp election. The inner ``if lane_idx == 0:`` yields no value, so
-    this primitive can be used in deeply nested control flow where
-    :func:`profile_region` would trigger ``cf.br`` lowering failures.
-    ``payload``: an optional runtime int32 decoded as ``Event.payload``.
+    Pair with :func:`read_globaltimer` for ``start_ns``. Unguarded: the caller elects the
+    recording thread and keeps ``0 <= event_idx < max_events_per_unit``. ``warp`` is stored as
+    the record's warp; ``payload`` is an optional runtime int32 decoded as ``Range.payload``.
     """
-    lane_idx = cute.arch.lane_idx()
     end_ns = read_globaltimer()
-    if lane_idx == 0:
-        base_ptr = buf.iterator.toint()
-        slice_size = Int64(1 + 4 * max_events_per_unit)
-        base_offset = Int64(unit_id) * slice_size + Int64(1 + 4 * event_idx)
-        byte_offset = base_offset * Int64(8)
-        dur_ns = end_ns - start_ns
-        _store_i64(base_ptr + byte_offset, start_ns)
-        _store_i64(base_ptr + byte_offset + Int64(8), dur_ns)
-        _store_i64(base_ptr + byte_offset + Int64(16), tag_word(tag, payload))
-        _store_i64(base_ptr + byte_offset + Int64(24), Int64(tid))
-
-
-@cute.jit
-def compact_anchor_init(
-    buf: cute.Tensor,
-    unit_id: Int32,
-    max_events_per_unit: Int32,
-) -> None:
-    """Write a full 64-bit globaltimer anchor to slot 0 of this unit's buffer.
-
-    Compact mode stores each event as a single packed int64 with only the low
-    32 bits of the timer. The decoder reconstructs each full 64-bit start as
-    the anchor plus the signed difference of their low 32 bits, so an event
-    may start up to ~2.1 s before or after the anchor; other warps need not
-    wait for it. Call once per CTA at the top of ``@cute.kernel``, BEFORE any
-    nested warp guards.
-
-    Only lane 0 of warp 0 performs the store.
-    """
-    warp_idx = cute.arch.warp_idx()
-    lane_idx = cute.arch.lane_idx()
-    if warp_idx == 0 and lane_idx == 0:
-        ts = read_globaltimer()
-        base_ptr = buf.iterator.toint()
-        slice_size = Int64(1 + max_events_per_unit)
-        byte_offset = Int64(unit_id) * slice_size * Int64(8)
-        _store_i64(base_ptr + byte_offset, ts)
-
-
-@cute.jit
-def compact_event_stop(
-    buf: cute.Tensor,
-    unit_id: Int32,
-    event_idx: Int32,
-    start_ts32: Int32,
-    tag: Int32,
-    max_events_per_unit: Int32,
-) -> None:
-    """Record one event in compact format to global memory; 1x ``STG.E.EF.64`` per event.
-
-    Pick this when total kernel slowdown matters most and you do not want to
-    plumb a smem ``MemRange`` through your ``SharedStorage``. Per-event STGs
-    overlap with surrounding compute, but each event pays full L2/HBM cost.
-    For the same workload, :func:`compact_event_stop_smem` records ~30-50 ns
-    less observer overhead per event (at the cost of an end-of-kernel flush).
-
-
-    Pair with :func:`read_globaltimer_lo32` for the start timestamp. The
-    packed record layout is::
-
-        bits  63..56  55..32     31..0
-              tag(8)  dur_ns(24) ts_lo32(32)
-
-    ``dur_ns`` wraps modulo 2^24 ns (~16.7 ms): a longer region decodes as its
-    duration modulo 2^24 — use the legacy 4xi64 path (:func:`raw_event_stop`)
-    for coarse outer regions if needed. ``tag`` is masked to 8 bits.
-
-    Only lane 0 of the calling warp performs the store, and only for
-    ``0 <= event_idx < max_events_per_unit``: an out-of-range slot is dropped
-    rather than written over a neighboring unit. The caller is responsible for
-    any outer warp guard. The inner ``if`` yields no value, so this primitive
-    is safe in deeply nested control flow.
-    """
-    lane_idx = cute.arch.lane_idx()
-    end_ts32 = read_globaltimer_lo32()
-    if (lane_idx == 0) & (event_idx >= 0) & (event_idx < max_events_per_unit):
-        dur32 = end_ts32 - start_ts32
-        ts_u = Int64(start_ts32) & Int64(0xFFFFFFFF)
-        dur_u = Int64(dur32) & Int64(0xFFFFFF)
-        tag_u = Int64(tag) & Int64(0xFF)
-        packed = ts_u | (dur_u << 32) | (tag_u << 56)
-        base_ptr = buf.iterator.toint()
-        slice_size = Int64(1 + max_events_per_unit)
-        byte_offset = (Int64(unit_id) * slice_size + Int64(1 + event_idx)) * Int64(8)
-        _store_i64(base_ptr + byte_offset, packed)
-
-
-@cute.jit
-def compact_anchor_init_smem(smem_buf: cute.Tensor) -> None:
-    """Write a 64-bit globaltimer anchor to slot 0 of a per-CTA smem profile buffer.
-
-    Companion to :func:`compact_event_stop_smem`. ``smem_buf`` is expected to
-    be the int64 tensor view of the caller's per-CTA smem ``MemRange``; the
-    slot 0 anchor lets the host decoder reconstruct full 64-bit timestamps
-    after :func:`compact_flush_smem_to_gmem` copies the slice out to global.
-    Call once at the top of ``@cute.kernel`` before any nested control flow.
-    Only lane 0 of warp 0 performs the write.
-    """
-    warp_idx = cute.arch.warp_idx()
-    lane_idx = cute.arch.lane_idx()
-    if warp_idx == 0 and lane_idx == 0:
-        smem_buf[0] = read_globaltimer()
-
-
-@cute.jit
-def compact_event_stop_smem(
-    smem_buf: cute.Tensor,
-    event_idx: Int32,
-    start_ts32: Int32,
-    tag: Int32,
-) -> None:
-    """Record one event into per-CTA smem; 1x ``STS.64`` per event, lowest observer cost.
-
-    Pick this when the recorded timestamps will drive optimization decisions:
-    the per-event hot-path cost is the smallest of any format (one shared-mem
-    store, no global address math), so recorded ``dur_ns`` for inner regions
-    is ~30-50 ns smaller than :func:`compact_event_stop` for the same logical
-    work. The cost is paid once at kernel exit via
-    :func:`compact_flush_smem_to_gmem`, which doesn't pollute the timestamps.
-
-
-    Same packed layout as :func:`compact_event_stop` (``tag | dur24 | ts32``)
-    but writes to shared memory instead of global. Pair with
-    :func:`read_globaltimer_lo32` for the start timestamp and call
-    :func:`compact_flush_smem_to_gmem` once at kernel exit to copy the slice
-    out to global memory.
-
-    Only lane 0 of the calling warp performs the store, and only for a slot
-    inside ``smem_buf`` (``0 <= event_idx < size(smem_buf) - 1``): an
-    out-of-range slot is dropped rather than written over the kernel's
-    neighboring shared memory. The caller is responsible for any outer warp
-    guard. The hot path is a single ``STS`` plus the timer read and bit-pack —
-    no global address arithmetic.
-    """
-    lane_idx = cute.arch.lane_idx()
-    end_ts32 = read_globaltimer_lo32()
-    if (lane_idx == 0) & (event_idx >= 0) & (event_idx < cute.size(smem_buf) - 1):
-        dur32 = end_ts32 - start_ts32
-        ts_u = Int64(start_ts32) & Int64(0xFFFFFFFF)
-        dur_u = Int64(dur32) & Int64(0xFFFFFF)
-        tag_u = Int64(tag) & Int64(0xFF)
-        packed = ts_u | (dur_u << 32) | (tag_u << 56)
-        smem_buf[Int32(1) + event_idx] = packed
-
-
-@cute.jit
-def compact_prepare_smem(
-    smem_buf: cute.Tensor,
-    max_events_per_unit: Int32,
-    record=True,
-) -> None:
-    """Clear and anchor a compact shared-memory profile slice."""
-    if record:
-        tidx, _, _ = cute.arch.thread_idx()
-        bdim, _, _ = cute.arch.block_dim()
-        slice_size = Int32(1) + max_events_per_unit
-        i = tidx
-        while i < slice_size:
-            smem_buf[i] = Int64(0)
-            i = i + bdim
-        cute.arch.barrier()
-        compact_anchor_init_smem(smem_buf)
-        cute.arch.barrier()
-
-
-@cute.jit
-def compact_flush_smem_to_gmem(
-    smem_buf: cute.Tensor,
-    gmem_buf: cute.Tensor,
-    unit_id: Int32,
-    max_events_per_unit: Int32,
-) -> None:
-    """Cooperative copy: smem profile slice -> per-unit slice in the gmem buffer.
-
-    Must be called once at kernel end, AFTER all events for this CTA have
-    been recorded via :func:`compact_event_stop_smem`. Issues a CTA-wide
-    ``__syncthreads`` first so pending event STS writes are visible to all
-    threads before the cooperative copy, then every thread copies a strided
-    subset of the ``1 + max_events_per_unit`` slots out to its position in
-    the global buffer (same layout as gmem-only compact mode).
-    """
-    cute.arch.barrier()
-    tidx, _, _ = cute.arch.thread_idx()
-    bdim, _, _ = cute.arch.block_dim()
-    slice_size = Int32(1) + max_events_per_unit
-    base_ptr = gmem_buf.iterator.toint()
-    base_byte_offset = Int64(unit_id) * Int64(slice_size) * Int64(8)
-    i = tidx
-    while i < slice_size:
-        # Cache-evict-first store: we never read these back from the device.
-        _store_i64(base_ptr + base_byte_offset + Int64(i) * Int64(8), smem_buf[i])
-        i = i + bdim
-
-
-class RegionToken(NamedTuple):
-    """Pairing token returned by :func:`region_start` and consumed by :func:`region_end`.
-
-    Captures everything :func:`region_end` needs to close the region (slot
-    index, start timestamp, unit id, target warp), so callers cannot mismatch
-    those fields between start and end. Implemented as ``NamedTuple`` so the
-    DSL can thread it through ``scf.for`` as a loop-carried value.
-    """
-
-    unit_id: Int32
-    event_idx: Int32
-    start_ns: Int64
-    target_warp: Int32
-
-
-def _env_flag(name: str, default: bool = True) -> bool:
-    """Parse a boolean-like environment variable."""
-    val = os.getenv(name)
-    if val is None:
-        return default
-    return val.strip().lower() not in ("0", "false", "off", "no", "")
-
-
-# Global kill-switch for profiling generation. Evaluated at kernel staging time,
-# so toggling the env var and re-staging the kernel removes all profiling code.
-ENABLE_PROFILING: bool = _env_flag("TNUGGETS_ENABLE_PROFILING", default=True)
-# Use cutlass.const_expr so the branch is compile-time in staged kernels.
-ENABLE_PROFILING_CONST = cutlass.const_expr(ENABLE_PROFILING)
+    base_ptr = buf.iterator.toint()
+    slice_size = Int64(1 + 4 * max_events_per_unit)
+    base_offset = Int64(unit_id) * slice_size + Int64(1 + 4 * event_idx)
+    byte_offset = base_offset * Int64(8)
+    dur_ns = end_ns - start_ns
+    _store_i64(base_ptr + byte_offset, start_ns)
+    _store_i64(base_ptr + byte_offset + Int64(8), dur_ns)
+    _store_i64(base_ptr + byte_offset + Int64(16), tag_word(tag, payload))
+    _store_i64(base_ptr + byte_offset + Int64(24), Int64(warp))
 
 
 @dsl_user_op
@@ -392,301 +147,192 @@ def _store_i64(ptr: Int64, val: Int64, *, loc=None, ip=None) -> None:
     )
 
 
-@dsl_user_op
-def _atomic_add_i64_ptr(ptr: Int64, val: Int64, *, loc=None, ip=None) -> Int64:
-    """Atomically add val to the int64 at ptr and return the old value.
-
-    Uses inline PTX atom.add.u64 instruction.
-    """
-    result = llvm.inline_asm(
-        T.i64(),
-        [ptr.ir_value(loc=loc, ip=ip), val.ir_value(loc=loc, ip=ip)],
-        "atom.add.u64 $0, [$1], $2;",
-        "=l,l,l",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return Int64(result)
+def compact_record(start_ts32: Int32, end_ts32: Int32, tag: Int32) -> Int64:
+    """Pack one compact record: ``tag(8) | dur_ns(24) | ts_lo32(32)``."""
+    ts_u = Int64(start_ts32) & Int64(0xFFFFFFFF)
+    dur_u = Int64(end_ts32 - start_ts32) & Int64(0xFFFFFF)
+    tag_u = Int64(tag) & Int64(0xFF)
+    return ts_u | (dur_u << 32) | (tag_u << 56)
 
 
 @cute.jit
-def static_start(
+def compact_anchor_init(
     buf: cute.Tensor,
     unit_id: Int32,
-    event_idx: Int32,
     max_events_per_unit: Int32,
-    bounds_check: cutlass.Constexpr = True,
-) -> Int64:
-    """Read start timestamp for an event within a unit's static buffer slice.
-
-    No atomics or memory traffic are performed here. The caller must pass the
-    returned timestamp to static_stop.
-
-    Args:
-        buf: Profile buffer tensor (int64).
-        unit_id: Which profiling unit this is (e.g., block index, warp index).
-        event_idx: Event index within this unit (0, 1, 2, ... tracked in registers).
-        max_events_per_unit: Maximum events per unit (determines slice size).
-        bounds_check: Compile-time flag. When ``True`` (default), gate the timer
-            read on ``0 <= event_idx < max_events_per_unit``. Setting ``False`` drops
-            the inner ``scf.if`` and is required when calling from deeply nested
-            control flow (e.g. inside ``if warp_idx == 0: for ...:`` in a
-            warp-specialized kernel) where the extra conditional has been seen
-            to trip ``cf.br`` lowering or LLVM dominance verification.
-
-    Returns:
-        Int64: Start timestamp (0 when ``bounds_check`` is True and the slot
-        is out of range).
-    """
-    if cutlass.const_expr(bounds_check):
-        start_ns = Int64(0)
-        if (event_idx >= 0) & (event_idx < max_events_per_unit):
-            start_ns = read_globaltimer()
-        return start_ns
-    return read_globaltimer()
-
-
-@cute.jit
-def static_stop(
-    buf: cute.Tensor,
-    unit_id: Int32,
-    event_idx: Int32,
-    start_ns: Int64,
-    tag: Int32,
-    tid: Int32,
-    max_events_per_unit: Int32,
-    bounds_check: cutlass.Constexpr = True,
-    payload: Int32 | None = None,
 ) -> None:
-    """Stop profiling an event, recording duration, tag, and tid.
+    """Write a full 64-bit globaltimer anchor to slot 0 of this unit's buffer.
 
-    Computes duration from the provided start timestamp and writes event data.
-    No atomics are used.
+    Compact mode stores each event as a single packed int64 with only the low
+    32 bits of the timer. The decoder reconstructs each full 64-bit start as
+    the anchor plus the signed difference of their low 32 bits, so an event
+    may start up to ~2.1 s before or after the anchor; other warps need not
+    wait for it. Call once per CTA at the top of ``@cute.kernel``, BEFORE any
+    nested warp guards.
 
-    Args:
-        buf: Profile buffer tensor (int64).
-        unit_id: Which profiling unit this is (must match static_start).
-        event_idx: Event index within this unit (must match static_start).
-        start_ns: Start timestamp returned by static_start.
-        tag: Tag ID for this event (from TagTable on host).
-        tid: Thread/block identifier for Perfetto visualization.
-        max_events_per_unit: Maximum events per unit (determines slice size).
-        bounds_check: Forwarded to :func:`static_start`.
-        payload: Optional runtime int32 stored with the tag (``Event.payload``).
+    Only lane 0 of warp 0 performs the store.
     """
-    should_record = True
-    if cutlass.const_expr(bounds_check):
-        should_record = (event_idx >= 0) & (event_idx < max_events_per_unit)
-    if should_record:
-        end_ns = read_globaltimer()
+    warp_idx = cute.arch.warp_idx()
+    lane_idx = cute.arch.lane_idx()
+    if warp_idx == 0 and lane_idx == 0:
+        ts = read_globaltimer()
         base_ptr = buf.iterator.toint()
-        slice_size = Int64(1 + 4 * max_events_per_unit)
-        base_offset = Int64(unit_id) * slice_size + Int64(1 + 4 * event_idx)
-        byte_offset = base_offset * Int64(8)
-        dur_ns = end_ns - start_ns
-        _store_i64(base_ptr + byte_offset, start_ns)
-        _store_i64(base_ptr + byte_offset + Int64(8), dur_ns)
-        _store_i64(base_ptr + byte_offset + Int64(16), tag_word(tag, payload))
-        _store_i64(base_ptr + byte_offset + Int64(24), Int64(tid))
+        slice_size = Int64(1 + max_events_per_unit)
+        byte_offset = Int64(unit_id) * slice_size * Int64(8)
+        _store_i64(base_ptr + byte_offset, ts)
 
 
 @cute.jit
-def warp_atomic_alloc(
-    buf: cute.Tensor,
-    unit_id: Int32,
-    max_events_per_unit: Int32,
-    target_warp: Int32,
-    record=True,
-) -> Int32:
-    """Atomically allocate event index, guarded to lane 0 of target_warp.
-
-    Only lane 0 of target_warp actually allocates. Other threads get -1.
-    This is the safe version to use in profile_region.
-
-    Args:
-        buf: Profile buffer tensor (int64).
-        unit_id: Which profiling unit this is.
-        max_events_per_unit: Maximum events per unit.
-        target_warp: Which warp should allocate.
-
-    Returns:
-        Int32: The allocated event index (or -1 for non-allocating threads).
-    """
-    warp_idx = cute.arch.warp_idx()
-    lane_idx = cute.arch.lane_idx()
-
-    event_idx = Int32(-1)
-    if record:
-        if warp_idx == target_warp and lane_idx == 0:
-            base_ptr = buf.iterator.toint()
-            slice_size = Int64(1 + 4 * max_events_per_unit)
-            counter_ptr = base_ptr + Int64(unit_id) * slice_size * Int64(8)
-            old_count = _atomic_add_i64_ptr(counter_ptr, Int64(1))
-            event_idx = Int32(old_count)
-    return event_idx
-
-
-@cute.jit
-def warp_start(
+def compact_event_stop(
     buf: cute.Tensor,
     unit_id: Int32,
     event_idx: Int32,
-    max_events_per_unit: Int32,
-    target_warp: Int32,
-    bounds_check: cutlass.Constexpr = True,
-    record=True,
-) -> Int64:
-    """Start profiling, but only for lane 0 of the specified warp.
-
-    Convenience wrapper around :func:`static_start` that adds a
-    ``warp_idx == target_warp and lane_idx == 0`` guard so only one thread
-    records the event.
-
-    Args:
-        buf: Profile buffer tensor (int64).
-        unit_id: Which profiling unit this is.
-        event_idx: Event index within this unit.
-        max_events_per_unit: Maximum events per unit.
-        target_warp: Which warp should profile.
-        bounds_check: Forwarded to :func:`static_start`.
-        record: Runtime predicate controlling whether the warp records.
-
-    Returns:
-        Int64: Start timestamp (0 for non-participating lanes).
-    """
-    warp_idx = cute.arch.warp_idx()
-    lane_idx = cute.arch.lane_idx()
-
-    start_ns = Int64(0)
-    if record:
-        if warp_idx == target_warp and lane_idx == 0:
-            start_ns = static_start(
-                buf, unit_id, event_idx, max_events_per_unit, bounds_check=bounds_check
-            )
-    return start_ns
-
-
-@cute.jit
-def warp_stop(
-    buf: cute.Tensor,
-    unit_id: Int32,
-    event_idx: Int32,
-    start_ns: Int64,
+    start_ts32: Int32,
     tag: Int32,
-    tid: Int32,
     max_events_per_unit: Int32,
-    target_warp: Int32,
-    bounds_check: cutlass.Constexpr = True,
-    record=True,
-    payload: Int32 | None = None,
 ) -> None:
-    """Stop profiling, but only for lane 0 of the specified warp.
+    """Record one event in compact format to global memory; 1x ``STG.E.EF.64`` per event.
 
-    Args:
-        buf: Profile buffer tensor (int64).
-        unit_id: Which profiling unit this is.
-        event_idx: Event index within this unit.
-        start_ns: Start timestamp returned by :func:`warp_start`.
-        tag: Tag ID for this event.
-        tid: Per-event tid.
-        max_events_per_unit: Maximum events per unit.
-        target_warp: Which warp should profile.
-        bounds_check: Forwarded to :func:`static_stop`.
-        record: Runtime predicate controlling whether the warp records.
-        payload: Optional runtime int32 stored with the tag (``Event.payload``).
+    Pick this when total kernel slowdown matters most and you do not want to
+    plumb a smem ``MemRange`` through your ``SharedStorage``. Per-event STGs
+    overlap with surrounding compute, but each event pays full L2/HBM cost.
+    For the same workload, :func:`compact_event_stop_smem` records ~30-50 ns
+    less observer overhead per event (at the cost of an end-of-kernel flush).
+
+
+    Pair with :func:`read_globaltimer_lo32` for the start timestamp. The
+    packed record layout is::
+
+        bits  63..56  55..32     31..0
+              tag(8)  dur_ns(24) ts_lo32(32)
+
+    ``dur_ns`` wraps modulo 2^24 ns (~16.7 ms): a longer region decodes as its
+    duration modulo 2^24 — use full records (:func:`event_stop`)
+    for coarse outer regions if needed. ``tag`` is masked to 8 bits.
+
+    Only lane 0 of the calling warp performs the store, and only for
+    ``0 <= event_idx < max_events_per_unit``: an out-of-range slot is dropped
+    rather than written over a neighboring unit. The caller is responsible for
+    any outer warp guard. The inner ``if`` yields no value, so this primitive
+    is safe in deeply nested control flow.
+    """
+    lane_idx = cute.arch.lane_idx()
+    end_ts32 = read_globaltimer_lo32()
+    if (lane_idx == 0) & (event_idx >= 0) & (event_idx < max_events_per_unit):
+        base_ptr = buf.iterator.toint()
+        slice_size = Int64(1 + max_events_per_unit)
+        byte_offset = (Int64(unit_id) * slice_size + Int64(1 + event_idx)) * Int64(8)
+        _store_i64(base_ptr + byte_offset, compact_record(start_ts32, end_ts32, tag))
+
+
+@cute.jit
+def compact_anchor_init_smem(smem_buf: cute.Tensor) -> None:
+    """Write a 64-bit globaltimer anchor to slot 0 of a per-CTA smem profile buffer.
+
+    Companion to :func:`compact_event_stop_smem`. ``smem_buf`` is expected to
+    be the int64 tensor view of the caller's per-CTA smem ``MemRange``; the
+    slot 0 anchor lets the host decoder reconstruct full 64-bit timestamps
+    after :func:`compact_flush_smem_to_gmem` copies the slice out to global.
+    Call once at the top of ``@cute.kernel`` before any nested control flow.
+    Only lane 0 of warp 0 performs the write.
     """
     warp_idx = cute.arch.warp_idx()
     lane_idx = cute.arch.lane_idx()
-
-    if record:
-        if warp_idx == target_warp and lane_idx == 0:
-            static_stop(
-                buf,
-                unit_id,
-                event_idx,
-                start_ns,
-                tag,
-                tid,
-                max_events_per_unit,
-                bounds_check=bounds_check,
-                payload=payload,
-            )
+    if warp_idx == 0 and lane_idx == 0:
+        smem_buf[0] = read_globaltimer()
 
 
-class _ProfileRegionContext:
-    """DSL-level context manager for profiling regions in CUTE kernels.
+@cute.jit
+def compact_event_stop_smem(
+    smem_buf: cute.Tensor,
+    event_idx: Int32,
+    start_ts32: Int32,
+    tag: Int32,
+    max_events_per_unit: Int32,
+) -> None:
+    """Record one event into per-CTA smem; 1x ``STS.64`` per event, lowest observer cost.
 
-    Generated at IR-staging time: ``__enter__`` emits the warp_start IR,
-    ``__exit__`` emits the warp_stop IR. Pairing is structural (Python
-    ``with``), so there is no way to start without ending. ``event_idx=None``
-    selects atomic slot allocation; a caller-supplied ``event_idx`` selects
-    static (no-atomic) allocation.
+    Pick this when the recorded timestamps will drive optimization decisions:
+    the per-event hot-path cost is the smallest of any format (one shared-mem
+    store, no global address math), so recorded ``dur_ns`` for inner regions
+    is ~30-50 ns smaller than :func:`compact_event_stop` for the same logical
+    work. The cost is paid once at kernel exit via
+    :func:`compact_flush_smem_to_gmem`, which doesn't pollute the timestamps.
+
+
+    Same packed layout as :func:`compact_event_stop` (``tag | dur24 | ts32``)
+    but writes to shared memory instead of global. Pair with
+    :func:`read_globaltimer_lo32` for the start timestamp and call
+    :func:`compact_flush_smem_to_gmem` once at kernel exit to copy the slice
+    out to global memory.
+
+    Only lane 0 of the calling warp performs the store, and only for
+    ``0 <= event_idx < max_events_per_unit`` (the slice holds ``1 + max_events_per_unit``
+    words): an out-of-range slot is dropped rather than written over the kernel's
+    neighboring shared memory. The caller is responsible for any outer warp
+    guard. The hot path is a single ``STS`` plus the timer read and bit-pack —
+    no global address arithmetic.
     """
+    lane_idx = cute.arch.lane_idx()
+    end_ts32 = read_globaltimer_lo32()
+    if (lane_idx == 0) & (event_idx >= 0) & (event_idx < max_events_per_unit):
+        smem_buf[Int32(1) + event_idx] = compact_record(start_ts32, end_ts32, tag)
 
-    def __init__(
-        self,
-        buf,
-        max_events_per_unit,
-        tag,
-        unit_id,
-        tid,
-        target_warp,
-        event_idx,
-        bounds_check,
-        record,
-        payload,
-    ):
-        self._buf = buf
-        self._max_events_per_unit = max_events_per_unit
-        self._tag = tag
-        self._unit_id = unit_id
-        self._tid = tid
-        self._target_warp = target_warp
-        self._event_idx = event_idx
-        self._use_atomic = event_idx is None
-        self._bounds_check = bounds_check
-        self._record = record
-        self._payload = payload
 
-    def __enter__(self):
-        if cutlass.const_expr(self._use_atomic):
-            self._event_idx = warp_atomic_alloc(
-                self._buf,
-                self._unit_id,
-                self._max_events_per_unit,
-                self._target_warp,
-                self._record,
-            )
+@cute.jit
+def compact_prepare_smem(
+    smem_buf: cute.Tensor,
+    max_events_per_unit: Int32,
+    record=True,
+) -> None:
+    """Clear and anchor a compact shared-memory profile slice (CTA-wide, with barriers).
 
-        self._start_ns = warp_start(
-            self._buf,
-            self._unit_id,
-            self._event_idx,
-            self._max_events_per_unit,
-            self._target_warp,
-            bounds_check=self._bounds_check,
-            record=self._record,
-        )
-        return self
+    ``record``: CTA-uniform runtime predicate; a CTA that does not record skips the slice.
+    """
+    if record:
+        tidx, _, _ = cute.arch.thread_idx()
+        bdim, _, _ = cute.arch.block_dim()
+        slice_size = Int32(1) + max_events_per_unit
+        i = tidx
+        while i < slice_size:
+            smem_buf[i] = Int64(0)
+            i = i + bdim
+        cute.arch.barrier()
+        compact_anchor_init_smem(smem_buf)
+        cute.arch.barrier()
 
-    def __exit__(self, exc_type, exc_value, traceback):
-        warp_stop(
-            self._buf,
-            self._unit_id,
-            self._event_idx,
-            self._start_ns,
-            self._tag,
-            self._tid,
-            self._max_events_per_unit,
-            self._target_warp,
-            bounds_check=self._bounds_check,
-            record=self._record,
-            payload=self._payload,
-        )
-        return False
+
+@cute.jit
+def compact_flush_smem_to_gmem(
+    smem_buf: cute.Tensor,
+    gmem_buf: cute.Tensor,
+    unit_id: Int32,
+    max_events_per_unit: Int32,
+    record=True,
+) -> None:
+    """Cooperative copy: smem profile slice -> per-unit slice in the gmem buffer.
+
+    Must be called once at kernel end, AFTER all events for this CTA have
+    been recorded via :func:`compact_event_stop_smem`. Issues a CTA-wide
+    ``__syncthreads`` first so pending event STS writes are visible to all
+    threads before the cooperative copy, then every thread copies a strided
+    subset of the ``1 + max_events_per_unit`` slots out to its position in
+    the global buffer (same layout as gmem-only compact mode). ``record``: the CTA-uniform
+    predicate passed to :func:`compact_prepare_smem`; a CTA that does not record flushes
+    nothing.
+    """
+    if record:
+        cute.arch.barrier()
+        tidx, _, _ = cute.arch.thread_idx()
+        bdim, _, _ = cute.arch.block_dim()
+        slice_size = Int32(1) + max_events_per_unit
+        base_ptr = gmem_buf.iterator.toint()
+        base_byte_offset = Int64(unit_id) * Int64(slice_size) * Int64(8)
+        i = tidx
+        while i < slice_size:
+            # Cache-evict-first store: we never read these back from the device.
+            _store_i64(base_ptr + base_byte_offset + Int64(i) * Int64(8), smem_buf[i])
+            i = i + bdim
 
 
 class _NoOpProfileRegion:
@@ -715,13 +361,14 @@ def compact_warp_stop_smem(
     event_idx: Int32,
     start_ts32: Int32,
     tag: Int32,
+    max_events_per_unit: Int32,
     target_warp: Int32,
     record=True,
 ) -> None:
     """Close a compact shared-memory region from lane 0 of one warp."""
     if record:
         if cute.arch.warp_idx() == target_warp and cute.arch.lane_idx() == 0:
-            compact_event_stop_smem(buf, event_idx, start_ts32, tag)
+            compact_event_stop_smem(buf, event_idx, start_ts32, tag, max_events_per_unit)
 
 
 @cute.jit
@@ -782,6 +429,7 @@ class _CompactProfileRegionContext:
                 self._event_idx,
                 self._start_ts32,
                 self._tag,
+                self._max_events_per_unit,
                 self._target_warp,
                 self._record,
             )
@@ -810,8 +458,17 @@ def compact_profile_region(
     record=True,
     smem=False,
 ):
-    """Profile one static-slot region using the compact packed record format."""
-    if not cutlass.const_expr(enabled) or not cutlass.const_expr(ENABLE_PROFILING_CONST):
+    """Context manager recording one compact region in static slot ``event_idx``.
+
+    Lane 0 of ``target_warp`` (default warp 0) reads the start timer on entry and stores the
+    record on exit, to the shared-memory slice ``buf`` (``smem=True``; flush it with
+    :func:`compact_flush_smem_to_gmem`) or to unit ``unit_id`` of the global buffer ``buf``.
+
+    Args:
+        enabled: Compile-time switch. When false, the region emits no profiling code.
+        record: Runtime predicate selecting whether this unit records the region.
+    """
+    if not cutlass.const_expr(enabled):
         return _NoOpProfileRegion()
     if target_warp is None:
         target_warp = Int32(0)
@@ -824,147 +481,4 @@ def compact_profile_region(
         event_idx,
         record,
         smem,
-    )
-
-
-def profile_region(
-    buf,
-    max_events_per_unit,
-    tag,
-    unit_id,
-    target_warp=None,
-    event_idx=None,
-    tid=None,
-    bounds_check=True,
-    enabled=True,
-    record=True,
-    payload=None,
-):
-    """Context manager that profiles a code region in a CUTE DSL kernel.
-
-    Atomic mode (default, ``event_idx=None``)::
-
-        for i in cutlass.range(4):
-            with profile_region(prof_buf, max_events, TAG_COMPUTE, bidx):
-                compute_something()
-
-    Static mode (``event_idx`` provided, no atomics)::
-
-        for i in cutlass.range(4):
-            with profile_region(..., event_idx=Int32(0) + i * Int32(2)):
-                ...
-
-    See :func:`region_start`/:func:`region_end` for explicit token pairing
-    across Python scopes or loop iterations.
-
-    Args:
-        buf: Profile buffer tensor.
-        max_events_per_unit: Slots reserved per unit (Int32).
-        tag: Tag ID for the region (Int32).
-        unit_id: Profiling unit (buffer slice) to write to (Int32).
-        target_warp: Which warp records the event. Defaults to ``Int32(0)``.
-        event_idx: Optional explicit slot index. ``None`` enables atomic mode.
-        tid: Per-event ``tid`` written into the slot and surfaced as the
-            Perfetto thread id. Defaults to ``unit_id`` for backward
-            compatibility with the single-warp case. For warp-specialized
-            kernels pass ``cute.arch.warp_idx()`` (or any per-warp value) so
-            each warp gets its own Perfetto lane.
-        bounds_check: Forwarded to :func:`static_start`/:func:`static_stop`.
-        enabled: Compile-time switch. When false, the region emits no profiling code.
-        record: Runtime predicate selecting whether this unit records the region.
-        payload: Optional runtime int32 recorded with the region (``Event.payload``),
-            e.g. the work item it belongs to.
-
-    Returns:
-        Context manager for use with ``with``.
-    """
-    if not cutlass.const_expr(enabled) or not cutlass.const_expr(ENABLE_PROFILING_CONST):
-        return _NoOpProfileRegion()
-
-    if target_warp is None:
-        target_warp = Int32(0)
-    if tid is None:
-        tid = unit_id
-
-    return _ProfileRegionContext(
-        buf,
-        max_events_per_unit,
-        tag,
-        unit_id,
-        tid,
-        target_warp,
-        event_idx,
-        bounds_check,
-        record,
-        payload,
-    )
-
-
-def region_start(
-    buf: cute.Tensor,
-    unit_id: Int32,
-    max_events_per_unit: Int32,
-    target_warp: Int32 | None = None,
-    event_idx: Int32 | None = None,
-) -> RegionToken:
-    """Open a region and return a :class:`RegionToken` for explicit pairing.
-
-    Use this when ``with profile_region(...)`` does not fit, e.g. when a region
-    spans two Python scopes or needs to be loop-carried across
-    ``cutlass.range`` iterations.
-
-    Args:
-        buf: Profile buffer tensor.
-        unit_id: Profiling unit (buffer slice) to write to.
-        max_events_per_unit: Slots reserved per unit.
-        target_warp: Which warp records the event. Defaults to ``Int32(0)``.
-        event_idx: Optional explicit slot index. ``None`` enables atomic
-            allocation via :func:`warp_atomic_alloc`.
-
-    Returns:
-        Token to pass to :func:`region_end`.
-    """
-    if target_warp is None:
-        target_warp = Int32(0)
-    if event_idx is None:
-        event_idx = warp_atomic_alloc(buf, unit_id, max_events_per_unit, target_warp)
-    start_ns = warp_start(buf, unit_id, event_idx, max_events_per_unit, target_warp)
-    return RegionToken(
-        unit_id=unit_id, event_idx=event_idx, start_ns=start_ns, target_warp=target_warp
-    )
-
-
-def region_end(
-    buf: cute.Tensor,
-    tag: Int32,
-    token: RegionToken,
-    max_events_per_unit: Int32,
-    tid: Int32 | None = None,
-    payload: Int32 | None = None,
-) -> None:
-    """Close a region opened by :func:`region_start`.
-
-    Slot index, start timestamp, unit id, and target warp all come from
-    ``token``, so the start/end pair can't drift apart on those fields.
-
-    Args:
-        buf: Profile buffer tensor.
-        tag: Tag ID for the region.
-        token: Token returned by :func:`region_start`.
-        max_events_per_unit: Slots reserved per unit.
-        tid: Per-event ``tid``. Defaults to the token's ``unit_id``.
-        payload: Optional runtime int32 recorded with the region (``Event.payload``).
-    """
-    if tid is None:
-        tid = token.unit_id
-    warp_stop(
-        buf,
-        token.unit_id,
-        token.event_idx,
-        token.start_ns,
-        tag,
-        tid,
-        max_events_per_unit,
-        token.target_warp,
-        payload=payload,
     )

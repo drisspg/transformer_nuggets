@@ -1,30 +1,29 @@
 """NVIDIA Intra-Kernel Profiling for CUTE DSL Kernels.
 
-This package provides utilities for profiling code regions *inside* GPU kernels,
-generating native Perfetto TrackEvent traces viewable in Perfetto (https://ui.perfetto.dev/).
-
-See README.md for the full list of recording modes (atomic / static / token /
-compact gmem / compact smem) and a guide on which to pick.
+Record code regions *inside* GPU kernels into a profile buffer, decode them on the host, and
+export native Perfetto TrackEvent traces (https://ui.perfetto.dev/). See README.md.
 
 Quick Start:
-    from transformer_nuggets.cute.profiler import profile_session, profile_region
+    from transformer_nuggets.cute.profiler import (
+        compact_anchor_init, compact_profile_region, profile_session
+    )
 
     @cute.kernel
     def my_kernel(output, prof_buf, max_events):
         bidx, _, _ = cute.arch.block_idx()
-        # Atomic mode: just omit event_idx
-        with profile_region(prof_buf, max_events, TAG_COMPUTE, bidx):
+        compact_anchor_init(prof_buf, bidx, max_events)
+        with compact_profile_region(prof_buf, max_events, TAG_COMPUTE, bidx, Int32(0)):
             compute_something()
 
     with profile_session(
-        max_events_per_unit=64,
+        max_events_per_unit=1,
         num_units=(num_blocks, "Block"),
         tag_names=["compute"],
         trace_path="trace.pftrace",
-    ) as (prof, tag_table):
-        my_kernel(output, prof.tensor, prof.max_events_per_unit)
-
-See the README.md in this directory for full documentation.
+        compact=True,
+    ) as session:
+        my_kernel(output, session.prof.tensor, session.prof.max_events_per_unit)
+    session.events  # decoded after the block
 """
 
 from transformer_nuggets.cute.profiler.host import (
@@ -50,25 +49,15 @@ from transformer_nuggets.cute.profiler.analysis import (
 )
 
 from transformer_nuggets.cute.profiler.ops import (
+    compact_anchor_init,
+    compact_event_stop,
+    compact_event_stop_smem,
+    compact_flush_smem_to_gmem,
+    compact_prepare_smem,
+    compact_profile_region,
+    event_stop,
     read_globaltimer,
     read_globaltimer_lo32,
-    static_start,
-    static_stop,
-    warp_atomic_alloc,
-    warp_start,
-    warp_stop,
-    profile_region,
-    region_start,
-    region_end,
-    RegionToken,
-    raw_event_stop,
-    compact_event_stop,
-    compact_anchor_init,
-    compact_event_stop_smem,
-    compact_anchor_init_smem,
-    compact_prepare_smem,
-    compact_flush_smem_to_gmem,
-    compact_profile_region,
 )
 
 from transformer_nuggets.cute.profiler.postprocessors import (
@@ -105,21 +94,11 @@ __all__ = [
     "validate_event_counts",
     # Device-side
     "read_globaltimer",
-    "static_start",
-    "static_stop",
-    "warp_atomic_alloc",
-    "warp_start",
-    "warp_stop",
-    "profile_region",
     "read_globaltimer_lo32",
-    "region_start",
-    "region_end",
-    "RegionToken",
-    "raw_event_stop",
+    "event_stop",
     "compact_event_stop",
     "compact_anchor_init",
     "compact_event_stop_smem",
-    "compact_anchor_init_smem",
     "compact_prepare_smem",
     "compact_flush_smem_to_gmem",
     "compact_profile_region",
