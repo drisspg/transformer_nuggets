@@ -11,8 +11,8 @@ profiling unit (one unit per CTA, usually):
   Warpdrive's ``"globaltimer"`` trace backend records these: they carry a warp, a payload and
   durations past 2^24 ns.
 
-This module imports only CuTeDSL: a kernel's compile key hashes the modules it imports, so
-the host decoder and analysis stay out of it.
+This module imports no other transformer_nuggets module: a kernel's compile key hashes the
+modules it imports, so the host decoder and analysis stay out of it.
 """
 
 from contextlib import contextmanager
