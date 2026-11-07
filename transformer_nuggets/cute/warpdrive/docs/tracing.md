@@ -6,7 +6,7 @@ Use the view that answers your question:
 
 | Question | View | What it records |
 |---|---|---|
-| Who runs, signals and owns storage? | [`describe()`](#inspect-the-kernel) | Declarations and available compile diagnostics |
+| Who runs, signals and owns storage? | [`describe()`](#inspect-the-kernel), or [as a graph](#draw-the-pipeline) | Declarations and available compile diagnostics |
 | Where does a handle open and close? | [Protocol trace](#trace-the-protocol) | Traced code sites, not runtime iterations |
 | When does a role work or wait? | [IKET](#iket) | Instrumented runtime ranges |
 | How do those ranges relate to channels? | [Pipeline plan](#join-a-capture-to-the-pipeline-plan) | A per-CTA, work-item model |
@@ -105,6 +105,143 @@ Two roles can still wait for each other's first publication: declaration counts 
 not establish progress. Runtime safety needs terminating work, matching epochs, a live
 dependency graph and storage for overlapping lifetimes. A timeout needs attribution, not
 an assumption that either the layer or the role body is correct.
+
+### Draw the pipeline
+
+`describe(format="mermaid")` draws the same declarations as a
+[Mermaid](https://mermaid.js.org/) flowchart, which GitHub renders in Markdown;
+`format="dot"` gives Graphviz DOT (`dot -Tsvg`). Like the text, it needs no compile and
+adds what a compile recorded: TMA check status, epoch ownership and named-barrier users.
+
+```python
+print(op.describe(format="mermaid"))
+```
+
+- **Roles** (blue) are role instances with their warps, register budget, CTA placement in a
+  cluster, and `raw`.
+- **Channels** run from producer to consumer, labelled like the text: stages, signal
+  mechanisms, FULL/EMPTY arrival counts, scope, sharing and storage. **Thick** edges cross
+  CTAs (pair-scoped); thin ones stay in a CTA. A channel with several roles on a side, or
+  slot-bound ends, is a grey junction: producers join it with a line and it points to each
+  consumer. Parallel channels that differ only in name and storage share one edge
+  (`k, kt, v, do ... each`).
+- **Synchronization that is not a handoff** is an orange hub joined by dotted lines: a
+  named barrier (`sync`, `arrive`, `native id`; listed in one box before a compile names
+  its users), a turnstile (`turn i`) and `Barriers` (to roles taking them as a parameter;
+  `barrier_ptr` users are not tracked).
+- **Other nodes:** `raw code` on an external channel side, `kernel code` calling a named
+  barrier natively, each work stream (pointing to its scheduler when it broadcasts), and one
+  note listing SMEM overlaps, shared buffers and TMEM aliases.
+
+The diagrams below are the uncompiled output for the single-CTA GEMM, FA4 forward and the
+2-CTA FA4 backward; print your build for current values.
+
+**GEMM** (`examples/gemm.py`): TMA → MMA → epilogue.
+
+```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 400}}}%%
+%% Gemm: 8 warps, single CTA, tcgen05 CtaGroup.ONE
+flowchart LR
+  role_epilogue["epilogue<br>warps 0-3 · 160 regs"]
+  role_load["load<br>warp 4 · 40 regs"]
+  role_mma["mma<br>warp 5 · 40 regs"]
+  stream_work[["stream work<br>OneShot(), Raster(along=m)<br>decoded locally in every role"]]
+  role_load -->|"ab · Ring(3)<br>Tma(49152 B) -#gt; Umma<br>full 1 x3, tx 49152 B<br>empty 1 x3<br>buffer A, B"| role_mma
+  role_mma -->|"acc · Ring(1)<br>Umma -#gt; Threads<br>full 1<br>empty 128"| role_epilogue
+  classDef role fill:#e8f0fe,stroke:#3b6db3,color:#111
+  class role_epilogue,role_load,role_mma role
+  classDef stream fill:#e6f4ea,stroke:#3a7d44,color:#111
+  class stream_work stream
+```
+
+**FA4 forward** (`examples/fa4_fwd.py`): each softmax instance owns one slot of `s`,
+`p_last` and `stats`; `mufu` (off by default, `turnstile=True`) makes them take turns
+around exp2.
+
+```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 400}}}%%
+%% FlashAttentionForward: 16 warps, single CTA, tcgen05 CtaGroup.ONE
+flowchart LR
+  role_softmax_0["softmax[0]<br>warps 0-3 · 192 regs"]
+  role_softmax_1["softmax[1]<br>warps 4-7 · 192 regs"]
+  role_correction["correction<br>warps 8-11 · 80 regs"]
+  role_mma["mma<br>warp 12 · 48 regs"]
+  role_epilogue["epilogue<br>warp 13 · 48 regs"]
+  role_load["load<br>warp 14 · 48 regs"]
+  stream_work[["stream work<br>OneShot(), Raster(along=m)<br>decoded locally in every role"]]
+  channel_s("s · Slots(2)<br>Umma -#gt; Threads<br>full 1 x2<br>empty 256 x2<br>release_fence tmem_store")
+  channel_p_last("p_last · Slots(2)<br>Threads -#gt; Umma<br>full 128 x2<br>empty 1 x2<br>commit_fence tmem_store")
+  channel_stats("stats · Slots(2)<br>Threads -#gt; Threads<br>full 128 x2<br>empty 128 x2<br>payload Float32(128, 2)")
+  turnstile_mufu{{"mufu<br>turnstile (disabled)"}}
+  storage_aliases["storage aliases<br>smem V (kv) overlaps K (kv)<br>tmem P inside S"]
+  role_mma --- channel_s
+  channel_s --> role_correction
+  channel_s -->|"slot 0"| role_softmax_0
+  channel_s -->|"slot 1"| role_softmax_1
+  role_softmax_0 ---|"slot 0"| channel_p_last
+  role_softmax_1 ---|"slot 1"| channel_p_last
+  channel_p_last --> role_mma
+  role_softmax_0 ---|"slot 0"| channel_stats
+  role_softmax_1 ---|"slot 1"| channel_stats
+  channel_stats --> role_correction
+  role_load -->|"q · Slots(2)<br>Tma(32768 B) -#gt; Umma<br>full 1 x2, tx 32768 B<br>empty 1 x2<br>buffer Q"| role_mma
+  role_load -->|"kv · Ring(3)<br>Tma(32768 B) -#gt; Umma<br>full 1 x3, tx 32768 B<br>empty 1 x3<br>buffer K, V"| role_mma
+  role_correction -->|"epi · Slots(2)<br>Threads -#gt; Threads<br>full 128 x2<br>empty 32 x2<br>buffer O, commit_fence smem_async"| role_epilogue
+  role_softmax_0 -.-|"turn 0"| turnstile_mufu
+  role_softmax_1 -.-|"turn 1"| turnstile_mufu
+  classDef role fill:#e8f0fe,stroke:#3b6db3,color:#111
+  class role_softmax_0,role_softmax_1,role_correction,role_mma,role_epilogue,role_load role
+  classDef stream fill:#e6f4ea,stroke:#3a7d44,color:#111
+  class stream_work stream
+  classDef channel fill:#f4f4f4,stroke:#777,color:#111
+  class channel_s,channel_p_last,channel_stats channel
+  classDef sync fill:#fdf2e0,stroke:#b26a00,color:#111
+  class turnstile_mufu sync
+  classDef storage fill:#fafafa,stroke:#aaa,stroke-dasharray:2 2,color:#111
+  class storage_aliases storage
+```
+
+**2-CTA FA4 backward** (`FlashAttentionBackward2Cta` in `examples/fa4_bwd.py`): every
+MMA-facing channel is pair-scoped, and the leader-only MMA warp issues for both CTAs. In
+the dS exchange each CTA's compute warps copy half of dS into the peer's SMEM; the copy
+completes on the peer's raw `xchg` barrier, and its `relay` warp forwards that arrival to
+the leader on `ds`. Hence `ds` joins compute and relay.
+
+```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 400}}}%%
+%% FlashAttentionBackward2Cta: 16 warps, CTA pair (2, 1, 1), tcgen05 CtaGroup.TWO, leader = rank 0
+flowchart LR
+  role_reduce["reduce<br>warps 0-3 · 136 regs · cta all"]
+  role_compute["compute<br>warps 4-11 · 136 regs · cta all"]
+  role_mma["mma<br>warp 12 · 104 regs · cta leader"]
+  role_load["load<br>warp 13 · 104 regs · cta all"]
+  role_relay["relay<br>warp 14 · 104 regs · cta all"]
+  stream_work[["stream work<br>OneShot(), Raster(along=m)<br>decoded locally in every role"]]
+  channel_ds("ds · Ring(1)<br>Warps -#gt; Umma<br>full leader 18<br>empty leader 1, peer 1<br>pair-scoped, release_mask 0b11, remote_scope cta, tail<br>buffer dS, dSx")
+  named_list_barriers["named barriers<br>compute_sync id 3 · 256 threads<br>reduce_sync id 4 · 128 threads<br>epi_sync_wg0 id 5 · 128 threads<br>epi_sync_wg1 id 6 · 128 threads<br>users known after a compile"]
+  barriers_xchg[("xchg<br>Barriers: 1 mbarriers, layer-initialized [1]<br>user-driven (unchecked)<br>roles reach it through barrier_ptr")]
+  storage_aliases["storage aliases<br>smem dKepi overlaps K (k)<br>smem dVepi overlaps V (v)<br>tmem P inside S<br>tmem dS inside dP<br>tmem dQ inside S"]
+  role_compute === channel_ds
+  role_relay === channel_ds
+  channel_ds ==> role_mma
+  role_load ==>|"k, kt, v, do · Ring(1) each<br>Tma(32768 B) -#gt; Umma<br>full leader 1, tx 65536 B (leader-armed)<br>empty leader 1, peer 1<br>pair-scoped, release_mask 0b11, tail<br>k: buffer K · kt: buffer Kt · v: buffer V · do: buffer dO, dOt"| role_mma
+  role_load ==>|"q, qt · Ring(1) each<br>Tma(16384 B) -#gt; Umma<br>full leader 1, tx 32768 B (leader-armed)<br>empty leader 1, peer 1<br>pair-scoped, release_mask 0b11, tail<br>q: buffer Q · qt: buffer Qt"| role_mma
+  role_load -->|"lse · Ring(1)<br>Tma(512 B) -#gt; Warps<br>full 1, tx 512 B<br>empty 8<br>CTA-local<br>buffer LSE, release_fence smem_async"| role_compute
+  role_load -->|"dpsum · Ring(1)<br>Tma(512 B) -#gt; Warps<br>full 1, tx 512 B<br>empty 8<br>CTA-local<br>override release_fence smem_async -#gt; none  (differs from derived)<br>buffer dPsum"| role_compute
+  role_mma ==>|"s, dp · Ring(1) each<br>Umma -#gt; Warps<br>full leader 1, peer 1<br>empty leader 16<br>pair-scoped, commit_mask 0b11, remote_scope cta<br>release_fence tmem_store"| role_compute
+  role_mma ==>|"dq · Ring(1)<br>Umma -#gt; Warps<br>full leader 1, peer 1<br>empty leader 8<br>pair-scoped, commit_mask 0b11, remote_scope cta"| role_reduce
+  role_mma ==>|"dkv · Slots(2)<br>Umma -#gt; Warps<br>full leader 1 x2, peer 1 x2<br>empty leader 16 x2<br>pair-scoped, commit_mask 0b11, remote_scope cta"| role_compute
+  classDef role fill:#e8f0fe,stroke:#3b6db3,color:#111
+  class role_reduce,role_compute,role_mma,role_load,role_relay role
+  classDef stream fill:#e6f4ea,stroke:#3a7d44,color:#111
+  class stream_work stream
+  classDef channel fill:#f4f4f4,stroke:#777,color:#111
+  class channel_ds channel
+  classDef sync fill:#fdf2e0,stroke:#b26a00,color:#111
+  class named_list_barriers,barriers_xchg sync
+  classDef storage fill:#fafafa,stroke:#aaa,stroke-dasharray:2 2,color:#111
+  class storage_aliases storage
+```
 
 ## Trace the protocol
 

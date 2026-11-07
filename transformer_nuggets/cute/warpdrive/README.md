@@ -124,6 +124,8 @@ finish. [Storage](docs/storage.md) shows how a handle selects its own buffer sta
 `print(op.describe())` shows what warpdrive worked out for a kernel: roles, warps, register
 budgets, every channel's per-CTA arrival counts, masks and TMA bytes, the scheduler and TMEM.
 [Tracing](docs/tracing.md#inspect-the-kernel) has the full output for the 2-CTA persistent GEMM.
+`op.describe(format="mermaid")` draws the same pipeline as a
+[diagram](docs/tracing.md#draw-the-pipeline).
 
 ## More examples and details
 
