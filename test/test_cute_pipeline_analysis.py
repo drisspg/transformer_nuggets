@@ -32,6 +32,7 @@ from transformer_nuggets.cute.profiler.pipeline import (
 from transformer_nuggets.cute.profiler import parse_iket
 from transformer_nuggets.cute.profiler.pipeline.analysis import ring_occupancy_samples
 from transformer_nuggets.utils.merge_traces import merge_traces
+from perfetto_trace import read_slices
 
 
 ANNOTATED_SOURCE = """
@@ -163,40 +164,6 @@ def test_semantic_edges_survive_role_edge_deduplication() -> None:
     assert [item.dependency.resource for item in timeline.dependencies] == ["x", "y"]
 
 
-def test_iket_json_join(tmp_path: Path) -> None:
-    timeline = toy_plan().schedule(iterations=2)
-    names = ["load.x", "compute.x"]
-    ranges = []
-    locations = [
-        {"ctaId": [0, 0, 0], "warpId": 0},
-        {"ctaId": [0, 0, 0], "warpId": 1},
-    ]
-    for item in timeline.regions:
-        ranges.append(
-            {
-                "startTs": 1_000 + item.start * 10,
-                "endTs": 1_000 + item.end * 10,
-                "rangeNameIdx": names.index(item.region.name),
-                "warpLocIdxs": [0 if item.region.role == "load" else 1] * 2,
-            }
-        )
-    path = tmp_path / "iket.json"
-    path.write_text(
-        json.dumps(
-            {
-                "stringTable": names,
-                "locationTable": locations,
-                "launches": [{"kernelName": "toy", "ranges": ranges}],
-            }
-        )
-    )
-
-    measured = join(parse_iket(path), timeline)
-
-    assert len(measured.regions) == len(timeline.regions)
-    assert measured.duration_ns == timeline.logical_duration * 10
-
-
 def write_iket(path: Path, ranges: list[tuple[str, int, int, int]]) -> Path:
     """Write an IKET JSON capture of CTA (0, 0, 0) from ``(name, warp, start, end)`` ranges."""
     names = sorted({name for name, *_ in ranges})
@@ -224,6 +191,32 @@ def write_iket(path: Path, ranges: list[tuple[str, int, int, int]]) -> Path:
         )
     )
     return path
+
+
+def logical_iket(path: Path, timeline) -> Path:
+    """An IKET capture of ``timeline`` at 10 ns per logical tick, warp 0 loading, warp 1
+    computing."""
+    return write_iket(
+        path,
+        [
+            (
+                item.region.name,
+                0 if item.region.role == "load" else 1,
+                1_000 + item.start * 10,
+                1_000 + item.end * 10,
+            )
+            for item in timeline.regions
+        ],
+    )
+
+
+def test_iket_json_join(tmp_path: Path) -> None:
+    timeline = toy_plan().schedule(iterations=2)
+
+    measured = join(parse_iket(logical_iket(tmp_path / "iket.json", timeline)), timeline)
+
+    assert len(measured.regions) == len(timeline.regions)
+    assert measured.duration_ns == timeline.logical_duration * 10
 
 
 def two_warp_plan() -> PipelinePlan:
@@ -456,20 +449,13 @@ def test_perfetto_zero_duration_slice_begins_before_it_ends(tmp_path: Path) -> N
     )
     measured = MeasuredCapture((0, 0, 0), 5, 4, regions)
 
-    trace = Trace()
-    trace.ParseFromString(
-        write_pipeline_perfetto(tmp_path / "empty.pftrace", timeline, measured).read_bytes()
-    )
+    output = write_pipeline_perfetto(tmp_path / "empty.pftrace", timeline, measured)
 
-    open_slices: dict[int, int] = {}
-    for packet in trace.packet:
-        event = packet.track_event
-        if event.type == TrackEvent.TYPE_SLICE_BEGIN:
-            open_slices[event.track_uuid] = open_slices.get(event.track_uuid, 0) + 1
-        elif event.type == TrackEvent.TYPE_SLICE_END:
-            assert open_slices.get(event.track_uuid, 0) > 0, "slice end without a begin"
-            open_slices[event.track_uuid] -= 1
-    assert not any(open_slices.values())
+    # read_slices raises on an end before its begin.
+    assert [(s.name, s.start_ns, s.end_ns) for s in read_slices(output)] == [
+        ("B · tile 0", 0, 4),
+        ("A · tile 0", 0, 0),
+    ]
 
 
 INDEXED_SOURCE = """
@@ -585,27 +571,7 @@ def test_capture_cli_reanalyzes_an_existing_trace(tmp_path: Path, capsys) -> Non
     source = tmp_path / "annotated.py"
     source.write_text(ANNOTATED_SOURCE)
     timeline = extract_plan(source).schedule(iterations=3)
-    names = ["load.x", "compute.x"]
-    locations = [{"ctaId": [0, 0, 0], "warpId": 0}, {"ctaId": [0, 0, 0], "warpId": 1}]
-    ranges = [
-        {
-            "startTs": 1_000 + item.start * 10,
-            "endTs": 1_000 + item.end * 10,
-            "rangeNameIdx": names.index(item.region.name),
-            "warpLocIdxs": [0 if item.region.role == "load" else 1] * 2,
-        }
-        for item in timeline.regions
-    ]
-    trace = tmp_path / "iket.trace.json"
-    trace.write_text(
-        json.dumps(
-            {
-                "stringTable": names,
-                "locationTable": locations,
-                "launches": [{"kernelName": "demo", "ranges": ranges}],
-            }
-        )
-    )
+    trace = logical_iket(tmp_path / "iket.trace.json", timeline)
 
     rc = main(
         [
