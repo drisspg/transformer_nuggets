@@ -66,6 +66,7 @@ from cutlass import Int32, cute, pipeline
 from cutlass._mlir.dialects import nvvm as _nvvm
 from cutlass.cutlass_dsl import if_generate
 
+from transformer_nuggets.cute.warpdrive._compat import mbarrier_arrive
 from transformer_nuggets.cute.warpdrive.cluster import (
     ALL,
     FILLS,
@@ -1258,9 +1259,9 @@ class _End:
         if len(shared) == 1:  # every CTA of the role signals the same ranks
             for c in shared.pop():
                 if self.ctas == (c,):
-                    cute.arch.mbarrier_arrive(bar, scope=scope)
+                    mbarrier_arrive(bar, scope=scope)
                 else:
-                    cute.arch.mbarrier_arrive(bar, c, scope=scope)
+                    mbarrier_arrive(bar, c, scope=scope)
             return
         # Targets relative to the signalling CTA (its MMA pair): pick them by rank.
         widths = {len(cs) for cs in targets.values()}
@@ -1268,7 +1269,7 @@ class _End:
         rank = cluster_rank()
         for k in range(widths.pop()):
             c = rank_value({r: cs[k] for r, cs in targets.items()}, rank)
-            cute.arch.mbarrier_arrive(bar, c, scope=scope)
+            mbarrier_arrive(bar, c, scope=scope)
 
     def _next(self, slot, op):
         """(index, phase, label) of the next use, advancing this end's state."""

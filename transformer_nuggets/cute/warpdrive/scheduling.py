@@ -88,6 +88,7 @@ from dataclasses import dataclass, field, fields, is_dataclass
 import cutlass
 from cutlass import Int32, Int64, cute
 
+from transformer_nuggets.cute.warpdrive._compat import store_async_dsmem
 from transformer_nuggets.cute.warpdrive.channels import Ring, Slots, Threads, Tma
 from transformer_nuggets.cute.warpdrive.protocol import (
     Lineage,
@@ -1348,7 +1349,7 @@ def _publish_cluster(slot_ptr, full, values, targets: cutlass.Constexpr):
         for c in cutlass.range_constexpr(len(targets)):
             for q in cutlass.range_constexpr(len(words) // 4):
                 dst = cute.make_ptr(Int32, base + 16 * q, cute.AddressSpace.smem, assumed_align=16)
-                cute.arch.store_async_dsmem(dst, tuple(words[4 * q : 4 * q + 4]), full, targets[c])
+                store_async_dsmem(dst, tuple(words[4 * q : 4 * q + 4]), full, targets[c])
 
 
 @cute.jit

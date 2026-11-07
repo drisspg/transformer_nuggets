@@ -7,7 +7,10 @@ attention-gym's ``attn_gym/_backends/cute/compat.py``.
 
 from importlib.metadata import version
 
-from cutlass import cute
+from cutlass import Int32, cute
+from cutlass._mlir import ir
+from cutlass._mlir.dialects import llvm, nvvm
+from cutlass.cutlass_dsl import T, dsl_user_op
 from packaging.specifiers import SpecifierSet
 from packaging.version import Version
 
@@ -34,21 +37,103 @@ if not cutedsl_version_matches(f">={MIN_CUTEDSL_VERSION}"):
     )
 
 
+def _remote(ptr: cute.Pointer, rank: ir.Value, loc, ip) -> ir.Value:
+    """``ptr``'s address in the SMEM of the cluster CTA ``rank`` (``mapa``)."""
+    dsmem = llvm.PointerType.get(cute.AddressSpace.dsmem)
+    return nvvm.mapa(dsmem, ptr.to_llvm_ptr(loc=loc, ip=ip), rank, loc=loc, ip=ip)
+
+
 if cutedsl_version_matches(">=4.8"):
     from cutlass.memory import SmemAllocator, TmemAllocator
     from cutlass.tensor_utils import LayoutEnum
+
+    store_async_dsmem = cute.arch.store_async_dsmem
 else:
     from cutlass.utils import LayoutEnum, SmemAllocator, TmemAllocator
+
+    @dsl_user_op
+    def store_async_dsmem(
+        smem_ptr: cute.Pointer,
+        value: int | Int32 | tuple[int | Int32, ...],
+        mbar_ptr: cute.Pointer,
+        peer_cta_rank: int | Int32,
+        *,
+        loc=None,
+        ip=None,
+    ) -> None:
+        """``cute.arch.store_async_dsmem`` with 4.8's 2- and 4-word ``value`` tuples (one
+        ``st.async.v2``/``.v4``); 4.6 and 4.7 store one word. Inline PTX: their libNVVM cannot
+        lower a vector ``st.async``."""
+        words = value if isinstance(value, tuple) else (value,)
+        n = len(words)
+        if n not in (1, 2, 4):
+            raise ValueError(f"store_async_dsmem stores 1, 2 or 4 words, got {n}")
+        if smem_ptr.alignment % (4 * n):
+            raise ValueError(
+                f"store_async_dsmem: a {n}-word store needs a {4 * n}-byte aligned smem_ptr, got "
+                f"alignment {smem_ptr.alignment}"
+            )
+        rank = Int32(peer_cta_rank).ir_value(loc=loc, ip=ip)
+        addr, mbar = (
+            llvm.ptrtoint(T.i32(), _remote(ptr, rank, loc, ip), loc=loc, ip=ip)
+            for ptr in (smem_ptr, mbar_ptr)
+        )
+        words = [Int32(w).ir_value(loc=loc, ip=ip) for w in words]
+        shape = "" if n == 1 else f".v{n}"
+        data = ", ".join(f"${i + 1}" for i in range(n))
+        data = data if n == 1 else f"{{{data}}}"
+        llvm.inline_asm(
+            None,
+            [addr, *words, mbar],
+            f"st.async.shared::cluster.mbarrier::complete_tx::bytes{shape}.b32 [$0], {data}, "
+            f"[${n + 1}];",
+            ",".join(["r"] * (n + 2)),
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+
 
 if cutedsl_version_matches(">=4.7"):
     from cutlass.base_dsl import Arch
 
     # The legacy FastDivmodDivisor warns from 4.7; the divmod arithmetic is the same.
     FastDivmodDivisor = cute.FastDivmodDivisorV2
+    mbarrier_arrive = cute.arch.mbarrier_arrive
 else:
     from cutlass.base_dsl.arch import Arch
 
     FastDivmodDivisor = cute.FastDivmodDivisor
+
+    @dsl_user_op
+    def mbarrier_arrive(
+        mbar_ptr: cute.Pointer,
+        peer_cta_rank_in_cluster: int | Int32 | None = None,
+        arrive_count: int | Int32 = 1,
+        *,
+        scope: nvvm.MemScopeKind | None = None,
+        loc=None,
+        ip=None,
+    ) -> None:
+        """``cute.arch.mbarrier_arrive`` with the ``scope`` keyword 4.7 added (default CTA).
+
+        4.6 always arrives at CTA scope; the NVVM op it lowers to already takes the scope.
+        """
+        if peer_cta_rank_in_cluster is None:
+            addr = mbar_ptr.to_llvm_ptr(loc=loc, ip=ip)
+        else:
+            rank = Int32(peer_cta_rank_in_cluster).ir_value(loc=loc, ip=ip)
+            addr = _remote(mbar_ptr, rank, loc, ip)
+        nvvm.mbarrier_arrive(
+            None,
+            addr,
+            count=Int32(arrive_count).ir_value(loc=loc, ip=ip),
+            scope=nvvm.MemScopeKind.CTA if scope is None else scope,
+            loc=loc,
+            ip=ip,
+        )
 
 
 __all__ = [
@@ -59,4 +144,6 @@ __all__ = [
     "SmemAllocator",
     "TmemAllocator",
     "cutedsl_version_matches",
+    "mbarrier_arrive",
+    "store_async_dsmem",
 ]
