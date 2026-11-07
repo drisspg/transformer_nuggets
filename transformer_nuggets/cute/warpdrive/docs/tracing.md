@@ -295,9 +295,9 @@ carry 2-D coordinates. Two example views use it:
 
 ```bash
 # persistent GEMM tiles per CTA and a grouped GEMM's groups
-python -m transformer_nuggets.cute.warpdrive.examples.schedule_views OUTDIR --ctas 148
+python -m transformer_nuggets.cute.warpdrive.examples.schedule_views OUTDIR --ctas 152
 # the Qwen megakernel's instruction table under its latency model; --timeline overlays a
-# capture (JSON format in the module docstring)
+# trace="globaltimer" capture (overlay() in the module docstring writes it)
 python -m transformer_nuggets.cute.warpdrive.examples.qwen_megakernel_viz OUT.html --ctas 152
 ```
 

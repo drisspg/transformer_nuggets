@@ -1,6 +1,6 @@
 """``schedule_html`` and the static-schedule views built on ``WorkStream.assignment``: the
 page carries every item once and needs nothing outside it; the GEMM views cover their work
-spaces; the megakernel view replays ``build_table``'s latency model."""
+spaces; the megakernel view draws ``list_schedule``'s latency model and a traced overlay."""
 
 import json
 import math
@@ -42,6 +42,8 @@ def test_schedule_page_carries_each_item_once():
         schedule_html("t", "s", [*items, Item("c", deps=(5,))], [[0], [1, 2]])
     with pytest.raises(ValueError, match="CTA is not one of rows"):
         schedule_html("t", "s", items, [[0], [1]], measured={0: (2, 0.0, 1.0)})
+    with pytest.raises(ValueError, match="give items spans"):
+        schedule_html("t", "s", [Item("a"), Item("b")], [[0], [1]], measured={0: (0, 0.0, 1.0)})
 
 
 def test_labels_cannot_break_out_of_the_page_data():
@@ -77,14 +79,19 @@ def test_grouped_host_decode_covers_each_group_exactly():
     assert len(data["label"]) == sum(math.ceil(size / tile_m) for size in sizes) * n_tiles
 
 
-def test_megakernel_model_replays_build_table():
-    """The replayed schedule is build_table's (megakernel_view asserts it per CTA); rows wait
+def test_megakernel_model_waits_for_gates_and_ctas():
+    """The table runs list_schedule's CTAs (megakernel_view asserts it per CTA); rows wait
     for their gates and their CTA, and the critical path runs from 0 to the makespan."""
     ctas = 61
-    rows, _ = mkv.instruction_rows(mk.QwenDecodeMegakernel(splits=4), ctas)
-    pred = mkv.predict(rows, ctas)
+    rows = mk.instruction_rows(mk.QwenDecodeMegakernel(splits=4))
+    pred = mk.list_schedule(rows, ctas)
     for p in pred:
         assert all(p.start >= pred[g].end + mk.DEPENDENCY_LATENCY - 1e-9 for g in p.gates)
+        if p.after is None:
+            assert p.start == 0
+        else:  # the row that set its start: a gate plus the latency, or its CTA's previous row
+            latency = mk.DEPENDENCY_LATENCY if p.after in p.gates else 0.0
+            assert p.start == pred[p.after].end + latency
     for cta in range(ctas):
         spans = [(p.start, p.end) for p in pred if p.cta == cta]
         assert all(a[1] <= b[0] + 1e-9 for a, b in zip(spans, spans[1:]))
@@ -92,3 +99,34 @@ def test_megakernel_model_replays_build_table():
     assert pred[path[0]].start == 0 and pred[path[-1]].end == max(p.end for p in pred)
     data = page_data(mkv.megakernel_view(ctas, splits=4))
     assert data["critical"] == path and sum(map(len, data["rows"])) == len(rows)
+
+
+def test_megakernel_overlay_from_trace_events():
+    """Compute work items become [table row, CTA, start, end] in us from the first start; load
+    items and regions are not spans. The overlay lands on the rows' drawn items."""
+    from types import SimpleNamespace
+
+    from transformer_nuggets.cute.profiler import Event
+
+    ctas, splits = 61, 4
+    runner = SimpleNamespace(max_ctas=ctas, op=SimpleNamespace(splits=splits))
+    events = [
+        Event(5_000, 2_000, 0, "compute", 0, unit_id=1, payload=1),
+        Event(1_000, 1_500, 0, "compute", 0, unit_id=0, payload=0),
+        Event(900, 100, 1, "load", 8, unit_id=0, payload=0),
+        Event(1_200, 300, 2, "poll", 0, unit_id=0, payload=0),
+    ]
+    data = mkv.overlay(events, runner)
+    assert data == {
+        "unit": "us",
+        "ctas": ctas,
+        "splits": splits,
+        "spans": [[0, 0, 0.0, 1.5], [1, 1, 4.0, 6.0]],
+    }
+    page = page_data(mkv.megakernel_view(ctas, splits, data))
+    assert len(page["measured"]) == 2
+    data["spans"][1][1] = 2  # table row 1 runs on CTA 1: a capture of another table
+    with pytest.raises(ValueError, match="not of this static table"):
+        mkv.megakernel_view(ctas, splits, data)
+    with pytest.raises(ValueError, match="no compute work-item ranges"):
+        mkv.overlay(events[2:], runner)

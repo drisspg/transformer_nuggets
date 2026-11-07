@@ -1,9 +1,9 @@
 """The Qwen3 megakernel's static schedule, drawn per CTA (``schedule_html``).
 
 ``build_table`` assigns the decode step's instructions to CTAs with a list schedule over a
-latency model (``assign_static``: ``ROW_COST`` per row, ``DEPENDENCY_LATENCY`` per producer
-group) and lays them out ``[slot][cta]`` for ``StaticPersistent``. This replays that model to
-draw, for each CTA, its rows coloured by op and shaded by layer, their predicted start and
+latency model (``list_schedule``: ``ROW_COST`` per row, ``DEPENDENCY_LATENCY`` per producer
+group) and lays them out ``[slot][cta]`` for ``StaticPersistent`` (``assign_static``). This
+draws, for each CTA, its rows coloured by op and shaded by layer, their predicted start and
 end, the producer rows each row waits for (the last row of each producer group: the one the
 model says gates it), and the predicted critical path. ``WorkStream.assignment`` maps the
 table rows back to CTAs the way the kernel runs them.
@@ -11,8 +11,16 @@ table rows back to CTAs the way the kernel runs them.
 A capture can be overlaid (``--timeline``): a JSON file
 ``{"unit": "us", "ctas": 152, "splits": 16, "spans": [[table_row, cta, start, end], ...]}``
 (``ctas`` and ``splits`` optional, checked against the drawn table), times from any common
-origin, for example the ``item`` and ``done`` stamps of a ``timeline=True`` run converted to
-microseconds.
+origin. ``overlay`` writes one from the compute work items of a ``trace="globaltimer"`` launch
+(``qwen_megakernel_trace``)::
+
+    runner = QwenMegakernel(weights, max_len, trace="globaltimer")
+    runner(weights, token, pos, *caches)  # compile, warm, and set the step's token and position
+    with trace_session(runner) as session:
+        runner.launch(*caches)
+    Path("capture.json").write_text(json.dumps(overlay(session.events, runner)))
+
+Draw it::
 
     python -m transformer_nuggets.cute.warpdrive.examples.qwen_megakernel_viz OUT.html \\
         [--ctas 152] [--splits 16] [--timeline capture.json]
@@ -20,69 +28,15 @@ microseconds.
 
 import argparse
 import json
-from dataclasses import dataclass
 from pathlib import Path
-from unittest import mock
 
+from transformer_nuggets.cute.profiler import Event
 from transformer_nuggets.cute.warpdrive.examples import qwen_megakernel as mk
+from transformer_nuggets.cute.warpdrive.examples.qwen_megakernel_trace import item_ranges
 from transformer_nuggets.cute.warpdrive.schedule_html import Item, schedule_html
 
-OPS = ("QKV", "ATTN", "OPROJ", "GATEUP", "DOWN", "LMHEAD")
 
-
-def instruction_rows(op: mk.QwenDecodeMegakernel, ctas: int):
-    """``(rows, table)``: the ``(words, producer groups, completed group)`` rows, in
-    dependency order, that ``build_table`` hands ``assign_static``, and the table it returns.
-    ``build_table`` keeps the rows local, so this records the call."""
-    rows = []
-
-    def record(given, n):
-        rows.extend(given)
-        return assign_static(given, n)
-
-    assign_static = mk.assign_static
-    with mock.patch.object(mk, "assign_static", record):
-        table = mk.build_table(op, ctas)
-    return rows, table
-
-
-@dataclass
-class Predicted:
-    """One row as the latency model schedules it."""
-
-    cta: int
-    start: float
-    end: float
-    gates: tuple[int, ...]  # the last row of each producer group it waits for
-    after: int | None  # the row that set its start (a gate, or its CTA's previous row)
-
-
-def predict(rows, ctas: int) -> list[Predicted]:
-    """Replay ``assign_static``'s list schedule, recording each row's span and gates."""
-    last: dict[tuple, int] = {}  # producer group -> its last-finishing row
-    finished: dict[tuple, float] = {}
-    free = [0.0] * ctas
-    tail: list[int | None] = [None] * ctas  # each CTA's previous row
-    out = []
-    for i, (words, deps, group) in enumerate(rows):
-        known = [d for d in deps if d in finished]
-        ready = max((finished[d] + mk.DEPENDENCY_LATENCY for d in known), default=0.0)
-        cta = min(range(ctas), key=lambda c: (max(free[c], ready), c))
-        start = max(free[cta], ready)
-        gate = max(known, key=finished.__getitem__, default=None)
-        after = last[gate] if gate is not None and ready >= free[cta] else tail[cta]
-        out.append(
-            Predicted(
-                cta, start, start + mk.ROW_COST[words[0]], tuple(last[d] for d in known), after
-            )
-        )
-        free[cta], tail[cta] = out[-1].end, i
-        if out[-1].end >= finished.get(group, 0.0):
-            finished[group], last[group] = out[-1].end, i
-    return out
-
-
-def critical_path(pred: list[Predicted]) -> list[int]:
+def critical_path(pred: list[mk.RowSpan]) -> list[int]:
     """Rows from the start to the last-finishing row, each the one that set the next's start."""
     i = max(range(len(pred)), key=lambda r: pred[r].end)
     path = []
@@ -100,7 +54,7 @@ def _label(words, deps, table_row: int) -> str:
         case mk.ATTN:
             what = f"ATTN layer {layer} · kv head {a}, split {b}"
         case mk.OPROJ | mk.DOWN:
-            what = f"{OPS[kind]} layer {layer} · rows {a * mk.ROWS}.. · k split {b}"
+            what = f"{mk.OP_NAMES[kind]} layer {layer} · rows {a * mk.ROWS}.. · k split {b}"
         case mk.GATEUP:
             what = f"GATEUP layer {layer} · tile {a}"
         case _:
@@ -111,24 +65,24 @@ def _label(words, deps, table_row: int) -> str:
 
 def megakernel_view(ctas: int, splits: int = 16, measured: dict | None = None) -> str:
     op = mk.QwenDecodeMegakernel(splits=splits)
-    rows, table = instruction_rows(op, ctas)
-    pred = predict(rows, ctas)
+    rows, table = mk.instruction_rows(op), mk.build_table(op, ctas)
+    pred = mk.list_schedule(rows, ctas)
     by_cta: list[list[int]] = [[] for _ in range(ctas)]
     for i, p in enumerate(pred):
         by_cta[p.cta].append(i)
     # The kernel's view: StaticPersistent over the [slot][cta] table, padding rows dropped.
     host = table.tolist()
     assigned = op.work.assignment(table, max_ctas=ctas, decode=lambda t: (host[t][0] >= 0, t))
-    table_row = {}
+    table_row, table_cta = {}, {}
     for cta, items in enumerate(assigned):
-        assert len(items) == len(by_cta[cta]), "the replayed model disagrees with build_table"
+        assert len(items) == len(by_cta[cta]), "build_table disagrees with list_schedule"
         for (t, _), i in zip(items, by_cta[cta]):
-            assert host[t][:4] == rows[i][0], "the replayed model disagrees with build_table"
-            table_row[t] = i
+            assert host[t][:4] == rows[i][0], "build_table disagrees with list_schedule"
+            table_row[t], table_cta[t] = i, cta
     items = [
         Item(
             _label(words, deps, t),
-            OPS[words[0]],
+            mk.OP_NAMES[words[0]],
             shade=words[1] / (mk.LAYERS - 1) if words[0] != mk.LMHEAD else 0.0,
             start=pred[i].start,
             end=pred[i].end,
@@ -139,7 +93,15 @@ def megakernel_view(ctas: int, splits: int = 16, measured: dict | None = None) -
     ]
     spans = None
     if measured is not None:
-        spans = {table_row[t]: (cta, s, e) for t, cta, s, e in measured["spans"] if t in table_row}
+        # A capture of another table (the atomic schedule, an ops subset) would land on the
+        # wrong rows: its rows run on other CTAs.
+        for t, cta, _, _ in measured["spans"]:
+            if table_cta.get(t) != cta:
+                raise ValueError(
+                    f"measured table row {t} ran on CTA {cta}, but this table runs it on "
+                    f"{table_cta.get(t)}: the capture is not of this static table"
+                )
+        spans = {table_row[t]: (cta, s, e) for t, cta, s, e in measured["spans"]}
     path = critical_path(pred)
     makespan = max(p.end for p in pred)
     return schedule_html(
@@ -149,10 +111,10 @@ def megakernel_view(ctas: int, splits: int = 16, measured: dict | None = None) -
         by_cta,
         critical=path,
         measured=spans,
-        kinds=OPS,
+        kinds=mk.OP_NAMES,
         notes=[
-            "Predicted spans replay assign_static's list schedule: ROW_COST "
-            + ", ".join(f"{OPS[k]} {c} us" for k, c in mk.ROW_COST.items())
+            "Predicted spans are list_schedule's model: ROW_COST "
+            + ", ".join(f"{mk.OP_NAMES[k]} {c} us" for k, c in mk.ROW_COST.items())
             + f", plus {mk.DEPENDENCY_LATENCY} us per producer group. Illustrative, not "
             "measured.",
             "Arrows on hover: the last row of each producer group the row waits for (the one "
@@ -166,6 +128,22 @@ def megakernel_view(ctas: int, splits: int = 16, measured: dict | None = None) -
             ),
         ],
     )
+
+
+def overlay(events: list[Event], runner: mk.QwenMegakernel) -> dict:
+    """The ``--timeline`` JSON of one traced launch of ``runner``: each table row's compute
+    work item on its CTA, in us from the earliest one's start."""
+    items = sorted(item_ranges(events).items())
+    if not items:
+        raise ValueError(
+            "no compute work-item ranges: trace a launch of a trace='globaltimer' runner"
+        )
+    t0 = min(e.start_ns for _, e in items)
+    spans = [
+        [row, e.unit_id, (e.start_ns - t0) / 1e3, (e.start_ns + e.dur_ns - t0) / 1e3]
+        for row, e in items
+    ]
+    return {"unit": "us", "ctas": runner.max_ctas, "splits": runner.op.splits, "spans": spans}
 
 
 def main():

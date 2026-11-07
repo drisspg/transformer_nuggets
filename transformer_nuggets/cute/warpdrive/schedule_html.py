@@ -85,6 +85,8 @@ def schedule_html(
         raise ValueError("a measured span's CTA is not one of rows")
     kinds = list(dict.fromkeys([*kinds, *(item.kind for item in items)]))
     timed = all(item.start is not None and item.end is not None for item in items)
+    if (critical or measured) and not (timed and items):
+        raise ValueError("critical and measured are drawn on the timeline: give items spans")
     data = {
         "kinds": kinds,
         "colors": [PALETTE[i % len(PALETTE)] for i in range(len(kinds))],
