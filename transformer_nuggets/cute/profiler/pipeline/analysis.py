@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from dataclasses import dataclass, replace
 import statistics
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 
 from transformer_nuggets.cute.profiler.pipeline.measure import MeasuredCapture
 from transformer_nuggets.cute.profiler.pipeline.plan import Dependency, Timeline
@@ -178,7 +178,6 @@ def analyze_pipeline(
         timer_epsilon_ns=timer_epsilon_ns,
     )
     measured_critical_path = critical_path(tuple(measured_weights), edges, measured_weights)
-    blocker_by_key = {(item.name, item.iteration): item for item in blockers}
     blockers = tuple(
         replace(
             item,
@@ -191,11 +190,8 @@ def analyze_pipeline(
         logical_critical_path=logical_critical_path,
         measured_critical_path=measured_critical_path,
         blockers=blockers,
-        rings=ring_analysis(timeline, measured, blocker_by_key),
-        depth_counterfactuals=depth_counterfactuals(
-            timeline,
-            measured_weights,
-        ),
+        rings=ring_analysis(timeline, measured, blockers),
+        depth_counterfactuals=depth_counterfactuals(timeline, measured_weights),
         logical_critical_cycle=critical_cycle(timeline, logical_weights, cycle_cap=cycle_cap),
     )
 
@@ -252,7 +248,7 @@ def concrete_edges(
                     dependency.resource,
                 )
             )
-    return tuple(unique_edges(edges))
+    return tuple(dict.fromkeys(edges))
 
 
 def critical_path(
@@ -343,8 +339,7 @@ def measured_blockers(
             ],
             key=lambda item: (item[0], item[1].kind, item[1].source),
         )
-        ready_ns = arrivals[-1][0] if arrivals else 0
-        binding = arrivals[-1][1] if arrivals else None
+        ready_ns, binding = arrivals[-1] if arrivals else (0, None)
         robustness = ready_ns - arrivals[-2][0] if len(arrivals) > 1 else None
         ready_delay_ns = max(start_ns - ready_ns, 0)
         if item.wait_ns is None:
@@ -356,6 +351,7 @@ def measured_blockers(
             wait_inside_ns = min(item.wait_ns, end_ns - start_ns)
             busy_ns = end_ns - start_ns - wait_inside_ns
         weights[key] = float(busy_ns + ready_delay_ns)
+        blocker = binding if wait_inside_ns else None
         blockers.append(
             StageBlocker(
                 name=key[0],
@@ -367,9 +363,9 @@ def measured_blockers(
                 wait_inside_ns=wait_inside_ns,
                 ready_delay_ns=ready_delay_ns,
                 busy_ns=busy_ns,
-                blocker=binding.source if binding and wait_inside_ns else None,
-                blocker_kind=binding.kind if binding and wait_inside_ns else None,
-                blocker_resource=binding.resource if binding and wait_inside_ns else None,
+                blocker=blocker.source if blocker else None,
+                blocker_kind=blocker.kind if blocker else None,
+                blocker_resource=blocker.resource if blocker else None,
                 blocker_robustness_ns=robustness,
                 wait_source="inferred" if item.wait_ns is None else "measured",
                 slack_ns=0.0,
@@ -444,7 +440,7 @@ def ring_occupancy_samples(
 def ring_analysis(
     timeline: Timeline,
     measured: MeasuredCapture,
-    blockers: Mapping[NodeKey, StageBlocker],
+    blockers: Iterable[StageBlocker],
 ) -> tuple[RingAnalysis, ...]:
     """Measure ring occupancy, run-ahead, and reuse-attributed wait."""
     resources = {resource.name: resource for resource in timeline.resources}
@@ -473,7 +469,7 @@ def ring_analysis(
             max_run_ahead = max(max_run_ahead, fill_index - released)
         reuse_wait_ns = sum(
             stage.wait_inside_ns
-            for stage in blockers.values()
+            for stage in blockers
             if stage.blocker_kind == "reuse" and stage.blocker_resource == resource_name
         )
         results.append(
@@ -588,11 +584,6 @@ def critical_cycle(
         total_distance=total_distance,
         cycles_checked=len(cycles),
     )
-
-
-def unique_edges(edges: list[ConcreteEdge]) -> list[ConcreteEdge]:
-    """Deduplicate exact concrete edges while preserving order."""
-    return list(dict.fromkeys(edges))
 
 
 def format_node(node: NodeKey | None) -> str:

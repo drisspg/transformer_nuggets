@@ -38,7 +38,7 @@ def trace_file(path: str | Path) -> Path:
         return path.with_suffix("").with_suffix(".pftrace")
     if path.suffix == ".json":
         return path.with_suffix(".pftrace")
-    return Path(f"{path}.pftrace") if path.suffix else path.with_suffix(".pftrace")
+    return Path(f"{path}.pftrace")
 
 
 @dataclass
