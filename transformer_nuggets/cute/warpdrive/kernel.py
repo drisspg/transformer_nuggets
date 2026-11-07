@@ -50,6 +50,7 @@ from transformer_nuggets.cute.warpdrive.cluster import (
 )
 from transformer_nuggets.cute.warpdrive.describe import describe_kernel
 from transformer_nuggets.cute.warpdrive.describe_graph import describe_graph
+from transformer_nuggets.cute.warpdrive.describe_html import describe_html
 from transformer_nuggets.cute.warpdrive.named import NamedBarrier
 from transformer_nuggets.cute.warpdrive.protocol import (
     ProtocolError,
@@ -1120,10 +1121,13 @@ class WarpSpecialized(metaclass=_KernelType):
 
         ``format="mermaid"`` or ``"dot"`` draws the same declarations as a graph: roles as
         nodes, channels as producer -> consumer edges, barriers and storage aliases
-        (``describe_graph.py``)."""
+        (``describe_graph.py``). ``format="html"`` draws that graph as a self-contained page
+        with details on hover (``describe_html.py``)."""
         self._collect()
         if format == "text":
             return describe_kernel(self)
+        if format == "html":
+            return describe_html(self)
         return describe_graph(self, format)
 
     def _barrier_plan(self):

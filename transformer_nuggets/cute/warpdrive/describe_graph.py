@@ -8,7 +8,7 @@ external side, the work streams and ``kernel code`` native callers are nodes of 
 Synchronization that is not a handoff (named barriers, turnstiles, ``Barriers``) is a hub joined
 to its users by undirected dotted edges, and one note lists the SMEM/TMEM aliases. Compile-only
 facts (TMA check status, epoch ownership, named-barrier users) appear once a compile has
-recorded them.
+recorded them. ``describe_html`` draws the same model as a self-contained page.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Literal
 
-from transformer_nuggets.cute.warpdrive.channels import SIDES, Barriers
+from transformer_nuggets.cute.warpdrive.channels import SIDES, Barriers, Tma, Umma
 from transformer_nuggets.cute.warpdrive.describe import (
     _overrides,
     channel_barriers,
@@ -52,6 +52,7 @@ class Node:
     id: str
     lines: tuple[str, ...]
     kind: NodeKind
+    ref: str = ""  # the role, channel, stream or hub it draws (empty for notes and raw code)
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,7 @@ class Edge:
     lines: tuple[str, ...] = ()
     kind: EdgeKind = "flow"
     cross_cta: bool = False
+    channels: tuple[str, ...] = ()  # the channels a handoff edge carries
 
 
 @dataclass
@@ -69,22 +71,34 @@ class Graph:
     nodes: list[Node] = field(default_factory=list)
     edges: list[Edge] = field(default_factory=list)
 
-    def add(self, kind: NodeKind, key: str, lines) -> str:
+    def add(self, kind: NodeKind, key: str, lines, ref: str = "") -> str:
         """Add a node; its id is ``kind_key`` made identifier-safe and unique."""
         base = f"{kind}_{re.sub(r'[^0-9A-Za-z]+', '_', key).strip('_')}"
         taken = {n.id for n in self.nodes}
         nid, k = base, 1
         while nid in taken:
             nid, k = f"{base}_{k}", k + 1
-        self.nodes.append(Node(nid, tuple(lines), kind))
+        self.nodes.append(Node(nid, tuple(lines), kind, ref))
         return nid
 
 
 def describe_graph(kernel, fmt: str) -> str:
     if fmt not in FORMATS:
-        raise ValueError(f"describe format must be 'text' or one of {FORMATS}, got {fmt!r}")
+        raise ValueError(
+            f"describe format must be 'text', 'html' or one of {FORMATS}, got {fmt!r}"
+        )
     graph = build_graph(kernel)
     return to_mermaid(graph) if fmt == "mermaid" else to_dot(graph)
+
+
+def mechanism(mech, named: bool = False) -> str:
+    """The colour key of a signal mechanism: ``tma``, ``umma``, ``threads`` (threads or warps)
+    or ``named`` (a named-barrier channel)."""
+    if named:
+        return "named"
+    if isinstance(mech, Tma):
+        return "tma"
+    return "umma" if mech is Umma else "threads"
 
 
 # --------------------------------------------------------------------------- #
@@ -97,7 +111,10 @@ def build_graph(kernel) -> Graph:
     graph = Graph(
         f"{type(kernel).__name__}: {kernel.num_warps} warps, {cluster.describe()}",
     )
-    roles = {r.name: graph.add("role", r.name, _role_lines(r, cluster)) for r in kernel._ws_roles}
+    roles = {
+        r.name: graph.add("role", r.name, _role_lines(r, cluster), r.name)
+        for r in kernel._ws_roles
+    }
     _streams(kernel, graph, roles)
     _channels(kernel, graph, roles)
     _hubs(kernel, graph, roles)
@@ -141,7 +158,7 @@ def _streams(kernel, graph: Graph, roles: dict) -> None:
             how, targets = "decoded locally in every role", []
         else:
             how, targets = "decoded locally", users
-        sid = graph.add("stream", name, [f"stream {name}", st.describe(), how])
+        sid = graph.add("stream", name, [f"stream {name}", st.describe(), how], name)
         graph.edges += [Edge(sid, roles[r], kind="stream") for r in targets]
 
 
@@ -159,11 +176,12 @@ def _channels(kernel, graph: Graph, roles: dict) -> None:
             parallel.setdefault(key, []).append((name, storage))
             continue
         lines = [f"{name} · {channel_kind(ch)}", *facts, *([storage] if storage else [])]
-        junction = graph.add("channel", name, lines)
+        junction = graph.add("channel", name, lines, name)
+        on = (name,)
         for nid, slot in producers:
-            graph.edges.append(Edge(nid, junction, _slot(slot), kind="into", cross_cta=cross))
+            graph.edges.append(Edge(nid, junction, _slot(slot), "into", cross, on))
         for nid, slot in consumers:
-            graph.edges.append(Edge(junction, nid, _slot(slot), cross_cta=cross))
+            graph.edges.append(Edge(junction, nid, _slot(slot), "flow", cross, on))
     for (src, dst, cross, kind, facts), chans in parallel.items():
         names = ", ".join(n for n, _ in chans)
         stores = {s for _, s in chans}
@@ -174,7 +192,8 @@ def _channels(kernel, graph: Graph, roles: dict) -> None:
         else:
             storage = [" · ".join(f"{n}: {s}" for n, s in chans if s)]
         head = f"{names} · {kind}" + (" each" if len(chans) > 1 else "")
-        graph.edges.append(Edge(src, dst, (head, *facts, *storage), cross_cta=cross))
+        on = tuple(n for n, _ in chans)
+        graph.edges.append(Edge(src, dst, (head, *facts, *storage), "flow", cross, on))
 
 
 def _ends(graph: Graph, roles: dict, name: str, ch, side: str) -> list[tuple[str, int | None]]:
@@ -244,7 +263,7 @@ def _hubs(kernel, graph: Graph, roles: dict) -> None:
             lines.append("unused")
         if users.get("unverified"):
             lines.append("participation unverified")
-        hub = graph.add("named", name, lines)
+        hub = graph.add("named", name, lines, name)
         for op, label in (("arrive", "arrive"), ("sync", "sync"), ("native", "native id")):
             for user in users.get(op, ()):
                 if user not in roles and outside is None:
@@ -253,7 +272,7 @@ def _hubs(kernel, graph: Graph, roles: dict) -> None:
                 graph.edges.append(Edge(end, hub, (label,), kind="spoke"))
     for name, ts in kernel._ws_turns.items():
         hub = graph.add(
-            "turnstile", name, [name, "turnstile" + ("" if ts.enabled else " (disabled)")]
+            "turnstile", name, [name, "turnstile" + ("" if ts.enabled else " (disabled)")], name
         )
         graph.edges += [
             Edge(roles[r.name], hub, (f"turn {i}",), kind="spoke")
@@ -265,7 +284,7 @@ def _hubs(kernel, graph: Graph, roles: dict) -> None:
         lines = [name, f"Barriers: {b.n} mbarriers, {init}", "user-driven (unchecked)"]
         if not users:
             lines.append("roles reach it through barrier_ptr")
-        hub = graph.add("barriers", name, lines)
+        hub = graph.add("barriers", name, lines, name)
         graph.edges += [Edge(roles[r], hub, ("Barriers",), kind="spoke") for r in users]
 
 

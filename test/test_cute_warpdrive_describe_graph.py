@@ -2,9 +2,12 @@
 graph. Toys check the drawn protocol (edge direction, pair scope, role instances, junctions,
 raw-code sides, hubs); every example kernel must draw a well-formed, deterministic graph."""
 
+import json
 import re
 import shutil
 import subprocess
+from html.parser import HTMLParser
+from xml.etree import ElementTree
 
 import pytest
 
@@ -297,3 +300,114 @@ def test_every_example_draws_a_well_formed_graph(make):
 def test_unknown_format_is_rejected():
     with pytest.raises(ValueError, match="describe format"):
         gemm.Gemm().describe(format="svg")
+
+
+# --------------------------------------------------------------------------- #
+# describe(format="html")
+# --------------------------------------------------------------------------- #
+
+
+class Page(HTMLParser):
+    """A ``describe(format="html")`` page: its drawn nodes (``{id: (kind, x, y, w, h)}``,
+    box from the translate and first rect), wires (``(classes, ends)``), details JSON, and
+    any reference to an outside resource."""
+
+    def __init__(self, text: str):
+        super().__init__()
+        self.nodes, self.wires, self.external = {}, [], []
+        self._node, self._data = None, None
+        self.feed(text)
+        self.svg = ElementTree.fromstring(text[text.index("<svg") : text.index("</svg>") + 6])
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        self.external += [v for k, v in attrs if k in ("src", "href") and v]
+        if tag == "link" or (tag == "script" and "src" in a):
+            self.external.append(tag)
+        classes = a.get("class", "").split()
+        if tag == "g" and "node" in classes:
+            x, y = map(
+                float, re.match(r"translate\(([-\d.]+),([-\d.]+)\)", a["transform"]).groups()
+            )
+            self._node = a["id"]
+            self.nodes[a["id"]] = [classes[1].removeprefix("kind-"), x, y, None, None]
+        elif (
+            tag == "rect"
+            and self._node
+            and self.nodes[self._node][3] is None
+            and "back" not in classes
+        ):
+            self.nodes[self._node][3:] = float(a["width"]), float(a["height"])
+        elif tag == "g" and "data-ends" in a:  # a drawn wire (not the legend's samples)
+            self.wires.append((set(classes), a["data-ends"].split()))
+        elif tag == "script" and a.get("id") == "data":
+            self._data = []
+
+    def handle_endtag(self, tag):
+        if tag == "g" and self._node:
+            self._node = None
+        if tag == "script" and self._data is not None:
+            self.details = json.loads("".join(self._data))
+            self._data = None
+
+    def handle_data(self, data):
+        if self._data is not None:
+            self._data.append(data)
+
+    def by_title(self, title: str) -> str:
+        (nid,) = (n for n, d in self.details.items() if d["title"] == title)
+        return nid
+
+    def ends(self, a: str, b: str) -> list[set[str]]:
+        return [classes for classes, ends in self.wires if ends == [a, b]]
+
+
+def test_html_draws_channels_as_chips_between_their_roles():
+    """A 1:1 channel is a chip the producer wires into and that wires to the consumer, in its
+    mechanisms' colours; a pair-scoped channel's wires are double; a junction chip wires to
+    every consumer instance."""
+    g = Page(PairPipeline().describe(format="html"))
+    load, mma, log = (g.by_title(n) for n in ("load", "mma", "log"))
+    data = g.by_title("data")
+    assert g.ends(load, data) == [{"wire", "into", "tma", "pair"}]
+    assert g.ends(data, mma) == [{"wire", "flow", "umma", "pair"}]
+    note = g.by_title("note")
+    assert g.ends(load, note) == [{"wire", "into", "threads"}]
+    assert g.ends(note, log) == [{"wire", "flow", "threads"}]
+    acc = g.by_title("acc")
+    assert all(g.ends(acc, g.by_title(f"sink[{i}]")) for i in range(2))
+    assert "cta leader: runs on the leader CTA of each MMA pair" in g.details[mma]["lines"]
+
+
+def test_html_hubs_and_raw_code():
+    """Hubs join their users; raw code is a node at its channel's external end."""
+    g = Page(SyncToy().describe(format="html"))
+    order = g.by_title("order")
+    assert g.nodes[order][0] == "turnstile"
+    assert all(g.ends(g.by_title(f"worker[{i}]"), order) for i in range(2))
+    assert g.ends(g.by_title("poll"), g.by_title("flags"))
+    raw = {g.details[n]["lines"][1]: n for n, node in g.nodes.items() if node[0] == "external"}
+    assert g.ends(g.by_title("out"), raw["out consumer"])
+    assert g.ends(raw["inbox producer"], g.by_title("inbox"))
+
+
+@pytest.mark.parametrize("make", EXAMPLES.values(), ids=EXAMPLES.keys())
+def test_every_example_draws_a_self_contained_page(make):
+    """The page is deterministic, needs no outside resource, has well-formed SVG, draws every
+    role and channel (each channel in exactly one chip), joins only drawn nodes, and lays
+    out its cards and chips without overlap."""
+    op = make()
+    text = op.describe(format="html")
+    assert make().describe(format="html") == text
+    g = Page(text)
+    assert g.external == []
+    titles = {d["title"] for d in g.details.values()}
+    assert {r.name for r in op._ws_roles} <= titles
+    chips = [g.details[n]["title"] for n, node in g.nodes.items() if node[0] == "chip"]
+    names = [name for title in chips for name in title.split(", ")]
+    assert sorted(names) == sorted(op._ws_chans)
+    assert all(set(ends) <= set(g.nodes) for _, ends in g.wires)
+    boxes = [n[1:] for n in g.nodes.values() if n[0] in ("role", "chip")]
+    for i, (x0, y0, w0, h0) in enumerate(boxes):
+        for x1, y1, w1, h1 in boxes[i + 1 :]:
+            assert x0 + w0 <= x1 or x1 + w1 <= x0 or y0 + h0 <= y1 or y1 + h1 <= y0
