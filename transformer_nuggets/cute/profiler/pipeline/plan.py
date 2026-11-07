@@ -98,7 +98,12 @@ class ScheduledDependency:
 
 @dataclass(frozen=True)
 class Timeline:
-    """Scheduled regions and dependencies for a finite iteration window."""
+    """Scheduled regions and dependencies for a finite iteration window.
+
+    ``dependencies`` are the window's concrete edges; ``plan_dependencies`` the plan's
+    symbolic ones, including those whose distance reaches past the window, which steady-state
+    analysis (recurrences, rings) needs.
+    """
 
     plan_name: str
     iteration_name: str
@@ -107,6 +112,7 @@ class Timeline:
     resources: tuple[Resource, ...]
     regions: tuple[ScheduledRegion, ...]
     dependencies: tuple[ScheduledDependency, ...]
+    plan_dependencies: tuple[Dependency, ...]
     logical_duration: int
 
     def to_dict(self) -> dict[str, object]:
@@ -297,5 +303,6 @@ class PipelinePlan:
             resources=tuple(self.resources.values()),
             regions=scheduled,
             dependencies=tuple(concrete_dependencies),
+            plan_dependencies=tuple(self.dependencies),
             logical_duration=max(item.end for item in scheduled),
         )

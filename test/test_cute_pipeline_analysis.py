@@ -29,6 +29,7 @@ from transformer_nuggets.cute.profiler.pipeline import (
     report,
     write_pipeline_perfetto,
 )
+from transformer_nuggets.cute.profiler.pipeline.analysis import ring_occupancy_samples
 from transformer_nuggets.utils.merge_traces import merge_traces
 
 
@@ -330,6 +331,60 @@ def test_analysis_and_perfetto_direct_flows(tmp_path: Path) -> None:
     }
     assert any(name.startswith("first ·") for name in process_names)
     assert any(name.startswith("second ·") for name in process_names)
+
+
+def test_steady_state_analysis_does_not_depend_on_the_window() -> None:
+    """A reuse distance at least the window length still bounds the recurrence and is a ring."""
+    results = []
+    for iterations in (1, 2, 4):
+        timeline = toy_plan().schedule(iterations=iterations)
+        analysis = analyze_pipeline(timeline, logical_capture(timeline))
+        cycle = analysis.logical_critical_cycle
+        results.append((cycle.initiation_interval, [ring.resource for ring in analysis.rings]))
+    assert results == [(4, ["x"])] * 3
+
+
+def fanout_plan(first: str) -> PipelinePlan:
+    """``load`` fills one slot of ``x`` that ``fast`` and ``slow`` both read and release."""
+    plan = PipelinePlan("fanout", iteration_name="tile")
+    for warp, name in enumerate(("load", "fast", "slow")):
+        plan.add_role(Role(name, name, warp, warp + 1, "#fff"))
+        plan.add_region(Region(name, name, name, 0, 1, name))
+    plan.add_resource(Resource("x", "X", 1, "SMEM", "x"))
+    consumers = ("fast", "slow") if first == "fast" else ("slow", "fast")
+    for consumer in consumers:
+        plan.add_dependency(Dependency("load", consumer, "x"))
+    for consumer in consumers:
+        plan.add_dependency(Dependency(consumer, "load", "x", distance=1, kind="reuse"))
+    return plan
+
+
+@pytest.mark.parametrize("first", ["fast", "slow"])
+def test_ring_slot_is_free_after_its_last_release(first: str) -> None:
+    """With two readers the slot drains when the slow one releases it, whatever the order of
+    the plan's dependencies."""
+    timeline = fanout_plan(first).schedule(iterations=2)
+    regions = [
+        (name, i, 600 * i + start, 600 * i + end)
+        for i in range(2)
+        for name, start, end in (("load", 0, 100), ("fast", 100, 300), ("slow", 100, 600))
+    ]
+    measured = MeasuredCapture(
+        "measured",
+        "fanout",
+        (0, 0, 0),
+        0,
+        1200,
+        tuple(MeasuredRegion(n, n, i, s, e, float(e - s), 1) for n, i, s, e in regions),
+    )
+    analysis = analyze_pipeline(timeline, measured)
+    assert [(r.resource, r.peak_occupancy, r.final_occupancy) for r in analysis.rings] == [
+        ("x", 1, 0)
+    ]
+    assert ring_occupancy_samples(timeline, measured) == {
+        "x": ((0, 0), (100, 1), (600, 0), (700, 1), (1200, 0))
+    }
+    assert [d.resource for d in analysis.depth_counterfactuals] == ["x"]
 
 
 def test_perfetto_splits_crossing_role_envelopes_and_normalizes_suffix(

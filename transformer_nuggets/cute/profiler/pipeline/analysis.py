@@ -236,7 +236,7 @@ def concrete_edges(
                     )
                 )
 
-    for dependency in unique_dependencies(timeline):
+    for dependency in timeline.plan_dependencies:
         distance = (
             depth_overrides.get(dependency.resource, dependency.distance)
             if dependency.kind == "reuse"
@@ -376,30 +376,63 @@ def measured_blockers(
     return tuple(blockers), weights
 
 
+def reuse_rings(timeline: Timeline) -> dict[str, tuple[Dependency, ...]]:
+    """Each ring resource's reuse dependencies, one per releasing reader."""
+    rings: dict[str, list[Dependency]] = defaultdict(list)
+    for dependency in timeline.plan_dependencies:
+        if dependency.kind == "reuse":
+            rings[dependency.resource].append(dependency)
+    return {resource: tuple(dependencies) for resource, dependencies in rings.items()}
+
+
+def ring_lifetimes(
+    timeline: Timeline,
+    measured: MeasuredCapture,
+    dependencies: tuple[Dependency, ...],
+) -> tuple[list[int], list[int]]:
+    """Origin-relative fill and release times of one ring's slots.
+
+    A slot fills when its producer finishes and is free again once the last of its readers
+    releases it.
+    """
+    measured_by_key = {(item.name, item.iteration): item for item in measured.regions}
+    producers = tuple(dict.fromkeys(dependency.target for dependency in dependencies))
+    readers = tuple(dict.fromkeys(dependency.source for dependency in dependencies))
+    fills: list[int] = []
+    releases: list[int] = []
+    for iteration in range(timeline.iterations):
+        for producer in producers:
+            if (producer, iteration) in measured_by_key:
+                fills.append(measured_by_key[(producer, iteration)].end_ns - measured.origin_ns)
+        released = [
+            measured_by_key[(reader, iteration)].end_ns
+            for reader in readers
+            if (reader, iteration) in measured_by_key
+        ]
+        if released:
+            releases.append(max(released) - measured.origin_ns)
+    return fills, releases
+
+
 def ring_occupancy_samples(
     timeline: Timeline,
     measured: MeasuredCapture,
 ) -> dict[str, tuple[tuple[int, int], ...]]:
     """Return normalized occupancy counter samples for every released resource."""
-    measured_by_key = {(item.name, item.iteration): item for item in measured.regions}
     samples = {}
-    for dependency in unique_dependencies(timeline):
-        if dependency.kind != "reuse":
-            continue
+    for resource, dependencies in reuse_rings(timeline).items():
+        fills, releases = ring_lifetimes(timeline, measured, dependencies)
         deltas: dict[int, int] = defaultdict(int)
-        for iteration in range(timeline.iterations):
-            producer = measured_by_key.get((dependency.target, iteration))
-            release = measured_by_key.get((dependency.source, iteration))
-            if producer is not None:
-                deltas[producer.end_ns - measured.origin_ns] += 1
-            if release is not None:
-                deltas[release.end_ns - measured.origin_ns] -= 1
+        for timestamp in fills:
+            deltas[timestamp] += 1
+        for timestamp in releases:
+            deltas[timestamp] -= 1
         occupancy = 0
         resource_samples = [(0, 0)]
         for timestamp, delta in sorted(deltas.items()):
             occupancy += delta
             resource_samples.append((timestamp, occupancy))
-        samples[dependency.resource] = tuple(resource_samples)
+        samples[resource] = tuple(resource_samples)
     return samples
 
 
@@ -409,28 +442,12 @@ def ring_analysis(
     blockers: Mapping[NodeKey, StageBlocker],
 ) -> tuple[RingAnalysis, ...]:
     """Measure ring occupancy, run-ahead, and reuse-attributed wait."""
-    measured_by_key = {(item.name, item.iteration): item for item in measured.regions}
     resources = {resource.name: resource for resource in timeline.resources}
     results = []
-    for dependency in unique_dependencies(timeline):
-        if dependency.kind != "reuse":
-            continue
-        resource = resources[dependency.resource]
-        events: list[tuple[int, int]] = []
-        fills: list[int] = []
-        releases: list[int] = []
-        for iteration in range(timeline.iterations):
-            producer_key = dependency.target, iteration
-            release_key = dependency.source, iteration
-            if producer_key in measured_by_key:
-                timestamp = measured_by_key[producer_key].end_ns - measured.origin_ns
-                fills.append(timestamp)
-                events.append((timestamp, 1))
-            if release_key in measured_by_key:
-                timestamp = measured_by_key[release_key].end_ns - measured.origin_ns
-                releases.append(timestamp)
-                events.append((timestamp, -1))
-        events.sort(key=lambda event: (event[0], event[1]))
+    for resource_name, dependencies in reuse_rings(timeline).items():
+        resource = resources[resource_name]
+        fills, releases = ring_lifetimes(timeline, measured, dependencies)
+        events = sorted([(timestamp, 1) for timestamp in fills] + [(t, -1) for t in releases])
         occupancy = 0
         peak = 0
         area = 0
@@ -451,12 +468,12 @@ def ring_analysis(
             max_run_ahead = max(max_run_ahead, fill_index - released)
         reuse_wait_ns = sum(
             stage.wait_inside_ns
-            for key, stage in blockers.items()
-            if stage.blocker_kind == "reuse" and stage.blocker_resource == dependency.resource
+            for stage in blockers.values()
+            if stage.blocker_kind == "reuse" and stage.blocker_resource == resource_name
         )
         results.append(
             RingAnalysis(
-                resource=dependency.resource,
+                resource=resource_name,
                 depth=resource.depth,
                 peak_occupancy=peak,
                 final_occupancy=occupancy,
@@ -478,21 +495,19 @@ def depth_counterfactuals(
     baseline = critical_path(nodes, concrete_edges(timeline), weights).makespan
     resources = {resource.name: resource for resource in timeline.resources}
     results = []
-    for dependency in unique_dependencies(timeline):
-        if dependency.kind != "reuse":
-            continue
-        resource = resources[dependency.resource]
+    for resource_name in reuse_rings(timeline):
+        resource = resources[resource_name]
         candidate = critical_path(
             nodes,
             concrete_edges(
                 timeline,
-                depth_overrides={dependency.resource: resource.depth + 1},
+                depth_overrides={resource_name: resource.depth + 1},
             ),
             weights,
         ).makespan
         results.append(
             DepthCounterfactual(
-                dependency.resource,
+                resource_name,
                 resource.depth,
                 resource.depth + 1,
                 baseline,
@@ -526,7 +541,7 @@ def critical_cycle(
         for left, right in zip(regions, regions[1:], strict=False):
             symbolic[left.name].append((right.name, "role", 0))
         symbolic[regions[-1].name].append((regions[0].name, f"role:{role}", 1))
-    for dependency in unique_dependencies(timeline):
+    for dependency in timeline.plan_dependencies:
         symbolic[dependency.source].append(
             (dependency.target, f"{dependency.kind}:{dependency.resource}", dependency.distance)
         )
@@ -568,22 +583,6 @@ def critical_cycle(
         total_distance=total_distance,
         cycles_checked=len(cycles),
     )
-
-
-def unique_dependencies(timeline: Timeline) -> tuple[Dependency, ...]:
-    """Return one copy of each symbolic dependency declaration."""
-    unique = {}
-    for item in timeline.dependencies:
-        dependency = item.dependency
-        key = (
-            dependency.source,
-            dependency.target,
-            dependency.resource,
-            dependency.distance,
-            dependency.kind,
-        )
-        unique.setdefault(key, dependency)
-    return tuple(unique.values())
 
 
 def unique_edges(edges: list[ConcreteEdge]) -> list[ConcreteEdge]:
