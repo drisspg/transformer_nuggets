@@ -91,14 +91,25 @@ def load_iket_capture(
             )
         ranges_by_warp[warp_id].append((item["startTs"], item["endTs"], name))
 
+    # A warp's n-th range of a region is iteration n, so every recording warp must record each
+    # region of its role once per iteration: a missing range would shift the later ones.
+    regions_by_role: dict[str, list[str]] = defaultdict(list)
+    for name, role_name in role_by_region.items():
+        regions_by_role[role_name].append(name)
     grouped: dict[tuple[str, int], list[tuple[int, int]]] = defaultdict(list)
-    for warp_ranges in ranges_by_warp.values():
+    for warp_id, warp_ranges in sorted(ranges_by_warp.items()):
         occurrences: dict[str, int] = defaultdict(int)
         for start_ns, end_ns, name in sorted(warp_ranges):
-            iteration = occurrences[name]
+            grouped[(name, occurrences[name])].append((start_ns, end_ns))
             occurrences[name] += 1
-            if iteration < timeline.iterations:
-                grouped[(name, iteration)].append((start_ns, end_ns))
+        role_name = role_by_region[warp_ranges[0][2]]
+        for name in regions_by_role[role_name]:
+            if occurrences[name] != timeline.iterations:
+                raise ValueError(
+                    f"IKET warp {warp_id} recorded {name!r} {occurrences[name]} times; the "
+                    f"timeline has {timeline.iterations} iterations (schedule(iterations="
+                    f"{occurrences[name]}) for a capture of that many)"
+                )
 
     expected = {scheduled.key for scheduled in timeline.regions}
     missing = sorted(expected - grouped.keys())

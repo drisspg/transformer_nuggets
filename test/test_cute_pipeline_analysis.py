@@ -206,6 +206,65 @@ def test_iket_json_join(tmp_path: Path) -> None:
     assert measured.duration_ns == timeline.logical_duration * 10
 
 
+def write_iket(path: Path, ranges: list[tuple[str, int, int, int]]) -> Path:
+    """Write an IKET JSON capture of CTA (0, 0, 0) from ``(name, warp, start, end)`` ranges."""
+    names = sorted({name for name, *_ in ranges})
+    warps = sorted({warp for _, warp, *_ in ranges})
+    path.write_text(
+        json.dumps(
+            {
+                "stringTable": names,
+                "locationTable": [{"ctaId": [0, 0, 0], "warpId": warp} for warp in warps],
+                "launches": [
+                    {
+                        "kernelName": "toy",
+                        "ranges": [
+                            {
+                                "startTs": start,
+                                "endTs": end,
+                                "rangeNameIdx": names.index(name),
+                                "warpLocIdxs": [warps.index(warp)],
+                            }
+                            for name, warp, start, end in ranges
+                        ],
+                    }
+                ],
+            }
+        )
+    )
+    return path
+
+
+def two_warp_plan() -> PipelinePlan:
+    """One region on a two-warp role."""
+    plan = PipelinePlan("two-warp", iteration_name="tile")
+    plan.add_role(Role("role", "Role", 0, 2, "#fff"))
+    plan.add_region(Region("work", "role", "Work", 0, 1, "work"))
+    return plan
+
+
+def test_iket_join_rejects_extra_occurrences(tmp_path: Path) -> None:
+    """A persistent CTA that ran three items does not silently analyze the first two."""
+    timeline = two_warp_plan().schedule(iterations=2)
+    path = write_iket(
+        tmp_path / "extra.json",
+        [("work", warp, 100 * i, 100 * i + 50) for warp in (0, 1) for i in range(3)],
+    )
+    with pytest.raises(ValueError, match=r"warp 0 recorded 'work' 3 times.*iterations=3"):
+        load_iket_capture(path, timeline)
+
+
+def test_iket_join_rejects_a_warp_missing_an_occurrence(tmp_path: Path) -> None:
+    """Warp 1 missing its middle range would shift its last one onto iteration 1, while warp 0
+    alone satisfies every (region, iteration)."""
+    timeline = two_warp_plan().schedule(iterations=3)
+    ranges = [("work", 0, 100 * i, 100 * i + 50) for i in range(3)]
+    ranges += [("work", 1, 100 * i, 100 * i + 50) for i in (0, 2)]
+    path = write_iket(tmp_path / "missing.json", ranges)
+    with pytest.raises(ValueError, match=r"warp 1 recorded 'work' 2 times"):
+        load_iket_capture(path, timeline)
+
+
 def test_analysis_and_perfetto_direct_flows(tmp_path: Path) -> None:
     timeline = toy_plan().schedule(iterations=4)
     measured = logical_capture(timeline)
