@@ -80,7 +80,7 @@ needs capture, use `benchmark_cuda_function_stats(fn, USE_CUDA_GRAPHS=True)`.
 CUTE intra-kernel profiling (writes a Perfetto trace):
 
 ```shell
-python -m transformer_nuggets.cute.profiler.example
+python examples/cute_profiler_buffering.py
 ```
 
 Measure tcgen05 MMA and TMEM instruction throughput and latency on sm_100/sm_103/sm_107
