@@ -7,7 +7,8 @@
 The command must launch the annotated kernel exactly once with IKET enabled. The
 run executes under ``run-iket`` with ``CUTE_DSL_NO_CACHE=1``; the raw IKET JSON
 and pftrace, the enriched pipeline pftrace, and the text report are copied to
-``<out>/<tag>.*`` so successive experiments stay side by side. Pass
+``<out>/<tag>.*`` (``<tag>`` kept whole, dots included) so successive experiments stay side
+by side. Pass
 ``--from-trace <trace.json>`` to re-analyze an existing capture without a GPU.
 """
 
@@ -26,7 +27,7 @@ from transformer_nuggets.cute.profiler.pipeline import (
     load_iket_capture,
     write_pipeline_perfetto,
 )
-from transformer_nuggets.cute.profiler.pipeline.report import report
+from transformer_nuggets.cute.profiler.pipeline.summary import report
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -58,10 +59,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def run_iket_once(command: list[str], run_dir: Path) -> Path:
     """Run ``command`` under ``run-iket`` with the JIT cache disabled; return its trace."""
-    shutil.rmtree(run_dir, ignore_errors=True)
     run_iket = shutil.which("run-iket")
     if run_iket is None:
         raise SystemExit("run-iket not found on PATH; install a CuTeDSL release with IKET")
+    shutil.rmtree(run_dir, ignore_errors=True)
     completed = subprocess.run(
         [run_iket, "--output-dir", str(run_dir), "--clobber", "profile", "--postprocess", "all"]
         + ["--", *command],
@@ -82,25 +83,26 @@ def main(argv: list[str] | None = None) -> int:
     cta = tuple(int(part) for part in args.cta.split(","))
 
     args.out.mkdir(parents=True, exist_ok=True)
-    prefix = args.out / args.tag
+
+    def artifact(suffix: str) -> Path:
+        return args.out / f"{args.tag}{suffix}"
+
     run_dir = args.out / f"iket_{args.tag}"
     if args.from_trace is not None:
         trace = args.from_trace
     else:
         trace = run_iket_once(args.command, run_dir)
-        shutil.copy(trace, prefix.with_suffix(".raw_iket.trace.json"))
+        shutil.copy(trace, artifact(".raw_iket.trace.json"))
         for raw in run_dir.glob("*.pftrace"):
-            shutil.copy(raw, prefix.with_suffix(".raw_iket.pftrace"))
+            shutil.copy(raw, artifact(".raw_iket.pftrace"))
 
     measured = load_iket_capture(trace, timeline, cta=cta)
     analysis = analyze_pipeline(timeline, measured)
-    write_pipeline_perfetto(
-        prefix.with_suffix(".enriched.pftrace"), timeline, measured, analysis=analysis
-    )
+    write_pipeline_perfetto(artifact(".enriched.pftrace"), timeline, measured, analysis=analysis)
     text = report(
         timeline, measured, analysis, unprofiled_iteration_ns=args.unprofiled_iteration_ns
     )
-    prefix.with_suffix(".report.txt").write_text(text + "\n")
+    artifact(".report.txt").write_text(text + "\n")
     print(text)
     if not args.keep_run_dir and args.from_trace is None:
         shutil.rmtree(run_dir, ignore_errors=True)

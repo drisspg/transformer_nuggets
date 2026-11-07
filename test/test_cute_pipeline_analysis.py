@@ -5,6 +5,8 @@ from __future__ import annotations
 from enum import Enum
 import json
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -603,6 +605,19 @@ def test_report_lists_regions_and_scheduler_findings() -> None:
     assert "RecMII" in text and "critical cycle: " in text
 
 
+def test_pipeline_report_is_the_function_after_importing_every_submodule() -> None:
+    """No submodule shadows the package's ``report`` export, whatever was imported first."""
+    script = (
+        "import pkgutil, importlib\n"
+        "import transformer_nuggets.cute.profiler.pipeline as pipeline\n"
+        "for info in pkgutil.iter_modules(pipeline.__path__):\n"
+        "    importlib.import_module(f'{pipeline.__name__}.{info.name}')\n"
+        "from transformer_nuggets.cute.profiler.pipeline import report\n"
+        "assert callable(report), report\n"
+    )
+    subprocess.run([sys.executable, "-c", script], check=True)
+
+
 def test_capture_cli_reanalyzes_an_existing_trace(tmp_path: Path, capsys) -> None:
     from transformer_nuggets.cute.profiler.pipeline.capture import main
 
@@ -634,7 +649,7 @@ def test_capture_cli_reanalyzes_an_existing_trace(tmp_path: Path, capsys) -> Non
     rc = main(
         [
             "--tag",
-            "demo",
+            "demo.v1",
             "--annotated",
             str(source),
             "--iterations",
@@ -647,6 +662,7 @@ def test_capture_cli_reanalyzes_an_existing_trace(tmp_path: Path, capsys) -> Non
     )
 
     assert rc == 0
-    assert (tmp_path / "traces" / "demo.enriched.pftrace").exists()
-    assert "RecMII" in (tmp_path / "traces" / "demo.report.txt").read_text()
+    # A dotted tag keeps its dot: demo.v1.report.txt, not demo.report.txt.
+    assert (tmp_path / "traces" / "demo.v1.enriched.pftrace").exists()
+    assert "RecMII" in (tmp_path / "traces" / "demo.v1.report.txt").read_text()
     assert "iteration 1 timeline" in capsys.readouterr().out
