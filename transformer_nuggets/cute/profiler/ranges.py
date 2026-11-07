@@ -1,7 +1,7 @@
 """The profiler's measurement model, ``Range``, and duration/overlap statistics over ranges.
 
 Both recorders produce ranges: ``host.decode_ranges`` from a ``%globaltimer`` profile buffer
-and ``pipeline.iket.parse_iket`` from an IKET capture. ``pipeline.measure.join`` joins either
+and ``iket.parse_iket`` from an IKET capture. ``pipeline.measure.join`` joins either
 to a pipeline plan; ``perfetto.write_ranges`` draws them.
 """
 

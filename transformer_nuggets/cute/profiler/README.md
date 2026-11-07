@@ -80,8 +80,8 @@ Contracts:
 
 | Records | Per-event device cost | Storage |
 |---|---|---|
-| Compact gmem (`compact_event_stop`, `smem=False`) | 2x `CS2R.32` + 1x `STG.E.EF.64` + address math | 8 B per event, global |
-| Compact smem (`compact_event_stop_smem`, `smem=True`) | 2x `CS2R.32` + 1x `STS.64` + bit-pack | 8 B per event in shared memory, flushed at exit |
+| Compact gmem (`compact_event_stop`, `smem=False`) | 2x `CS2R.32` + 1x `STG.E.EF.64` + address math + slot bounds check | 8 B per event, global |
+| Compact smem (`compact_event_stop_smem`, `smem=True`) | 2x `CS2R.32` + 1x `STS.64` + bit-pack + slot bounds check | 8 B per event in shared memory, flushed at exit |
 
 The smem path needs a CTA-local `Int64` tensor of `1 + max_events_per_unit` slots
 (`SmemAllocator.allocate_array` or a `cute.struct.MemRange`): `compact_prepare_smem(smem, max,
@@ -145,10 +145,12 @@ ranges for one sampled CTA, joins them to the kernel's pipeline plan (stage reus
 arrows and the stage ring's occupancy. It checks correctness and times the unprofiled
 specializations separately.
 
-One GB300 run of this checkout measured 167.5 us with one stage and 126.6 us with two (1.32x,
-five interleaved rounds). In the sampled CTA, the producer load's overlap with consumer work
-rose from 0% to 74%, median producer acquire fell from 192 to 32 ns, median consumer wait from
-192 to 64 ns, and the producer's measured wait for a released stage from 42 us to 0. Treat
+One GB300 run on 2026-11-07 (branch `profiler-fix`, CuTeDSL 4.8.0, the command above) measured
+167.5 us with one stage and 126.6 us with two (1.32x, five interleaved rounds). In the sampled
+CTA, the producer load's overlap with consumer work rose from 0% to 74%, median producer
+acquire fell from 192 to 32 ns, median consumer wait from 192 to 64 ns, and the producer's wait
+for a released stage (inferred from the consumer's release, as compact records trace no wait
+ranges) from 42 us to 0. Treat
 these as a worked interpretation, not expected constants; rerun on the target kernel and GPU.
 
 ## Pipeline analysis
