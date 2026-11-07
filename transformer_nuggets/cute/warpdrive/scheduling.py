@@ -950,8 +950,9 @@ class BoundWork:
 
 
 def _unit_cap(schedule, max_ctas, cs: int):
-    """``launch_units``'s cap: ``max_ctas`` in whole work units of ``cs`` CTAs (at least one),
-    or None for a schedule without ``uses_max_ctas``."""
+    """``launch_units``'s cap, shared by the launch and ``assignment``: ``max_ctas`` in whole
+    work units of ``cs`` CTAs (at least one cluster when ``cs > 1``), or None for a schedule
+    without ``uses_max_ctas``."""
     if not schedule.uses_max_ctas:
         return None
     if max_ctas is None:
