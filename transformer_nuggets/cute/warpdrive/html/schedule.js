@@ -22,7 +22,7 @@ const str = (c) => `rgb(${c[0]},${c[1]},${c[2]})`;
 const RAMP = ["#2f5d73", "#5f7f67", "#c9a35a"].map(rgb);
 let palette = {};
 function refreshPalette() {
-  palette = { paper: rgb(css("--paper")), panel: css("--panel"), ink: css("--ink"),
+  palette = { paper: rgb(css("--paper")), ink: css("--ink"),
     muted: css("--muted"), rule: css("--rule"), amber: css("--amber") };
   palette.kinds = D.colors.map(rgb);
 }
@@ -49,7 +49,7 @@ function spanRows() {
   const rows = Array.from({ length: CTAS }, () => []);
   for (let i = 0; i < N; i++) {
     const s = span(i);
-    if (s && s.cta < CTAS) rows[s.cta].push(i);
+    if (s) rows[s.cta].push(i);
   }
   rows.forEach((r) => r.sort((a, b) => span(a).start - span(b).start));
   return rows;
@@ -86,7 +86,7 @@ function addView(parent, title) {
 const rowH = () => Math.max(3, Math.min(16, Math.floor(620 / CTAS)));
 const LABEL_W = 52;
 
-function rowLabels(ctx, top, rh, h) {
+function rowLabels(ctx, top, rh) {
   const every = Math.max(1, Math.ceil(12 / rh));
   ctx.fillStyle = palette.muted;
   ctx.textBaseline = "middle";
@@ -118,7 +118,7 @@ function timeline(parent) {
     v.rows.forEach((r) => r.forEach((i) => { tmax = Math.max(tmax, span(i).end); }));
     tmax = tmax || 1;
     const x = (t) => LABEL_W + (t / tmax) * (w - LABEL_W - 6);
-    v.x = x; v.top = top; v.rh = rh; v.tmax = tmax; v.w = w;
+    v.top = top; v.rh = rh; v.tmax = tmax; v.w = w;
     const dim = state.critical && critical.size;
     v.rows.forEach((r, c) => r.forEach((i) => {
       const s = span(i);
@@ -127,7 +127,7 @@ function timeline(parent) {
       ctx.fillRect(x(s.start), top + c * rh, Math.max(1, x(s.end) - x(s.start) - 0.4), rh - (rh > 4));
     }));
     ctx.globalAlpha = 1;
-    rowLabels(ctx, top, rh, h);
+    rowLabels(ctx, top, rh);
     // time axis
     const step = niceStep(tmax / 8);
     ctx.fillStyle = palette.muted;
@@ -343,8 +343,8 @@ function setup() {
       draw();
     });
   });
-  const toggle = (id, key, available) => {
-    const b = document.getElementById(id);
+  const toggle = (key, available) => {
+    const b = document.getElementById(key);
     b.hidden = !available;
     b.setAttribute("aria-pressed", "false");
     b.addEventListener("click", () => {
@@ -353,8 +353,8 @@ function setup() {
       draw();
     });
   };
-  toggle("critical", "critical", Boolean(D.start && D.critical.length));
-  toggle("measured", "measured", Boolean(D.start && D.measured));
+  toggle("critical", Boolean(D.start && D.critical.length));
+  toggle("measured", Boolean(D.start && D.measured));
   legend();
   readout();
   draw();

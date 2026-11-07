@@ -31,6 +31,7 @@ from transformer_nuggets.cute.warpdrive.channels import SIDES, Tma
 from transformer_nuggets.cute.warpdrive.describe import _overrides, is_pair
 from transformer_nuggets.cute.warpdrive.describe_graph import (
     Graph,
+    _warps,
     build_graph,
     mechanism,
     wire_mechanism,
@@ -133,7 +134,7 @@ def _items(graph: Graph, kernel):
         elif n.kind == "role":
             boxes[n.id] = _role_box(n, roles[n.ref], kernel)
         elif n.kind == "channel":
-            boxes[n.id] = _chip_box(n.id, [n.ref], n.lines, kernel, chans)
+            boxes[n.id] = _chip_box(n.id, [n.ref], n.lines, kernel)
         elif n.kind in _HUB_KINDS and n.id not in edged:  # no known users to join
             panel.append(_section(n.ref, n.lines[1:]))
         elif n.kind in _HUB_KINDS:
@@ -159,7 +160,7 @@ def _items(graph: Graph, kernel):
                 wires.append(_Wire(e.src, e.dst, e.kind, color, e.cross_cta, label, junction))
             case _:  # a 1:1 channel edge: a chip between its ends
                 chip = f"chip_{i}"
-                boxes[chip] = _chip_box(chip, list(e.channels), e.lines, kernel, chans)
+                boxes[chip] = _chip_box(chip, list(e.channels), e.lines, kernel)
                 ch = chans[e.channels[0]]
                 prod, cons = (mechanism(m, ch.named) for m in (ch.producer, ch.consumer))
                 wires.append(_Wire(e.src, chip, "into", prod, e.cross_cta, chip=chip))
@@ -185,10 +186,6 @@ def _pill(x, y, text, cls) -> tuple[str, float]:
         f'rx="2"/>{_text(x + 4, y + 9, text, "badge-t")}</g>',
         w,
     )
-
-
-def _warps(warps: range) -> str:
-    return f"warp {warps.start}" if len(warps) == 1 else f"warps {warps.start}-{warps.stop - 1}"
 
 
 def _role_box(n, r, kernel) -> _Box:
@@ -266,8 +263,8 @@ def _chip_badges(names: list[str], kernel, ch) -> list[tuple[str, str]]:
     return badges
 
 
-def _chip_box(cid: str, names: list[str], lines, kernel, chans) -> _Box:
-    ch = chans[names[0]]
+def _chip_box(cid: str, names: list[str], lines, kernel) -> _Box:
+    ch = kernel._ws_chans[names[0]]
     prod, cons = (mechanism(m, ch.named) for m in (ch.producer, ch.consumer))
     label = ", ".join(names)
     kind = ("slots" if ch.fixed else "ring") + (" each" if len(names) > 1 else "")
@@ -458,7 +455,7 @@ def _layout(boxes: dict[str, _Box], links, spokes) -> list[list[tuple[float, flo
     top = min(boxes[n].y - boxes[n].h / 2 for n in boxes)
     for b in boxes.values():
         b.y += MARGIN + 6 - top
-    return _routes(boxes, links, dag, chains, col_w)
+    return _routes(boxes, links, chains, col_w)
 
 
 def _order(layers, up, down, users) -> list[list[str]]:
@@ -517,7 +514,7 @@ def _place(layer: list[str], boxes, want: list[float]) -> None:
         boxes[n].y = v + o
 
 
-def _routes(boxes, links, dag, chains, col_w):
+def _routes(boxes, links, chains, col_w):
     """Each link's points in its own direction. Ports spread along the box sides; a wire runs
     straight across each column and curves only in the gaps between columns."""
     out_ports: dict[str, list[tuple[float, int]]] = {}
@@ -532,7 +529,7 @@ def _routes(boxes, links, dag, chains, col_w):
             span = boxes[n].h * 0.5
             for k, (_, i) in enumerate(items):
                 frac = 0.5 if len(items) == 1 else k / (len(items) - 1)
-                at[i] = boxes[n].y + (frac - 0.5) * span * (len(items) > 1)
+                at[i] = boxes[n].y + (frac - 0.5) * span
     routes = []
     for i, ((a, b), chain) in enumerate(zip(links, chains)):
         pts = []
@@ -546,7 +543,7 @@ def _routes(boxes, links, dag, chains, col_w):
             else:
                 pts += [(box.x - half, box.y), (box.x + half, box.y)]
         pts = [p for k, p in enumerate(pts) if k == 0 or p != pts[k - 1]]
-        routes.append(pts if dag[i] == (a, b) else pts[::-1])
+        routes.append(pts if (chain[0], chain[-1]) == (a, b) else pts[::-1])
     return routes
 
 
