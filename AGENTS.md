@@ -3,6 +3,17 @@
 - Use `agent_space/` (git-ignored, at repo root) for temporary scripts, scratch files, and throwaway experiments.
 - Do not commit files from this directory.
 
+# Worktree Environments
+
+- Every worktree gets its own `.venv` built with `uv venv` + `uv pip install -e` from that
+  worktree (uv hard-links wheels from its cache, so it takes seconds). Never symlink, copy,
+  or `cp -al` another env: console scripts (`pytest`, `prek`) keep the source env's
+  interpreter in their shebang, so they silently run the other env's Python and packages.
+- The same applies to side-by-side envs for other CuTeDSL versions: build each with
+  `uv venv`, and invoke tools as `<env>/bin/python -m pytest` rather than `<env>/bin/pytest`.
+- Verify from outside the repo: `cd /tmp && <env>/bin/python -c "import transformer_nuggets,
+  cutlass; print(transformer_nuggets.__file__, cutlass.__version__)"`.
+
 # Project Skills
 
 - `.agents/skills/analyzing-pytorch-rooflines/SKILL.md` — eager/AOT roofline capture,
