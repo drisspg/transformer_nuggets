@@ -358,15 +358,17 @@ def compact_profile_region(
     if target_warp is None:
         target_warp = Int32(0)
     start_ts32 = compact_warp_start(target_warp, record)
-    yield
-    compact_warp_stop(
-        buf,
-        unit_id,
-        event_idx,
-        start_ts32,
-        tag,
-        max_events_per_unit,
-        target_warp,
-        record,
-        smem,
-    )
+    try:
+        yield
+    finally:
+        compact_warp_stop(
+            buf,
+            unit_id,
+            event_idx,
+            start_ts32,
+            tag,
+            max_events_per_unit,
+            target_warp,
+            record,
+            smem,
+        )
