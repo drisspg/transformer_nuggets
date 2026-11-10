@@ -1,5 +1,10 @@
 # warpdrive
 
+**Frozen:** warpdrive and its profiler/cache now live in
+[attention-gym](https://github.com/meta-pytorch/attention-gym/tree/main/attn_gym/warpdrive), with
+[docs here](https://github.com/meta-pytorch/attention-gym/tree/main/docs/warpdrive).
+Do not iterate here; this copy stays for TN's own kernels (sgemm, blockscaled/mxfp8/nvfp4, examples).
+
 Write the load, MMA and epilogue of a warp-specialized CuTeDSL kernel as separate methods.
 Connect them with channels:
 

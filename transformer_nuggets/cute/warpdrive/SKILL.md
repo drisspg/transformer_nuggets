@@ -5,6 +5,12 @@ description: Authors and ports warp-specialized CuTeDSL kernels using warpdrive.
 
 # Authoring warpdrive kernels
 
+**Frozen:** warpdrive and its profiler/cache now live in
+[attention-gym](https://github.com/meta-pytorch/attention-gym/tree/main/attn_gym/warpdrive), with
+[docs](https://github.com/meta-pytorch/attention-gym/tree/main/docs/warpdrive) and an
+[authoring skill](https://github.com/meta-pytorch/attention-gym/tree/main/.agents/skills/authoring-warpdrive).
+Do not iterate here; this copy stays for TN's own kernels (sgemm, blockscaled/mxfp8/nvfp4, examples).
+
 This skill lives with the library. Resolve its relative paths from this directory, using the
 same checkout for docs, examples and imported code. The repository docs and implementation
 are the API authority; do not substitute another checkout's newer API.

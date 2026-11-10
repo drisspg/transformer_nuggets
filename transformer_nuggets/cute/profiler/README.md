@@ -1,5 +1,10 @@
 # Intra-Kernel Profiling for CUTE DSL
 
+**Frozen:** the profiler now lives in
+[attention-gym's warpdrive/profiler](https://github.com/meta-pytorch/attention-gym/tree/main/attn_gym/warpdrive/profiler),
+with [docs here](https://github.com/meta-pytorch/attention-gym/tree/main/docs/warpdrive).
+Do not iterate here; this copy stays for TN's own kernels (sgemm, blockscaled/mxfp8/nvfp4, examples).
+
 Record code regions **inside** GPU kernels, decode them into ranges, analyze them against a
 pipeline plan, and export native [Perfetto](https://ui.perfetto.dev/) traces.
 

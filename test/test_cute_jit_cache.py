@@ -259,15 +259,21 @@ class TracedConfig:
         self.found = record
 
 
-def test_a_class_argument_keys_by_name_even_with_an_instance_hook():
-    target = cute_target.CompileTarget("test")
+def test_a_class_argument_keys_by_name_and_keeps_no_trace_record(isolated_cache):
+    """Cold, memory, and disk calls must not call a class's unbound trace hooks."""
 
-    def compile_kernel(kind):
-        return kind
+    @cute_cache.jit_cache
+    def compile_kernel(kind: type) -> FakeCompiled:
+        return FakeCompiled(kind.__name__)
 
-    first = cute_cache._make_key(compile_kernel, (TracedConfig,), {}, target)
-    assert first == cute_cache._make_key(compile_kernel, (TracedConfig,), {}, target)
-    assert first != cute_cache._make_key(compile_kernel, (CompileConfig,), {}, target)
+    assert compile_kernel(TracedConfig)() == "TracedConfig"
+    assert compile_kernel(TracedConfig)() == "TracedConfig"
+    assert compile_kernel(CompileConfig)() == "CompileConfig"
+    assert compile_kernel.cache_info() == cute_cache.CacheInfo(hits=1, misses=2, currsize=2)
+    assert not list(isolated_cache.rglob("*.trace"))
+    compile_kernel.cache_clear()
+    assert compile_kernel(TracedConfig)() == "TracedConfig"
+    assert compile_kernel.cache_info() == cute_cache.CacheInfo(hits=1, misses=0, currsize=1)
 
 
 def test_cached_calls_restore_the_trace_record(isolated_cache):

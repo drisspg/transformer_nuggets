@@ -21,6 +21,7 @@
 
 # Authoring warpdrive kernels
 
+- **Frozen:** warpdrive and its profiler/cache now live in [attention-gym](https://github.com/meta-pytorch/attention-gym/tree/main/attn_gym/warpdrive), with [docs here](https://github.com/meta-pytorch/attention-gym/tree/main/docs/warpdrive). Do not iterate here; this copy stays for TN's own kernels (sgemm, blockscaled/mxfp8/nvfp4, examples).
 - Read `transformer_nuggets/cute/warpdrive/SKILL.md` when authoring or porting a kernel.
   The skill, authoring guide, safety contract and examples live with the library and must
   match the checkout being used.

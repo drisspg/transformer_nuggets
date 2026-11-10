@@ -203,9 +203,16 @@ def _load_compiled(path: Path) -> Any:
 
 
 def _trace_holders(args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[Any]:
-    """Arguments that keep trace-time results, positional first, then keywords by name."""
+    """Arguments that keep trace-time results, positional first, then keywords by name.
+
+    Class-valued arguments are excluded: instance trace hooks are unbound on the class.
+    """
     values = (*args, *(kwargs[name] for name in sorted(kwargs)))
-    return [value for value in values if callable(getattr(value, "__cute_trace_record__", None))]
+    return [
+        value
+        for value in values
+        if not isinstance(value, type) and callable(getattr(value, "__cute_trace_record__", None))
+    ]
 
 
 def _trace_records(holders: list[Any]) -> tuple[Any, ...] | None:

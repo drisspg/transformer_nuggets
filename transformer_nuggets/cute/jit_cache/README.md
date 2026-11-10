@@ -1,5 +1,10 @@
 # jit_cache
 
+**Frozen:** jit_cache now lives in
+[attention-gym's warpdrive/cache](https://github.com/meta-pytorch/attention-gym/tree/main/attn_gym/warpdrive/cache),
+with [docs here](https://github.com/meta-pytorch/attention-gym/tree/main/docs/warpdrive).
+Do not iterate here; this copy stays for TN's own kernels (sgemm, blockscaled/mxfp8/nvfp4, examples).
+
 A persistent compile cache for TVM-FFI CuTeDSL kernels, ported from Attention Gym
 (`attn_gym/_backends/cute/cache.py` and `_key.py`) with the same keys and invalidation rules,
 plus trace records and `uncached=` (below).
